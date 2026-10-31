@@ -27,6 +27,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.world.Container;
 import net.minecraft.tags.BlockTags;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
@@ -123,6 +124,13 @@ public class AutoDirt extends Module implements Restocker.Owner {
         .name("ignore")
         .description("Blocks that are never covered.")
         .defaultValue(Blocks.CHEST, Blocks.TRAPPED_CHEST, Blocks.ENDER_CHEST, Blocks.BARREL, Blocks.CRAFTING_TABLE, Blocks.FURNACE)
+        .build()
+    );
+
+    private final Setting<Boolean> skipDirt = sgGeneral.add(new BoolSetting.Builder()
+        .name("skip-dirt-blocks")
+        .description("Never covers dirt-like blocks: dirt, grass, coarse or rooted dirt, podzol, mycelium, moss, mud, dirt paths and farmland. Turn off to cover them too, for example to pave mycelium with grass blocks, and put the ones to keep in ignore. The block you're placing is never covered either way.")
+        .defaultValue(true)
         .build()
     );
 
@@ -630,7 +638,9 @@ public class AutoDirt extends Module implements Restocker.Owner {
 
         BlockPos belowPos = pos.below();
         BlockState below = mc.level.getBlockState(belowPos);
-        if (isDirt(below)) return false;
+        // Never the block we're placing, so it never stacks on itself
+        if (below.is(dirtItem.get() instanceof BlockItem blockItem ? blockItem.getBlock() : Blocks.DIRT)) return false;
+        if (skipDirt.get() && isDirt(below)) return false;
         if (ignore.get().contains(below.getBlock())) return false;
         if (!below.isFaceSturdy(mc.level, belowPos, Direction.UP)) return false;
 

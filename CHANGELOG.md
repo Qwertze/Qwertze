@@ -7,6 +7,14 @@ Versions before 0.2.8 are listed on the [GitHub releases page](https://github.co
 
 ## [Unreleased]
 
+## [0.3.2-dev.3] - 2026-10-31
+
+### Added
+- auto-dirt: `skip-dirt-blocks` (on by default). Turn it off to cover dirt-like blocks too, such as mycelium, so a mushroom island can be paved with grass blocks. The `ignore` list still applies.
+
+### Changed
+- auto-dirt: never places a block on the same block, so with Grass Block as `dirt-item` grass never goes on grass.
+
 ## [0.3.2-dev.2] - 2026-10-16
 
 ### Added
