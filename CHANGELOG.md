@@ -7,6 +7,12 @@ Versions before 0.2.8 are listed on the [GitHub releases page](https://github.co
 
 ## [Unreleased]
 
+## [0.3.2-dev.4] - 2026-10-31
+
+### Changed
+- auto-dirt: `skip-dirt-blocks` is now `dirt-blocks`, a list of the dirt-like blocks it never covers. Remove a block to cover it, for example Mycelium to pave a mushroom island. If you had `skip-dirt-blocks` off, remove the blocks you want covered from the list.
+- auto-dirt: with Grass Block as the `dirt-item` it now always puts grass on plain dirt, for example the dirt you uncover by mining mycelium, while grass, mycelium and the other `dirt-blocks` are still skipped.
+
 ## [0.3.2-dev.3] - 2026-10-31
 
 ### Added

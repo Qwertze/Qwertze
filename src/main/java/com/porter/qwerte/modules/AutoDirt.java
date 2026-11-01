@@ -26,7 +26,6 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.world.Container;
-import net.minecraft.tags.BlockTags;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -127,10 +126,11 @@ public class AutoDirt extends Module implements Restocker.Owner {
         .build()
     );
 
-    private final Setting<Boolean> skipDirt = sgGeneral.add(new BoolSetting.Builder()
-        .name("skip-dirt-blocks")
-        .description("Never covers dirt-like blocks: dirt, grass, coarse or rooted dirt, podzol, mycelium, moss, mud, dirt paths and farmland. Turn off to cover them too, for example to pave mycelium with grass blocks, and put the ones to keep in ignore. The block you're placing is never covered either way.")
-        .defaultValue(true)
+    private final Setting<List<Block>> dirtBlocks = sgGeneral.add(new BlockListSetting.Builder()
+        .name("dirt-blocks")
+        .description("Dirt-like blocks that are never covered. Remove a block to cover it too, for example Mycelium to pave a mushroom island. With Grass Block as the dirt-item, plain Dirt is always covered, so dirt you uncover gets grass on it. The block you're placing is never covered either way.")
+        .defaultValue(Blocks.DIRT, Blocks.GRASS_BLOCK, Blocks.COARSE_DIRT, Blocks.ROOTED_DIRT, Blocks.PODZOL, Blocks.MYCELIUM,
+            Blocks.MOSS_BLOCK, Blocks.PALE_MOSS_BLOCK, Blocks.MUD, Blocks.MUDDY_MANGROVE_ROOTS, Blocks.DIRT_PATH, Blocks.FARMLAND)
         .build()
     );
 
@@ -640,16 +640,14 @@ public class AutoDirt extends Module implements Restocker.Owner {
         BlockState below = mc.level.getBlockState(belowPos);
         // Never the block we're placing, so it never stacks on itself
         if (below.is(dirtItem.get() instanceof BlockItem blockItem ? blockItem.getBlock() : Blocks.DIRT)) return false;
-        if (skipDirt.get() && isDirt(below)) return false;
         if (ignore.get().contains(below.getBlock())) return false;
+        // Grass goes on plain dirt, so placing grass always covers it, like dirt uncovered by mining mycelium
+        boolean grassOnDirt = dirtItem.get() == Items.GRASS_BLOCK && below.is(Blocks.DIRT);
+        if (!grassOnDirt && dirtBlocks.get().contains(below.getBlock())) return false;
         if (!below.isFaceSturdy(mc.level, belowPos, Direction.UP)) return false;
 
         // Also checks for entities, including us, in the way
         return BlockUtils.canPlace(pos, true);
-    }
-
-    private static boolean isDirt(BlockState state) {
-        return state.is(BlockTags.DIRT) || state.is(Blocks.DIRT_PATH) || state.is(Blocks.FARMLAND);
     }
 
     private boolean isDirtItem(ItemStack stack) {

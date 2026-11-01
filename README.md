@@ -86,9 +86,11 @@ switched on and off on its own.
 - Places dirt on every empty spot in reach that sits on a solid block that isn't dirt, nearest first.
 - Never places dirt on dirt, grass, coarse or rooted dirt, podzol, mycelium, mud, dirt paths or farmland, so it never
   stacks.
-- **Paving dirt-like ground:** turn off `skip-dirt-blocks` to cover those blocks too, for example to turn a mushroom
-  island into grass: set `dirt-item` to Grass Block and add anything you want kept to `ignore`. It never places a block
-  on the same block, so grass never goes on grass.
+- **Covering dirt-like ground:** the blocks it skips are in `dirt-blocks`, remove one to cover it too. To turn a
+  mushroom island into grass, set `dirt-item` to Grass Block and remove Mycelium from `dirt-blocks`.
+- **Grass on dirt:** with Grass Block as the `dirt-item`, plain dirt is always covered, so when you mine mycelium (or
+  anything else) and dirt is uncovered, grass goes on top of it. It never places a block on the same block, so grass
+  never goes on grass.
 - Never places into water or lava, or where you or another entity is standing.
 - Only covers ground below your feet by default, so walls and ledges are left alone.
 - Pick which dirt block to place, how far it reaches, how fast it places, and blocks it should never cover.
