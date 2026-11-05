@@ -317,6 +317,18 @@ A kit is a set of items packed together in one shulker, slot for slot with the s
 - A container mostly full of shulkers shows what the shulkers mostly hold, with a small shulker in the corner.
 - Icons update as the stash does: whenever stash-sorter sorts or you open a container yourself.
 
+### Stash Manager
+New in 0.4.0-dev and still being tested.
+- Sends what is in the stash saved by stash-sorter to the [Stash Manager server](stash-manager-server/README.md), a
+  small website for your network that shows the stash like a Minecraft inventory. Set `server-url` and `api-key` (the
+  server shows its key in the Link addon panel).
+- With `accept-orders` on, the bot takes orders from the website. It gathers the items, loose stacks first and then out
+  of shulkers, packs them into empty shulkers and puts them into the delivery container. Leftovers and unpacked
+  shulkers go back where they came from. stash-sorter doesn't need to be on; to stop the bot, turn off `accept-orders`
+  or this module.
+- Pick the delivery container with `select-delivery` and a right-click on the container. It is never sorted into.
+- An order in progress is saved with the stash, so it carries on after a disconnect.
+
 ## Installation
 
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) for Minecraft **1.21.11** or **1.21.4**.

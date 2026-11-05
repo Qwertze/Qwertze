@@ -37,6 +37,12 @@ public class Stash {
         public ItemStack[] contents;
         public boolean excluded;
         public boolean dropOff;
+        // Where finished orders are delivered. Also excluded, so nothing is ever sorted into or out of it
+        public boolean delivery;
+        // What excluded was before this became the delivery container, restored when it stops being one
+        public boolean wasExcluded, wasDropOff;
+        // When its contents were last read (milliseconds); 0 for stashes saved before this was kept, which counts as old
+        public long lastRead;
         public boolean unreachable;
         public int order;
         // The text of the sign the sorter put up on this container itself, and where, saved with the stash
@@ -134,6 +140,30 @@ public class Stash {
         public Compact compact;
     }
 
+    /**
+     * The order the bot is working on, saved so a restart carries on instead of starting again: its id, how many of its
+     * units (shulkers to deliver) are already delivered, and what was delivered per line key.
+     */
+    public static class ActiveOrder {
+        /** One shulker of the plan: kind 0 = packed shulker (key = group key), 1 = empty shulker (key = item key), 2 = built from lots. */
+        public static class UnitPlan {
+            public int kind;
+            public String key = "";
+            public final List<String> lotKeys = new ArrayList<>();
+            public final List<Integer> lotCounts = new ArrayList<>();
+        }
+
+        public String id = "";
+        public int done;
+        public int shulkersDelivered;
+        public final java.util.Map<String, Integer> delivered = new java.util.LinkedHashMap<>();
+        /** The order's lines as {type, key, count}, to report against when it is resumed. */
+        public final List<String[]> lines = new ArrayList<>();
+        /** The planned shulkers, so a resume carries on the same plan whatever the stash holds by then. */
+        public final List<UnitPlan> units = new ArrayList<>();
+    }
+
+    public ActiveOrder activeOrder;
     public final List<Orphan> orphans = new ArrayList<>();
     // The stacks the sorter took out of the stash and carries, by inventory slot, so they are still known as the stash's
     // after a restart
@@ -150,6 +180,31 @@ public class Stash {
     public static final int MAX_X = 256, MAX_Y = 128, MAX_Z = 256;
 
     public String areaDimension = "";
+    // The delivery container, kept on the stash itself so that no pruning of the box list (a perimeter that leaves it out,
+    // say) can lose it. It stays until the user clears it
+    public BlockPos deliveryPos;
+
+    /**
+     * Makes sure the delivery container is among the boxes: the box flagged as one gives the position, else the saved
+     * position is made a box again.
+     */
+    public void ensureDelivery() {
+        for (Box b : boxes) {
+            if (b.delivery) {
+                deliveryPos = b.pos;
+                return;
+            }
+        }
+        if (deliveryPos == null) return;
+
+        Box box = new Box(deliveryPos, new ArrayList<>(List.of(deliveryPos)));
+        box.delivery = true;
+        box.excluded = true;
+        boxes.add(box);
+        dirty = true;
+    }
+    // The dimension the stash is in, noted when a container of it is first read; empty for stashes saved before
+    public String dimension = "";
     private static Object cachedLevel;
     private static String cachedDimension = "";
 
@@ -375,6 +430,10 @@ public class Stash {
             tag.put("parts", positions(box.parts));
             tag.putBoolean("excluded", box.excluded);
             tag.putBoolean("dropOff", box.dropOff);
+            if (box.lastRead > 0) tag.putLong("readAt", box.lastRead);
+            if (box.delivery) tag.putBoolean("delivery", true);
+            if (box.wasExcluded) tag.putBoolean("wasExcluded", true);
+            if (box.wasDropOff) tag.putBoolean("wasDropOff", true);
             if (box.noCompact) tag.putBoolean("noCompact", true);
             if (box.autoLabel != null) tag.putString("autoLabel", box.autoLabel);
             if (box.autoSignPos != null) tag.put("autoSignPos", positions(List.of(box.autoSignPos)));
@@ -425,9 +484,52 @@ public class Stash {
 
         if (inFlight != null) root.put("inFlight", writeInFlight(inFlight, ops));
 
+        if (activeOrder != null) {
+            CompoundTag order = new CompoundTag();
+            order.putString("id", activeOrder.id);
+            order.putInt("done", activeOrder.done);
+            order.putInt("shulkers", activeOrder.shulkersDelivered);
+            ListTag orderLines = new ListTag();
+            for (String[] l : activeOrder.lines) {
+                CompoundTag line = new CompoundTag();
+                line.putString("type", l[0]);
+                line.putString("key", l[1]);
+                line.putInt("count", Integer.parseInt(l[2]));
+                orderLines.add(line);
+            }
+            order.put("lines", orderLines);
+            ListTag planned = new ListTag();
+            for (ActiveOrder.UnitPlan u : activeOrder.units) {
+                CompoundTag unit = new CompoundTag();
+                unit.putInt("kind", u.kind);
+                unit.putString("key", u.key);
+                ListTag lots = new ListTag();
+                for (int i = 0; i < u.lotKeys.size(); i++) {
+                    CompoundTag lot = new CompoundTag();
+                    lot.putString("key", u.lotKeys.get(i));
+                    lot.putInt("count", u.lotCounts.get(i));
+                    lots.add(lot);
+                }
+                unit.put("lots", lots);
+                planned.add(unit);
+            }
+            order.put("units", planned);
+            ListTag lines = new ListTag();
+            for (var entry : activeOrder.delivered.entrySet()) {
+                CompoundTag line = new CompoundTag();
+                line.putString("key", entry.getKey());
+                line.putInt("count", entry.getValue());
+                lines.add(line);
+            }
+            order.put("delivered", lines);
+            root.put("activeOrder", order);
+        }
+
         if (corner1 != null) root.put("corner1", positions(List.of(corner1)));
         if (corner2 != null) root.put("corner2", positions(List.of(corner2)));
         if (!areaDimension.isEmpty()) root.putString("areaDimension", areaDimension);
+        if (deliveryPos != null) root.put("deliveryPos", positions(List.of(deliveryPos)));
+        if (!dimension.isEmpty()) root.putString("dimension", dimension);
 
         try {
             Files.createDirectories(folder());
@@ -502,7 +604,7 @@ public class Stash {
         f.version = number(tag.get("version"), 0);
         // From a version this one doesn't understand: ignored
         if (f.version != InFlight.VERSION) return null;
-        f.savedAt = NbtOps.INSTANCE.getNumberValue(tag.get("savedAt")).result().map(Number::longValue).orElse(0L);
+        f.savedAt = longNumber(tag.get("savedAt"));
         f.dimension = text(tag, "dimension");
         f.job = text(tag, "job");
         f.handle = text(tag, "handle");
@@ -545,6 +647,7 @@ public class Stash {
 
         RegistryOps<Tag> ops = mc.level.registryAccess().createSerializationContext(NbtOps.INSTANCE);
         Stash stash = new Stash(name, server);
+        boolean[] errors = { false };
 
         try {
             CompoundTag root = NbtIo.readCompressed(path, NbtAccounter.unlimitedHeap());
@@ -559,6 +662,12 @@ public class Stash {
             }
             String areaDim = string(root.get("areaDimension"));
             if (areaDim != null) stash.areaDimension = areaDim;
+            if (root.get("deliveryPos") instanceof ListTag dp) {
+                List<BlockPos> at = readPositions(dp);
+                if (!at.isEmpty()) stash.deliveryPos = at.getFirst();
+            }
+            String dim = string(root.get("dimension"));
+            if (dim != null) stash.dimension = dim;
             if (root.get("held") instanceof ListTag heldList) {
                 for (Tag t : heldList) {
                     if (!(t instanceof CompoundTag tag)) continue;
@@ -568,10 +677,50 @@ public class Stash {
                 }
             }
             if (root.get("inFlight") instanceof CompoundTag flight) stash.inFlight = readInFlight(flight, ops);
+            if (root.get("activeOrder") instanceof CompoundTag order) {
+                ActiveOrder active = new ActiveOrder();
+                active.id = text(order, "id");
+                active.done = number(order.get("done"), 0);
+                active.shulkersDelivered = number(order.get("shulkers"), active.done);
+                if (order.get("lines") instanceof ListTag orderLines) {
+                    for (Tag t : orderLines) {
+                        if (t instanceof CompoundTag line) active.lines.add(new String[] { text(line, "type"), text(line, "key"), String.valueOf(number(line.get("count"), 0)) });
+                    }
+                }
+                if (order.get("units") instanceof ListTag planned) {
+                    for (Tag t : planned) {
+                        if (!(t instanceof CompoundTag unit)) continue;
+                        ActiveOrder.UnitPlan u = new ActiveOrder.UnitPlan();
+                        u.kind = number(unit.get("kind"), 0);
+                        u.key = text(unit, "key");
+                        if (unit.get("lots") instanceof ListTag lots) {
+                            for (Tag lt : lots) {
+                                if (lt instanceof CompoundTag lot) {
+                                    u.lotKeys.add(text(lot, "key"));
+                                    u.lotCounts.add(number(lot.get("count"), 0));
+                                }
+                            }
+                        }
+                        active.units.add(u);
+                    }
+                }
+                active.done = Math.max(0, Math.min(active.done, active.units.size()));
+                if (order.get("delivered") instanceof ListTag lines) {
+                    for (Tag t : lines) {
+                        if (t instanceof CompoundTag line) active.delivered.put(text(line, "key"), number(line.get("count"), 0));
+                    }
+                }
+                if (!active.id.isEmpty()) stash.activeOrder = active;
+            }
             ListTag list = (ListTag) root.get("boxes");
-            if (list == null) return stash;
+            if (list == null) {
+                stash.ensureDelivery();
+                return stash;
+            }
 
             for (Tag t : list) {
+                // One damaged entry must not take the whole stash (and the world join) with it
+                try {
                 CompoundTag tag = (CompoundTag) t;
                 List<BlockPos> parts = readPositions((ListTag) tag.get("parts"));
                 if (parts.isEmpty()) continue;
@@ -579,6 +728,11 @@ public class Stash {
                 Box box = new Box(parts.getFirst(), parts);
                 box.excluded = flag(tag, "excluded");
                 box.dropOff = flag(tag, "dropOff");
+                // Saved before read times existed: no tag, which counts as read long ago
+                box.lastRead = longNumber(tag.get("readAt"));
+                box.delivery = flag(tag, "delivery");
+                box.wasExcluded = flag(tag, "wasExcluded");
+                box.wasDropOff = flag(tag, "wasDropOff");
                 box.noCompact = flag(tag, "noCompact");
                 box.autoLabel = string(tag.get("autoLabel"));
                 if (tag.get("autoSignPos") instanceof ListTag sign) {
@@ -602,6 +756,10 @@ public class Stash {
                 }
 
                 stash.boxes.add(box);
+                } catch (RuntimeException ex) {
+                    QwerteAddon.LOG.warn("Skipped a container of stash {} that couldn't be read: {}", name, ex.toString());
+                    errors[0] = true;
+                }
             }
             if (root.get("orphans") instanceof ListTag lost) {
                 for (Tag t : lost) {
@@ -614,11 +772,41 @@ public class Stash {
                         string(tag.get("dimension"))));
                 }
             }
-        } catch (IOException | ClassCastException e) {
+        } catch (IOException | RuntimeException e) {
             QwerteAddon.LOG.error("Couldn't load stash {}", name, e);
+            errors[0] = true;
         }
 
+        // A stash that did not load fully could be saved over the original later: the original is kept first
+        if (errors[0]) backUp(path);
+
+        stash.ensureDelivery();
         return stash;
+    }
+
+    /** A long from a number tag; 0 when there is none (a stash saved before the field existed) or it is not a number. */
+    private static long longNumber(Tag tag) {
+        if (tag == null) return 0L;
+        return NbtOps.INSTANCE.getNumberValue(tag).result().map(Number::longValue).orElse(0L);
+    }
+
+    /** Copies a stash file that had errors to name.bak-yyyyMMdd-HHmmss, keeping the last three, and says so once. */
+    private static void backUp(Path path) {
+        try {
+            String stamp = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+            Path copy = path.resolveSibling(path.getFileName() + ".bak-" + stamp);
+            Files.copy(path, copy, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+
+            String prefix = path.getFileName() + ".bak-";
+            try (var files = Files.list(path.getParent())) {
+                var old = files.filter(f -> f.getFileName().toString().startsWith(prefix)).sorted().toList();
+                for (int i = 0; i < old.size() - 3; i++) Files.deleteIfExists(old.get(i));
+            }
+            QwerteAddon.LOG.warn("Stash file had errors; a backup was saved as {}", copy.getFileName());
+            meteordevelopment.meteorclient.utils.player.ChatUtils.warning("Stash file had errors; a backup was saved as %s", copy.getFileName());
+        } catch (IOException | RuntimeException e) {
+            QwerteAddon.LOG.warn("Couldn't back up the stash file {}: {}", path.getFileName(), e.toString());
+        }
     }
 
     private static boolean flag(CompoundTag tag, String key) {

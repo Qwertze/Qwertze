@@ -31,3 +31,14 @@ bin/
 # fabric
 
 run/
+
+# stash manager server data (holds the API key)
+
+stash-manager-data/
+stash-manager-server/stash-manager-data/
+stash-manager-server/.gradle/
+stash-manager-server/build/
+
+# python
+
+__pycache__/

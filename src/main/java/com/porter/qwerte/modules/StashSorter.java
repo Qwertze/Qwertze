@@ -156,6 +156,7 @@ public class StashSorter extends Module {
         Exclude("Exclude"),
         DropOff("Drop-off"),
         CompactSkip("Compact skip"),
+        Delivery("Delivery"),
         Corner1("Area corner 1"),
         Corner2("Area corner 2");
 
@@ -183,7 +184,7 @@ public class StashSorter extends Module {
 
     private final Setting<Boolean> sortItems = sgGeneral.add(new BoolSetting.Builder()
         .name("sort-items")
-        .description("Off: scan only. The module still reads containers it doesn't know or that went stale, watches containers and signs, and keeps the saved stash current for stash-overlay and search, but never moves items: no taking, depositing, compacting, labelling, kits or picking up from the ground. Containers are only opened to read them.")
+        .description("Off: scan only. The module still reads containers it doesn't know or that went stale, watches containers and signs, and keeps the saved stash current for stash-overlay and search, but never sorts: no taking, depositing, compacting, labelling, saved kits or picking up from the ground. Containers are only opened to read them. Orders from stash-manager still run, they are the only thing that moves items, and what an order leaves over is put back where it came from.")
         .defaultValue(true)
         .build()
     );
@@ -204,7 +205,7 @@ public class StashSorter extends Module {
 
     private final Setting<Pick> pick = sgGeneral.add(new EnumSetting.Builder<Pick>()
         .name("pick")
-        .description("Right-click containers to mark them. Exclude: never sorted into or out of. Drop-off: emptied into the stash, for others to drop items in. Compact skip: never used to gather stacks or shulkers for compacting. Right-click again to unmark. Area corner 1 and 2: the block you right-click becomes that corner of the stash perimeter. Works while the module is off.")
+        .description("Right-click containers to mark them. Exclude: never sorted into or out of. Drop-off: emptied into the stash, for others to drop items in. Compact skip: never used to gather stacks or shulkers for compacting. Delivery: where finished stash-manager orders are put (one per stash, never sorted into or out of). Right-click again to unmark. Area corner 1 and 2: the block you right-click becomes that corner of the stash perimeter. Works while the module is off.")
         .defaultValue(Pick.Off)
         .build()
     );
@@ -559,7 +560,7 @@ public class StashSorter extends Module {
         Pattern.compile("^(\\w{3,16}) -> (?:me|you): (.+)$")
     };
 
-    private enum Job { Survey, Take, Deposit, Dump, Fetch, Clean, Fill, Compact, KitTake, KitUnpack, KitFill, FetchSigns, Label, Gather, Ground, Explore, Unbundle }
+    private enum Job { Survey, Take, Deposit, Dump, Fetch, Clean, Fill, Compact, Deliver, Return, KitTake, KitUnpack, KitFill, FetchSigns, Label, Gather, Ground, Explore, Unbundle }
 
     private enum Step { Walking, Opening, Working }
 
@@ -1403,6 +1404,7 @@ public class StashSorter extends Module {
         @Override
         public void held(int slot, ItemStack stack) {
             stashHeld.put(slot, stack.copy());
+            noteOrderHeld(slot, stack);
         }
 
         @Override
@@ -1423,6 +1425,69 @@ public class StashSorter extends Module {
         @Override
         public void warn(String text) {
             warning("%s", text);
+        }
+
+        @Override
+        public boolean claims(ItemStack stack) {
+            return orderRunner.claims(stack);
+        }
+
+        @Override
+        public boolean namedShulkers() {
+            return namedForOrders();
+        }
+    });
+
+    // Orders from the Stash Manager server: kits built from exact items, delivered to the delivery container
+    private final OrderRunner orderRunner = new OrderRunner(kitBuilder, new OrderRunner.Owner() {
+        @Override
+        public Stash stash() {
+            return stash;
+        }
+
+        @Override
+        public boolean gate() {
+            return ordersOn();
+        }
+
+        @Override
+        public boolean usable(Box box) {
+            return !blocked(box, Job.Take) && !signPending(box) && !box.unreachable;
+        }
+
+        @Override
+        public boolean keepWhole(Box box) {
+            return box.labels.stream().anyMatch(Categories::isKeepWhole);
+        }
+
+        @Override
+        public boolean namedShulkers() {
+            return namedForOrders();
+        }
+
+        @Override
+        public boolean rereading() {
+            return !staleBoxes().isEmpty();
+        }
+
+        @Override
+        public int staleCount() {
+            return staleBoxes().size();
+        }
+
+        @Override
+        public double distance(Box box) {
+            return mc.player.getEyePosition().distanceToSqr(Vec3.atCenterOf(nearestPart(box)));
+        }
+
+        @Override
+        public Set<Integer> carry() {
+            return ownedCarry();
+        }
+
+        @Override
+        public void say(String text) {
+            info("%s", text);
         }
     });
     private int collectedSlot = -1;
@@ -1465,6 +1530,21 @@ public class StashSorter extends Module {
 
     @Override
     public void onActivate() {
+        // Taking over from stash-manager's driving: that is torn down first, then this starts as usual
+        if (driven) {
+            driven = false;
+            teardown();
+        }
+        setup();
+    }
+
+    /**
+     * Everything a start needs. {@code user} (the module was turned on) adds what is for a person: new containers near
+     * you, signs, everything marked stale, the checks and the talk. Driven by stash-manager only the state is reset.
+     */
+    private void setup() {
+        setUp = true;
+        boolean user = isActive();
         job = null;
         target = null;
         breakRetries = 0;
@@ -1512,15 +1592,30 @@ public class StashSorter extends Module {
         restoreHeld();
 
         // Scan-only never carries anything, so there are no slots to find
-        if (sortItems.get()) {
+        if (sorting()) {
             if (!pickCarrySlots()) {
-                toggle();
+                turnOff();
                 return;
             }
+        }
+        else if (ordersWanted()) {
+            // Not sorting moves nothing by itself, but orders need slots to carry in
+            pickCarrySlots(false);
         }
         else {
             carry.clear();
             pruneHeld();
+        }
+        orderHeld.clear();
+        heldFrom.clear();
+        returnGaveUp.clear();
+        returnWarned.clear();
+        // What an order took before a stop is put back now
+        if (!sorting() && ordersWanted()) {
+            for (int slot : stashHeld.keySet()) {
+                ItemStack there = mc.player.getInventory().getItem(slot);
+                if (carry.contains(slot) && !there.isEmpty()) orderHeld.put(slot, there.copy());
+            }
         }
 
         boolean existed = ensureStash() != null;
@@ -1532,6 +1627,10 @@ public class StashSorter extends Module {
             info("A shulker step was under way at %s when I stopped, finishing it first.", pendingResume.placed.toShortString());
         }
         else pendingResume = null;
+
+        // Driven: reads, orders and leftovers only. New containers, signs, marking everything stale, the checks and the talk
+        // are for a person turning the module on
+        if (!user) return;
 
         int added = addNearbyBoxes();
         labeller.reset();
@@ -1554,13 +1653,14 @@ public class StashSorter extends Module {
         checkOrphans();
         // Players may have changed things while it was off or the connection was down: every container is read again,
         // what is known stays in use until each one is
-        for (Box box : stash.boxes) box.stale = !box.excluded;
+        // (not the ones read within the fresh-minutes window: those are only read again if something marks them stale)
+        for (Box box : stash.boxes) box.stale = !box.excluded && !fresh(box);
 
         // With a perimeter the containers come from exploring it, and the checks wait until that is done
         if (!stash.hasArea() && !checkStash()) return;
 
         int unknown = (int) stash.boxes.stream().filter(b -> !b.excluded && (!b.known() || b.stale)).count();
-        if (!sortItems.get()) info("Stash \"%s\": %d containers, scan only: reading %d unknown or stale ones, then watching for changes.", stash.name, stash.boxes.size(), unknown);
+        if (!sorting()) info("Stash \"%s\": %d containers, scan only: reading %d unknown or stale ones, then watching for changes.", stash.name, stash.boxes.size(), unknown);
         else if (!existed) info("New stash \"%s\": scanning %d containers, then sorting.", stash.name, stash.boxes.size());
         else if (unknown > 0) info("Stash \"%s\": %d containers, scanning %d new ones first.", stash.name, stash.boxes.size(), unknown);
         else info("Stash \"%s\": %d containers, sorting by %s.", stash.name, stash.boxes.size(), mode.get() == Mode.Tiers ? "tier" : "sign");
@@ -1569,7 +1669,7 @@ public class StashSorter extends Module {
         List<String> plan = new ArrayList<>();
         if (stash.hasArea()) plan.add("explore the area");
         if (unknown > 0) plan.add("read " + unknown + " containers");
-        plan.add(!sortItems.get() ? "watch for changes" : mode.get() == Mode.Tiers ? "sort by tier" : "sort by sign");
+        plan.add(!sorting() ? "watch for changes" : mode.get() == Mode.Tiers ? "sort by tier" : "sort by sign");
         StringBuilder next = new StringBuilder();
         for (int i = 0; i < plan.size(); i++) next.append(i == 0 ? "" : ", then ").append(plan.get(i));
         step(String.format("starting \"%s\", %d containers; next: %s.", stash.name, stash.boxes.stream().filter(b -> !b.excluded).count(), next));
@@ -1579,6 +1679,14 @@ public class StashSorter extends Module {
 
     @Override
     public void onDeactivate() {
+        teardown();
+    }
+
+    private void teardown() {
+        setUp = false;
+        // An order stops where it is: its saved plan carries on at the next claim
+        orderRunner.reset();
+
         // Only a window of ours, never one the player opened
         if (mc.player != null && mc.player.containerMenu != mc.player.inventoryMenu && ourMenu(mc.player.containerMenu)) {
             if (!mc.player.containerMenu.getCarried().isEmpty()) recoverCursor();
@@ -1614,8 +1722,9 @@ public class StashSorter extends Module {
         syncHeld();
         if (stash != null && stash.isDirty()) stash.save();
 
-        if (mc.player != null && !carriedSlots().isEmpty()) {
-            alert("Stopped while carrying %d stacks from the stash, they're in your inventory.", carriedSlots().size());
+        if (mc.player != null) {
+            int held = sorting() ? carriedSlots().size() : (int) orderHeld.keySet().stream().filter(slot -> !mc.player.getInventory().getItem(slot).isEmpty()).count();
+            if (held > 0) alert("Stopped while carrying %d stacks from the stash, they're in your inventory.", held);
         }
 
         job = null;
@@ -1630,7 +1739,9 @@ public class StashSorter extends Module {
      */
     private void unstuck() {
         if (mc.player == null || mc.level == null) return;
-        if (!isActive()) {
+        // Driven by stash-manager counts as running: it is stopped and started again like the module
+        boolean wasOn = isActive();
+        if (!isActive() && !driven) {
             if (ensureStash() == null || stash.inFlight == null) {
                 info("Nothing to unstick: the sorter is off and no unfinished shulker step is saved.");
                 return;
@@ -1651,7 +1762,7 @@ public class StashSorter extends Module {
         BlockPos wasCollecting = handle == Handle.Collect ? placed : null;
 
         // Turning off saves a standing shulker to be finished on the next start: that record is dropped before turning on
-        toggle();
+        turnOff();
         if (stash != null && stash.inFlight != null) {
             stash.inFlight = null;
             stash.markDirty();
@@ -1663,13 +1774,21 @@ public class StashSorter extends Module {
         }
         else if (wasCollecting != null) alert("Unstuck: the shulker from %s may still be on the ground there, check for it.", wasCollecting.toShortString());
         alert("Unstuck: dropped what I was doing, starting over.");
-        toggle();
+        // The module goes back on if it was on; driven by stash-manager it is started again by its next tick
+        if (wasOn && !isActive()) toggle();
     }
 
     /**
      * Works out which slots to carry stash items in, from the settings or, by default, every empty slot.
      */
     private boolean pickCarrySlots() {
+        return pickCarrySlots(true);
+    }
+
+    /**
+     * @param required false in scan-only mode, where the slots are only for orders: having none is not an error
+     */
+    private boolean pickCarrySlots(boolean required) {
         carry.clear();
         pruneHeld();
         Set<Integer> keep = parseSlots(keepSlots.get());
@@ -1691,6 +1810,7 @@ public class StashSorter extends Module {
         }
 
         if (carry.isEmpty()) {
+            if (!required) return true;
             alertError(designated ? "Your carry-slots are all full. Empty at least one of them." : "Empty at least one inventory slot to carry items in.");
             return false;
         }
@@ -1722,7 +1842,7 @@ public class StashSorter extends Module {
     @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (stash == null) {
-            toggle();
+            turnOff();
             return;
         }
         ticks++;
@@ -1771,17 +1891,21 @@ public class StashSorter extends Module {
             if (ticks % 100 == 0 && stash.hasArea()) {
                 int added = scanArea();
                 // Containers that are gone, where the chunk is loaded to tell
-                boolean gone = stash.boxes.removeIf(box -> mc.level.isLoaded(box.pos) && !isContainer(box.pos));
+                boolean gone = stash.boxes.removeIf(this::blockGone);
                 if (gone) stash.markDirty();
                 if (added > 0 || gone) {
                     version++;
                     idle = false;
                 }
             }
+            // Scan-only with no carry slot yet: looked for again now and then, for orders
+            if (!sorting() && ordersWanted() && carry.isEmpty() && ticks % 100 == 0 && job == null && mc.player.containerMenu == mc.player.inventoryMenu) pickCarrySlots(false);
+            // Not taking orders and nothing of an order held: no carry slots
+            else if (!sorting() && !ordersWanted() && orderHeld.isEmpty() && !carry.isEmpty()) carry.clear();
             // Scan-only was switched off: there are carry slots to find now
-            if (sortItems.get() && carry.isEmpty()) {
+            if (sorting() && carry.isEmpty()) {
                 if (!pickCarrySlots()) {
-                    toggle();
+                    turnOff();
                     return;
                 }
                 idle = false;
@@ -1851,7 +1975,7 @@ public class StashSorter extends Module {
      */
     public boolean busyWithJob() {
         // Between jobs, and while waiting for others, it holds nothing: whoever is working finishes its step first
-        return isActive() && gate == Gate.Running && (job != null || handle != null);
+        return running() && gate == Gate.Running && (job != null || handle != null);
     }
 
     private boolean restingIdle() {
@@ -1864,7 +1988,7 @@ public class StashSorter extends Module {
      * Collecting from the ground is on and possible: the setting, not scan-only, Baritone there, the module running.
      */
     private boolean groundOn() {
-        return isActive() && sortItems.get() && collectGround.get() && BARITONE;
+        return isActive() && sorting() && collectGround.get() && BARITONE;
     }
 
     /**
@@ -2322,7 +2446,7 @@ public class StashSorter extends Module {
                 dropDone(box, false);
             }
         }
-        if (sortItems.get() && ticks % 20 == 0) {
+        if (sorting() && ticks % 20 == 0) {
             boolean any = false;
             for (Box box : stash.boxes) {
                 if (!box.dropOff || box.unreachable || box.excluded || box.stale) continue;
@@ -2420,6 +2544,10 @@ public class StashSorter extends Module {
         // A shulker step that was saved comes before anything else
         if (startResume()) return true;
 
+        // An order in hand comes before the sorter's own work: reading stale containers, exploring, sorting, compacting,
+        // labelling, saved kits, the ground. They wait until it is finished or parked
+        if (orderRunner.planned() && orderPriorityStep()) return true;
+
         // Exploring: whatever unknown or old is within reach is read before moving on to the next waypoint
         if (exploring && stash.hasArea()) {
             Box close = nearest(stash.boxes.stream().filter(b -> (!b.known() || b.stale) && !b.excluded && !b.unreachable && !failedSurvey.contains(b)
@@ -2428,22 +2556,26 @@ public class StashSorter extends Module {
         }
 
         // With a perimeter, its chunks are loaded first, so its containers are known before anything is sorted
-        if (startExplore()) return true;
-        if (!isActive()) return false;
+        if (explorePending && exploreRan && !exploring) explorePending = false;
+        if ((isActive() || explorePending) && startExplore()) return true;
+        if (!running()) return false;
 
         Box unread = nearest(stash.boxes.stream().filter(b -> !b.known() && !b.unreachable && !failedSurvey.contains(b) && !signPending(b)).toList());
         if (unread != null) return start(Job.Survey, unread);
 
         // Scan-only: the containers last seen before a stop are read again, then everything is read, nothing is moved.
-        if (!sortItems.get()) {
+        if (!sorting()) {
             Box old = nearest(staleBoxes());
             if (old != null) return start(Job.Survey, old);
         }
 
+        // Scan-only: an order is the only thing that moves items, and what it leaves over goes back where it came from
+        if (!sorting() && scanOnlyOrderStep()) return true;
+
         // Scan-only: everything is read, nothing is moved. A kit in hand is let go of, and a shulker standing in the
         // world is fetched back by finishSorting
-        if (!sortItems.get()) {
-            kitBuilder.suspend("scan only.");
+        if (!sorting()) {
+            if (!orderKit()) kitBuilder.suspend("scan only.");
             finishSorting();
             return false;
         }
@@ -2482,8 +2614,21 @@ public class StashSorter extends Module {
         List<Box> toReread = staleBoxes();
         boolean rereading = !toReread.isEmpty();
 
+        // An order kit left over from an order that is over is let go of, so it can't be taken for a saved kit
+        if (orderKit() && !orderRunner.running()) kitBuilder.dropOrderKit();
+
+        // Sorting: a shulker an order unpacked goes back to the container it came from, named or not
+        if (sorting() && !rereading && !kitBuilder.active() && !orderKit()) {
+            List<Integer> back = returnCandidates();
+            returning = !back.isEmpty();
+            if (returning && returnLeftovers(back)) return true;
+        }
+
+        // An order carries on until it is delivered, failed or paused. New work on it waits until what is carried is put away
+        if (orderRunner.running() && !rereading && (kitBuilder.active() || activeCarried().isEmpty()) && runOrder(orderRunner.next())) return true;
+
         // A kit being built carries on until it's finished or given up on
-        if (kitBuilder.active() && !rereading) {
+        if (kitBuilder.active() && !rereading && !orderKit()) {
             if (!kitsOn()) {
                 kitBuilder.suspend(!shulkersOk() ? "placing shulkers failed lately, so no shulker work for a few minutes."
                     : mode.get() != Mode.Signs ? "kits are only built in Signs mode." : "build-kits was switched off.");
@@ -2603,7 +2748,7 @@ public class StashSorter extends Module {
         if (startGround()) return true;
 
         // Nothing left to sort: build kits
-        if (kitsOn() && activeCarried().isEmpty() && !compactor.active() && kitBuilder.begin() && runKit(kitBuilder.next())) return true;
+        if (kitsOn() && !orderKit() && activeCarried().isEmpty() && !compactor.active() && kitBuilder.begin() && runKit(kitBuilder.next())) return true;
 
         // Everything is where it belongs: a full shulker's worth of anything is packed, which frees chest slots
         if (!kitBuilder.active() && compactor.start() && compactor.next()) return true;
@@ -2658,7 +2803,7 @@ public class StashSorter extends Module {
      * @return true when emptying has begun
      */
     private boolean startUnbundle() {
-        if (!sortItems.get()) return false;
+        if (!sorting()) return false;
         if (mc.screen != null || mc.player.containerMenu != mc.player.inventoryMenu || !mc.player.containerMenu.getCarried().isEmpty()) return false;
         if (freeCarrySlot() == -1) return false;
 
@@ -2803,6 +2948,388 @@ public class StashSorter extends Module {
         return false;
     }
 
+    // Order work: the carry slots holding what an order took out of the stash (with a copy of the stack, to tell it from
+    // something the player put there since), and the container each came from
+    private final Map<Integer, ItemStack> orderHeld = new java.util.LinkedHashMap<>();
+    private final Map<Integer, Box> heldFrom = new HashMap<>();
+    // Slots nowhere could be found for, so it does not try over and over; told once
+    private final Set<Integer> returnGaveUp = new HashSet<>();
+    private final Set<Integer> returnWarned = new HashSet<>();
+    private int returnGaveUpVersion;
+    private boolean returning;
+    // When the bot last worked on an order, and last did any job (in ticks of the clock)
+    private int lastOrderWork = -100000, lastOwnJob = -100000;
+
+    /** For the info string: leftovers of an order are being put back. */
+    boolean returningLeftovers() {
+        return returning && !sorting();
+    }
+
+    private boolean orderWork() {
+        return orderKit() || orderRunner.running();
+    }
+
+    private void noteOrderHeld(int slot, ItemStack baseline) {
+        if (slot < 0 || !orderWork()) return;
+        orderHeld.put(slot, baseline.copy());
+        if (target != null && (job == Job.KitTake || job == Job.Fetch)) heldFrom.put(slot, target);
+    }
+
+    /** A shulker of an order picked up again after it was placed: it keeps where it came from. */
+    private void noteCollected(int from, int slot) {
+        if (slot < 0 || !orderWork()) return;
+        ItemStack there = mc.player.getInventory().getItem(slot);
+        if (!there.isEmpty()) orderHeld.put(slot, there.copy());
+        Box source = heldFrom.get(from);
+        if (source != null) heldFrom.put(slot, source);
+        // Kept with what is held from the stash, so it is still known after a restart
+        if (!there.isEmpty()) stashHeld.put(slot, there.copy());
+    }
+
+    /** Whether the slot still holds what the order put there (shulkers change inside, loose stacks shrink). */
+    private boolean stillOurs(int slot) {
+        ItemStack now = mc.player.getInventory().getItem(slot);
+        if (now.isEmpty()) return false;
+
+        ItemStack was = orderHeld.get(slot);
+        if (was == null) {
+            orderHeld.put(slot, now.copy());
+            return true;
+        }
+        boolean same = Utils.isShulker(now.getItem()) ? now.getItem() == was.getItem() : ItemStack.isSameItemSameComponents(now, was);
+        if (!same) return false;
+        orderHeld.put(slot, now.copy());
+        return true;
+    }
+
+    /**
+     * Carry slots with things the order took that nothing is going to use any more: not the shulker being built or the
+     * finished one waiting for delivery.
+     */
+    private List<Integer> leftoverSlots() {
+        if (mc.player == null) return List.of();
+        orderHeld.keySet().removeIf(slot -> !stillOurs(slot));
+        heldFrom.keySet().retainAll(orderHeld.keySet());
+        returnGaveUp.retainAll(orderHeld.keySet());
+        returnWarned.retainAll(orderHeld.keySet());
+        if (returnGaveUpVersion != version) {
+            returnGaveUp.clear();
+            returnGaveUpVersion = version;
+        }
+
+        List<Integer> out = new ArrayList<>();
+        for (int slot : orderHeld.keySet()) {
+            ItemStack stack = mc.player.getInventory().getItem(slot);
+            if (orderRunner.claims(stack) || kitBuilder.holds(slot) || returnGaveUp.contains(slot)) continue;
+            out.add(slot);
+        }
+        return out;
+    }
+
+    /**
+     * What is put back by itself: everything an order left over when not sorting; when sorting only the shulkers taken
+     * from a known container (those go back where they came from, the rest is sorted like anything else).
+     */
+    private List<Integer> returnCandidates() {
+        List<Integer> left = leftoverSlots();
+        if (!sorting()) return left;
+        left.removeIf(slot -> !Utils.isShulker(mc.player.getInventory().getItem(slot).getItem()) || !heldFrom.containsKey(slot));
+        return left;
+    }
+
+    /** An order that is planned: put leftover shulkers back, then the next step of the order. @return true when a job was started */
+    private boolean orderPriorityStep() {
+        if (!sorting()) return scanOnlyOrderStep();
+
+        List<Integer> back = returnCandidates();
+        List<Integer> spent = spentSources(back);
+        if (!spent.isEmpty() && returnLeftovers(spent)) {
+            returning = true;
+            return true;
+        }
+        returning = !back.isEmpty() && !kitBuilder.active() && !orderKit();
+        if (returning && returnLeftovers(back)) return true;
+        return (kitBuilder.active() || activeCarried().isEmpty()) && runOrder(orderRunner.next());
+    }
+
+    /** Of these held slots, the shulkers the order kit being built is done with. */
+    private List<Integer> spentSources(List<Integer> held) {
+        if (!kitBuilder.active() || !orderKit()) return List.of();
+        List<Integer> out = new ArrayList<>();
+        for (int slot : held) if (kitBuilder.sourceSpent(slot)) out.add(slot);
+        return out;
+    }
+
+    /** What may be put back now: while the kit is built only the shulkers it is done with, else every leftover. */
+    private List<Integer> returnPool() {
+        List<Integer> candidates = returnCandidates();
+        return kitBuilder.active() ? spentSources(candidates) : candidates;
+    }
+
+    /** Not sorting: carries on with the order, or puts leftovers back. @return true when a job was started */
+    private boolean scanOnlyOrderStep() {
+        if (orderKit() && !orderRunner.running()) kitBuilder.dropOrderKit();
+
+        List<Integer> left = returnCandidates();
+
+        // A source shulker with nothing more the kit needs goes back at once, while the kit is still being built
+        List<Integer> spent = spentSources(left);
+        if (!spent.isEmpty() && returnLeftovers(spent)) {
+            returning = true;
+            return true;
+        }
+        returning = !left.isEmpty() && !kitBuilder.active();
+
+        if (orderRunner.running() && (kitBuilder.active() || left.isEmpty()) && runOrder(orderRunner.next())) return true;
+        return returning && returnLeftovers(left);
+    }
+
+    /** Whether a container could take this stack right now. */
+    private boolean roomFor(Box box, ItemStack stack) {
+        if (box.contents == null) return false;
+        for (ItemStack here : box.contents) {
+            if (here.isEmpty()) return true;
+            if (ItemStack.isSameItemSameComponents(here, stack) && here.getCount() < here.getMaxStackSize()) return true;
+        }
+        return false;
+    }
+
+    private boolean returnable(Box box, ItemStack stack) {
+        return box != null && stash.boxes.contains(box) && box.known() && !box.stale && !box.excluded && !box.delivery && !box.dropOff && !box.unreachable
+            && !isKitBox(box) && box.labels.stream().noneMatch(Categories::isKeepWhole)
+            && !blocked(box, Job.Return) && !signPending(box) && roomFor(box, stack);
+    }
+
+    /**
+     * Starts putting the first leftover back: in the container it was taken from if that has room, else the nearest
+     * container that has.
+     */
+    private boolean returnLeftovers(List<Integer> left) {
+        int slot = left.get(0);
+        ItemStack stack = mc.player.getInventory().getItem(slot);
+
+        Box home = heldFrom.get(slot);
+        if (!returnable(home, stack)) {
+            // Shulkers are only ever put back where they came from when sorting; the rest is sorted
+            home = sorting() ? null : nearest(stash.boxes.stream().filter(b -> returnable(b, stack)).toList());
+        }
+        if (home == null) {
+            returnGaveUp.add(slot);
+            if (returnWarned.add(slot)) alert("Nowhere in the stash has room for %s I'm carrying from an order, keeping it in your inventory.", StackInfo.label(stack));
+            return false;
+        }
+        return start(Job.Return, home);
+    }
+
+    /** Puts one leftover into the open container. */
+    private boolean returnOne() {
+        if (!mc.player.containerMenu.getCarried().isEmpty()) return recoverBounded();
+
+        for (int slot : returnPool()) {
+            ItemStack stack = mc.player.getInventory().getItem(slot);
+            if (!canFit(stack)) continue;
+            InvUtils.shiftClick().slotId(inventoryToMenu(slot, target.contents.length));
+            return true;
+        }
+        return false;
+    }
+
+    // Driven by stash-manager: the loop runs without the module being turned on, to read containers, take orders and
+    // put leftovers back. Never to sort.
+
+    private boolean driven;
+    private boolean explorePending;
+
+    /** The loop is running: the module is on, or stash-manager is driving it. */
+    private boolean running() {
+        return isActive() || driven;
+    }
+
+    /** Sorting, compacting, labelling, saved kits and ground pickup: only when the module itself is on and sort-items is. */
+    private boolean sorting() {
+        return isActive() && sortItems.get();
+    }
+
+    private boolean ordersWanted() {
+        StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+        return manager != null && manager.takingOrders();
+    }
+
+    private void turnOff() {
+        if (isActive()) toggle();
+        else if (driven) {
+            driven = false;
+            teardown();
+        }
+    }
+
+    /** Containers waiting to be read: not read yet, or stale. */
+    boolean needsReading() {
+        if (stash == null) return false;
+        if (explorePending && stash.hasArea() && BARITONE) return true;
+        return stash.boxes.stream().anyMatch(b -> !b.excluded && !b.unreachable && !failedSurvey.contains(b) && (!b.known() || b.stale));
+    }
+
+    /** stash-manager is driving the loop. */
+    boolean driving() {
+        return driven;
+    }
+
+    int staleCount() {
+        return staleBoxes().size();
+    }
+
+    /**
+     * stash-manager's call, every tick: whether it needs the loop. When the module is on it runs by itself and this does
+     * nothing. Starting is the same set-up as turning the module on (minus what is only for a person doing it), and
+     * stopping the same tear-down, without the module's switch ever moving.
+     */
+    void drive(boolean want) {
+        if (isActive()) {
+            driven = false;
+            return;
+        }
+        if (mc.player == null || mc.level == null) {
+            driven = false;
+            setUp = false;
+            return;
+        }
+
+        driveBlocked = null;
+        if (want) driveBlocked = notInStashWorld();
+        if (driveBlocked != null) want = false;
+
+        if (want && !driven) {
+            driven = true;
+            setup();
+        }
+        else if (!want && (driven || setUp)) {
+            driven = false;
+            teardown();
+        }
+    }
+
+    // Set up and not yet torn down, driven or not
+    private boolean setUp;
+    // Why the loop can't be driven now, for the blocker
+    private String driveBlocked;
+
+    /**
+     * Why the player is not where the stash is, or null: no stash, another dimension, or (when the stash does not know its
+     * dimension yet) too far from every container it knows.
+     */
+    private String notInStashWorld() {
+        if (stash == null) return "no stash";
+        String dim = !stash.dimension.isEmpty() ? stash.dimension : stash.areaDimension;
+        if (!dim.isEmpty()) return dim.equals(Stash.currentDimension()) ? null : "wrong dimension";
+
+        Vec3 at = mc.player.position();
+        for (Box box : stash.boxes) {
+            if (box.known() && at.distanceToSqr(Vec3.atCenterOf(box.pos)) <= 128 * 128) return null;
+        }
+        return "too far from the stash";
+    }
+
+    /** stash-manager's setting: orders may unpack shulkers with a custom name. */
+    private static boolean namedForOrders() {
+        StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+        return manager == null || manager.useNamedShulkers();
+    }
+
+    /** The kit being built is a transient one made for an order. */
+    private boolean orderKit() {
+        return kitBuilder.kit() != null && kitBuilder.kit().exact;
+    }
+
+    private boolean ordersOn() {
+        return running() && shulkersOk();
+    }
+
+    private boolean runOrder(OrderRunner.Intent intent) {
+        return switch (intent) {
+            case OrderRunner.Idle idleStep -> false;
+            case OrderRunner.Build build -> runKit(build.intent());
+            case OrderRunner.Fetch fetch -> fetch(fetch.box(), fetch.slot());
+            case OrderRunner.Deliver deliver -> start(Job.Deliver, deliver.box());
+        };
+    }
+
+    /** Puts the order's finished shulker into the delivery container, stopping when it is full. */
+    private boolean deliverOne() {
+        if (!mc.player.containerMenu.getCarried().isEmpty()) return recoverBounded();
+
+        // What the container held before, to see afterwards that it gained the shulker
+        if (actions == 0) orderRunner.deliveryOpened(target.contents);
+
+        for (int slot : carriedSlots()) {
+            if (!orderRunner.claims(mc.player.getInventory().getItem(slot))) continue;
+            if (!canFit(mc.player.getInventory().getItem(slot))) {
+                orderRunner.deliveryFull();
+                return false;
+            }
+            InvUtils.shiftClick().slotId(inventoryToMenu(slot, target.contents.length));
+            return true;
+        }
+        // Only a read after the settle wait, or of a freshly opened window, is the server's word and not our own prediction
+        if (settled || actions == 0) orderRunner.deliveryClosed(target.contents);
+        return false;
+    }
+
+    // For the Stash Manager module
+
+    OrderRunner orders() {
+        return orderRunner;
+    }
+
+    /** Why an order can't be taken now, or null if one can. */
+    String orderBlocker() {
+        if (!running()) return driveBlocked != null ? driveBlocked : "starting";
+        if (!shulkersOk()) return "sorter can't use shulkers";
+        if (carry.isEmpty()) return "no free inventory slot";
+        if (ensureStash() == null) return "no stash";
+        if (orderRunner.deliveryBox() == null) return "no delivery box";
+        if (kitBuilder.active() && !orderKit()) return "busy: building a kit";
+        return orderRunner.holdsOrder() ? "busy" : null;
+    }
+
+    /**
+     * For stash-manager (the website's rescan button): every known container is read again, nearest first, and the area
+     * is explored again for new ones. What is known stays in place, so the index keeps showing it until each is read.
+     * Works with sort-items off, and with the sorter off: the reading starts when it is turned on.
+     * @return how many containers will be read, or -1 when no stash is loaded
+     */
+    int rescan() {
+        if (ensureStash() == null) return -1;
+        int count = 0;
+        for (Box box : stash.boxes) {
+            if (box.excluded) continue;
+            box.stale = true;
+            count++;
+        }
+        forgetExploration();
+        explorePending = true;
+        stash.save();
+        version++;
+        idle = false;
+        return count;
+    }
+
+    /** The server cancelled an order: the sorter wakes up to stop it at the next safe point. */
+    boolean orderCancel(String id) {
+        boolean held = orderRunner.cancel(id);
+        if (held) {
+            version++;
+            idle = false;
+        }
+        return held;
+    }
+
+    /** A new order was taken: the sorter wakes up for it. */
+    void orderTaken() {
+        version++;
+        idle = false;
+    }
+
     private boolean isKitJob() {
         return job == Job.KitTake || job == Job.KitUnpack || job == Job.KitFill;
     }
@@ -2944,7 +3471,7 @@ public class StashSorter extends Module {
      * fits inside a kit is an ordinary bulk shulker.
      */
     private boolean isKitShulker(ItemStack shulker) {
-        return Kits.claims(shulker) || kitBuilder.heldKit(shulker) != null;
+        return Kits.claims(shulker) || kitBuilder.heldKit(shulker) != null || orderRunner.claims(shulker);
     }
 
     /**
@@ -2963,16 +3490,14 @@ public class StashSorter extends Module {
         return room;
     }
 
-    private static boolean emptyShulker(ItemStack shulker) {
-        if (shulker == null || shulker.isEmpty() || !Utils.isShulker(shulker.getItem()) || shulker.has(DataComponents.CUSTOM_NAME) || Kits.claims(shulker)) return false;
+    private boolean emptyShulker(ItemStack shulker) {
+        if (shulker == null || shulker.isEmpty() || !Utils.isShulker(shulker.getItem()) || shulker.has(DataComponents.CUSTOM_NAME) || Kits.claims(shulker) || orderRunner.claims(shulker)) return false;
         for (ItemStack s : inside(shulker)) if (s != null && !s.isEmpty()) return false;
         return true;
     }
 
     private static ItemStack[] inside(ItemStack shulker) {
-        ItemStack[] contents = new ItemStack[27];
-        Utils.getItemsInContainerItem(shulker, contents);
-        return contents;
+        return Kits.inside(shulker);
     }
 
     private int carriedStacksOf(BulkKey key) {
@@ -3030,8 +3555,8 @@ public class StashSorter extends Module {
                 step(String.format("repacking: cleaning a mixed shulker beside %s; next: break and pick it up, then put away %d stacks.", xyz(here), n));
             }
             case Fill -> step(String.format("repacking: filling a shulker beside %s; next: break and pick it up, then put it away.", xyz(here)));
-            case KitFill -> step(String.format("kits: filling a kit shulker beside %s; next: break and pick it up.", xyz(here)));
-            case KitUnpack -> step(String.format("kits: unpacking a kit shulker beside %s; next: break and pick it up.", xyz(here)));
+            case KitFill -> step(String.format(orderKit() ? "order: filling the shulker for the order beside %s; next: break and pick it up." : "kits: filling a kit shulker beside %s; next: break and pick it up.", xyz(here)));
+            case KitUnpack -> step(String.format(orderKit() ? "order: taking what the order needs out of a shulker beside %s; next: break and pick it up." : "kits: unpacking a kit shulker beside %s; next: break and pick it up.", xyz(here)));
             default -> { }
         }
         return true;
@@ -3580,7 +4105,11 @@ public class StashSorter extends Module {
             stalled.removeAll(circular);
             circular.clear();
         }
-        if (job == Job.KitFill || job == Job.KitUnpack) kitBuilder.handled(job == Job.KitFill, collectedSlot >= 0 ? collectedSlot : handledSlot);
+        if (job == Job.KitFill || job == Job.KitUnpack) {
+            kitBuilder.handled(job == Job.KitFill, collectedSlot >= 0 ? collectedSlot : handledSlot);
+            // The shulker picked up again: an unpacked one goes back to the stash in scan-only mode
+            noteCollected(handledSlot, collectedSlot >= 0 ? collectedSlot : handledSlot);
+        }
         handle = null;
         placed = null;
         placedConfirmed = false;
@@ -4045,7 +4574,25 @@ public class StashSorter extends Module {
         return null;
     }
 
+    /** Stay-on, or stash-manager is driving it: the sorter rests when it has nothing to do instead of turning itself off. */
+    private boolean keepOn() {
+        return stayOn.get() || driven;
+    }
+
     private void finishSorting() {
+        // An order in hand keeps the sorter awake, even when it has to wait (paused, or for a saved kit)
+        if (orderRunner.running()) {
+            // The pass is over all the same: its counters start again, or the loop watchdog would fire on every tick
+            boxVisits.clear();
+            circular.clear();
+            loopReported.clear();
+            closedEarlyReported.clear();
+            passJobs = 0;
+            passMin = Integer.MAX_VALUE;
+            wait = Math.max(wait, 20);
+            return;
+        }
+
         // A plan in hand: the shulker standing in the world is fetched back first, then what was gathered for it is put away
         if (compactor.active()) {
             compactor.abort("sorting is finishing");
@@ -4067,18 +4614,18 @@ public class StashSorter extends Module {
         extra += compactor.takeRunSummary();
         if (!stuckCarried.isEmpty()) extra += String.format(" %d stacks I am carrying have nowhere to go.", stuckCarried.size());
         long leftInDropOffs = stash.boxes.stream().filter(b -> b.dropOff && b.known() && !b.unreachable).mapToLong(b -> b.contents.length - b.free()).sum();
-        if (sortItems.get() && leftInDropOffs > 0) extra += String.format(" %d stacks are still in drop-offs, there's no room left in the stash.", leftInDropOffs);
+        if (sorting() && leftInDropOffs > 0) extra += String.format(" %d stacks are still in drop-offs, there's no room left in the stash.", leftInDropOffs);
 
         // Scan-only: one scan, then off, unless stay-on keeps it watching
-        if (!sortItems.get()) {
-            if (!stayOn.get()) {
+        if (!sorting()) {
+            if (!keepOn()) {
                 info("Scan only: read %d containers, the saved stash is up to date.%s", scanned, extra);
                 step(String.format("done: read %d containers; stopping.", scanned));
                 scanned = 0;
-                toggle();
+                turnOff();
                 return;
             }
-            if (scanned > 0 || !extra.equals(lastSummary)) {
+            if (!driven && (scanned > 0 || !extra.equals(lastSummary))) {
                 info("Scan only: read %d containers, the saved stash is up to date.%s Watching for changes.", scanned, extra);
                 step(String.format("idle: read %d containers; next: re-read a container when it changes.", scanned));
             }
@@ -4091,7 +4638,7 @@ public class StashSorter extends Module {
             return;
         }
 
-        if (stayOn.get()) {
+        if (keepOn()) {
             // Waking up for a drop-off check that finds nothing says nothing; a changed summary does
             if (moved > 0 || !extra.equals(lastSummary)) {
                 info("Sorted, moved %d stacks.%s Waiting for more to sort.", moved, extra);
@@ -4107,7 +4654,7 @@ public class StashSorter extends Module {
 
         info("Done, moved %d stacks.%s", moved, extra);
         step(String.format("done: moved %d stacks, packed %d shulkers; stopping.", moved, packedRun));
-        toggle();
+        turnOff();
     }
 
     // When the job in hand began, for the debug log
@@ -4208,10 +4755,15 @@ public class StashSorter extends Module {
                         source != null ? after + "take from " + xyz(source.pos) : others.isEmpty() ? "carry on" : others.size() + " more stops"));
                 }
                 case Compact -> step(String.format("sorting: merging partial stacks in %s at %s; next: carry on.", home(box), xyz(box.pos)));
-                case Fetch -> step(String.format("repacking: fetching a mixed shulker from %s at %s; next: clean it beside the chest.", home(box), xyz(box.pos)));
+                case Fetch -> {
+                    if (orderWork()) {
+                        step(String.format("order: fetching %s from %s at %s.", kitBuilder.active() ? kitBuilder.fetchPurpose() : "the shulker the order asks for", home(box), xyz(box.pos)));
+                    }
+                    else step(String.format("repacking: fetching a mixed shulker from %s at %s; next: clean it beside the chest.", home(box), xyz(box.pos)));
+                }
                 case FetchSigns -> step(String.format("labelling: fetching signs from %s at %s; next: put up the signs.", home(box), xyz(box.pos)));
                 case Gather -> { /* said by the compactor */ }
-                case KitTake -> step(String.format("kits: taking items from %s at %s; next: fill the kit shulker.", home(box), xyz(box.pos)));
+                case KitTake -> step(String.format(orderKit() ? "order: taking items for the order from %s at %s; next: fill the shulker." : "kits: taking items from %s at %s; next: fill the kit shulker.", home(box), xyz(box.pos)));
                 default -> { }
             }
         } catch (RuntimeException e) {
@@ -4224,7 +4776,7 @@ public class StashSorter extends Module {
             // Never close with something on the cursor, it would be merged into the inventory or dropped
             if (!mc.player.containerMenu.getCarried().isEmpty() && !recoverCursor()) {
                 alertError("Couldn't put away the stack on the cursor, no free slot. Stopping, and the stack may be dropped when the container closes.");
-                toggle();
+                turnOff();
                 return;
             }
             closeOurWindow(mc.player.containerMenu);
@@ -4425,6 +4977,8 @@ public class StashSorter extends Module {
             case Take -> takeOne();
             case Fetch -> fetchOne();
             case Compact -> compactOne();
+            case Deliver -> deliverOne();
+            case Return -> returnOne();
             case Deposit -> depositOne();
             case Dump -> dumpOne();
         };
@@ -4460,7 +5014,7 @@ public class StashSorter extends Module {
     private int chained;
 
     private boolean chainJob() {
-        if (!sortItems.get() || signAbort || target == null || job == null || actions == 0) return false;
+        if (!sorting() || signAbort || target == null || job == null || actions == 0) return false;
         if (job != Job.Deposit && job != Job.Take && job != Job.Dump && job != Job.Compact) return false;
         // Only after a part that got somewhere, and never on a container given up on, with a sign changing, in the
         // middle of a swap, and not more than 4 times in a row
@@ -4771,6 +5325,9 @@ public class StashSorter extends Module {
     private static void carryMarks(Box from, Box to) {
         to.excluded |= from.excluded;
         to.dropOff |= from.dropOff;
+        to.delivery |= from.delivery;
+        to.wasExcluded |= from.wasExcluded;
+        to.wasDropOff |= from.wasDropOff;
     }
 
     // Moving items
@@ -4804,6 +5361,7 @@ public class StashSorter extends Module {
         if (into == -1 || wantSlot >= target.contents.length || !fetchWants.test(target.contents[wantSlot])) return false;
 
         stashHeld.put(into, target.contents[wantSlot].copy());
+        noteOrderHeld(into, target.contents[wantSlot]);
         InvUtils.move().fromId(wantSlot).toId(inventoryToMenu(into, target.contents.length));
         wantSlot = -1;
         return true;
@@ -5035,7 +5593,7 @@ public class StashSorter extends Module {
      * particular, in which case it's left where it is. Never an excluded or drop-off container.
      */
     private List<Box> destinationsFor(ItemStack stack) {
-        if (stack.isEmpty()) return List.of();
+        if (stack.isEmpty() || orderRunner.claims(stack)) return List.of();
         if (destCache == null) return computeDestinations(stack);
         return destCache.computeIfAbsent(DestKey.of(stack), k -> computeDestinations(stack));
     }
@@ -5314,8 +5872,9 @@ public class StashSorter extends Module {
         int added = 0;
 
         // With a perimeter, nothing outside it belongs to the stash
-        if (stash.hasArea() && stash.boxes.removeIf(box -> box.parts.stream().noneMatch(stash::inArea))) stash.markDirty();
-        if (stash.boxes.removeIf(box -> mc.level.isLoaded(box.pos) && !isContainer(box.pos))) stash.markDirty();
+        // (the delivery container is wherever the user put it: outside the perimeter is fine)
+        if (stash.hasArea() && stash.boxes.removeIf(box -> !box.delivery && box.parts.stream().noneMatch(stash::inArea))) stash.markDirty();
+        if (stash.boxes.removeIf(this::blockGone)) stash.markDirty();
 
         // A chest next to a saved one may have made it a double (or a double been halved): bring the parts up to date
         // and forget one that is now just the other half of an earlier box. Changed boxes get read again.
@@ -5340,6 +5899,9 @@ public class StashSorter extends Module {
                 }
             }
         }
+
+        // Nothing above takes the delivery container; if it was lost some other way it is made a box again from its position
+        stash.ensureDelivery();
 
         // The perimeter replaces radius and height: every container inside it, in the chunks that are loaded
         if (stash.hasArea()) return added + scanArea();
@@ -5419,17 +5981,96 @@ public class StashSorter extends Module {
             box.noCompact = !box.noCompact;
             notice(box.noCompact ? "%s is never used to gather for compacting." : "%s can be used for compacting again.", box.pos.toShortString());
         }
+        else if (pick.get() == Pick.Delivery) {
+            boolean set = markDelivery(box);
+            notice(set ? "%s is where orders are delivered. It is never sorted." : "%s is a normal container again.", box.pos.toShortString());
+        }
         else if (pick.get() == Pick.Exclude) {
             box.excluded = !box.excluded;
             box.dropOff = false;
+            if (box.delivery && box.pos.equals(stash.deliveryPos)) stash.deliveryPos = null;
+            box.delivery = false;
             notice(box.excluded ? "%s won't be sorted." : "%s will be sorted again.", box.pos.toShortString());
         }
         else {
             box.dropOff = !box.dropOff;
             box.excluded = false;
+            if (box.delivery && box.pos.equals(stash.deliveryPos)) stash.deliveryPos = null;
+            box.delivery = false;
             notice(box.dropOff ? "%s is a drop-off, it'll be emptied into the stash." : "%s is a normal container again.", box.pos.toShortString());
         }
 
+        stash.save();
+        version++;
+        return true;
+    }
+
+    /**
+     * Makes this box the delivery container, or a normal one again if it was. There is only one: the old one is restored
+     * to what it was before. The same for the pick and for stash-manager.
+     * @return true when it is now the delivery container
+     */
+    /** Whether the container's block is really gone (its chunk is loaded and it is no container). */
+    private boolean blockGone(Box box) {
+        if (!mc.level.isLoaded(box.pos)) return false;
+        if (!box.delivery) return !isContainer(box.pos);
+
+        // The delivery container counts as long as it is a chest or barrel, whatever the barrels setting says
+        var entity = mc.level.getBlockEntity(box.pos);
+        if (entity instanceof ChestBlockEntity || entity instanceof BarrelBlockEntity) return false;
+        stash.deliveryPos = null;
+        alert("Delivery container at %s is gone (block removed), cleared.", box.pos.toShortString());
+        return true;
+    }
+
+    private boolean markDelivery(Box box) {
+        boolean set = !box.delivery;
+        for (Box other : stash.boxes) {
+            if (other.delivery) {
+                other.delivery = false;
+                other.excluded = other.wasExcluded;
+                other.dropOff = other.wasDropOff;
+                other.wasExcluded = other.wasDropOff = false;
+            }
+        }
+        if (set) {
+            box.wasExcluded = box.excluded;
+            box.wasDropOff = box.dropOff;
+            box.delivery = true;
+            box.excluded = true;
+        }
+        box.dropOff = false;
+        stash.deliveryPos = set ? box.pos : null;
+        return set;
+    }
+
+    /**
+     * For stash-manager: marks or unmarks the container at this block as the delivery container.
+     * @return 1 when it is now the delivery container, 0 when it was unmarked, -1 when it isn't a container, -2 when no
+     *         stash is loaded
+     */
+    int toggleDelivery(BlockPos pos) {
+        if (mc.level == null || ensureStash() == null) return -2;
+        if (!isContainer(pos)) return -1;
+
+        Box box = stash.boxAt(pos);
+        if (box == null) {
+            box = makeBox(pos.immutable());
+            stash.boxes.add(box);
+        }
+        boolean set = markDelivery(box);
+        stash.save();
+        version++;
+        return set ? 1 : 0;
+    }
+
+    /** For stash-manager: no delivery container any more. @return false when there was none or no stash */
+    boolean clearDelivery() {
+        if (ensureStash() == null) return false;
+        Box was = null;
+        for (Box b : stash.boxes) if (b.delivery) was = b;
+        if (was == null) return false;
+        markDelivery(was);
         stash.save();
         version++;
         return true;
@@ -5494,7 +6135,7 @@ public class StashSorter extends Module {
     private void areaChanged() {
         forgetExploration();
         if (job == Job.Explore) finishExplore();
-        if (isActive()) {
+        if (running()) {
             areaDirty = true;
             version++;
             idle = false;
@@ -5610,22 +6251,22 @@ public class StashSorter extends Module {
      */
     private boolean checkStash() {
         long sortable = stash.boxes.stream().filter(b -> !b.excluded && !b.dropOff).count();
-        if (!sortItems.get()) {
+        if (!sorting()) {
             if (stash.boxes.isEmpty()) {
                 error("Found no containers within %d blocks.", radius.get());
-                toggle();
+                turnOff();
                 return false;
             }
         }
         else if (sortable < 2) {
             error("Found %d container%s to sort within %d blocks, need at least 2.", sortable, sortable == 1 ? "" : "s", radius.get());
-            toggle();
+            turnOff();
             return false;
         }
 
-        if (sortItems.get() && mode.get() == Mode.Signs && stash.boxes.stream().allMatch(b -> b.labels.isEmpty())) {
+        if (sorting() && mode.get() == Mode.Signs && stash.boxes.stream().allMatch(b -> b.labels.isEmpty())) {
             alertError("None of the containers have signs on them. Put signs on them, or use Tiers mode.");
-            toggle();
+            turnOff();
             return false;
         }
         return true;
@@ -5853,8 +6494,16 @@ public class StashSorter extends Module {
     }
 
     private class Tracker {
+        // Driven by stash-manager the module's own handlers are not subscribed: the loop is ticked from here
+        @EventHandler
+        private void onEngineTick(TickEvent.Pre event) {
+            if (driven && !isActive() && mc.player != null && mc.level != null) StashSorter.this.onTick(event);
+        }
+
         @EventHandler
         private void onGameLeft(GameLeftEvent event) {
+            driven = false;
+            setUp = false;
             // Before anything is forgotten: what is carried and the shulker standing in the world are written down
             if (stash != null) {
                 BlockPos standing = standingShulker();
@@ -5884,6 +6533,11 @@ public class StashSorter extends Module {
             alertQueue.clear();
             worldTicks = 0;
             kitBuilder.reset();
+            orderRunner.reset();
+            orderHeld.clear();
+            heldFrom.clear();
+            returnGaveUp.clear();
+            returnWarned.clear();
             stashHeld.clear();
             labeller.reset();
             compactor.reset();
@@ -5942,7 +6596,7 @@ public class StashSorter extends Module {
                 else if (BaritoneHelper.isActive() && !BaritoneHelper.goalIs((baritone.api.pathing.goals.Goal) ourGoal)) BaritoneHelper.unconfine();
             }
             // Safeguard for the sneak: it never outlives the module
-            if (ledgeSneaking && !isActive()) ledgeGuard(false);
+            if (ledgeSneaking && !running()) ledgeGuard(false);
             labeller.restoreHand();
             restoreHotbar();
 
@@ -5977,7 +6631,7 @@ public class StashSorter extends Module {
             watchStash();
 
             // The sorter reads the containers it opens itself
-            if (isActive() && job != null) return;
+            if (running() && job != null) return;
 
             AbstractContainerMenu menu = mc.player.containerMenu;
             if (menu instanceof ChestMenu) {
@@ -6049,7 +6703,19 @@ public class StashSorter extends Module {
         return false;
     }
 
+    /** Whether the box was read recently enough, by stash-manager's fresh-minutes, to be trusted without reading it again. */
+    private boolean fresh(Box box) {
+        StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+        long window = (manager == null ? 5 : manager.freshMinutes()) * 60_000L;
+        return window > 0 && box.known() && box.lastRead > 0 && System.currentTimeMillis() - box.lastRead < window;
+    }
+
     private void read(Box box) {
+        box.lastRead = System.currentTimeMillis();
+        if (stash.dimension.isEmpty() && mc.level != null) {
+            stash.dimension = Stash.currentDimension();
+            stash.markDirty();
+        }
         readAt.put(box, clock);
         AbstractContainerMenu menu = mc.player.containerMenu;
         boolean differs = changed(box, menu);
@@ -6070,7 +6736,9 @@ public class StashSorter extends Module {
      */
     private void watchStash() {
         // Our own and the player's opens are not other players'
-        if (isActive() && target != null && job != null) ownTouch.put(target, clock);
+        if (orderWork() || returning) lastOrderWork = clock;
+        if (running() && (job != null || handle != null)) lastOwnJob = clock;
+        if (running() && target != null && job != null) ownTouch.put(target, clock);
         if (trackedBox != null) ownTouch.put(trackedBox, clock);
 
         if (watch.get() && clock % LID_POLL_TICKS == 0) {
@@ -6087,7 +6755,11 @@ public class StashSorter extends Module {
      */
     private boolean openedByUs(Box box) {
         Integer at = ownTouch.get(box);
-        return at != null && clock - at <= OWN_TOUCH_TICKS;
+        if (at != null && clock - at <= OWN_TOUCH_TICKS) return true;
+        // Working on an order, a lid near the bot soon after one of its jobs is its own: a shulker put down or taken up beside
+        // a chest, a close that arrives late
+        return clock - lastOrderWork <= OWN_TOUCH_TICKS * 2 && clock - lastOwnJob <= OWN_TOUCH_TICKS * 2 && mc.player != null
+            && mc.player.getEyePosition().distanceToSqr(Vec3.atCenterOf(nearestPart(box))) <= 12 * 12;
     }
 
     /**
@@ -6096,7 +6768,7 @@ public class StashSorter extends Module {
      */
     private void accessed(Box box) {
         debug("Another player used the container at %s.", box.pos.toShortString());
-        if (isActive()) {
+        if (running()) {
             // One we've just read ourselves isn't read again for a minute: a late lid event from our own opening on a
             // laggy server would otherwise start a loop. The visit is kept, once per container, for after that
             Integer last = readAt.get(box);
@@ -6148,7 +6820,7 @@ public class StashSorter extends Module {
      * Signs are watched for changes: while sorting by signs, and in scan-only mode, which keeps the saved labels current.
      */
     private boolean signsWatched() {
-        return watchSigns.get() && (mode.get() == Mode.Signs || !sortItems.get());
+        return watchSigns.get() && (mode.get() == Mode.Signs || !sorting());
     }
 
     /**
@@ -6214,7 +6886,7 @@ public class StashSorter extends Module {
         idle = false;
 
         String was = before.isEmpty() ? "no sign" : before.getFirst(), is = now.isEmpty() ? "no sign" : now.getFirst();
-        if (sortItems.get()) info("Sign at %s changed: \"%s\" -> \"%s\", re-sorting.", box.pos.toShortString(), was, is);
+        if (sorting()) info("Sign at %s changed: \"%s\" -> \"%s\", re-sorting.", box.pos.toShortString(), was, is);
         else info("Sign at [%d, %d, %d] changed: \"%s\" -> \"%s\" (scan only).", box.pos.getX(), box.pos.getY(), box.pos.getZ(), was, is);
     }
 
@@ -6472,7 +7144,9 @@ public class StashSorter extends Module {
             // Signs kept for labelling, and what compacting is gathering and packing, are not put away
             if (labeller.reservedSlot(slot) || setAside.contains(slot)) continue;
             // A bundle with things in it is emptied, not put away
-            if (fullBundle(mc.player.getInventory().getItem(slot))) continue;
+            if (fullBundle(mc.player.getInventory().getItem(slot)) || orderRunner.claims(mc.player.getInventory().getItem(slot))) continue;
+            // The shulker an order is being built in
+            if (orderKit() && kitBuilder.holds(slot)) continue;
             if (!idOf(mc.player.getInventory().getItem(slot)).equals(stuckCarried.get(slot))) slots.add(slot);
         }
         return slots;
@@ -6487,6 +7161,8 @@ public class StashSorter extends Module {
             ItemStack stack = mc.player.getInventory().getItem(slot);
             if (stack.isEmpty() || !isOwn(slot, stack)) slots.add(slot);
         }
+        // Not sorting, only what an order itself took counts as carried: the rest of the slots are the player's
+        if (!sorting()) slots.removeIf(slot -> !mc.player.getInventory().getItem(slot).isEmpty() && !orderHeld.containsKey(slot));
         return slots;
     }
 

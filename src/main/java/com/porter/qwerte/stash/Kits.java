@@ -183,7 +183,48 @@ public final class Kits {
     public static ItemStack[] inside(ItemStack shulker) {
         ItemStack[] contents = new ItemStack[Kit.SLOTS];
         Utils.getItemsInContainerItem(shulker, contents);
+
+        // Shulkers that came through ViaVersion keep their items in block_entity_data. A shulker always has a (default,
+        // empty) container component, so the reader never looks there: it is asked again with the container taken off
+        if (shulker.has(net.minecraft.core.component.DataComponents.BLOCK_ENTITY_DATA) && allEmpty(contents)) {
+            ItemStack[] other = legacyContents(shulker);
+            if (other != null) return other;
+        }
         return contents;
+    }
+
+    // The legacy read is worked out once per stack and tick
+    private static final java.util.IdentityHashMap<ItemStack, ItemStack[]> LEGACY = new java.util.IdentityHashMap<>();
+    private static int legacyTick = -1;
+
+    private static ItemStack[] legacyContents(ItemStack shulker) {
+        int tick = net.minecraft.client.Minecraft.getInstance().player == null ? -1 : net.minecraft.client.Minecraft.getInstance().player.tickCount;
+        if (tick != legacyTick) {
+            LEGACY.clear();
+            legacyTick = tick;
+        }
+        if (LEGACY.containsKey(shulker)) return LEGACY.get(shulker);
+
+        ItemStack[] result = null;
+        // Only data that has an item list is worth the read
+        if (com.porter.qwerte.compat.LegacyItems.hasItemList(shulker)) {
+            try {
+                ItemStack copy = shulker.copy();
+                copy.remove(net.minecraft.core.component.DataComponents.CONTAINER);
+                ItemStack[] other = new ItemStack[Kit.SLOTS];
+                Utils.getItemsInContainerItem(copy, other);
+                if (!allEmpty(other)) result = other;
+            } catch (RuntimeException e) {
+                // Not readable: treated as the container says
+            }
+        }
+        LEGACY.put(shulker, result);
+        return result;
+    }
+
+    private static boolean allEmpty(ItemStack[] contents) {
+        for (ItemStack s : contents) if (s != null && !s.isEmpty()) return false;
+        return true;
     }
 
     // Chests
@@ -335,7 +376,7 @@ public final class Kits {
         for (Tag e : slots) {
             if (!(e instanceof CompoundTag entry) || entry.get("slot") == null || entry.get("item") == null) return null;
 
-            int slot = NbtOps.INSTANCE.getNumberValue(entry.get("slot")).result().map(Number::intValue).orElse(-1);
+            int slot = entry.get("slot") == null ? -1 : NbtOps.INSTANCE.getNumberValue(entry.get("slot")).result().map(Number::intValue).orElse(-1);
             if (slot < 0 || slot >= Kit.SLOTS) {
                 QwerteAddon.LOG.warn("Kit {} has a slot out of range: {}", name, slot);
                 return null;

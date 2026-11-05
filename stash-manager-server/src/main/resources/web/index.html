@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Stash Manager</title>
+  <link rel="icon" href="/placeholder.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/streamer-init.js"></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="layout">
+    <header class="panel header">
+      <div class="title-row">
+        <h1 class="title">Stash Manager</h1>
+        <label class="stash-picker">
+          <span class="label">Stash</span>
+          <select id="stash-select" class="mc-select" disabled>
+            <option value="">(none)</option>
+          </select>
+        </label>
+        <div class="bot-status" id="bot-status">
+          <span class="dot dot-off" id="bot-dot"></span>
+          <span id="bot-text">No stash</span>
+        </div>
+        <label class="stash-picker">
+          <span class="label">Bot</span>
+          <select id="bot-select" class="mc-select" disabled>
+            <option value="">(no bots)</option>
+          </select>
+        </label>
+        <button type="button" class="mc-button" id="link-open">Link addon</button>
+        <div class="sudo-box" id="sudo-box" hidden>
+          <span class="sudo-text" id="sudo-text"></span>
+          <button type="button" class="mc-button small" id="sudo-lock" title="End admin mode now">Lock now</button>
+        </div>
+        <button type="button" class="mc-button streamer-btn" id="streamer-btn" aria-pressed="false" title="Blur coordinates, keys, addresses, console and events (this browser only)">Streamer mode<span class="streamer-state" id="streamer-state">: off</span></button>
+        <span class="live-badge" id="live-badge">LIVE &ndash; hidden</span>
+        <button type="button" class="mc-button" id="logout-btn" title="Log out of this browser">Log out</button>
+      </div>
+      <div class="info-row" id="info-row">
+        <span id="info-index"></span>
+        <span id="info-containers"></span>
+        <span id="info-meta"></span>
+        <div class="rescan-box" id="rescan-box" hidden>
+          <button type="button" class="mc-button small" id="rescan-btn">Rescan stash</button>
+          <div class="rescan-status" id="rescan-status"></div>
+          <div class="progress rescan-progress" id="rescan-progress" hidden><div class="progress-fill" id="rescan-fill"></div></div>
+        </div>
+      </div>
+      <div class="conflict-warn" id="conflict-warn" hidden></div>
+      <nav class="dash-nav" id="dash-nav" aria-label="Pages">
+        <button type="button" class="mc-button nav-btn" data-page="stash">Stash</button>
+        <button type="button" class="mc-button nav-btn" data-page="orders">Orders</button>
+        <button type="button" class="mc-button nav-btn" data-page="bots" id="bots-open">Bots</button>
+        <button type="button" class="mc-button nav-btn" data-page="activity" id="nav-activity" hidden>Activity</button>
+        <button type="button" class="mc-button nav-btn" data-page="settings">Settings</button>
+        <button type="button" class="mc-button nav-btn" data-page="proxy" id="nav-proxy" hidden>Proxy</button>
+        <button type="button" class="mc-button nav-btn" data-page="console">Console</button>
+      </nav>
+    </header>
+
+    <div class="tabs-wrap" id="tabs-wrap">
+      <div class="tabs" id="tabs" role="tablist" aria-label="Creative tabs"></div>
+      <div class="tabs tabs-right" id="tabs-right" role="tablist" aria-label="Orders"></div>
+    </div>
+
+    <main class="panel inventory" id="inventory">
+      <div class="panel-label" id="panel-label">Search</div>
+
+      <div class="view view-items" id="view-items">
+        <div class="grid-wrap" id="grid-wrap">
+          <div class="item-grid" id="item-grid"></div>
+          <div class="empty" id="empty" hidden>
+            <p id="empty-text">No stash index yet. Turn on stash-manager in the addon and set its API key.</p>
+          </div>
+        </div>
+        <div class="toolbar">
+          <input id="search" class="mc-input" type="search" placeholder="Search (e.g. diamond sword, @minecraft)" autocomplete="off" spellcheck="false">
+          <select id="sort" class="mc-select" aria-label="Sort">
+            <option value="creative">Creative order</option>
+            <option value="count">Count</option>
+            <option value="name">Name A-Z</option>
+            <option value="id">ID</option>
+          </select>
+        </div>
+        <div class="summary" id="summary"></div>
+        <div class="hint">Right-click a shulker box to look inside. Shift-click an item to add a stack to the order cart.</div>
+      </div>
+
+      <div class="view view-orders" id="view-orders" hidden>
+        <section class="inset bot-strip" id="bot-strip">
+          <div class="bot-line" id="delivery-status"></div>
+          <div class="bot-line warn" id="order-blocker" hidden></div>
+        </section>
+        <section class="inset order-picker">
+          <div class="section-title">Order maker</div>
+          <div class="crumbs" id="crumbs"></div>
+          <div class="picker-body" id="picker-body"></div>
+          <div class="hint">Drag an item onto the cart, or double-click it: +1 stack. Hold Shift: +1 shulker of it. Click an item for an exact amount.</div>
+        </section>
+        <section class="inset cart" id="cart-drop">
+          <div class="cart-head">
+            <div class="section-title">Cart</div>
+            <div class="cart-count" id="cart-count"></div>
+          </div>
+          <div class="cart-cols">
+            <div class="chest-col">
+              <div class="gui-box">
+                <div class="gui-title">Delivery chest <span class="gui-sub">(planned layout)</span></div>
+                <div class="chest-grid" id="chest-grid"></div>
+              </div>
+              <div class="gui-box">
+                <div class="gui-title" id="bin-title">Shulker Box</div>
+                <div class="shulker-grid bin-grid" id="bin-grid"></div>
+              </div>
+              <div class="note">Click a shulker in the chest to look inside. Right-click a stack to remove it. The bot may deliver less if it can't reach everything.</div>
+            </div>
+            <div class="lines-col">
+              <div class="cart-lines" id="cart-lines"></div>
+              <div class="cart-totals" id="cart-totals"></div>
+              <input id="cart-note" class="mc-input" type="text" maxlength="200" placeholder="Note for the bot (optional)" autocomplete="off">
+              <div class="cart-actions">
+                <button type="button" class="mc-button" id="cart-place">Place order</button>
+                <button type="button" class="mc-button danger" id="cart-clear">Clear cart</button>
+              </div>
+              <div class="note" id="cart-status"></div>
+              <div class="note warn" id="cart-offline" hidden>Bot offline. The order will start when it reconnects.</div>
+            </div>
+          </div>
+        </section>
+        <section class="inset order-list">
+          <div class="cart-head">
+            <div class="section-title">Orders</div>
+            <button type="button" class="mc-button small" id="orders-clear" disabled>Clear history</button>
+          </div>
+          <div id="order-list"></div>
+        </section>
+      </div>
+    </main>
+
+    <main class="panel dash-page" id="page-bots" hidden>
+      <div class="panel-label">Bots</div>
+      <section class="inset">
+        <div class="section-title">Dashboard bots</div>
+        <div class="note">Proxy bots running the Qwerte Stash plugin with the dashboard on. Pick one to change its settings or use its console.</div>
+        <div class="dash-bots" id="dash-bots"></div>
+      </section>
+      <section class="inset">
+        <div class="section-title">Stashes</div>
+        <div class="note">Every stash, with the bot that owns it. Click a row to show that stash.</div>
+        <div class="bots-table" id="stash-bots"></div>
+      </section>
+    </main>
+
+    <main class="panel dash-page" id="page-activity" hidden>
+      <div class="dash-head">
+        <div class="panel-label" id="activity-title">Activity</div>
+      </div>
+      <div class="note" id="act-empty" hidden></div>
+      <div class="act-body" id="act-body" hidden>
+        <section class="inset act-status">
+          <div class="act-head" id="act-head"></div>
+          <div class="act-stats" id="act-stats"></div>
+        </section>
+        <div class="act-cols">
+          <section class="inset">
+            <div class="section-title">Now doing</div>
+            <div class="act-now" id="act-now"></div>
+          </section>
+          <section class="inset">
+            <div class="cart-head">
+              <div class="section-title">Events</div>
+              <div class="act-filters">
+                <select id="act-source" class="mc-select" aria-label="Source"></select>
+                <select id="act-level" class="mc-select" aria-label="Level">
+                  <option value="">All levels</option>
+                  <option value="info">Info</option>
+                  <option value="warn">Warnings</option>
+                  <option value="error">Errors</option>
+                </select>
+              </div>
+            </div>
+            <div class="act-events" id="act-events"></div>
+          </section>
+        </div>
+        <section class="inset">
+          <div class="cart-head">
+            <div class="section-title">Modules <span class="note" id="act-mod-count"></span></div>
+            <div class="act-filters">
+              <input id="act-mod-filter" class="mc-input" type="search" placeholder="Filter modules" autocomplete="off" spellcheck="false">
+              <label class="unset"><input type="checkbox" id="act-enabled-only"> enabled only</label>
+            </div>
+          </div>
+          <div id="act-modules"></div>
+        </section>
+        <section class="inset">
+          <div class="section-title">Plugins</div>
+          <div class="act-plugins" id="act-plugins"></div>
+        </section>
+      </div>
+    </main>
+
+    <main class="panel dash-page" id="page-settings" hidden>
+      <div class="dash-head">
+        <div class="panel-label" id="settings-title">Settings</div>
+        <div class="dash-actions">
+          <span class="note" id="settings-status"></span>
+          <button type="button" class="mc-button" id="settings-revert" disabled>Revert</button>
+          <button type="button" class="mc-button" id="settings-save" disabled>Save</button>
+        </div>
+      </div>
+      <div class="offline-banner" id="settings-offline" hidden></div>
+      <div class="settings-body" id="settings-body"></div>
+    </main>
+
+    <main class="panel dash-page proxy-page" id="page-proxy" hidden>
+      <div class="dash-head">
+        <div class="panel-label" id="proxy-title">Proxy</div>
+        <div class="dash-actions">
+          <select id="proxy-scope" class="mc-select" aria-label="Which config"></select>
+          <span class="note" id="proxy-status"></span>
+          <button type="button" class="mc-button" id="proxy-revert" disabled>Revert</button>
+          <button type="button" class="mc-button" id="proxy-save" disabled>Save</button>
+        </div>
+      </div>
+      <div class="offline-banner" id="proxy-offline" hidden></div>
+      <div class="proxy-cols">
+        <aside class="inset proxy-side">
+          <input id="proxy-search" class="mc-input" type="search" placeholder="Search all settings" autocomplete="off" spellcheck="false">
+          <div class="section-list" id="proxy-nav"></div>
+        </aside>
+        <div class="settings-body proxy-body" id="proxy-body"></div>
+      </div>
+      <div class="note">Changes here need the website password typed in the last 15 minutes. Secrets are never shown or changed here.</div>
+    </main>
+
+    <main class="panel dash-page" id="page-console" hidden>
+      <div class="dash-head">
+        <div class="panel-label" id="console-title">Console</div>
+        <span class="note" id="console-state"></span>
+      </div>
+      <div class="offline-banner" id="console-offline" hidden></div>
+      <div class="console-log" id="console-log"></div>
+      <form class="console-input" id="console-form">
+        <span class="console-prompt">&gt;</span>
+        <input id="console-cmd" class="mc-input" data-sensitive type="text" maxlength="500" autocomplete="off" spellcheck="false" placeholder="A proxy command, e.g. help">
+        <button type="submit" class="mc-button" id="console-send">Run</button>
+      </form>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <div class="modal-backdrop" id="link-modal" hidden>
+    <div class="panel modal" role="dialog" aria-modal="true" aria-labelledby="link-title">
+      <div class="modal-head">
+        <h2 class="modal-title" id="link-title">Link addon</h2>
+        <button type="button" class="mc-button small" id="link-close" aria-label="Close">X</button>
+      </div>
+      <ol class="steps">
+        <li>In Meteor, open the <b>stash-manager</b> module.</li>
+        <li>Paste the <b>server-url</b> and the <b>api-key</b> below.</li>
+        <li>Enable the module with a stash loaded.</li>
+      </ol>
+      <p class="note link-multi">One API key works for any number of bots. Give each bot its own stash name (Meteor: stash-sorter's <b>stash-name</b>; proxy: the stash name in the plugin), so their indexes and orders stay apart. A stash name belongs to the first bot that uses it; release it in <b>Bots</b> to hand it to another.</p>
+
+      <div class="field-label">server-url</div>
+      <div class="copy-list" id="link-urls"></div>
+
+      <div class="field-label">api-key</div>
+      <div class="copy-row">
+        <code class="copy-value" id="link-key" data-sensitive>Loading...</code>
+        <button type="button" class="mc-button" id="link-key-toggle">Show</button>
+        <button type="button" class="mc-button" id="link-key-copy">Copy</button>
+      </div>
+      <div class="note" id="link-key-note" hidden></div>
+      <div class="note">Bots sign every request with this key; the key itself never crosses the network. An addon or plugin from before signing is refused with 401 (unsigned) until it is updated.</div>
+
+      <div class="field-label">Linked bots</div>
+      <div class="link-bots" id="link-bots"></div>
+      <div class="link-status" id="link-status">
+        <span class="dot dot-off" id="link-dot"></span>
+        <span id="link-status-text">Waiting for addon...</span>
+      </div>
+
+      <div class="modal-foot">
+        <button type="button" class="mc-button danger" id="link-regen">Regenerate key</button>
+        <span class="note" id="link-copy-note"></span>
+      </div>
+      <div class="field-label">Website login</div>
+      <div class="modal-foot account-row">
+        <button type="button" class="mc-button" id="password-open">Change password</button>
+        <button type="button" class="mc-button danger" id="logout-all">Log out everywhere</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="auth-screen" id="auth-screen" hidden>
+    <form class="panel auth-box" id="auth-form" novalidate>
+      <h2 class="auth-title">Stash Manager</h2>
+      <p class="auth-text" id="auth-text"></p>
+      <input type="text" name="username" autocomplete="username" value="stash-manager" class="auth-user" tabindex="-1" aria-hidden="true">
+      <label class="auth-field" id="auth-code-row" hidden>
+        <span class="field-label">Setup code (shown in the server window)</span>
+        <input id="auth-code" class="mc-input" type="text" autocomplete="off" spellcheck="false" maxlength="20" placeholder="XXXX-XXXX">
+      </label>
+      <label class="auth-field" id="auth-password-row">
+        <span class="field-label">Password</span>
+        <input id="auth-password" class="mc-input" type="password" autocomplete="current-password" maxlength="1024">
+      </label>
+      <label class="auth-field" id="auth-confirm-row" hidden>
+        <span class="field-label">Confirm password</span>
+        <input id="auth-confirm" class="mc-input" type="password" autocomplete="new-password" maxlength="1024">
+      </label>
+      <button type="submit" class="mc-button" id="auth-submit">Log in</button>
+      <div class="note warn auth-error" id="auth-error"></div>
+    </form>
+  </div>
+
+  <div class="tooltip" id="tooltip" hidden></div>
+  <div class="drag-ghost" id="drag-ghost" hidden></div>
+</body>
+</html>

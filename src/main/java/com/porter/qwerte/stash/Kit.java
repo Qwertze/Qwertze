@@ -24,7 +24,7 @@ public final class Kit {
     /**
      * An item as kits see it: the item and its components, less durability and repair cost.
      */
-    public record Key(Item item, DataComponentMap components) {}
+    public record Key(Item item, DataComponentMap components, String exact) {}
 
     /**
      * One kind of item in a kit: how many slots it fills, how many items in total, and the count of each slot.
@@ -46,6 +46,8 @@ public final class Kit {
     }
 
     public final String name;
+    /** A transient kit made for an order: items match exactly, damage and repair cost included. Not a saved kit. */
+    public final boolean exact;
     private final ItemStack[] layout = new ItemStack[SLOTS];
     private final Key[] keys = new Key[SLOTS];
     private final Map<Key, Need> needs = new LinkedHashMap<>();
@@ -53,7 +55,12 @@ public final class Kit {
     private final int[] order;
 
     public Kit(String name, ItemStack[] stacks) {
+        this(name, stacks, false);
+    }
+
+    public Kit(String name, ItemStack[] stacks, boolean exact) {
         this.name = name;
+        this.exact = exact;
 
         for (int i = 0; i < SLOTS; i++) {
             ItemStack stack = i < stacks.length && stacks[i] != null ? stacks[i] : ItemStack.EMPTY;
@@ -61,10 +68,10 @@ public final class Kit {
             if (layout[i].isEmpty()) continue;
 
             ItemStack here = layout[i];
-            Key key = keyOf(here);
+            Key key = key(here);
             keys[i] = key;
             items.add(here.getItem());
-            Need need = needs.computeIfAbsent(key, k -> new Need(k, normalized(here)));
+            Need need = needs.computeIfAbsent(key, k -> new Need(k, exact ? here.copyWithCount(1) : normalized(here)));
             need.counts.add(layout[i].getCount());
             need.total += layout[i].getCount();
         }
@@ -105,7 +112,27 @@ public final class Kit {
 
     public static Key keyOf(ItemStack stack) {
         ItemStack copy = normalized(stack);
-        return new Key(copy.getItem(), copy.getComponents());
+        return new Key(copy.getItem(), copy.getComponents(), null);
+    }
+
+    /** The key this kit matches a stack by: exact for an order kit, else {@link #keyOf}. */
+    public Key key(ItemStack stack) {
+        // An order kit counts by the index key: what the server sends for the same item can differ in components (ViaVersion's
+        // marker, the way a shulker's items are stored), so raw components are never compared to decide what is wanted.
+        // Which exact variant sits in a slot is decided by the stacks really put there (see KitBuilder.fillOneExact)
+        if (!exact) return keyOf(stack);
+        String indexKey = StashIndex.keyOf(stack);
+        return indexKey != null ? new Key(stack.getItem(), DataComponentMap.EMPTY, indexKey) : new Key(stack.getItem(), stack.copyWithCount(1).getComponents(), null);
+    }
+
+    /** {@link #totals} by this kit's own keys. */
+    public Map<Key, Integer> totalsOf(ItemStack[] contents) {
+        Map<Key, Integer> totals = new HashMap<>();
+        for (ItemStack stack : contents) {
+            if (stack == null || stack.isEmpty()) continue;
+            totals.merge(key(stack), stack.getCount(), Integer::sum);
+        }
+        return totals;
     }
 
     /**
@@ -179,7 +206,7 @@ public final class Kit {
      * so kits made by hand are recognised too.
      */
     public boolean matchesFinished(ItemStack[] contents) {
-        Map<Key, Integer> have = totals(contents);
+        Map<Key, Integer> have = totalsOf(contents);
         if (have.size() != needs.size()) return false;
         for (Need need : needs.values()) {
             Integer count = have.get(need.key);
@@ -192,7 +219,7 @@ public final class Kit {
      * Something of the kit and nothing else, no more of anything than the kit holds, and not finished.
      */
     public boolean matchesPartial(ItemStack[] contents) {
-        Map<Key, Integer> have = totals(contents);
+        Map<Key, Integer> have = totalsOf(contents);
         if (have.isEmpty()) return false;
 
         boolean complete = have.size() == needs.size();
@@ -208,12 +235,14 @@ public final class Kit {
      * Slot for slot, count for count.
      */
     public boolean exactLayout(ItemStack[] contents) {
+        // An order kit is done when it holds the right totals, in whatever slots
+        if (exact) return matchesFinished(contents);
         for (int i = 0; i < SLOTS; i++) {
             ItemStack stack = i < contents.length && contents[i] != null ? contents[i] : ItemStack.EMPTY;
             if (keys[i] == null) {
                 if (!stack.isEmpty()) return false;
             }
-            else if (stack.isEmpty() || stack.getCount() != layout[i].getCount() || !keys[i].equals(keyOf(stack))) return false;
+            else if (stack.isEmpty() || stack.getCount() != layout[i].getCount() || !keys[i].equals(key(stack))) return false;
         }
         return true;
     }

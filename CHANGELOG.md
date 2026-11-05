@@ -7,6 +7,29 @@ Versions before 0.2.8 are listed on the [GitHub releases page](https://github.co
 
 ## [Unreleased]
 
+## [0.4.0-dev.1] - 2026-11-05
+
+A big test build: the Stash Manager website and stash orders. Not fully tested in game yet.
+
+### Added
+- **stash-manager** module: sends what is in the stash saved by stash-sorter to the Stash Manager server on your network (`server-url`, `api-key`). Only changes are sent, checked every `scan-interval` seconds. `include-excluded` lists excluded containers too.
+- stash-manager: **orders**. With `accept-orders` on, the bot takes orders placed on the website. It gathers the items from the stash, loose stacks first and then out of shulkers, packs them into empty shulkers and puts the shulkers into the delivery container. Leftovers go back to the container they came from, and so do the shulkers it unpacked. stash-sorter doesn't need to be on: stash-manager drives it, using stash-sorter's settings, and never sorts. To stop the bot, turn off `accept-orders` or stash-manager.
+- stash-manager: a delivery container (Delivery group: `select-delivery`, then right-click a container; `clear-delivery`; `show-delivery` and `delivery-color` outline it). It is never sorted into.
+- stash-manager: `use-named-shulkers` (on) lets orders take items out of shulkers with a custom name. `order-messages` (on) says in chat when an order is taken, delivered or fails.
+- stash-manager: `fresh-minutes` (5). A container read within that many minutes isn't read again when stash-sorter or an order starts, unless something marked it changed. 0 reads everything every time. A rescan from the website always reads everything.
+- stash-manager: an order in progress is saved in the stash file with its plan, so it carries on after a disconnect or restart.
+- **Stash Manager server** (`stash-manager-server/`, a separate jar, see its README):
+  - A website for your network that shows the stash like a Minecraft inventory, with search and item icons.
+  - Orders, a page for each bot, plugin and proxy settings, a console, and an Activity view of what each bot is doing.
+  - One password protects the whole website. Each browser stays logged in for 30 days.
+  - A **Streamer mode** button blurs coordinates, keys, server addresses and console output.
+  - Works behind an HTTPS reverse proxy listed in `allowedHosts`.
+
+### Changed
+- stash-sorter: the delivery container is never sorted, compacted or used as a source, and items in it don't show in search.
+- stash-sorter: kits can be built for an order, matching the exact items asked for, and an order's shulker is never taken apart or filed away by the sorter.
+- stash-sorter: shulkers that came through ViaVersion, which keep their items in block entity data, no longer look empty.
+
 ## [0.3.2-dev.4] - 2026-10-31
 
 ### Changed
