@@ -76,6 +76,11 @@ final class KitBuilder {
         default boolean namedShulkers() {
             return false;
         }
+
+        /** The carry slot of a shulker box crafted for the order (empty, unused), or -1. An order kit is built in it. */
+        default int craftedBase() {
+            return -1;
+        }
     }
 
     sealed interface Intent permits Take, Fetch, Unpack, Fill, Done, Abort {}
@@ -294,6 +299,9 @@ final class KitBuilder {
 
     private record Spot(Box box, int slot) {}
 
+    /** The base is a crafted shulker already in the inventory, not one in a container. */
+    private static final Spot CRAFTED = new Spot(null, -1);
+
     private record Plan(Kit kit, Spot base, double distance) {}
 
     /**
@@ -402,6 +410,7 @@ final class KitBuilder {
                 if (k.exact && badBases.contains(spot)) continue;
                 if (base == null || emptyRank(spot) < emptyRank(base)) base = spot;
             }
+            if (base == null && k.exact && owner.craftedBase() >= 0) base = CRAFTED;
             if (base == null) return null;
         }
 
@@ -479,7 +488,8 @@ final class KitBuilder {
      */
     boolean beginOrder(Kit orderKit) {
         if (kit != null || owner.stash() == null || mc.player == null) return false;
-        if (plan(orderKit, new Scan(List.of(orderKit))) == null) return false;
+        Plan planned = plan(orderKit, new Scan(List.of(orderKit)));
+        if (planned == null) return false;
 
         kit = orderKit;
         baseSlot = -1;
@@ -499,6 +509,11 @@ final class KitBuilder {
         List<ItemStack> out = new ArrayList<>();
         for (Spot spot : new Scan(List.of(new Kit("", new ItemStack[0], true))).empties) out.add(spot.box.contents[spot.slot]);
         return out;
+    }
+
+    /** How much of each of the kit's items this builder could take from the stash right now (by its own scan). */
+    Map<Key, Integer> supply(Kit k) {
+        return new Scan(List.of(k)).available(k);
     }
 
     /** Lets go of an order kit without a word, when its order is over. */
@@ -584,11 +599,21 @@ final class KitBuilder {
             Plan plan = plan(kit, scan);
             if (plan == null) return new Abort("the items or shulkers aren't there anymore");
 
-            shulkersBefore.clear();
-            for (int i = 0; i < 36; i++) if (Utils.isShulker(mc.player.getInventory().getItem(i).getItem())) shulkersBefore.add(i);
-            pendingBase = true;
-            lastBase = plan.base;
-            return new Fetch(plan.base.box, plan.base.slot);
+            if (plan.base == CRAFTED) {
+                // Built in a shulker box crafted for the order, already in the inventory
+                int crafted = owner.craftedBase();
+                if (crafted < 0) return new Abort("the crafted shulker is gone");
+                baseSlot = crafted;
+                hadBase = true;
+                needBase = false;
+            }
+            else {
+                shulkersBefore.clear();
+                for (int i = 0; i < 36; i++) if (Utils.isShulker(mc.player.getInventory().getItem(i).getItem())) shulkersBefore.add(i);
+                pendingBase = true;
+                lastBase = plan.base;
+                return new Fetch(plan.base.box, plan.base.slot);
+            }
         }
 
         if (!isShulker(baseSlot)) return new Abort("lost the kit shulker");

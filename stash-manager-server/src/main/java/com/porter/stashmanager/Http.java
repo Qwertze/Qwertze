@@ -31,7 +31,7 @@ final class Http {
     }
 
     static void securityHeaders(Headers h) {
-        h.set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
+        h.set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; font-src 'self'; script-src 'self'; "
             + "base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
         h.set("X-Content-Type-Options", "nosniff");
         h.set("Referrer-Policy", "no-referrer");

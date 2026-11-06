@@ -10,6 +10,7 @@ import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.StringTag;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.RegistryOps;
 import net.minecraft.world.item.ItemStack;
@@ -151,6 +152,9 @@ public class Stash {
             public String key = "";
             public final List<String> lotKeys = new ArrayList<>();
             public final List<Integer> lotCounts = new ArrayList<>();
+            /** How naming went: done (named or given up on), named, why not, and the key it has with its name. */
+            public boolean nameDone, named;
+            public String nameFailure = "", namedKey = "";
         }
 
         public String id = "";
@@ -161,6 +165,15 @@ public class Stash {
         public final List<String[]> lines = new ArrayList<>();
         /** The planned shulkers, so a resume carries on the same plan whatever the stash holds by then. */
         public final List<UnitPlan> units = new ArrayList<>();
+        /** The order's shulker names (see {@link Order.Names}): mode "" for none. */
+        public String namesMode = "";
+        public String namesAll = "";
+        public final List<String> namesEach = new ArrayList<>();
+        /** Shulkers delivered without the name they were meant to get, and why (distinct reasons), for the order's note. */
+        public int unnamed;
+        public final List<String> unnamedReasons = new ArrayList<>();
+        /** Shulker boxes crafted for this order so far (the per-order cap and the end message count them). */
+        public int crafted;
     }
 
     public ActiveOrder activeOrder;
@@ -183,6 +196,13 @@ public class Stash {
     // The delivery container, kept on the stash itself so that no pruning of the box list (a perimeter that leaves it out,
     // say) can lose it. It stays until the user clears it
     public BlockPos deliveryPos;
+    // The anvil orders are named at. Not a container: never a box, never indexed. Stays until the user clears it
+    public BlockPos anvilPos;
+    // How the anvil came to be remembered: "set" (picked by hand), "found" (placed, found in the area) or "placed" (taken from
+    // the stash and placed). "" counts as set
+    public String anvilSource = "";
+    // The crafting table orders craft at. Not a container: never a box, never indexed. Stays until the user clears it
+    public BlockPos craftingTablePos;
 
     /**
      * Makes sure the delivery container is among the boxes: the box flagged as one gives the position, else the saved
@@ -511,9 +531,27 @@ public class Stash {
                     lots.add(lot);
                 }
                 unit.put("lots", lots);
+                if (u.nameDone) unit.putBoolean("nameDone", true);
+                if (u.named) unit.putBoolean("named", true);
+                if (!u.nameFailure.isEmpty()) unit.putString("nameFailure", u.nameFailure);
+                if (!u.namedKey.isEmpty()) unit.putString("namedKey", u.namedKey);
                 planned.add(unit);
             }
             order.put("units", planned);
+            if (!activeOrder.namesMode.isEmpty()) {
+                order.putString("namesMode", activeOrder.namesMode);
+                order.putString("namesAll", activeOrder.namesAll);
+                ListTag each = new ListTag();
+                for (String n : activeOrder.namesEach) each.add(StringTag.valueOf(n));
+                order.put("namesEach", each);
+            }
+            if (activeOrder.crafted > 0) order.putInt("crafted", activeOrder.crafted);
+            if (activeOrder.unnamed > 0) {
+                order.putInt("unnamed", activeOrder.unnamed);
+                ListTag why = new ListTag();
+                for (String r : activeOrder.unnamedReasons) why.add(StringTag.valueOf(r));
+                order.put("unnamedWhy", why);
+            }
             ListTag lines = new ListTag();
             for (var entry : activeOrder.delivered.entrySet()) {
                 CompoundTag line = new CompoundTag();
@@ -529,6 +567,9 @@ public class Stash {
         if (corner2 != null) root.put("corner2", positions(List.of(corner2)));
         if (!areaDimension.isEmpty()) root.putString("areaDimension", areaDimension);
         if (deliveryPos != null) root.put("deliveryPos", positions(List.of(deliveryPos)));
+        if (anvilPos != null) root.put("anvilPos", positions(List.of(anvilPos)));
+        if (anvilPos != null && !anvilSource.isEmpty()) root.putString("anvilSource", anvilSource);
+        if (craftingTablePos != null) root.put("craftingTablePos", positions(List.of(craftingTablePos)));
         if (!dimension.isEmpty()) root.putString("dimension", dimension);
 
         try {
@@ -666,6 +707,16 @@ public class Stash {
                 List<BlockPos> at = readPositions(dp);
                 if (!at.isEmpty()) stash.deliveryPos = at.getFirst();
             }
+            if (root.get("anvilPos") instanceof ListTag ap) {
+                List<BlockPos> at = readPositions(ap);
+                if (!at.isEmpty()) stash.anvilPos = at.getFirst();
+            }
+            String anvilSource = string(root.get("anvilSource"));
+            if (anvilSource != null && stash.anvilPos != null) stash.anvilSource = anvilSource;
+            if (root.get("craftingTablePos") instanceof ListTag ct) {
+                List<BlockPos> at = readPositions(ct);
+                if (!at.isEmpty()) stash.craftingTablePos = at.getFirst();
+            }
             String dim = string(root.get("dimension"));
             if (dim != null) stash.dimension = dim;
             if (root.get("held") instanceof ListTag heldList) {
@@ -701,8 +752,26 @@ public class Stash {
                                 }
                             }
                         }
+                        u.nameDone = flag(unit, "nameDone");
+                        u.named = flag(unit, "named");
+                        u.nameFailure = text(unit, "nameFailure");
+                        u.namedKey = text(unit, "namedKey");
                         active.units.add(u);
                     }
+                }
+                String namesMode = string(order.get("namesMode"));
+                if (namesMode != null && !namesMode.isEmpty()) {
+                    active.namesMode = namesMode;
+                    String all = string(order.get("namesAll"));
+                    active.namesAll = all == null ? "" : all;
+                    if (order.get("namesEach") instanceof ListTag each) {
+                        for (Tag t : each) active.namesEach.add(string(t) == null ? "" : string(t));
+                    }
+                }
+                active.unnamed = number(order.get("unnamed"), 0);
+                active.crafted = number(order.get("crafted"), 0);
+                if (order.get("unnamedWhy") instanceof ListTag why) {
+                    for (Tag t : why) if (string(t) != null) active.unnamedReasons.add(string(t));
                 }
                 active.done = Math.max(0, Math.min(active.done, active.units.size()));
                 if (order.get("delivered") instanceof ListTag lines) {

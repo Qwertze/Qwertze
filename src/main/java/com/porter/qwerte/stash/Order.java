@@ -5,6 +5,7 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -26,12 +27,79 @@ public final class Order {
     /** The stacks to put in one slot: an item key and how many. */
     public record Lot(String key, int count) {}
 
+    /** The longest name the anvil takes. */
+    public static final int MAX_NAME = 50;
+    /** The most names an "each" list may hold. */
+    public static final int MAX_NAMES = 54;
+
+    /**
+     * What the shulkers of an order are to be called: none, one name for all ("all"), or one per shulker by position
+     * ("each", blank or missing means unnamed). Texts are kept as the server sent them (trimmed); {@link #nameFor}
+     * says which are usable.
+     */
+    public record Names(String mode, String all, List<String> each) {
+        public static final String ALL = "all", EACH = "each";
+
+        /** Null when there is nothing to name. */
+        public static Names of(String mode, String all, List<String> each) {
+            if (ALL.equals(mode)) {
+                String t = all == null ? "" : all.trim();
+                return t.isBlank() ? null : new Names(ALL, t, List.of());
+            }
+            if (EACH.equals(mode) && each != null) {
+                List<String> list = new ArrayList<>();
+                boolean any = false;
+                for (int i = 0; i < each.size() && i < MAX_NAMES; i++) {
+                    String t = each.get(i) == null ? "" : each.get(i).trim();
+                    if (!t.isBlank()) any = true;
+                    list.add(t);
+                }
+                return any ? new Names(EACH, "", list) : null;
+            }
+            return null;
+        }
+
+        /** The name wanted for the i-th shulker (0-based), trimmed; null when it is to stay unnamed. May not pass {@link #valid}. */
+        public String nameFor(int i) {
+            if (i < 0) return null;
+            if (ALL.equals(mode)) return all.isBlank() ? null : all;
+            if (i >= each.size()) return null;
+            String t = each.get(i);
+            return t.isBlank() ? null : t.trim();
+        }
+    }
+
+    /** A name the bot may put on a shulker: 1 to 50 characters, no control characters and no section sign. */
+    public static boolean valid(String name) {
+        if (name == null) return false;
+        String t = name.trim();
+        if (t.isEmpty() || t.length() > MAX_NAME) return false;
+        for (int i = 0; i < t.length(); i++) {
+            char c = t.charAt(i);
+            if (Character.isISOControl(c) || c == (char) 0xA7) return false;
+        }
+        return true;
+    }
+
+    /** "3 shulker(s) delivered unnamed: no anvil set, not enough XP levels", or "" when none. */
+    public static String unnamedNote(int count, Collection<String> reasons) {
+        if (count <= 0) return "";
+        return count + " shulker(s) delivered unnamed" + (reasons.isEmpty() ? "" : ": " + String.join(", ", reasons));
+    }
+
     public final String id;
     public final List<Line> lines;
+    /** Null: no naming. */
+    public final Names names;
 
     public Order(String id, List<Line> lines) {
+        this(id, lines, null);
+    }
+
+    public Order(String id, List<Line> lines, Names names) {
         this.id = id;
         this.lines = lines;
+        this.names = names;
     }
 
     /**
@@ -54,7 +122,35 @@ public final class Order {
             }
         }
         String id = o.get("id").getAsString();
-        return id.isEmpty() || lines.isEmpty() ? null : new Order(id, lines);
+        return id.isEmpty() || lines.isEmpty() ? null : new Order(id, lines, parseNames(o));
+    }
+
+    private static boolean isText(JsonElement e) {
+        return e != null && e.isJsonPrimitive() && e.getAsJsonPrimitive().isString();
+    }
+
+    /** The order's names, or null when it has none or they can't be read (then nothing is named). */
+    private static Names parseNames(JsonObject o) {
+        try {
+            if (!o.has("names") || !o.get("names").isJsonObject()) return null;
+            JsonObject n = o.getAsJsonObject("names");
+            String mode = n.has("mode") && n.get("mode").isJsonPrimitive() ? n.get("mode").getAsString() : "";
+            if (Names.ALL.equals(mode)) {
+                return Names.of(mode, isText(n.get("name")) ? n.get("name").getAsString() : "", null);
+            }
+            if (Names.EACH.equals(mode) && n.has("names") && n.get("names").isJsonArray()) {
+                List<String> list = new ArrayList<>();
+                // Only JSON strings are names: a number or boolean entry is one shulker left unnamed
+                for (JsonElement e : n.getAsJsonArray("names")) {
+                    if (list.size() >= MAX_NAMES) break;
+                    list.add(isText(e) ? e.getAsString() : "");
+                }
+                return Names.of(mode, "", list);
+            }
+        } catch (RuntimeException ex) {
+            // Unreadable names: the shulkers are delivered unnamed
+        }
+        return null;
     }
 
     /** The total asked for per line key and type, lines with the same type and key merged. */

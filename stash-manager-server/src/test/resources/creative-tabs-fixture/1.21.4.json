@@ -1,0 +1,2 @@
+{ "version": "1.21.4", "tabs": ["building_blocks", "natural_blocks", "combat"],
+  "items": { "minecraft:stone": ["building_blocks", 12], "minecraft:dirt": ["natural_blocks", 3], "minecraft:diamond_sword": ["combat", 5] } }

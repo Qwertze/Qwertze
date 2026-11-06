@@ -61,9 +61,18 @@ dependencies {
 
     // Baritone (dekrom's fork, https://github.com/dekrom/baritone), optional at runtime
     modCompileOnly("dekrom:baritone-api-fabric:${target("baritone")}")
+
+    // Tests of the pure classes (recipes, crafting plans, spot search); nothing of Minecraft is started
+    testImplementation(platform("org.junit:junit-bom:5.11.4"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 tasks {
+    test {
+        useJUnitPlatform()
+    }
+
     processResources {
         val propertyMap = mapOf(
             "version" to project.version,

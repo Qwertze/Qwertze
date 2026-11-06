@@ -42,3 +42,6 @@ stash-manager-server/build/
 # python
 
 __pycache__/
+
+# generator run logs (game output)
+stash-manager-server/dev/*/logs/

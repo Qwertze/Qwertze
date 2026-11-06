@@ -7,6 +7,28 @@ Versions before 0.2.8 are listed on the [GitHub releases page](https://github.co
 
 ## [Unreleased]
 
+## [0.4.0-dev.4] - 2026-11-05
+
+Dev pre-release. Mirrors Stash Sorter plugin 1.8.1.
+
+### Removed
+- Stash Manager website: the order note.
+
+### Fixed
+- Stash Manager website: stashes from proxy bots showed only Search, Other and Shulkers. The server now fills in the creative tabs from vanilla tables for 1.21.4 and 1.21.11, also for indexes it already holds.
+
+### Added
+- stash-manager: shulker names for orders. With an anvil set (Anvil group: `select-anvil`, then right-click an anvil; `clear-anvil`, `show-anvil`, `anvil-color`) the bot renames each shulker the order asks a name for before delivering it, about 1 XP level each. A shulker it can't name (no anvil, too few levels, anvil gone) is delivered unnamed, and the order says so.
+- Stash Manager website: name an order's shulkers, all with one name or each one separately next to the planned layout. Warns when the bot has no anvil or too few levels.
+- Stash Manager website: a Retry button on failed and cancelled orders places the same order again.
+- Stash Manager website: themes (Classic, Modern, Light, Dark, Midnight, High contrast, or Match system), picked in Settings > Appearance or with the palette button in the header. Saved per browser. The theme fonts (Inter, IBM Plex Sans, Space Mono, JetBrains Mono, Atkinson Hyperlegible; SIL Open Font License, licences in the jar under licenses/fonts/) are served by the server itself, with no third-party requests.
+- Stash Manager website: a phone layout below 768px wide: compact sticky header, status chips, bottom tab bar with a More sheet, a stash index card, switches for on/off settings and a save bar that only shows with unsaved changes. On touch screens, tap a shulker box to look inside, and long-press an item or tap its + to add a stack to the cart.
+- stash-manager: an anvil is found or put down when none is set. The order of preference is the anvil selected by hand, then one remembered from before, then a placed anvil found in the stash area, then an anvil taken from the stash and placed. With none, the shulker is delivered unnamed with "no anvils available to rename with" and the order goes on.
+- stash-manager: crafting (off by default, `enable-crafting`). Orders and compaction may craft a plain Shulker Box when no empty one is left, from stash shells and a chest (made from planks, made from logs), at a crafting table set with `select-crafting-table` (`clear-crafting-table`, `show-crafting-table`, `crafting-table-color`). Limits: `craft-max-per-order` (27), `craft-max-ops-per-task` (128), `craft-max-per-hour` (54), and `craft-never-use` (empty by default). Kits never craft. Damaged items, stacks that hold contents, kit, excluded, drop-off and delivery containers, and items another line needs are never used.
+- stash-sorter: with no room beside the bot, a shulker or anvil is put down at the nearest good spot within 5 blocks that the bot can walk to. The same search as the plugin's.
+- Stash Manager website: shulker box icons show their colour and a contents overlay, with flat tops on every version.
+- Stash Manager website: the Bots view shows each bot's crafting status (on/off, table set) and where its anvil came from (set, found, placed, none).
+
 ## [0.4.0-dev.1] - 2026-11-05
 
 A big test build: the Stash Manager website and stash orders. Not fully tested in game yet.

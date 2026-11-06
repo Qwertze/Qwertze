@@ -19,6 +19,7 @@ import meteordevelopment.meteorclient.renderer.ShapeMode;
 import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.orbit.EventHandler;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 
@@ -28,7 +29,9 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -111,6 +114,11 @@ public class StashManager extends Module {
                 warning("No stash is loaded. Scan one with stash-sorter first; this uses the stash named in its settings.");
                 this.selectDelivery.set(false);
             }
+            // Only one of the picks at a time
+            else if (on) {
+                if (this.selectAnvil != null && this.selectAnvil.get()) this.selectAnvil.set(false);
+                if (this.selectCraftingTable != null && this.selectCraftingTable.get()) this.selectCraftingTable.set(false);
+            }
         })
         .build()
     );
@@ -140,6 +148,143 @@ public class StashManager extends Module {
         .description("The outline of the delivery container.")
         .defaultValue(new SettingColor(60, 255, 90, 90))
         .visible(showDelivery::get)
+        .build()
+    );
+
+    private final SettingGroup sgAnvil = settings.createGroup("Anvil");
+
+    private final Setting<Boolean> selectAnvil = sgAnvil.add(new BoolSetting.Builder()
+        .name("select-anvil")
+        .description("Turn on, then right-click an anvil to make it the anvil orders are named at (when an order gives its shulkers names). Right-click the current one to clear it. It may be outside the stash area, and is never sorted or listed. Turns itself off after one click.")
+        .defaultValue(false)
+        .onChanged(on -> {
+            if (on && Modules.get().get(StashSorter.class).currentStash() == null) {
+                warning("No stash is loaded. Scan one with stash-sorter first; this uses the stash named in its settings.");
+                this.selectAnvil.set(false);
+            }
+            else if (on) {
+                if (this.selectDelivery.get()) this.selectDelivery.set(false);
+                if (this.selectCraftingTable != null && this.selectCraftingTable.get()) this.selectCraftingTable.set(false);
+            }
+        })
+        .build()
+    );
+
+    private final Setting<Boolean> clearAnvil = sgAnvil.add(new BoolSetting.Builder()
+        .name("clear-anvil")
+        .description("Turn on to clear the anvil. Turns itself off again.")
+        .defaultValue(false)
+        .onChanged(on -> {
+            if (!on) return;
+            this.clearAnvil.set(false);
+            if (Modules.get().get(StashSorter.class).clearAnvil()) info("Anvil cleared.");
+            else info("There is no anvil.");
+        })
+        .build()
+    );
+
+    private final Setting<Boolean> showAnvil = sgAnvil.add(new BoolSetting.Builder()
+        .name("show-anvil")
+        .description("Outline the anvil while this module is on.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<SettingColor> anvilColor = sgAnvil.add(new ColorSetting.Builder()
+        .name("anvil-color")
+        .description("The outline of the anvil.")
+        .defaultValue(new SettingColor(255, 190, 40, 90))
+        .visible(showAnvil::get)
+        .build()
+    );
+
+    private final SettingGroup sgCrafting = settings.createGroup("Crafting");
+
+    private final Setting<Boolean> enableCrafting = sgCrafting.add(new BoolSetting.Builder()
+        .name("enable-crafting")
+        .description("Orders and compaction may craft a plain Shulker Box when no empty one is left: shulker shells and a chest (made of planks, made of logs) are taken from the stash and crafted at the crafting table below. Shulker shells can't be crafted, so they have to be in the stash. Needs a crafting table set. Kits never craft.")
+        .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<Integer> craftMaxPerOrder = sgCrafting.add(new IntSetting.Builder()
+        .name("craft-max-per-order")
+        .description("The most Shulker Boxes crafted for one order.")
+        .defaultValue(27)
+        .min(1)
+        .sliderRange(1, 54)
+        .build()
+    );
+
+    private final Setting<Integer> craftMaxOpsPerTask = sgCrafting.add(new IntSetting.Builder()
+        .name("craft-max-ops-per-task")
+        .description("The most grid fills (ingredients put into the crafting grid) in one trip to the table. A bigger craft is done in several trips.")
+        .defaultValue(128)
+        .min(8)
+        .sliderRange(8, 512)
+        .build()
+    );
+
+    private final Setting<Integer> craftMaxPerHour = sgCrafting.add(new IntSetting.Builder()
+        .name("craft-max-per-hour")
+        .description("The most Shulker Boxes crafted in an hour.")
+        .defaultValue(54)
+        .min(1)
+        .sliderRange(1, 216)
+        .build()
+    );
+
+    private final Setting<List<Item>> craftNeverUse = sgCrafting.add(new ItemListSetting.Builder()
+        .name("craft-never-use")
+        .description("Items crafting never uses as ingredients, whatever the stash holds.")
+        .defaultValue(List.of())
+        .build()
+    );
+
+    private final SettingGroup sgCraftingTable = settings.createGroup("Crafting table");
+
+    private final Setting<Boolean> selectCraftingTable = sgCraftingTable.add(new BoolSetting.Builder()
+        .name("select-crafting-table")
+        .description("Turn on, then right-click a crafting table to make it the table crafting is done at. Right-click the current one to clear it. It may be outside the stash area, and is never sorted or listed. Turns itself off after one click.")
+        .defaultValue(false)
+        .onChanged(on -> {
+            if (on && Modules.get().get(StashSorter.class).currentStash() == null) {
+                warning("No stash is loaded. Scan one with stash-sorter first; this uses the stash named in its settings.");
+                this.selectCraftingTable.set(false);
+            }
+            else if (on) {
+                if (this.selectDelivery.get()) this.selectDelivery.set(false);
+                if (this.selectAnvil.get()) this.selectAnvil.set(false);
+            }
+        })
+        .build()
+    );
+
+    private final Setting<Boolean> clearCraftingTable = sgCraftingTable.add(new BoolSetting.Builder()
+        .name("clear-crafting-table")
+        .description("Turn on to clear the crafting table. Turns itself off again.")
+        .defaultValue(false)
+        .onChanged(on -> {
+            if (!on) return;
+            this.clearCraftingTable.set(false);
+            if (Modules.get().get(StashSorter.class).clearCraftingTable()) info("Crafting table cleared.");
+            else info("There is no crafting table.");
+        })
+        .build()
+    );
+
+    private final Setting<Boolean> showCraftingTable = sgCraftingTable.add(new BoolSetting.Builder()
+        .name("show-crafting-table")
+        .description("Outline the crafting table while this module is on.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<SettingColor> craftingTableColor = sgCraftingTable.add(new ColorSetting.Builder()
+        .name("crafting-table-color")
+        .description("The outline of the crafting table.")
+        .defaultValue(new SettingColor(120, 170, 255, 90))
+        .visible(showCraftingTable::get)
         .build()
     );
 
@@ -183,6 +328,7 @@ public class StashManager extends Module {
 
     // Client thread only: the delivery container's blocks, for drawing, and what the last heartbeat said about it
     private List<BlockPos> deliveryParts = List.of();
+    private BlockPos anvilPart, craftingTablePart;
     private String sentDelivery = "";
     // The rescan id handled and not yet acknowledged to the server, or -1
     private long rescanDone = -1;
@@ -201,11 +347,47 @@ public class StashManager extends Module {
      * @return true when the click is used, so the container doesn't open
      */
     private boolean onRightClick() {
-        if (!selectDelivery.get()) return false;
+        if (!selectDelivery.get() && !selectAnvil.get() && !selectCraftingTable.get()) return false;
         if (mc.player == null || mc.level == null || !mc.mouseHandler.isMouseGrabbed()) return false;
         if (!(mc.hitResult instanceof BlockHitResult hit) || hit.getType() != HitResult.Type.BLOCK) return false;
 
         BlockPos pos = hit.getBlockPos();
+        if (selectCraftingTable.get()) {
+            switch (Modules.get().get(StashSorter.class).toggleCraftingTable(pos)) {
+                case -2 -> {
+                    warning("No stash is loaded. Scan one with stash-sorter first.");
+                    this.selectCraftingTable.set(false);
+                }
+                case -1 -> info("That isn't a crafting table.");
+                case 0 -> {
+                    info("Crafting table cleared.");
+                    this.selectCraftingTable.set(false);
+                }
+                default -> {
+                    info("Crafting table set to %d, %d, %d.", pos.getX(), pos.getY(), pos.getZ());
+                    this.selectCraftingTable.set(false);
+                }
+            }
+            return true;
+        }
+        if (!selectDelivery.get()) {
+            switch (Modules.get().get(StashSorter.class).toggleAnvil(pos)) {
+                case -2 -> {
+                    warning("No stash is loaded. Scan one with stash-sorter first.");
+                    this.selectAnvil.set(false);
+                }
+                case -1 -> info("That isn't an anvil.");
+                case 0 -> {
+                    info("Anvil cleared.");
+                    this.selectAnvil.set(false);
+                }
+                default -> {
+                    info("Anvil set to %d, %d, %d.", pos.getX(), pos.getY(), pos.getZ());
+                    this.selectAnvil.set(false);
+                }
+            }
+            return true;
+        }
         int result = Modules.get().get(StashSorter.class).toggleDelivery(pos);
         switch (result) {
             case -2 -> {
@@ -227,6 +409,14 @@ public class StashManager extends Module {
 
     @EventHandler
     private void onRender3D(Render3DEvent event) {
+        if (showAnvil.get() && anvilPart != null) {
+            SettingColor anvil = anvilColor.get();
+            event.renderer.box(anvilPart, anvil, anvil, ShapeMode.Both, 0);
+        }
+        if (showCraftingTable.get() && craftingTablePart != null) {
+            SettingColor table = craftingTableColor.get();
+            event.renderer.box(craftingTablePart, table, table, ShapeMode.Both, 0);
+        }
         if (!showDelivery.get()) return;
         SettingColor color = deliveryColor.get();
         for (BlockPos part : deliveryParts) event.renderer.box(part, color, color, ShapeMode.Both, 0);
@@ -241,7 +431,11 @@ public class StashManager extends Module {
     @Override
     public void onDeactivate() {
         selectDelivery.set(false);
+        selectAnvil.set(false);
+        selectCraftingTable.set(false);
         deliveryParts = List.of();
+        anvilPart = null;
+        craftingTablePart = null;
         // Nobody is left to tell the server how an order is going: park it so a later claim carries on
         StashSorter sorter = Modules.get().get(StashSorter.class);
         if (sorter != null) {
@@ -352,7 +546,7 @@ public class StashManager extends Module {
             lastHeartbeat = now;
             String sig = deliverySig();
             long done = rescanDone;
-            send(base, "/api/v1/heartbeat", StashIndex.heartbeat(built, deliveryPos(), orderBlocker(), done, rescanBlocked()), key, (code, body) -> {
+            send(base, "/api/v1/heartbeat", StashIndex.heartbeat(built, deliveryPos(), orderBlocker(), done, rescanBlocked(), namingInfo(), craftingInfo(), anvilSource()), key, (code, body) -> {
                 if (code != 200) return false;
                 sentDelivery = sig;
                 if (done >= 0 && rescanDone == done) rescanDone = -1;
@@ -465,6 +659,25 @@ public class StashManager extends Module {
         return d == null ? null : new int[] { d.pos.getX(), d.pos.getY(), d.pos.getZ() };
     }
 
+    /** What the heartbeat says about naming: whether an anvil is ready, and the bot's XP level (-1: unknown). */
+    private int[] namingInfo() {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        if (sorter == null) return new int[] { 0, -1 };
+        return new int[] { sorter.anvilReady() ? 1 : 0, sorter.xpLevels() };
+    }
+
+    /** Where the anvil in use came from, for the heartbeat: "set", "found", "placed" or "none". */
+    private String anvilSource() {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        return sorter == null ? "none" : sorter.anvilSource();
+    }
+
+    /** What the heartbeat says about crafting: whether it is on, and whether a crafting table is ready. */
+    private int[] craftingInfo() {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        return new int[] { enableCrafting.get() ? 1 : 0, sorter != null && sorter.craftingTableReady() ? 1 : 0 };
+    }
+
     /** Why a rescan can't start yet, or null. */
     private String rescanBlocked() {
         StashSorter sorter = Modules.get().get(StashSorter.class);
@@ -505,7 +718,7 @@ public class StashManager extends Module {
     /** What the heartbeat says about delivery; when it changes, another heartbeat goes out at once. */
     private String deliverySig() {
         int[] d = deliveryPos();
-        return (d == null ? "none" : d[0] + "," + d[1] + "," + d[2]) + "|" + orderBlocker() + "|" + rescanDone + "|" + rescanBlocked();
+        return (d == null ? "none" : d[0] + "," + d[1] + "," + d[2]) + "|" + (namingInfo()[0]) + anvilSource() + "|" + craftingInfo()[0] + craftingInfo()[1] + "|" + orderBlocker() + "|" + rescanDone + "|" + rescanBlocked();
     }
 
     /** The module is on and taking orders. */
@@ -519,6 +732,22 @@ public class StashManager extends Module {
 
     boolean useNamedShulkers() {
         return useNamedShulkers.get();
+    }
+
+    /** enable-crafting. */
+    boolean craftingEnabled() {
+        return enableCrafting.get();
+    }
+
+    /** The items crafting never uses, as ids like minecraft:beacon. */
+    Set<String> craftNeverUse() {
+        Set<String> out = new HashSet<>();
+        for (Item item : craftNeverUse.get()) out.add(net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(item).toString());
+        return out;
+    }
+
+    com.porter.qwerte.craft.CraftPlanner.Caps craftCaps() {
+        return new com.porter.qwerte.craft.CraftPlanner.Caps(craftMaxPerOrder.get(), craftMaxOpsPerTask.get(), craftMaxPerHour.get());
     }
 
     /** Starts or stops the sorter's loop for this module: when it takes orders, or containers wait to be read. */
@@ -542,6 +771,8 @@ public class StashManager extends Module {
         OrderRunner runner = sorter.orders();
         Stash.Box delivery = runner.deliveryBox();
         deliveryParts = delivery == null ? List.of() : List.copyOf(delivery.parts);
+        anvilPart = sorter.anvilPos();
+        craftingTablePart = sorter.craftingTablePos();
 
         String info = runner.info();
         if (sorter.returningLeftovers()) {

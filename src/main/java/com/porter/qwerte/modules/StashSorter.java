@@ -14,6 +14,8 @@ import com.porter.qwerte.stash.Containers;
 import com.porter.qwerte.stash.Stash;
 import com.porter.qwerte.stash.Stash.Box;
 import com.porter.qwerte.utils.BaritoneHelper;
+import com.porter.qwerte.craft.AnvilFinder;
+import com.porter.qwerte.utils.PlaceSearch;
 import meteordevelopment.meteorclient.MeteorClient;
 import meteordevelopment.meteorclient.events.entity.player.InteractBlockEvent;
 import meteordevelopment.meteorclient.events.game.GameLeftEvent;
@@ -560,12 +562,12 @@ public class StashSorter extends Module {
         Pattern.compile("^(\\w{3,16}) -> (?:me|you): (.+)$")
     };
 
-    private enum Job { Survey, Take, Deposit, Dump, Fetch, Clean, Fill, Compact, Deliver, Return, KitTake, KitUnpack, KitFill, FetchSigns, Label, Gather, Ground, Explore, Unbundle }
+    private enum Job { Survey, Take, Deposit, Dump, Fetch, Clean, Fill, Compact, Deliver, Return, KitTake, KitUnpack, KitFill, FetchSigns, Label, Gather, Ground, Explore, Unbundle, Name, CraftTake, CraftUnpack, Craft, AnvilPlace }
 
     private enum Step { Walking, Opening, Working }
 
     // Repacking a shulker in the world: put it down, open it, move items, break it, pick it back up
-    private enum Handle { Place, Open, Work, Break, Collect, Return, Leave, Resume }
+    private enum Handle { Place, Wander, Open, Work, Break, Collect, Return, Leave, Resume }
 
     // Giving way: running, letting go of what is ours, then waiting for the others to finish and be quiet
     private enum Gate { Running, Yielding, Waiting }
@@ -1109,6 +1111,8 @@ public class StashSorter extends Module {
     // Repacking
     private int wantSlot = -1;
     private int handledSlot;
+    // Where the shulker handled came from, before it was moved to the hotbar to be placed
+    private int handledOrigin;
     private BulkKey fillKey;
     private Item mainItem;
 
@@ -1372,6 +1376,11 @@ public class StashSorter extends Module {
         public void changed() {
             syncInFlight();
         }
+
+        @Override
+        public String craftEmpty(String purpose) {
+            return craftEmptyForCompaction(purpose);
+        }
     });
 
     // Building kits
@@ -1489,6 +1498,36 @@ public class StashSorter extends Module {
         public void say(String text) {
             info("%s", text);
         }
+
+        @Override
+        public String anvilProblem() {
+            return StashSorter.this.anvilProblem();
+        }
+
+        @Override
+        public BlockPos anvilPos() {
+            return stash == null ? null : stash.anvilPos;
+        }
+
+        @Override
+        public Crafter crafter() {
+            return crafter;
+        }
+
+        @Override
+        public boolean craftingOn() {
+            return StashSorter.this.craftingOn();
+        }
+
+        @Override
+        public String craftBlocker() {
+            return StashSorter.this.craftBlocker();
+        }
+
+        @Override
+        public boolean anvilMissing() {
+            return StashSorter.this.anvilMissing();
+        }
     });
     private int collectedSlot = -1;
     private int seenKits;
@@ -1568,12 +1607,17 @@ public class StashSorter extends Module {
         packTried.clear();
         compactor.reset();
         failedSpots.clear();
+        resetWander();
         placeFailures = 0;
         lastPlaceTick = -1000;
         repackPausedUntil = 0;
         dropLost = false;
         placedConfirmed = false;
         kitBuilder.reset();
+        crafter.reset();
+        craftForOrder = false;
+        craftCooldownUntil = 0;
+        craftHealth.note(null, null, null);
         collectedSlot = -1;
         scanned = 0;
         unbundleBlocked.clear();
@@ -1689,6 +1733,15 @@ public class StashSorter extends Module {
 
         // Only a window of ours, never one the player opened
         if (mc.player != null && mc.player.containerMenu != mc.player.inventoryMenu && ourMenu(mc.player.containerMenu)) {
+            // A crafting table is never closed with items in the grid: they are taken back first
+            if (mc.player.containerMenu instanceof net.minecraft.world.inventory.CraftingMenu cm) {
+                for (int i = 0; i < 30; i++) {
+                    Crafter.Act back = crafter.drain(cm);
+                    if (back == null || back.kind() != Crafter.Act.CLICK) break;
+                    mc.gameMode.handleInventoryMouseClick(cm.containerId, back.slot(), back.button(), ClickType.PICKUP, mc.player);
+                }
+                if (!crafter.clean(cm)) alert("Stopped with items left in the crafting table, no room to take them back. The server returns them to your inventory.");
+            }
             if (!mc.player.containerMenu.getCarried().isEmpty()) recoverCursor();
             closeOurWindow(mc.player.containerMenu);
         }
@@ -1718,6 +1771,12 @@ public class StashSorter extends Module {
         syncedHandle = null;
         syncedPlaced = null;
         kitBuilder.deactivate();
+        // What the craft gathered stays tracked as the stash's, so it goes back later
+        if (crafter.active()) crafter.finish();
+        crafter.reset();
+        craftForOrder = false;
+        anvilSession = false;
+        anvilSlot = -1;
 
         syncHeld();
         if (stash != null && stash.isDirty()) stash.save();
@@ -1881,6 +1940,7 @@ public class StashSorter extends Module {
             // Never start while a container is open, it might be one the player is using
             if (mc.player.containerMenu != mc.player.inventoryMenu) return;
             pruneHeld();
+            if (relocateNamed()) return;
             remindStuck();
             releaseDeferred();
             applyStale();
@@ -1940,6 +2000,18 @@ public class StashSorter extends Module {
         }
         if (job == Job.Label) {
             labeller.tick();
+            return;
+        }
+        if (job == Job.Name) {
+            nameTick();
+            return;
+        }
+        if (job == Job.Craft) {
+            craftTick();
+            return;
+        }
+        if (job == Job.AnvilPlace) {
+            anvilPlaceTick();
             return;
         }
         stepTicks++;
@@ -2211,6 +2283,14 @@ public class StashSorter extends Module {
     private boolean cleanupStep() {
         AbstractContainerMenu menu = mc.player.containerMenu;
         if (menu != mc.player.inventoryMenu && ourMenu(menu)) {
+            // A crafting table is never closed with items in the grid: they are taken back first
+            if (menu instanceof net.minecraft.world.inventory.CraftingMenu && crafter.active() && cleanupTries < CURSOR_TRIES * 2) {
+                Crafter.Act back = crafter.drain(menu);
+                if (back != null && back.kind() == Crafter.Act.CLICK) {
+                    if (cleanupTries++ % 4 == 0) craftClick(menu, back.slot(), back.button());
+                    return false;
+                }
+            }
             // Never closed with something on the cursor, it would be merged into the inventory or dropped. After a few
             // tries it is closed anyway, so the others are not kept waiting for a click that never works
             if (!menu.getCarried().isEmpty() && cleanupTries < CURSOR_TRIES) {
@@ -2569,6 +2649,9 @@ public class StashSorter extends Module {
             if (old != null) return start(Job.Survey, old);
         }
 
+        // Scan-only: crafting whose order is over is driven to its end (the grid emptied, what was gathered put back)
+        if (!sorting() && crafter.active() && (!craftForOrder || !orderRunner.running()) && runCraft(crafter.next())) return true;
+
         // Scan-only: an order is the only thing that moves items, and what it leaves over goes back where it came from
         if (!sorting() && scanOnlyOrderStep()) return true;
 
@@ -2625,7 +2708,10 @@ public class StashSorter extends Module {
         }
 
         // An order carries on until it is delivered, failed or paused. New work on it waits until what is carried is put away
-        if (orderRunner.running() && !rereading && (kitBuilder.active() || activeCarried().isEmpty()) && runOrder(orderRunner.next())) return true;
+        if (orderRunner.running() && !rereading && (kitBuilder.active() || crafter.active() || activeCarried().isEmpty()) && runOrder(orderRunner.next())) return true;
+
+        // Crafting for the compactor carries on until it is done or given up on
+        if (crafter.active() && (!craftForOrder || !orderRunner.running()) && !rereading && runCraft(crafter.next())) return true;
 
         // A kit being built carries on until it's finished or given up on
         if (kitBuilder.active() && !rereading && !orderKit()) {
@@ -2752,6 +2838,7 @@ public class StashSorter extends Module {
 
         // Everything is where it belongs: a full shulker's worth of anything is packed, which frees chest slots
         if (!kitBuilder.active() && compactor.start() && compactor.next()) return true;
+        if (crafter.active() && (!craftForOrder || !orderRunner.running()) && runCraft(crafter.next())) return true;
 
         finishSorting();
         return false;
@@ -2966,13 +3053,13 @@ public class StashSorter extends Module {
     }
 
     private boolean orderWork() {
-        return orderKit() || orderRunner.running();
+        return orderKit() || orderRunner.running() || crafter.active();
     }
 
     private void noteOrderHeld(int slot, ItemStack baseline) {
         if (slot < 0 || !orderWork()) return;
         orderHeld.put(slot, baseline.copy());
-        if (target != null && (job == Job.KitTake || job == Job.Fetch)) heldFrom.put(slot, target);
+        if (target != null && (job == Job.KitTake || job == Job.Fetch || job == Job.CraftTake)) heldFrom.put(slot, target);
     }
 
     /** A shulker of an order picked up again after it was placed: it keeps where it came from. */
@@ -3020,7 +3107,7 @@ public class StashSorter extends Module {
         List<Integer> out = new ArrayList<>();
         for (int slot : orderHeld.keySet()) {
             ItemStack stack = mc.player.getInventory().getItem(slot);
-            if (orderRunner.claims(stack) || kitBuilder.holds(slot) || returnGaveUp.contains(slot)) continue;
+            if (orderRunner.claims(stack) || kitBuilder.holds(slot) || crafter.holds(slot) || crafter.reserved(slot) || slot == anvilSlot || returnGaveUp.contains(slot)) continue;
             out.add(slot);
         }
         return out;
@@ -3047,9 +3134,9 @@ public class StashSorter extends Module {
             returning = true;
             return true;
         }
-        returning = !back.isEmpty() && !kitBuilder.active() && !orderKit();
+        returning = !back.isEmpty() && !kitBuilder.active() && !orderKit() && !crafter.active();
         if (returning && returnLeftovers(back)) return true;
-        return (kitBuilder.active() || activeCarried().isEmpty()) && runOrder(orderRunner.next());
+        return (kitBuilder.active() || crafter.active() || activeCarried().isEmpty()) && runOrder(orderRunner.next());
     }
 
     /** Of these held slots, the shulkers the order kit being built is done with. */
@@ -3078,9 +3165,9 @@ public class StashSorter extends Module {
             returning = true;
             return true;
         }
-        returning = !left.isEmpty() && !kitBuilder.active();
+        returning = !left.isEmpty() && !kitBuilder.active() && !crafter.active();
 
-        if (orderRunner.running() && (kitBuilder.active() || left.isEmpty()) && runOrder(orderRunner.next())) return true;
+        if (orderRunner.running() && (kitBuilder.active() || crafter.active() || left.isEmpty()) && runOrder(orderRunner.next())) return true;
         return returning && returnLeftovers(left);
     }
 
@@ -3109,9 +3196,19 @@ public class StashSorter extends Module {
         ItemStack stack = mc.player.getInventory().getItem(slot);
 
         Box home = heldFrom.get(slot);
+        // A shulker emptied by taking its items does not go back where it came from if it is misplaced there: it goes where
+        // empty shulkers belong, else the nearest container that takes it
+        boolean emptied = Utils.isShulker(stack.getItem()) && !stack.has(DataComponents.CUSTOM_NAME) && emptyShulker(stack);
+        if (emptied && home != null && !destinationsFor(stack).contains(home)) home = null;
         if (!returnable(home, stack)) {
-            // Shulkers are only ever put back where they came from when sorting; the rest is sorted
-            home = sorting() ? null : nearest(stash.boxes.stream().filter(b -> returnable(b, stack)).toList());
+            if (emptied) {
+                home = nearest(destinationsFor(stack).stream().filter(b -> returnable(b, stack)).toList());
+                if (home == null) home = nearest(stash.boxes.stream().filter(b -> returnable(b, stack)).toList());
+            }
+            else {
+                // Shulkers are only ever put back where they came from when sorting; the rest is sorted
+                home = sorting() ? null : nearest(stash.boxes.stream().filter(b -> returnable(b, stack)).toList());
+            }
         }
         if (home == null) {
             returnGaveUp.add(slot);
@@ -3251,7 +3348,1158 @@ public class StashSorter extends Module {
             case OrderRunner.Build build -> runKit(build.intent());
             case OrderRunner.Fetch fetch -> fetch(fetch.box(), fetch.slot());
             case OrderRunner.Deliver deliver -> start(Job.Deliver, deliver.box());
+            case OrderRunner.Rename rename -> startName(rename);
+            case OrderRunner.Craft craft -> startOrderCraft(craft);
+            case OrderRunner.FindAnvil find -> startFindAnvil();
         };
+    }
+
+    // Crafting (Job.Craft). The table is no Box: it is never read, sorted or indexed
+    private static final int CRAFT_JOB_TICKS = 20 * 180, CRAFT_OPEN_TICKS = 20 * 15, CRAFT_OPEN_TRIES = 4, CRAFT_OPEN_RETRY = 40;
+    private static final int CRAFT_COOLDOWN_TICKS = 20 * 60 * 5;
+    // The reasons crafting is refused or given up on, worded as the proxy plugin has them
+    private static final String NO_TABLE = "needs a crafting table (select-crafting-table)", TABLE_GONE = "the crafting table is gone",
+        TABLE_NOT_REACHED = "couldn't reach the crafting table", TABLE_NOT_OPENED = "couldn't open the crafting table",
+        TABLE_CLOSED = "the crafting table closed before it was done", TABLE_OTHER_DIMENSION = "the crafting table is in another dimension";
+    private static final String SHULKER_BOX_ID = "minecraft:shulker_box";
+    private BlockPos craftPos;
+    private String craftFailure;
+    private boolean craftDone, craftForOrder;
+    private int craftJobTicks, craftOpenTries, craftOpenClickAt, craftDrainTries;
+    // A table that failed, for which order: later crafts of that order don't try it again
+    private final com.porter.qwerte.craft.CraftHealth craftHealth = new com.porter.qwerte.craft.CraftHealth();
+    // How long the window has been kept open for lack of room to empty the grid, and whether the order was told
+    private int craftStuckTicks;
+    private boolean craftStuckReported;
+    // Compaction asked for a craft that failed: not asked again for a while
+    private int craftCooldownUntil;
+    private String craftCooldownWhy = "";
+
+    private boolean craftingOn() {
+        StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+        return manager != null && manager.craftingEnabled();
+    }
+
+    private boolean isTable(BlockPos pos) {
+        return mc.level.getBlockState(pos).is(Blocks.CRAFTING_TABLE);
+    }
+
+    /** Why nothing can be crafted now (no table, it is gone, it failed for this order), or null. */
+    private String craftBlocker() {
+        if (stash == null || stash.craftingTablePos == null) return NO_TABLE;
+        if (mc.level == null || mc.player == null) return "no world";
+        if (!stash.dimension.isEmpty() && !stash.dimension.equals(Stash.currentDimension())) return TABLE_OTHER_DIMENSION;
+        if (mc.level.isLoaded(stash.craftingTablePos) && !isTable(stash.craftingTablePos)) return TABLE_GONE;
+        return craftHealth.problem(orderRunner.orderId(), stash.craftingTablePos);
+    }
+
+    /** For the heartbeat: a crafting table is set and, where its chunk is loaded, it is one. */
+    boolean craftingTableReady() {
+        Stash s = ensureStash();
+        if (s == null || s.craftingTablePos == null || mc.level == null) return false;
+        return !mc.level.isLoaded(s.craftingTablePos) || isTable(s.craftingTablePos);
+    }
+
+    BlockPos craftingTablePos() {
+        Stash s = ensureStash();
+        return s == null ? null : s.craftingTablePos;
+    }
+
+    /**
+     * For stash-manager: sets the crafting table, or clears it if it is this one.
+     * @return 1 when set, 0 when cleared, -1 when the block is no crafting table, -2 when no stash is loaded
+     */
+    int toggleCraftingTable(BlockPos pos) {
+        if (mc.level == null || ensureStash() == null) return -2;
+        if (stash.craftingTablePos != null && stash.craftingTablePos.equals(pos)) {
+            stash.craftingTablePos = null;
+            stash.save();
+            return 0;
+        }
+        if (!isTable(pos)) return -1;
+        stash.craftingTablePos = pos.immutable();
+        stash.save();
+        return 1;
+    }
+
+    /** For stash-manager: no crafting table any more. @return false when there was none or no stash */
+    boolean clearCraftingTable() {
+        if (ensureStash() == null || stash.craftingTablePos == null) return false;
+        stash.craftingTablePos = null;
+        stash.save();
+        return true;
+    }
+
+    private final Crafter crafter = new Crafter(new Crafter.Owner() {
+        @Override
+        public Stash stash() {
+            return stash;
+        }
+
+        @Override
+        public Set<Integer> carry() {
+            return ownedCarry();
+        }
+
+        @Override
+        public int freeCarrySlot() {
+            return StashSorter.this.freeCarrySlot();
+        }
+
+        @Override
+        public int freeCarryCount() {
+            return StashSorter.this.freeCarryCount();
+        }
+
+        @Override
+        public boolean usable(Box box) {
+            return !blocked(box, Job.Take) && !blocked(box, Job.CraftTake) && !signPending(box) && !box.unreachable;
+        }
+
+        @Override
+        public boolean keepWhole(Box box) {
+            return box.labels.stream().anyMatch(Categories::isKeepWhole);
+        }
+
+        @Override
+        public boolean namedShulkers() {
+            return namedForOrders();
+        }
+
+        @Override
+        public boolean claimed(ItemStack shulker) {
+            return Kits.claims(shulker) || orderRunner.claims(shulker) || kitBuilder.heldKit(shulker) != null;
+        }
+
+        @Override
+        public void held(int slot, ItemStack stack) {
+            stashHeld.put(slot, stack.copy());
+            noteOrderHeld(slot, stack);
+        }
+
+        @Override
+        public double distance(Box box) {
+            return mc.player.getEyePosition().distanceToSqr(Vec3.atCenterOf(nearestPart(box)));
+        }
+
+        @Override
+        public Set<String> neverUse() {
+            StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+            return manager == null ? Set.of() : manager.craftNeverUse();
+        }
+
+        @Override
+        public com.porter.qwerte.craft.CraftPlanner.Caps caps() {
+            StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+            return manager == null ? com.porter.qwerte.craft.CraftPlanner.Caps.NONE : manager.craftCaps();
+        }
+
+        @Override
+        public void say(String text) {
+            info("%s", text);
+        }
+    });
+
+    /** Starts the step the crafter asks for. @return true when a job was started */
+    private boolean runCraft(Crafter.Intent intent) {
+        switch (intent) {
+            case Crafter.Take take -> {
+                if (start(Job.CraftTake, take.box())) return true;
+                crafter.abort("couldn't reach " + take.box().pos.toShortString());
+            }
+            case Crafter.Fetch fetch -> {
+                if (fetch(fetch.box(), fetch.slot())) return true;
+                crafter.abort("couldn't reach " + fetch.box().pos.toShortString());
+            }
+            case Crafter.Unpack unpack -> {
+                if (shulkersOk()) return startHandling(Job.CraftUnpack, unpack.slot(), null);
+                crafter.abort("placing shulkers failed lately, so no shulker work for a few minutes");
+            }
+            case Crafter.Table table -> {
+                return startCraftTable();
+            }
+            case Crafter.Done done -> { }
+            case Crafter.Abort abort -> crafter.abort(abort.reason());
+        }
+        endCraft();
+        return false;
+    }
+
+    /** The crafting session is over: the order (or the compactor) is told how it went. */
+    private void endCraft() {
+        Crafter.Outcome outcome = crafter.finish();
+        if (anvilSession) {
+            // The anvil was only gathered: it is placed now
+            anvilSession = false;
+            craftForOrder = false;
+            int slot = outcome.failure() == null ? anvilItemSlot() : -1;
+            if (slot < 0 || !startAnvilPlace(slot)) {
+                crafter.clearLastHeld();
+                warning("No anvil to place: %s.", outcome.failure() == null ? "the anvil couldn't be taken" : outcome.failure());
+                orderRunner.anvilFound(false);
+            }
+            version++;
+            idle = false;
+            return;
+        }
+        if (craftForOrder) orderRunner.craftEnded(outcome);
+        else {
+            if (outcome.failure() != null) {
+                craftCooldownUntil = ticks + CRAFT_COOLDOWN_TICKS;
+                craftCooldownWhy = outcome.failure();
+                warning("Couldn't craft a shulker box: %s.", outcome.failure());
+            }
+            else if (outcome.crafted() > 0) info("Crafted %d Shulker Box.", outcome.crafted());
+        }
+        craftForOrder = false;
+        version++;
+        idle = false;
+    }
+
+    /** The order wants this many plain shulker boxes crafted. */
+    private boolean startOrderCraft(OrderRunner.Craft craft) {
+        if (!crafter.active()) {
+            String why = crafter.begin(new Crafter.Request(SHULKER_BOX_ID, craft.count(), "order " + orderRunner.orderId(), true, orderRunner.crafted(), orderRunner::craftPool, orderRunner::lotKeys, false));
+            if (why != null) {
+                orderRunner.craftEnded(new Crafter.Outcome(SHULKER_BOX_ID, 0, why));
+                return false;
+            }
+            craftForOrder = true;
+        }
+        return runCraft(crafter.next());
+    }
+
+    /** Compaction has no empty shulker: crafts one. @return null when started, "" when crafting is off, else why not */
+    private String craftEmptyForCompaction(String purpose) {
+        if (!craftingOn()) return "";
+        if (ticks < craftCooldownUntil) return craftCooldownWhy;
+        if (crafter.active()) return null;
+        String why = craftBlocker();
+        if (why == null) why = crafter.begin(new Crafter.Request(SHULKER_BOX_ID, 1, purpose, false, 0, crafter::survey));
+        if (why != null) {
+            craftCooldownUntil = ticks + CRAFT_COOLDOWN_TICKS;
+            craftCooldownWhy = why;
+            return why;
+        }
+        craftForOrder = false;
+        return null;
+    }
+
+    private boolean startCraftTable() {
+        String bad = craftBlocker();
+        BlockPos table = stash == null ? null : stash.craftingTablePos;
+        if (bad == null && !walkOn() && !inReachOf(table)) bad = TABLE_NOT_REACHED;
+        if (bad != null) {
+            crafter.tableEnded(bad);
+            return false;
+        }
+
+        craftPos = table;
+        craftFailure = null;
+        craftDone = false;
+        craftJobTicks = craftOpenTries = craftOpenClickAt = craftDrainTries = 0;
+        craftStuckTicks = 0;
+        craftStuckReported = false;
+
+        job = Job.Craft;
+        target = null;
+        handle = null;
+        actions = 0;
+        jobCounted = false;
+        stepTicks = 0;
+        jobInterruptions = 0;
+        startSigSet = endSigSet = false;
+        settled = false;
+        openPos = null;
+        openMenuBefore = null;
+        recoveries = 0;
+        swapStep = 0;
+        step(craftForOrder ? "order: crafting at the crafting table; next: carry on with the order." : "crafting: at the crafting table; next: carry on.");
+
+        if (inReachOf(craftPos)) step = Step.Opening;
+        else {
+            walkNear(craftPos, 2);
+            // The table may be outside the stash area: that is not a reason to refuse the way
+            walkInside = false;
+            step = Step.Walking;
+        }
+        return true;
+    }
+
+    private void craftTick() {
+        stepTicks++;
+        lastOwnAct = ticks;
+        if (step == Step.Working) craftJobTicks++;
+        if (craftJobTicks > CRAFT_JOB_TICKS + 400) {
+            if (craftFailure == null) craftFailure = "crafting didn't finish";
+            craftEnd();
+            return;
+        }
+        if (craftJobTicks > CRAFT_JOB_TICKS && craftFailure == null) craftFailure = "crafting didn't finish";
+        switch (step) {
+            case Walking -> craftWalk();
+            case Opening -> craftOpen();
+            case Working -> craftWork();
+        }
+    }
+
+    private void craftWalk() {
+        if (mc.level.isLoaded(craftPos) && !isTable(craftPos)) {
+            craftFailure = TABLE_GONE;
+            craftEnd();
+            return;
+        }
+        if (inReachOf(craftPos)) {
+            releaseGoal();
+            step = Step.Opening;
+            stepTicks = 0;
+            craftOpenTries = 0;
+            return;
+        }
+        boolean stopped = stepTicks > PATH_GRACE_TICKS && !BaritoneHelper.isMoving();
+        if (stopped || stepTicks > WALK_TIMEOUT) {
+            craftFailure = TABLE_NOT_REACHED;
+            craftEnd();
+        }
+    }
+
+    private void craftOpen() {
+        if (!isTable(craftPos)) {
+            craftFailure = TABLE_GONE;
+            craftEnd();
+            return;
+        }
+        AbstractContainerMenu open = mc.player.containerMenu;
+        if (open != mc.player.inventoryMenu) {
+            if (openPos != null && open != openMenuBefore && open instanceof net.minecraft.world.inventory.CraftingMenu) {
+                ownedMenu = open;
+                step = Step.Working;
+                stepTicks = 0;
+                wait = delay.get();
+                return;
+            }
+            // Something else opened (one left over, a plugin window): closed, and the click made again
+            if (!open.getCarried().isEmpty()) recoverCursor();
+            mc.player.closeContainer();
+        }
+
+        if (stepTicks > CRAFT_OPEN_TICKS || (craftOpenTries >= CRAFT_OPEN_TRIES && stepTicks - craftOpenClickAt > CRAFT_OPEN_RETRY)) {
+            craftFailure = TABLE_NOT_OPENED;
+            craftEnd();
+            return;
+        }
+
+        if (craftOpenTries < CRAFT_OPEN_TRIES && (craftOpenTries == 0 || stepTicks - craftOpenClickAt >= CRAFT_OPEN_RETRY)) {
+            craftOpenTries++;
+            craftOpenClickAt = stepTicks;
+            BlockPos pos = craftPos;
+            BlockHitResult hit = new BlockHitResult(Vec3.atCenterOf(pos), Direction.UP, pos, false);
+            Runnable click = () -> {
+                if (gate != Gate.Running || job != Job.Craft) return;
+                openPos = pos;
+                openClickTick = ticks;
+                openMenuBefore = mc.player.containerMenu;
+                BlockUtils.interact(hit, InteractionHand.MAIN_HAND, true);
+            };
+
+            if (rotate.get()) Rotations.rotate(Rotations.getYaw(pos), Rotations.getPitch(pos), click);
+            else click.run();
+        }
+    }
+
+    /** One click in the open crafting window: always PICKUP, never a shift-click. */
+    private void craftClick(AbstractContainerMenu menu, int slot, int button) {
+        mc.gameMode.handleInventoryMouseClick(menu.containerId, slot, button, ClickType.PICKUP, mc.player);
+        yielder.inventoryChangedByUs();
+        wait = Math.max(delay.get(), 4);
+    }
+
+    private void craftWork() {
+        AbstractContainerMenu menu = mc.player.containerMenu;
+        if (!(menu instanceof net.minecraft.world.inventory.CraftingMenu) || menu != ownedMenu) {
+            craftEnd();
+            return;
+        }
+        if (craftFailure == null && crafter.failure() != null) craftFailure = crafter.failure();
+        if (craftFailure != null || craftDone) {
+            craftEnd();
+            return;
+        }
+
+        Crafter.Act act = crafter.window(menu);
+        switch (act.kind()) {
+            case Crafter.Act.CLICK -> craftClick(menu, act.slot(), act.button());
+            case Crafter.Act.DONE -> {
+                craftDone = true;
+                craftEnd();
+            }
+            case Crafter.Act.FAIL -> {
+                craftFailure = act.why();
+                craftEnd();
+            }
+            default -> { }
+        }
+    }
+
+    /**
+     * Ends the job at the table. The window is never closed with something in the grid or on the cursor: it is taken back
+     * first, and when there is no room for it the window stays open and the player is told.
+     */
+    private void craftEnd() {
+        if (ourGoal != null) releaseGoal();
+        AbstractContainerMenu menu = mc.player.containerMenu;
+        if (menu instanceof net.minecraft.world.inventory.CraftingMenu && menu == ownedMenu && !crafter.clean(menu)) {
+            Crafter.Act back = crafter.drain(menu);
+            if (back != null && back.kind() == Crafter.Act.CLICK) {
+                craftDrainTries++;
+                craftClick(menu, back.slot(), back.button());
+                return;
+            }
+            if (craftDrainTries++ % 200 == 0) alert("No room for what is in the crafting table, keeping the window open. Please make room in your inventory.");
+            // After about two minutes the order step ends with a clear reason; the window stays open and the alert goes on
+            if (++craftStuckTicks > 20 * 120 && !craftStuckReported) {
+                craftStuckReported = true;
+                crafter.abort(com.porter.qwerte.craft.CraftHealth.NO_ROOM);
+                if (craftForOrder) orderRunner.abortOrder(com.porter.qwerte.craft.CraftHealth.NO_ROOM + " (the crafting window is still open)");
+            }
+            return;
+        }
+        if (menu != mc.player.inventoryMenu && ourMenu(menu)) closeOurWindow(menu);
+        ownedMenu = null;
+        openPos = null;
+        openMenuBefore = null;
+        recoveries = 0;
+
+        String why = craftFailure;
+        if (why == null && !craftDone) why = TABLE_CLOSED;
+        if (why != null) {
+            QwerteAddon.LOG.info("[stash-sorter] crafting given up: {}", why);
+        }
+        // Table trouble is remembered for the order the way the plugin does: no result, not taken, couldn't reach or open, or
+        // two closes in a row. Not after a single close
+        craftHealth.note(orderRunner.orderId(), craftPos, why);
+        crafter.tableEnded(why);
+        craftFailure = null;
+        craftDone = false;
+        job = null;
+        target = null;
+        wait = delay.get();
+    }
+
+    // Naming a shulker at the anvil (Job.Name). Not a container job: the anvil is no Box, it is never read, sorted or indexed
+    private static final int NAME_RESULT_TICKS = 20 * 30, NAME_JOB_TICKS = 20 * 40, NAME_SETTLE_TICKS = 6, NAME_COST_WAIT_TICKS = 20 * 3;
+    private static final int NAME_CHECK_TICKS = 20 * 5, NAME_MAX_TAKES = 3, NAME_TOO_DEAR = 40;
+    private static final int NAME_OPEN_TICKS = 20 * 15, NAME_OPEN_TRIES = 4, NAME_OPEN_RETRY = 40;
+    // The reasons a shulker goes unnamed, worded as the proxy plugin has them
+    private static final String NO_ANVIL = "no anvil set", ANVIL_GONE = "the anvil is gone (the block there isn't an anvil)",
+        OTHER_DIMENSION = "the anvil is in another dimension", TOO_FEW_LEVELS = "too few XP levels",
+        NOT_REACHED = "couldn't reach the anvil", NOT_OPENED = "couldn't open the anvil",
+        CLOSED = "the anvil closed before it was done", TOO_DEAR = "the anvil said it is too expensive",
+        NO_RESULT = "no result from the anvil in time", NOT_TAKEN = "the anvil didn't give the shulker back named",
+        NAME_UNFINISHED = "naming didn't finish";
+    private int nameTakes, nameCheckTicks, nameOpenTries, nameOpenClickAt, nameDrainTries, nameClosedStreak;
+    private boolean nameSucceeded;
+    private String nameStreakOrder;
+    // Why the anvil could not be used (reached, opened), for which order and anvil: later shulkers of that order go unnamed
+    // at once instead of walking there again
+    private String anvilFailure, anvilFailedOrder;
+    private BlockPos anvilFailedFor;
+    private BlockPos namePos;
+    private String nameText;
+    private String nameFailure;
+    private int nameSlot = -1, nameSentAt, nameJobTicks, nameResultSeen;
+    private boolean nameSent, namePlaced;
+    // The carry slot the shulker came from: it is put back there, and found again if it landed elsewhere
+    private int relocateSlot = -1;
+
+    private boolean isAnvil(BlockPos pos) {
+        return mc.level.getBlockState(pos).is(net.minecraft.tags.BlockTags.ANVIL);
+    }
+
+    /** Why shulkers can't be named now, or null. */
+    private String anvilProblem() {
+        if (stash == null || stash.anvilPos == null) return NO_ANVIL;
+        if (mc.level == null || mc.player == null) return "no world";
+        if (!stash.dimension.isEmpty() && !stash.dimension.equals(Stash.currentDimension())) return OTHER_DIMENSION;
+        if (mc.level.isLoaded(stash.anvilPos) && !isAnvil(stash.anvilPos)) return ANVIL_GONE;
+        if (anvilFailure != null && stash.anvilPos.equals(anvilFailedFor) && java.util.Objects.equals(anvilFailedOrder, orderRunner.orderId())) return anvilFailure;
+        if (!mc.player.hasInfiniteMaterials() && mc.player.experienceLevel < 1) return TOO_FEW_LEVELS;
+        return null;
+    }
+
+    /** For the heartbeat: an anvil is set and, where its chunk is loaded, it is one. */
+    boolean anvilReady() {
+        Stash s = ensureStash();
+        if (s == null || s.anvilPos == null || mc.level == null) return false;
+        return !mc.level.isLoaded(s.anvilPos) || isAnvil(s.anvilPos);
+    }
+
+    /** For the heartbeat: the bot's XP level, or -1. */
+    int xpLevels() {
+        return mc.player == null ? -1 : mc.player.experienceLevel;
+    }
+
+    BlockPos anvilPos() {
+        Stash s = ensureStash();
+        return s == null ? null : s.anvilPos;
+    }
+
+    /**
+     * For stash-manager: sets the anvil, or clears it if it is this one.
+     * @return 1 when set, 0 when cleared, -1 when the block is no anvil, -2 when no stash is loaded
+     */
+    int toggleAnvil(BlockPos pos) {
+        if (mc.level == null || ensureStash() == null) return -2;
+        if (stash.anvilPos != null && stash.anvilPos.equals(pos)) {
+            stash.anvilPos = null;
+            stash.anvilSource = "";
+            stash.save();
+            return 0;
+        }
+        if (!isAnvil(pos)) return -1;
+        stash.anvilPos = pos.immutable();
+        stash.anvilSource = "set";
+        stash.save();
+        return 1;
+    }
+
+    /** For stash-manager: no anvil any more. @return false when there was none or no stash */
+    boolean clearAnvil() {
+        if (ensureStash() == null || stash.anvilPos == null) return false;
+        stash.anvilPos = null;
+        stash.anvilSource = "";
+        stash.save();
+        return true;
+    }
+
+    // Finding an anvil to name at (Job.AnvilPlace). In order: the one picked by hand, a remembered one, a placed anvil found in
+    // the stash area, one taken from the stash and placed. Nothing works: the rename fails with AnvilFinder.NONE
+    private static final String[] ANVIL_IDS = { "minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil" };
+    private static final int ANVIL_PLACE_TICKS = 20 * 90, ANVIL_TRIES = 3;
+    private boolean anvilSession, anvilPlaced, anvilWalking;
+    private int anvilSlot = -1, anvilPlaceTries, anvilPlacedAt, anvilWalkStart, anvilRestarts;
+    private BlockPos anvilSpot, anvilStand;
+    private final Set<PlaceSearch.Pos> anvilSkip = new HashSet<>();
+
+    /** No anvil is set or remembered, or the one that was is gone. */
+    boolean anvilMissing() {
+        if (stash == null || stash.anvilPos == null) return true;
+        return mc.level != null && mc.level.isLoaded(stash.anvilPos) && !isAnvil(stash.anvilPos);
+    }
+
+    /** For the heartbeat: where the anvil in use came from: "set", "found", "placed" or "none". */
+    String anvilSource() {
+        Stash s = ensureStash();
+        if (s == null || s.anvilPos == null) return "none";
+        return s.anvilSource.isEmpty() ? "set" : s.anvilSource;
+    }
+
+    private static boolean anvilItem(ItemStack s) {
+        return !s.isEmpty() && (s.is(Items.ANVIL) || s.is(Items.CHIPPED_ANVIL) || s.is(Items.DAMAGED_ANVIL));
+    }
+
+    /** The inventory slot of an anvil item gathered for placing, or -1. */
+    private int anvilItemSlot() {
+        var inv = mc.player.getInventory();
+        if (anvilSlot >= 0 && anvilItem(inv.getItem(anvilSlot))) return anvilSlot;
+        for (int slot : crafter.lastHeld()) if (anvilItem(inv.getItem(slot)) && (stashHeld.containsKey(slot) || orderHeld.containsKey(slot))) return slot;
+        return -1;
+    }
+
+    /** Placed anvils in the stash area: the perimeter if one is set, else the radius and height around us. Loaded chunks only. */
+    private List<AnvilFinder.Pos> placedAnvils() {
+        List<AnvilFinder.Pos> out = new ArrayList<>();
+        if (mc.level == null) return out;
+        int minX, maxX, minY, maxY, minZ, maxZ;
+        if (stash.hasArea()) {
+            BlockPos lo = stash.areaMin(), hi = stash.areaMax();
+            minX = lo.getX(); maxX = hi.getX(); minY = lo.getY(); maxY = hi.getY(); minZ = lo.getZ(); maxZ = hi.getZ();
+        }
+        else {
+            BlockPos at = mc.player.blockPosition();
+            int r = radius.get(), h = height.get();
+            minX = at.getX() - r; maxX = at.getX() + r; minY = at.getY() - h; maxY = at.getY() + h; minZ = at.getZ() - r; maxZ = at.getZ() + r;
+        }
+        int minSection = mc.level.getMinSectionY();
+        for (int cx = minX >> 4; cx <= maxX >> 4; cx++) {
+            for (int cz = minZ >> 4; cz <= maxZ >> 4; cz++) {
+                if (!mc.level.hasChunk(cx, cz)) continue;
+                var sections = mc.level.getChunk(cx, cz).getSections();
+                for (int i = 0; i < sections.length; i++) {
+                    int baseY = (minSection + i) * 16;
+                    if (baseY + 15 < minY || baseY > maxY) continue;
+                    var section = sections[i];
+                    // Whole sections without an anvil in their palette are skipped
+                    if (section.hasOnlyAir() || !section.maybeHas(st -> st.is(net.minecraft.tags.BlockTags.ANVIL))) continue;
+                    for (int x = 0; x < 16; x++) {
+                        for (int y = 0; y < 16; y++) {
+                            for (int z = 0; z < 16; z++) {
+                                if (!section.getBlockState(x, y, z).is(net.minecraft.tags.BlockTags.ANVIL)) continue;
+                                int wx = cx * 16 + x, wy = baseY + y, wz = cz * 16 + z;
+                                if (wx < minX || wx > maxX || wy < minY || wy > maxY || wz < minZ || wz > maxZ) continue;
+                                out.add(new AnvilFinder.Pos(wx, wy, wz));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
+    /** An anvil is needed: finds one placed, or gathers one from the stash to place. The outcome goes to the order runner. */
+    private boolean startFindAnvil() {
+        if (stash == null || mc.level == null) {
+            orderRunner.anvilFound(false);
+            return false;
+        }
+        // An anvil taken out earlier and not yet placed (the job was interrupted)
+        if (anvilSlot >= 0 && !anvilItem(mc.player.getInventory().getItem(anvilSlot))) anvilSlot = -1;
+        int held = anvilItemSlot();
+        if (held >= 0 && startAnvilPlace(held)) return true;
+
+        AnvilFinder.Memory memory = stash.anvilPos == null ? null
+            : new AnvilFinder.Memory(new AnvilFinder.Pos(stash.anvilPos.getX(), stash.anvilPos.getY(), stash.anvilPos.getZ()), AnvilFinder.Source.of(stash.anvilSource.isEmpty() ? "set" : stash.anvilSource));
+        AnvilFinder.Decision decision = AnvilFinder.decide(memory, new AnvilFinder.World() {
+            @Override
+            public boolean isAnvil(AnvilFinder.Pos p) {
+                BlockPos at = new BlockPos(p.x(), p.y(), p.z());
+                return !mc.level.isLoaded(at) || StashSorter.this.isAnvil(at);
+            }
+
+            @Override
+            public AnvilFinder.Pos search() {
+                AnvilFinder.Pos from = new AnvilFinder.Pos(mc.player.getBlockX(), mc.player.getBlockY(), mc.player.getBlockZ());
+                return AnvilFinder.nearest(placedAnvils(), from, p -> !stash.hasArea() || stash.inArea(new BlockPos(p.x(), p.y(), p.z())));
+            }
+
+            @Override
+            public boolean stockHasAnvil() {
+                Map<String, Long> pool = orderRunner.craftPool();
+                for (String id : ANVIL_IDS) if (pool.getOrDefault(id, 0L) > 0) return true;
+                return false;
+            }
+        });
+        if (decision.forget()) {
+            info("The anvil I knew is gone, looking for another.");
+            stash.anvilPos = null;
+            stash.anvilSource = "";
+            stash.save();
+        }
+        switch (decision.step()) {
+            case USE -> orderRunner.anvilFound(true);
+            case FOUND -> {
+                stash.anvilPos = new BlockPos(decision.pos().x(), decision.pos().y(), decision.pos().z());
+                stash.anvilSource = "found";
+                stash.save();
+                info("Found an anvil in the stash area, using it for naming from now on.");
+                orderRunner.anvilFound(true);
+            }
+            case PLACE_FROM_STOCK -> {
+                Map<String, Long> pool = orderRunner.craftPool();
+                String id = null;
+                for (String candidate : ANVIL_IDS) if (id == null && pool.getOrDefault(candidate, 0L) > 0) id = candidate;
+                String why = id == null ? "none in the stash"
+                    : crafter.begin(new Crafter.Request(id, 1, "naming", false, 0, orderRunner::craftPool, orderRunner::lotKeys, true));
+                if (why != null) {
+                    warning("No anvil to place: %s.", why);
+                    orderRunner.anvilFound(false);
+                    return false;
+                }
+                craftForOrder = true;
+                anvilSession = true;
+                info("No anvil in the area, taking one out of the stash to place.");
+                return runCraft(crafter.next());
+            }
+            case FAIL -> {
+                warning("%s.", decision.failure());
+                orderRunner.anvilFound(false);
+            }
+        }
+        return false;
+    }
+
+    private boolean startAnvilPlace(int slot) {
+        anvilSlot = slot;
+        anvilSpot = anvilStand = null;
+        anvilPlaced = anvilWalking = false;
+        anvilPlaceTries = anvilRestarts = 0;
+        anvilSkip.clear();
+        job = Job.AnvilPlace;
+        target = null;
+        handle = null;
+        actions = 0;
+        jobCounted = false;
+        stepTicks = 0;
+        jobInterruptions = 0;
+        startSigSet = endSigSet = false;
+        settled = false;
+        openPos = null;
+        openMenuBefore = null;
+        recoveries = 0;
+        swapStep = 0;
+        step("order: placing an anvil to name the shulkers at; next: carry on with the order.");
+        return true;
+    }
+
+    private void anvilPlaceTick() {
+        stepTicks++;
+        lastOwnAct = ticks;
+        var inv = mc.player.getInventory();
+
+        if (anvilPlaced) {
+            if (isAnvil(anvilSpot)) anvilPlaceDone(true);
+            else if (stepTicks - anvilPlacedAt > 40) anvilPlaceDone(false);
+            return;
+        }
+        if (stepTicks > ANVIL_PLACE_TICKS || anvilSlot < 0 || !anvilItem(inv.getItem(anvilSlot))) {
+            anvilPlaceDone(false);
+            return;
+        }
+
+        if (anvilWalking) {
+            Vec3 at = mc.player.position();
+            if (at.distanceToSqr(Vec3.atBottomCenterOf(anvilStand)) <= 1.8 * 1.8) {
+                releaseGoal();
+                anvilWalking = false;
+                wait = delay.get();
+                return;
+            }
+            if (ourGoal == null) {
+                if (++anvilRestarts > 3) anvilSpotFailed();
+                else {
+                    walkNear(anvilStand, 1);
+                    anvilWalkStart = stepTicks;
+                }
+                return;
+            }
+            boolean stopped = stepTicks - anvilWalkStart > PATH_GRACE_TICKS && !BaritoneHelper.isMoving();
+            if (stopped || stepTicks - anvilWalkStart > WANDER_TICKS) anvilSpotFailed();
+            return;
+        }
+
+        if (anvilSpot == null) {
+            PlaceSearch.Result found = PlaceSearch.search(pos(mc.player.blockPosition()), placeView(), anvilSkip);
+            if (found.found() == null) {
+                QwerteAddon.LOG.info("anvil: no spot within {} blocks: {}", PlaceSearch.RADIUS, found.why());
+                anvilPlaceDone(false);
+                return;
+            }
+            anvilSpot = bp(found.found().spot());
+            anvilStand = bp(found.found().stand());
+            if (found.found().steps() > 0) {
+                if (!walkOn()) {
+                    anvilPlaceDone(false);
+                    return;
+                }
+                info("No spot for the anvil beside me, walking %d steps to the nearest one.", found.found().steps());
+                walkNear(anvilStand, 1);
+                anvilWalking = true;
+                anvilWalkStart = stepTicks;
+                anvilRestarts = 0;
+                return;
+            }
+        }
+
+        // It has to be in the hotbar to place it
+        if (anvilSlot >= 9) {
+            Set<Integer> keep = parseSlots(keepSlots.get());
+            int hotbar = -1;
+            for (int i = 0; i < 9 && hotbar == -1; i++) if (!keep.contains(i) && inv.getItem(i).isEmpty()) hotbar = i;
+            if (hotbar == -1) {
+                warning("No free hotbar slot to place the anvil from.");
+                anvilPlaceDone(false);
+                return;
+            }
+            // The tracking of the stack goes with it, or what is left of it would count as the player's own
+            int old = anvilSlot;
+            ItemStack was = inv.getItem(old).copy();
+            Box source = heldFrom.get(old);
+            InvUtils.move().from(old).to(hotbar);
+            anvilSlot = hotbar;
+            stashHeld.remove(old);
+            orderHeld.remove(old);
+            heldFrom.remove(old);
+            stashHeld.put(hotbar, was);
+            if (orderWork()) orderHeld.put(hotbar, was.copy());
+            if (source != null) heldFrom.put(hotbar, source);
+            wait = delay.get();
+            return;
+        }
+        if (!BlockUtils.canPlace(anvilSpot, true)) {
+            anvilSpotFailed();
+            return;
+        }
+        if (BlockUtils.place(anvilSpot, new FindItemResult(anvilSlot, inv.getItem(anvilSlot).getCount()), rotate.get(), 50, true, true, true)) {
+            anvilPlaced = true;
+            anvilPlacedAt = stepTicks;
+            wait = delay.get();
+        }
+        else anvilSpotFailed();
+    }
+
+    /** That spot did not work: not tried again, and another is looked for (a few times). */
+    private void anvilSpotFailed() {
+        releaseGoal();
+        if (anvilSpot != null) anvilSkip.add(pos(anvilSpot));
+        anvilSpot = anvilStand = null;
+        anvilWalking = false;
+        if (++anvilPlaceTries >= ANVIL_TRIES) anvilPlaceDone(false);
+    }
+
+    private void anvilPlaceDone(boolean ok) {
+        releaseGoal();
+        if (ok) {
+            stash.anvilPos = anvilSpot.immutable();
+            stash.anvilSource = "placed";
+            stash.save();
+            info("Placed an anvil to name shulkers at, remembered for next time.");
+        }
+        else warning("Couldn't place an anvil.");
+        // An anvil item that was not placed is carried like anything else and put back
+        anvilSlot = -1;
+        crafter.clearLastHeld();
+        anvilSpot = anvilStand = null;
+        anvilPlaced = anvilWalking = false;
+        job = null;
+        target = null;
+        wait = delay.get();
+        orderRunner.anvilFound(ok);
+        version++;
+        idle = false;
+    }
+
+
+    private boolean startName(OrderRunner.Rename rename) {
+        String bad = anvilProblem();
+        if (bad == null && !walkOn() && !inReachOf(rename.anvil())) bad = NOT_REACHED;
+        if (bad != null) {
+            orderRunner.nameFailed(bad);
+            return runOrder(orderRunner.next());
+        }
+
+        namePos = rename.anvil();
+        nameText = rename.name();
+        nameSlot = relocateSlot = rename.slot();
+        nameSent = namePlaced = false;
+        nameSentAt = nameJobTicks = nameResultSeen = 0;
+        nameTakes = nameCheckTicks = nameOpenTries = nameOpenClickAt = nameDrainTries = 0;
+        nameSucceeded = false;
+        nameFailure = null;
+        if (!java.util.Objects.equals(nameStreakOrder, orderRunner.orderId())) {
+            nameStreakOrder = orderRunner.orderId();
+            nameClosedStreak = 0;
+        }
+
+        job = Job.Name;
+        target = null;
+        handle = null;
+        actions = 0;
+        jobCounted = false;
+        stepTicks = 0;
+        jobInterruptions = 0;
+        startSigSet = endSigSet = false;
+        settled = false;
+        openPos = null;
+        openMenuBefore = null;
+        recoveries = 0;
+        swapStep = 0;
+        step("order: naming a shulker at the anvil; next: deliver it.");
+
+        if (inReachOf(namePos)) step = Step.Opening;
+        else {
+            walkNear(namePos, 2);
+            // The anvil may be outside the stash area: that is not a reason to refuse the way
+            walkInside = false;
+            step = Step.Walking;
+        }
+        return true;
+    }
+
+    private void nameTick() {
+        stepTicks++;
+        lastOwnAct = ticks;
+        // The whole job at the anvil (window open) is capped; the walk and the open have their own limits
+        if (step == Step.Working) nameJobTicks++;
+        if (nameJobTicks > NAME_JOB_TICKS + 400) {
+            if (nameFailure == null) nameFailure = NAME_UNFINISHED;
+            nameEnd();
+            return;
+        }
+        if (nameJobTicks > NAME_JOB_TICKS && nameFailure == null) nameFailure = NAME_UNFINISHED;
+        switch (step) {
+            case Walking -> nameWalk();
+            case Opening -> nameOpen();
+            case Working -> nameWork();
+        }
+    }
+
+    private void nameWalk() {
+        if (mc.level.isLoaded(namePos) && !isAnvil(namePos)) {
+            nameFailure = ANVIL_GONE;
+            nameEnd();
+            return;
+        }
+        if (inReachOf(namePos)) {
+            releaseGoal();
+            step = Step.Opening;
+            stepTicks = 0;
+            nameOpenTries = 0;
+            return;
+        }
+        boolean stopped = stepTicks > PATH_GRACE_TICKS && !BaritoneHelper.isMoving();
+        if (stopped || stepTicks > WALK_TIMEOUT) {
+            nameFailure = NOT_REACHED;
+            nameEnd();
+        }
+    }
+
+    private void nameOpen() {
+        if (!isAnvil(namePos)) {
+            nameFailure = ANVIL_GONE;
+            nameEnd();
+            return;
+        }
+        AbstractContainerMenu open = mc.player.containerMenu;
+        if (open != mc.player.inventoryMenu) {
+            if (openPos != null && open != openMenuBefore && open instanceof net.minecraft.world.inventory.AnvilMenu) {
+                ownedMenu = open;
+                step = Step.Working;
+                stepTicks = 0;
+                wait = delay.get();
+                return;
+            }
+            // Something else opened (one left over, a plugin window): closed, and the click made again
+            if (!open.getCarried().isEmpty()) recoverCursor();
+            mc.player.closeContainer();
+        }
+
+        if (stepTicks > NAME_OPEN_TICKS || (nameOpenTries >= NAME_OPEN_TRIES && stepTicks - nameOpenClickAt > NAME_OPEN_RETRY)) {
+            nameFailure = NOT_OPENED;
+            nameEnd();
+            return;
+        }
+
+        if (nameOpenTries < NAME_OPEN_TRIES && (nameOpenTries == 0 || stepTicks - nameOpenClickAt >= NAME_OPEN_RETRY)) {
+            nameOpenTries++;
+            nameOpenClickAt = stepTicks;
+            BlockPos pos = namePos;
+            BlockHitResult hit = new BlockHitResult(Vec3.atCenterOf(pos), Direction.UP, pos, false);
+            Runnable click = () -> {
+                if (gate != Gate.Running || job != Job.Name) return;
+                openPos = pos;
+                openClickTick = ticks;
+                openMenuBefore = mc.player.containerMenu;
+                BlockUtils.interact(hit, InteractionHand.MAIN_HAND, true);
+            };
+
+            if (rotate.get()) Rotations.rotate(Rotations.getYaw(pos), Rotations.getPitch(pos), click);
+            else click.run();
+        }
+    }
+
+    /** One click in the open anvil window. */
+    private void nameClick(int slotId) {
+        InvUtils.click().slotId(slotId);
+        yielder.inventoryChangedByUs();
+        wait = Math.max(delay.get(), 4);
+    }
+
+    /**
+     * Works out what to do from what the window shows, so it can be picked up at any point: the shulker goes in, the
+     * rename is sent, the result is checked and taken into the same slot the shulker came from, and the slot is checked
+     * for the name. When it can't be named the shulker is taken back out first.
+     */
+    private void nameWork() {
+        AbstractContainerMenu menu = mc.player.containerMenu;
+        if (!(menu instanceof net.minecraft.world.inventory.AnvilMenu anvil) || menu != ownedMenu) {
+            nameEnd();
+            return;
+        }
+
+        ItemStack cursor = menu.getCarried();
+        ItemStack input = anvil.getSlot(net.minecraft.world.inventory.AnvilMenu.INPUT_SLOT).getItem();
+        ItemStack result = anvil.getSlot(net.minecraft.world.inventory.AnvilMenu.RESULT_SLOT).getItem();
+        int home = inventoryToMenu(nameSlot, 3);
+
+        // Something was picked up: it goes back into the slot the shulker came from
+        if (!cursor.isEmpty()) {
+            int free = freeCarrySlot();
+            if (menu.getSlot(home).getItem().isEmpty()) nameClick(home);
+            else if (free != -1) nameClick(inventoryToMenu(free, 3));
+            else if (!recoverBounded()) nameEnd();
+            return;
+        }
+
+        if (nameFailure != null) {
+            if (!input.isEmpty()) nameClick(net.minecraft.world.inventory.AnvilMenu.INPUT_SLOT);
+            else nameEnd();
+            return;
+        }
+
+        if (input.isEmpty()) {
+            if (namePlaced) {
+                // Taken out of the anvil: the slot it came from must now carry the name
+                if (nameTakes > 0 && !result.isEmpty()) return;
+                net.minecraft.network.chat.Component shown = mc.player.getInventory().getItem(nameSlot).get(DataComponents.CUSTOM_NAME);
+                if (shown != null && shown.getString().equals(nameText)) {
+                    nameSucceeded = true;
+                    nameEnd();
+                    return;
+                }
+                if (++nameCheckTicks > NAME_CHECK_TICKS) nameFailure = NOT_TAKEN;
+                return;
+            }
+            if (!orderRunner.claims(mc.player.getInventory().getItem(nameSlot))) {
+                nameFailure = CLOSED;
+                return;
+            }
+            InvUtils.move().fromId(home).toId(net.minecraft.world.inventory.AnvilMenu.INPUT_SLOT);
+            yielder.inventoryChangedByUs();
+            namePlaced = true;
+            wait = delay.get();
+            return;
+        }
+
+        if (!nameSent) {
+            // What the anvil screen does when the name box changes
+            if (anvil.setItemName(nameText)) mc.player.connection.send(new net.minecraft.network.protocol.game.ServerboundRenameItemPacket(nameText));
+            nameSent = true;
+            nameSentAt = stepTicks;
+            wait = delay.get();
+            return;
+        }
+
+        net.minecraft.network.chat.Component custom = result.get(DataComponents.CUSTOM_NAME);
+        boolean named = !result.isEmpty() && Utils.isShulker(result.getItem()) && custom != null && custom.getString().equals(nameText);
+        if (!named) {
+            nameResultSeen = 0;
+            // After a take that did not go through, the result is gone with it: that is the refused take
+            if (nameTakes > 0) nameFailure = NOT_TAKEN;
+            else if (stepTicks - nameSentAt > NAME_RESULT_TICKS) nameFailure = NO_RESULT;
+            return;
+        }
+        // The server's answer, not only our own guess, is what is taken: the result stays a moment first
+        nameResultSeen++;
+        int cost = anvil.getCost();
+        boolean free = mc.player.hasInfiniteMaterials();
+        if (nameResultSeen < NAME_SETTLE_TICKS || (cost <= 0 && !free && nameResultSeen <= NAME_COST_WAIT_TICKS)) return;
+
+        // A rename costs at least one level
+        int need = Math.max(1, cost);
+        if (!free && need >= NAME_TOO_DEAR) {
+            nameFailure = TOO_DEAR;
+            return;
+        }
+        if (!free && mc.player.experienceLevel < need) {
+            nameFailure = TOO_FEW_LEVELS;
+            return;
+        }
+        // A take the server keeps refusing is given up on after a few clicks, not repeated
+        if (nameTakes >= NAME_MAX_TAKES) {
+            nameFailure = NOT_TAKEN;
+            return;
+        }
+        nameTakes++;
+        nameClick(net.minecraft.world.inventory.AnvilMenu.RESULT_SLOT);
+        wait = Math.max(wait, NAME_SETTLE_TICKS * 2);
+    }
+
+    private void rememberAnvil(String why) {
+        anvilFailure = why;
+        anvilFailedOrder = orderRunner.orderId();
+        anvilFailedFor = namePos;
+    }
+
+    /**
+     * The window is never closed on the shulker: one still in the anvil or on the cursor goes back into the slot it came
+     * from (kept free for it) or another free carry slot first, for a few tries.
+     * @return true when a click was made and the window stays open
+     */
+    private boolean nameDrain(AbstractContainerMenu menu) {
+        if (!(menu instanceof net.minecraft.world.inventory.AnvilMenu anvil) || menu != ownedMenu || ++nameDrainTries > 20) return false;
+        int home = inventoryToMenu(nameSlot, 3);
+        if (!menu.getCarried().isEmpty()) {
+            int free = freeCarrySlot();
+            if (menu.getSlot(home).getItem().isEmpty()) nameClick(home);
+            else if (free != -1) nameClick(inventoryToMenu(free, 3));
+            else return false;
+            return true;
+        }
+        if (!anvil.getSlot(net.minecraft.world.inventory.AnvilMenu.INPUT_SLOT).getItem().isEmpty()) {
+            nameClick(net.minecraft.world.inventory.AnvilMenu.INPUT_SLOT);
+            return true;
+        }
+        return false;
+    }
+
+    private void nameEnd() {
+        if (ourGoal != null) releaseGoal();
+        AbstractContainerMenu menu = mc.player.containerMenu;
+        if (nameDrain(menu)) return;
+        if (menu != mc.player.inventoryMenu && ourMenu(menu)) {
+            if (!menu.getCarried().isEmpty()) recoverCursor();
+            closeOurWindow(menu);
+        }
+        ownedMenu = null;
+        openPos = null;
+        openMenuBefore = null;
+        recoveries = 0;
+        if (nameFailure != null) {
+            QwerteAddon.LOG.info("[stash-sorter] naming given up: {}", nameFailure);
+            // An anvil that can't be reached or opened, gives no result or doesn't give the shulker back is not tried again
+            // for the rest of this order
+            if (nameFailure.equals(NOT_REACHED) || nameFailure.equals(NOT_OPENED) || nameFailure.equals(NO_RESULT) || nameFailure.equals(NOT_TAKEN)) rememberAnvil(nameFailure);
+            // A found or placed anvil that can't be reached or opened is forgotten, so the next naming searches again; a hand-set one never
+            if ((nameFailure.equals(NOT_REACHED) || nameFailure.equals(NOT_OPENED)) && stash.anvilPos != null && namePos != null && namePos.equals(stash.anvilPos)
+                && ("found".equals(stash.anvilSource) || "placed".equals(stash.anvilSource))) {
+                stash.anvilPos = null;
+                stash.anvilSource = "";
+                stash.save();
+            }
+            orderRunner.nameFailed(nameFailure);
+        }
+        // Closes that nobody asked for, twice in a row, count as a bad anvil too
+        if (nameSucceeded) nameClosedStreak = 0;
+        else if (nameFailure == null && ++nameClosedStreak >= 2) rememberAnvil(CLOSED);
+        nameSucceeded = false;
+        nameFailure = null;
+        job = null;
+        target = null;
+        wait = delay.get();
+    }
+
+    /**
+     * Between jobs: the shulker that was at the anvil is back in the inventory but not in a carry slot (the window was
+     * closed on it), so the order can find it again: it goes to the slot it came from, or any free carry slot.
+     * @return true when a click was made
+     */
+    private boolean relocateNamed() {
+        if (relocateSlot < 0) return false;
+        var inv = mc.player.getInventory();
+        if (!orderRunner.running() || !mc.player.containerMenu.getCarried().isEmpty() || mc.screen != null) {
+            if (!orderRunner.running()) relocateSlot = -1;
+            return false;
+        }
+        for (int s : carry) {
+            if (orderRunner.claims(inv.getItem(s))) {
+                relocateSlot = -1;
+                return false;
+            }
+        }
+        int dest = inv.getItem(relocateSlot).isEmpty() ? relocateSlot : freeCarrySlot();
+        for (int s = 0; s < 36; s++) {
+            if (carry.contains(s) || !orderRunner.claims(inv.getItem(s))) continue;
+            // Held but nowhere to put it: tried again later
+            if (dest == -1) return false;
+            bundleClick(s, 0);
+            bundleClick(dest, 0);
+            relocateSlot = -1;
+            wait = delay.get();
+            return true;
+        }
+        relocateSlot = -1;
+        return false;
     }
 
     /** Puts the order's finished shulker into the delivery container, stopping when it is full. */
@@ -3519,9 +4767,10 @@ public class StashSorter extends Module {
 
     private boolean startHandling(Job next, int slot, BulkKey fill) {
         restoreHotbar();
+        resetWander();
         job = next;
         target = null;
-        handledSlot = slot;
+        handledSlot = handledOrigin = slot;
         fillKey = fill;
         handle = Handle.Place;
         handleTicks = 0;
@@ -3556,6 +4805,7 @@ public class StashSorter extends Module {
             }
             case Fill -> step(String.format("repacking: filling a shulker beside %s; next: break and pick it up, then put it away.", xyz(here)));
             case KitFill -> step(String.format(orderKit() ? "order: filling the shulker for the order beside %s; next: break and pick it up." : "kits: filling a kit shulker beside %s; next: break and pick it up.", xyz(here)));
+            case CraftUnpack -> step(String.format("crafting: taking what the craft needs out of a shulker beside %s; next: break and pick it up.", xyz(here)));
             case KitUnpack -> step(String.format(orderKit() ? "order: taking what the order needs out of a shulker beside %s; next: break and pick it up." : "kits: unpacking a kit shulker beside %s; next: break and pick it up.", xyz(here)));
             default -> { }
         }
@@ -3582,6 +4832,7 @@ public class StashSorter extends Module {
 
         switch (handle) {
             case Place -> handlePlace();
+            case Wander -> handleWander();
             case Open -> handleOpen();
             case Work -> handleWork();
             case Break -> handleBreak();
@@ -3606,12 +4857,21 @@ public class StashSorter extends Module {
         }
 
         // Where first: nothing is moved for a spot that isn't there
-        BlockPos spot = safeSpot();
+        // The spot a walk was made for is placed at directly; else one beside me
+        BlockPos spot = wanderSpot != null && BlockUtils.canPlace(wanderSpot, true) && spotProblem(wanderSpot) == null ? wanderSpot : null;
         if (spot == null) {
-            pauseShulkers("No safe room to put a shulker down beside me");
+            wanderSpot = null;
+            spot = safeSpot();
+        }
+        if (spot == null) {
+            // Nothing beside me: the nearest spot within 5 blocks that can be walked to, and only when there is none the work pauses
+            String why = startWander();
+            if (why == null) return;
+            pauseShulkers("no spot within " + PlaceSearch.RADIUS + " blocks: " + why);
             endHandling();
             return;
         }
+        wanderSpot = null;
 
         // It has to be in the hotbar to place it
         int hotbar = handledSlot;
@@ -3796,6 +5056,7 @@ public class StashSorter extends Module {
         boolean busy = switch (job) {
             case Clean -> takeStray(menu);
             case KitUnpack -> kitBuilder.unpackOne(menu);
+            case CraftUnpack -> crafter.unpackOne(menu);
             case KitFill -> kitBuilder.fillOne(menu);
             default -> packing ? compactor.packOne(menu) : packOne(menu);
         };
@@ -3821,6 +5082,7 @@ public class StashSorter extends Module {
         // Nothing to take out after all: stop trying, or we'd keep reopening the same shulker
         if (job == Job.Clean && actions == 0) pauseShulkers("There was nothing to take out of the shulker");
         if (isKitJob() && actions == 0) kitBuilder.suspend("there was nothing I could move in the shulker.");
+        if (job == Job.CraftUnpack && actions == 0) crafter.unpackFailed();
         closeOurWindow(mc.player.containerMenu);
         handle = Handle.Break;
         handleTicks = 0;
@@ -4098,6 +5360,7 @@ public class StashSorter extends Module {
     }
 
     private void endHandling() {
+        resetWander();
         // A shulker cleaned or filled is real headway: the counters start again
         if (job == Job.Clean || job == Job.Fill) {
             passJobs = 0;
@@ -4105,10 +5368,15 @@ public class StashSorter extends Module {
             stalled.removeAll(circular);
             circular.clear();
         }
+        if (job == Job.CraftUnpack) {
+            int now = collectedSlot >= 0 ? collectedSlot : handledSlot;
+            crafter.relocated(handledOrigin, now);
+            noteCollected(handledOrigin, now);
+        }
         if (job == Job.KitFill || job == Job.KitUnpack) {
             kitBuilder.handled(job == Job.KitFill, collectedSlot >= 0 ? collectedSlot : handledSlot);
             // The shulker picked up again: an unpacked one goes back to the stash in scan-only mode
-            noteCollected(handledSlot, collectedSlot >= 0 ? collectedSlot : handledSlot);
+            noteCollected(handledOrigin, collectedSlot >= 0 ? collectedSlot : handledSlot);
         }
         handle = null;
         placed = null;
@@ -4147,6 +5415,7 @@ public class StashSorter extends Module {
         dropLost = true;
         compactor.drop();
         if (isKitJob()) kitBuilder.suspend(why);
+        if (job == Job.CraftUnpack) crafter.abort(why);
         endHandling();
     }
 
@@ -4531,7 +5800,7 @@ public class StashSorter extends Module {
                 if (!mc.level.getBlockState(p.above()).isAir()) continue;
                 if (!mc.level.getBlockState(p.below()).isFaceSturdy(mc.level, p.below(), Direction.UP)) continue;
 
-                String why = unsafeBecause(p);
+                String why = spotProblem(p);
                 if (why == null) return p;
                 debug("Not putting a shulker at %s: %s.", p.toShortString(), why);
                 rejected.merge(why, 1, Integer::sum);
@@ -4540,7 +5809,7 @@ public class StashSorter extends Module {
         if (!rejected.isEmpty()) {
             StringBuilder text = new StringBuilder();
             for (var entry : rejected.entrySet()) text.append(text.isEmpty() ? "" : ", ").append(entry.getValue()).append("x ").append(entry.getKey());
-            info("No safe spot for a shulker beside me at %s: %s.", feet.toShortString(), text);
+            info("No safe spot for a shulker beside me: %s.", text);
         }
         return null;
     }
@@ -4572,6 +5841,158 @@ public class StashSorter extends Module {
             if (mc.level.getBlockState(spot.relative(d)).is(Blocks.HOPPER)) return "there is a hopper next to it";
         }
         return null;
+    }
+
+    /** All the rules for a shulker (or an anvil) at this spot: the safe ones, away from the special blocks, inside the perimeter. */
+    private String spotProblem(BlockPos spot) {
+        String why = unsafeBecause(spot);
+        if (why != null) return why;
+        String special = nearSpecial(spot);
+        if (special != null) return special;
+        if (stash.hasArea() && !stash.inArea(spot)) return "it is outside the stash area";
+        return null;
+    }
+
+    /** On or next to the delivery container, the anvil or the crafting table: those are walked up to and used. */
+    private String nearSpecial(BlockPos spot) {
+        for (Box box : stash.boxes) {
+            if (!box.delivery) continue;
+            for (BlockPos part : box.parts) if (touches(spot, part)) return "it is next to the delivery container";
+        }
+        if (stash.anvilPos != null && touches(spot, stash.anvilPos)) return "it is next to the anvil";
+        if (stash.craftingTablePos != null && touches(spot, stash.craftingTablePos)) return "it is next to the crafting table";
+        return null;
+    }
+
+    private static boolean touches(BlockPos a, BlockPos b) {
+        return Math.abs(a.getX() - b.getX()) <= 1 && Math.abs(a.getY() - b.getY()) <= 1 && Math.abs(a.getZ() - b.getZ()) <= 1;
+    }
+
+    // Walking to a spot for a block (a shulker, an anvil) when there is none beside us: PlaceSearch, as the plugin's
+    private static final int WANDER_TRIES = 3, WANDER_TICKS = 20 * 20;
+    private BlockPos wanderStand, wanderSpot;
+    private int wanderTries, wanderStart, wanderRestarts;
+    private final Set<PlaceSearch.Pos> wanderFailed = new HashSet<>();
+
+    private static PlaceSearch.Pos pos(BlockPos p) {
+        return new PlaceSearch.Pos(p.getX(), p.getY(), p.getZ());
+    }
+
+    private static BlockPos bp(PlaceSearch.Pos p) {
+        return new BlockPos(p.x(), p.y(), p.z());
+    }
+
+    private void resetWander() {
+        wanderTries = wanderRestarts = 0;
+        wanderFailed.clear();
+        wanderStand = wanderSpot = null;
+    }
+
+    /** The world as the placement search sees it. */
+    private PlaceSearch.View placeView() {
+        return new PlaceSearch.View() {
+            private boolean empty(int x, int y, int z) {
+                BlockPos p = new BlockPos(x, y, z);
+                BlockState st = mc.level.getBlockState(p);
+                return st.getCollisionShape(mc.level, p).isEmpty() && st.getFluidState().isEmpty();
+            }
+
+            @Override
+            public boolean open(int x, int y, int z) {
+                return empty(x, y, z);
+            }
+
+            @Override
+            public boolean floor(int x, int y, int z) {
+                BlockPos p = new BlockPos(x, y, z);
+                return mc.level.getBlockState(p).isFaceSturdy(mc.level, p, Direction.UP);
+            }
+
+            @Override
+            public boolean standable(int x, int y, int z) {
+                BlockPos p = new BlockPos(x, y, z);
+                return empty(x, y, z) && empty(x, y + 1, z) && !mc.level.getBlockState(p.below()).getCollisionShape(mc.level, p.below()).isEmpty()
+                    && stash.boxAt(p) == null;
+            }
+
+            @Override
+            public String unsafe(PlaceSearch.Pos spot) {
+                return unsafeBecause(bp(spot));
+            }
+
+            @Override
+            public boolean inArea(PlaceSearch.Pos p) {
+                return !stash.hasArea() || stash.inArea(bp(p));
+            }
+
+            @Override
+            public boolean guarded(PlaceSearch.Pos spot) {
+                return nearSpecial(bp(spot)) != null;
+            }
+        };
+    }
+
+    /**
+     * No spot beside us: looks for the nearest spot within 5 blocks that can be walked to, and starts walking to the cell
+     * beside it. When the cell to stand in is where we stand, the spot is just used.
+     * @return null when the walk started (or the spot is at hand), else why there is nothing to walk to
+     */
+    private String startWander() {
+        if (!walkOn()) return "walking is off";
+        if (wanderTries >= WANDER_TRIES) return "couldn't walk to one";
+        PlaceSearch.Result found = PlaceSearch.search(pos(mc.player.blockPosition()), placeView(), wanderFailed);
+        if (found.found() == null) return found.why();
+
+        wanderTries++;
+        wanderSpot = bp(found.found().spot());
+        if (found.found().steps() == 0) return null;
+        wanderStand = bp(found.found().stand());
+        wanderRestarts = 0;
+        info("No spot for a shulker beside me, walking %d steps to the nearest one.", found.found().steps());
+        walkNear(wanderStand, 1);
+        wanderStart = handleTicks;
+        handle = Handle.Wander;
+        return null;
+    }
+
+    /** Walks to the cell beside the chosen spot; there, the block is put down at that spot. A shulker carried is never dropped. */
+    private void handleWander() {
+        if (wanderStand == null) {
+            handle = Handle.Place;
+            handleTicks = 0;
+            return;
+        }
+        Vec3 at = mc.player.position();
+        boolean arrived = at.distanceToSqr(Vec3.atBottomCenterOf(wanderStand)) <= 1.8 * 1.8;
+        if (arrived) {
+            releaseGoal();
+            wanderStand = null;
+            handle = Handle.Place;
+            handleTicks = 0;
+            wait = delay.get();
+            return;
+        }
+        // A goal let go of while giving way is set again, a few times
+        if (ourGoal == null) {
+            if (++wanderRestarts > 3) {
+                wanderGiveUp();
+                return;
+            }
+            walkNear(wanderStand, 1);
+            wanderStart = handleTicks;
+            return;
+        }
+        boolean stopped = handleTicks - wanderStart > PATH_GRACE_TICKS && !BaritoneHelper.isMoving();
+        if (stopped || handleTicks - wanderStart > WANDER_TICKS) wanderGiveUp();
+    }
+
+    /** The walk did not get there: that spot is not tried again, and the next best is looked for. */
+    private void wanderGiveUp() {
+        releaseGoal();
+        if (wanderSpot != null) wanderFailed.add(pos(wanderSpot));
+        wanderStand = wanderSpot = null;
+        handle = Handle.Place;
+        handleTicks = 0;
     }
 
     /** Stay-on, or stash-manager is driving it: the sorter rests when it has nothing to do instead of turning itself off. */
@@ -4763,6 +6184,7 @@ public class StashSorter extends Module {
                 }
                 case FetchSigns -> step(String.format("labelling: fetching signs from %s at %s; next: put up the signs.", home(box), xyz(box.pos)));
                 case Gather -> { /* said by the compactor */ }
+                case CraftTake -> step(String.format("crafting: taking ingredients from %s at %s; next: the crafting table.", home(box), xyz(box.pos)));
                 case KitTake -> step(String.format(orderKit() ? "order: taking items for the order from %s at %s; next: fill the shulker." : "kits: taking items from %s at %s; next: fill the kit shulker.", home(box), xyz(box.pos)));
                 default -> { }
             }
@@ -4970,10 +6392,11 @@ public class StashSorter extends Module {
         }
 
         boolean busy = switch (job) {
-            case Survey, Clean, Fill, KitUnpack, KitFill, Label, Ground, Explore, Unbundle -> false;
+            case Survey, Clean, Fill, KitUnpack, KitFill, Label, Ground, Explore, Unbundle, Name, CraftUnpack, Craft, AnvilPlace -> false;
             case FetchSigns -> labeller.fetchSignsOne(target, actions);
             case Gather -> compactor.gatherOne(target);
             case KitTake -> kitBuilder.takeOne(target);
+            case CraftTake -> crafter.takeOne(target);
             case Take -> takeOne();
             case Fetch -> fetchOne();
             case Compact -> compactOne();
@@ -6533,6 +7956,8 @@ public class StashSorter extends Module {
             alertQueue.clear();
             worldTicks = 0;
             kitBuilder.reset();
+            crafter.reset();
+            craftForOrder = false;
             orderRunner.reset();
             orderHeld.clear();
             heldFrom.clear();
@@ -6612,7 +8037,9 @@ public class StashSorter extends Module {
                         job = null;
                         target = null;
                     }
-                    if (job == Job.Ground || job == Job.Explore || job == Job.Unbundle) job = null;
+                    if (job == Job.Ground || job == Job.Explore || job == Job.Unbundle || job == Job.Name || job == Job.Craft || job == Job.AnvilPlace) job = null;
+                    anvilSlot = -1;
+                    anvilSession = false;
                     // Another dimension or a new life: nothing was explored there, and the area may not be used at all
                     forgetExploration();
                     // Another world or dimension: the ground is another ground
@@ -7147,6 +8574,8 @@ public class StashSorter extends Module {
             if (fullBundle(mc.player.getInventory().getItem(slot)) || orderRunner.claims(mc.player.getInventory().getItem(slot))) continue;
             // The shulker an order is being built in
             if (orderKit() && kitBuilder.holds(slot)) continue;
+            // What a craft gathered, and the boxes it made for an order
+            if (crafter.holds(slot) || crafter.reserved(slot) || slot == anvilSlot) continue;
             if (!idOf(mc.player.getInventory().getItem(slot)).equals(stuckCarried.get(slot))) slots.add(slot);
         }
         return slots;

@@ -21,6 +21,7 @@ import java.util.regex.Pattern;
 final class OrderRoutes {
     private static final Pattern CANCEL = Pattern.compile("^/api/v1/orders/(o-[0-9a-f]{12})/cancel$");
     private static final Pattern STATUS = Pattern.compile("^/api/v1/orders/(o-[0-9a-f]{12})/status$");
+    private static final Pattern RETRY = Pattern.compile("^/api/v1/orders/(o-[0-9a-f]{12})/retry$");
     private static final Pattern FORCE_CANCEL = Pattern.compile("^/api/v1/orders/(o-[0-9a-f]{12})/force-cancel$");
     private static final int MAX_KEY = 256;
     private static final int MAX_RESULT_LINES = 400;
@@ -41,6 +42,7 @@ final class OrderRoutes {
             .exact(Router.GET, "/api/v1/orders", Router.Guard.SESSION, this::list)
             .pattern(Router.POST, CANCEL, Router.Guard.BROWSER_WRITE, this::cancel)
             .pattern(Router.POST, FORCE_CANCEL, Router.Guard.BROWSER_WRITE, this::forceCancel)
+            .pattern(Router.POST, RETRY, Router.Guard.BROWSER_WRITE, this::retry)
             .pattern(Router.POST, STATUS, Router.Guard.ADDON_KEY, this::status);
     }
 
@@ -59,13 +61,13 @@ final class OrderRoutes {
             Http.error(ex, 400, "server and stash are required");
             return;
         }
-        String note = "";
-        if (o.has("note") && !o.get("note").isJsonNull()) {
-            note = AddonRoutes.string(o, "note");
-            if (note == null || note.length() > OrderStore.MAX_NOTE) {
-                Http.error(ex, 400, "note must be a string of at most " + OrderStore.MAX_NOTE + " characters");
-                return;
-            }
+        // "note" (removed) is ignored if an old page still sends it.
+        JsonObject names;
+        try {
+            names = OrderStore.normalizeNames(o.get("names"));
+        } catch (OrderStore.OrderException e) {
+            lineError(ex, e.status, e.getMessage(), -1);
+            return;
         }
         if (!o.has("lines") || !o.get("lines").isJsonArray()) {
             Http.error(ex, 400, "lines must be an array");
@@ -100,7 +102,7 @@ final class OrderRoutes {
             lines.add(line);
         }
         try {
-            OrderStore.Order order = orders.place(server, stash, lines, note);
+            OrderStore.Order order = orders.place(server, stash, lines, names);
             JsonObject out = Http.ok();
             out.add("order", order.toJson());
             Http.json(ex, 200, out);
@@ -148,6 +150,24 @@ final class OrderRoutes {
             Http.json(ex, 200, out);
         } catch (OrderStore.OrderException e) {
             Http.error(ex, e.status, e.getMessage());
+        }
+    }
+
+    /** POST /api/v1/orders/{id}/retry: places a failed or cancelled order again as a new pending order. */
+    private void retry(HttpExchange ex) throws IOException {
+        Matcher m = RETRY.matcher(ex.getRequestURI().getRawPath());
+        if (!m.matches()) {
+            Http.error(ex, 404, "not found");
+            return;
+        }
+        try {
+            OrderStore.Order order = orders.retry(m.group(1));
+            JsonObject out = Http.ok();
+            out.add("order", order.toJson());
+            Http.json(ex, 200, out);
+        } catch (OrderStore.OrderException e) {
+            if (e.status == 400) lineError(ex, e.status, e.getMessage(), e.line);
+            else Http.error(ex, e.status, e.getMessage());
         }
     }
 

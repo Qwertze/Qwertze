@@ -9,7 +9,7 @@
   var SEARCH_DEBOUNCE_MS = 100;
   var PLACEHOLDER = "/placeholder.svg";
   var ICON_RETRIES = 20;
-  var ICON_SOURCE_TOKEN = "g1"; // bump when the server changes how icons are made
+  var ICON_SOURCE_TOKEN = "g2"; // bump when the server changes how icons are made
   var DEFAULT_MC = "1.21.11";
   var ICON_RETRY_DELAYS = [1000, 2000, 3000, 5000];
   var STORAGE_KEY = "stashManager.selected";
@@ -47,6 +47,10 @@
     infoIndex: $("info-index"),
     infoContainers: $("info-containers"),
     infoMeta: $("info-meta"),
+    indexMeta: $("index-meta"),
+    tileContainers: $("tile-containers"),
+    tileStale: $("tile-stale"),
+    tileIndexed: $("tile-indexed"),
     gridWrap: $("grid-wrap"),
     grid: $("item-grid"),
     empty: $("empty"),
@@ -64,7 +68,12 @@
     pickerBody: $("picker-body"),
     cartLines: $("cart-lines"),
     cartTotals: $("cart-totals"),
-    cartNote: $("cart-note"),
+    namesSeg: $("names-seg"),
+    namesAll: $("names-all"),
+    namesEach: $("names-each"),
+    namesRows: $("names-rows"),
+    namesWarn: $("names-warn"),
+    craftInfo: $("craft-info"),
     cartPlace: $("cart-place"),
     cartClear: $("cart-clear"),
     cartStatus: $("cart-status"),
@@ -682,6 +691,10 @@
       el.infoIndex.textContent = "";
       el.infoContainers.textContent = "";
       el.infoMeta.textContent = "";
+      el.indexMeta.textContent = "";
+      el.tileContainers.textContent = "\u2013";
+      el.tileStale.textContent = "\u2013";
+      el.tileIndexed.textContent = "\u2013";
       return;
     }
     if (s.indexedAt != null) {
@@ -704,6 +717,14 @@
       if (str(idx.mcVersion)) meta.push("MC " + str(idx.mcVersion));
     }
     el.infoMeta.textContent = meta.join(" \u00b7 ");
+    // The same values for the stash index card (mobile layout).
+    el.tileIndexed.textContent = s.indexedAt != null ? ago(s.indexedAt) : "never";
+    el.tileContainers.textContent = c ? grouped(num(c.known, 0)) + " / " + grouped(num(c.total, 0)) : "\u2013";
+    el.tileStale.textContent = c ? grouped(num(c.stale, 0)) : "\u2013";
+    var shortMeta = [];
+    if (idx && str(idx.dimension)) shortMeta.push(str(idx.dimension).replace(/^minecraft:/, ""));
+    if (idx && str(idx.mcVersion)) shortMeta.push("MC " + str(idx.mcVersion));
+    el.indexMeta.textContent = shortMeta.join(" \u00b7 ");
   }
 
   // ---------- bots overview ----------
@@ -988,8 +1009,14 @@
     }
   }
 
+  /** The number a slot shows: for a shulker-box item with filled groups, only the empty ones. */
+  function slotCount(entry) {
+    return typeof entry.emptyCount === "number" ? entry.emptyCount : entry.item.count;
+  }
+
   function setCount(entry) {
-    var text = entry.item.count === 1 ? "" : compact(entry.item.count);
+    var n = slotCount(entry);
+    var text = n === 1 ? "" : compact(n);
     if (entry.countEl.textContent !== text) entry.countEl.textContent = text;
   }
 
@@ -1007,6 +1034,14 @@
     countEl.className = "count";
     slot.appendChild(img);
     slot.appendChild(countEl);
+    // Touch layout only (CSS hides it elsewhere): the shift-click action, as a visible button.
+    var addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.className = "slot-add";
+    addBtn.textContent = "+";
+    addBtn.setAttribute("aria-label", "Add a stack of " + item.name + " to the cart");
+    slot.appendChild(addBtn);
+    slot.addEventListener("click", gridSlotClick);
 
     var entry = {
       item: item,
@@ -1039,8 +1074,86 @@
     });
     img.src = entry.url;
     setCount(entry);
+    if (item.isShulker) setFace(entry, shulkerFace(item.contents));
     slotEntry.set(slot, entry);
     return entry;
+  }
+
+  // ---------- filled-shulker icons ----------
+  // A filled shulker is drawn as its box with the item it holds most of on top (by total count over all its
+  // stacks, items of the same id counted together; a tie goes to the item in the lowest slot). When it holds
+  // more than one kind of item, the second most common one is drawn small in the top-left corner as the
+  // "mixed" marker. A plain shulker icon always means an empty one. The tooltip and the shulker window still
+  // list the full contents.
+
+  /** { id, second } for a shulker's contents (second: null unless mixed), or null when it is empty. */
+  function shulkerFace(contents) {
+    if (!contents || !contents.length) return null;
+    var totals = new Map();
+    var firstSlot = new Map();
+    contents.forEach(function (c) {
+      var it = itemByKey(c.key);
+      var id = it ? it.id : String(c.key).split("#")[0];
+      totals.set(id, (totals.get(id) || 0) + c.count);
+      if (!firstSlot.has(id) || c.slot < firstSlot.get(id)) firstSlot.set(id, c.slot);
+    });
+    var ids = Array.from(totals.keys()).sort(function (x, y) {
+      return totals.get(y) - totals.get(x) || firstSlot.get(x) - firstSlot.get(y);
+    });
+    return ids.length ? { id: ids[0], second: ids.length > 1 ? ids[1] : null } : null;
+  }
+
+  /**
+   * Puts (or clears, for null) the contents icon and the mixed marker on a slot-like holder: anything with
+   * .slot and .countEl (grid entries, pooled plan slots, icon wrappers). Images only reload when a URL changes.
+   */
+  function setFace(h, face) {
+    h.faceImg = swapFaceImage(h, h.faceImg, face ? iconUrl(face.id, state.mc) : null, "face");
+    h.face2Img = swapFaceImage(h, h.face2Img, face && face.second ? iconUrl(face.second, state.mc) : null, "face face-second");
+    h.slot.classList.toggle("has-face", !!face);
+  }
+
+  function swapFaceImage(h, img, url, cls) {
+    if (img && img.dataset.url === url) return img;
+    if (img) img.remove();
+    return url ? faceImage(url, h, cls) : null;
+  }
+
+  /** A contents <img>, with the same 503 retry as the slot icon. */
+  function faceImage(url, h, cls) {
+    var img = document.createElement("img");
+    img.alt = "";
+    img.className = cls;
+    img.decoding = "async";
+    img.width = 20;
+    img.height = 20;
+    img.draggable = false;
+    img.dataset.url = url;
+    var tries = 0;
+    img.addEventListener("error", function () {
+      if (img.getAttribute("src") !== PLACEHOLDER) img.src = PLACEHOLDER;
+      tries++;
+      if (tries > ICON_RETRIES) return;
+      var n = tries;
+      window.setTimeout(function () {
+        if (img.isConnected) img.src = url + "&retry=" + n;
+      }, retryDelay(n));
+    });
+    img.src = url;
+    h.slot.insertBefore(img, h.countEl || null);
+    return img;
+  }
+
+  /** iconImg for a line that may be a filled shulker: the icon plus its contents icon, in a small wrapper. */
+  function iconWithContents(id, contents, size) {
+    var face = shulkerFace(contents);
+    var icon = iconImg(id, size);
+    if (!face) return icon;
+    var wrap = document.createElement("span");
+    wrap.className = "icon-wrap";
+    wrap.appendChild(icon);
+    setFace({ slot: wrap, countEl: null }, face);
+    return wrap;
   }
 
   /**
@@ -1139,10 +1252,20 @@
     if (state.tab === "shulkers" && sortName === "creative") sortName = "count";
     var sorter = sorters[sortName] || sorters.count;
     var source = tabEntries(state.tab);
-    var shown = source.filter(function (e) { return matches(e, query); });
-    shown.sort(sorter);
+    var shown;
+    if (state.tab === "shulkers") {
+      shown = source.filter(function (e) { return matches(e, query); });
+      shown.sort(sorter);
+    } else {
+      // A shulker-box item stays in the list (as the anchor for its filled groups) when only a group matches.
+      shown = source.filter(function (e) {
+        return matches(e, query) || (e.filledGroups && e.filledGroups.some(function (g) { return matches(g, query); }));
+      });
+      shown.sort(sorter);
+      shown = withFilledGroups(shown, query);
+    }
     var total = 0;
-    for (var i = 0; i < shown.length; i++) total += shown[i].item.count;
+    for (var i = 0; i < shown.length; i++) total += slotCount(shown[i]);
 
     // Only touch the grid when the set or order of slots changed. Count changes were already
     // written into the existing slots by updateItems.
@@ -1169,13 +1292,24 @@
     state.searchTimer = window.setTimeout(renderNow, delay || 0);
   }
 
+  /** How many slots the current tab has without a search (filled shulker groups count as their own slots). */
+  function tabSlotCount() {
+    var source = tabEntries(state.tab);
+    if (state.tab === "shulkers") return source.length;
+    var n = 0;
+    source.forEach(function (e) {
+      n += e.filledGroups ? (e.emptyCount > 0 ? 1 : 0) + e.filledGroups.length : 1;
+    });
+    return n;
+  }
+
   function updateSummary(shownCount, shownTotal) {
-    var all = state.items.length ? tabEntries(state.tab).length : 0;
+    var all = state.items.length ? tabSlotCount() : 0;
     if (!all) {
       el.summary.textContent = "";
       return;
     }
-    var what = state.tab === "shulkers" ? " filled shulker kinds \u00b7 total " : " item types \u00b7 total ";
+    var what = state.tab === "shulkers" ? " filled shulker kinds \u00b7 total " : " slots \u00b7 total ";
     el.summary.textContent = "Showing " + grouped(shownCount) + " of " + grouped(all) + what +
       grouped(shownTotal || 0) + (state.tab === "shulkers" ? " shulkers" : " items");
   }
@@ -1221,6 +1355,10 @@
       var shulkers = approx(it.count / (it.maxStack * 27));
       frag.appendChild(line("tt-count", "Count: " + grouped(it.count) + " (\u2248 " + plural(stacks, "stack") + ", " +
         plural(shulkers, "shulker") + ")"));
+      if (typeof entry.emptyCount === "number") {
+        frag.appendChild(line("tt-line", grouped(entry.emptyCount) + " empty, " + grouped(it.count - entry.emptyCount) +
+          " filled (listed next to it, showing what they hold)"));
+      }
       if (isShulkerBoxId(it.id) && state.byKey.get(it.key) === entry) frag.appendChild(line("tt-hint", "Right-click to see the filled ones"));
     }
     frag.appendChild(line("tt-id", it.id));
@@ -1760,6 +1898,7 @@
         entry.item = item;
         if (old.count !== item.count) setCount(entry);
       }
+      setFace(entry, shulkerFace(item.contents)); // after the items: names and ids come from them
       entry.hay = haystack(item);
       next.set(item.key, entry);
       out.push(entry);
@@ -1767,6 +1906,49 @@
     state.shulkerByKey = next;
     state.shulkers = out;
     state.hasShulkerData = Array.isArray(index.shulkers);
+    updateEmptyCounts();
+  }
+
+  /**
+   * A shulker-box item counts every box of its kind, filled or not. Where filled groups exist, its slot in the
+   * creative tabs and Search shows only the empty ones (plain icon), and the filled groups are listed right
+   * after it with their contents icons (see withFilledGroups). Groups match their base item like
+   * filledGroupsFor does: by itemKey, or by id for older indexes.
+   */
+  function updateEmptyCounts() {
+    var filled = new Map();
+    state.items.forEach(function (e) {
+      if (!isShulkerBoxId(e.item.id)) return;
+      var groups = filledGroupsFor(e.item);
+      if (groups.length) filled.set(e, groups);
+    });
+    state.items.forEach(function (e) {
+      var groups = filled.get(e) || null;
+      var before = e.emptyCount;
+      e.filledGroups = groups;
+      e.emptyCount = groups ? Math.max(0, e.item.count - groups.reduce(function (n, g) { return n + g.item.count; }, 0)) : undefined;
+      if (before !== e.emptyCount) setCount(e);
+    });
+  }
+
+  /**
+   * The creative tabs and Search: each shulker-box item with filled groups becomes its empty boxes (if any are
+   * left, and it matches the search) followed by its filled groups that match, most first. Groups are found by
+   * their own name and contents too, so searching "diamond" shows the shulkers full of diamonds.
+   */
+  function withFilledGroups(sorted, query) {
+    var out = [];
+    sorted.forEach(function (e) {
+      if (!e.filledGroups) {
+        out.push(e);
+        return;
+      }
+      if (e.emptyCount > 0 && matches(e, query)) out.push(e);
+      e.filledGroups.filter(function (g) { return matches(g, query); })
+        .sort(sorters.count)
+        .forEach(function (g) { out.push(g); });
+    });
+    return out;
   }
 
   function filledGroupsFor(item) {
@@ -1919,23 +2101,85 @@
     openWindow(item.name, body, "chooser-window");
   }
 
+  /** What right-click on a slot does (touch: what a tap on a main-grid slot does). */
+  function slotContextAction(entry) {
+    if (entry.onContext) entry.onContext();
+    else if (entry.onActivate) entry.onActivate();
+    else if (entry.item.isShulker) openShulkerPreview(entry.item);
+    else if (isShulkerBoxId(entry.item.id)) openShulkerChooser(entry.item);
+  }
+
+  // Touch equivalents for the main item grid (mouse behaviour is unchanged):
+  // tap = right-click (look inside a shulker), long-press = shift-click (add a stack to the cart).
+  var LONG_PRESS_MS = 500;
+  var LONG_PRESS_SLOP = 10;
+  var touchPress = { pointer: "mouse", timer: 0, x: 0, y: 0, firedUntil: 0 };
+
+  document.addEventListener("pointerdown", function (e) { touchPress.pointer = e.pointerType || "mouse"; }, true);
+
+  function cancelLongPress() {
+    window.clearTimeout(touchPress.timer);
+    touchPress.timer = 0;
+  }
+
+  el.grid.addEventListener("pointerdown", function (e) {
+    cancelLongPress();
+    if (e.pointerType === "mouse" || !e.isPrimary) return;
+    var slot = e.target.closest ? e.target.closest(".slot") : null;
+    var entry = slot ? slotEntry.get(slot) : null;
+    if (!entry || e.target.closest(".slot-add")) return;
+    touchPress.x = e.clientX;
+    touchPress.y = e.clientY;
+    touchPress.timer = window.setTimeout(function () {
+      touchPress.timer = 0;
+      touchPress.firedUntil = Date.now() + 1000; // swallow the click (and menu) that follow this press
+      hideTooltip();
+      quickAdd(entry.item);
+    }, LONG_PRESS_MS);
+  });
+  /**
+   * Main-grid taps, registered on each slot (createEntry). A listener on the slot itself makes it a tap target
+   * for the browser's touch adjustment, which otherwise snaps a tap on the slot onto its nearby "+" button.
+   */
+  function gridSlotClick(e) {
+    var slot = e.currentTarget;
+    var entry = el.grid.contains(slot) ? slotEntry.get(slot) : null;
+    if (!entry) return;
+    if (e.target.closest(".slot-add")) {
+      e.preventDefault();
+      quickAdd(entry.item);
+    } else if (touchPress.firedUntil > Date.now()) {
+      touchPress.firedUntil = 0; // the click that ends a long-press
+      e.preventDefault();
+      hideTooltip(); // the browser's compatibility mouseover showed it again
+    } else if (touchPress.pointer !== "mouse" && !e.shiftKey && !entry.onActivate) {
+      e.preventDefault();
+      slotContextAction(entry);
+    }
+  }
+  el.grid.addEventListener("pointermove", function (e) {
+    if (touchPress.timer && Math.hypot(e.clientX - touchPress.x, e.clientY - touchPress.y) > LONG_PRESS_SLOP) cancelLongPress();
+  });
+  ["pointerup", "pointercancel", "pointerleave"].forEach(function (t) { el.grid.addEventListener(t, cancelLongPress); });
+  el.gridWrap.addEventListener("scroll", cancelLongPress, { passive: true });
+  window.addEventListener("scroll", cancelLongPress, { passive: true });
+
   // Right-click opens shulker windows; the browser menu is suppressed only on slots.
   document.addEventListener("contextmenu", function (e) {
     var slot = e.target.closest ? e.target.closest(".slot") : null;
     var entry = slot ? slotEntry.get(slot) : null;
     if (!entry) return;
     e.preventDefault();
-    if (entry.onContext) entry.onContext();
-    else if (entry.onActivate) entry.onActivate();
-    else if (entry.item.isShulker) openShulkerPreview(entry.item);
-    else if (isShulkerBoxId(entry.item.id)) openShulkerChooser(entry.item);
+    // A touch long-press also raises a context menu: on the main grid the press itself is the action.
+    if (touchPress.pointer !== "mouse" && el.grid.contains(slot)) return;
+    slotContextAction(entry);
   });
 
   // Left click: windows' clickable slots, the order picker, and shift-click to add a stack to the cart.
   document.addEventListener("click", function (e) {
     var slot = e.target.closest ? e.target.closest(".slot") : null;
     var entry = slot ? slotEntry.get(slot) : null;
-    if (!entry) return;
+    if (!entry || e.defaultPrevented) return; // handled by the item grid's touch handler
     if (entry.onActivate) {
       entry.onActivate();
       return;
@@ -1977,7 +2221,8 @@
     timer: 0,
     loading: false,
     token: 0,
-    expanded: new Set()
+    expanded: new Set(),
+    retryErrors: new Map() // order id -> why the last retry was refused
   };
   var cart = { lines: [], badLine: -1 };
   var picker = { level: "types", type: null, entry: null, search: "", slots: [], qtyHost: null };
@@ -2215,7 +2460,7 @@
     picker.entry = null;
     plan.selected = null;
     plan.fullCount = -1;
-    el.cartNote.value = "";
+    resetNames();
     el.cartStatus.textContent = "";
     if (state.tab === "orders") {
       renderPicker();
@@ -2242,6 +2487,7 @@
       el.deliveryStatus.textContent = "";
       el.deliveryStatus.className = "bot-line";
       el.orderBlocker.hidden = true;
+      renderCraftInfo();
       return;
     }
     var d = s.delivery;
@@ -2257,6 +2503,179 @@
     var blocker = str(s.orderBlocker);
     el.orderBlocker.hidden = !blocker;
     el.orderBlocker.textContent = blocker ? "Bot can't take orders right now: " + blocker : "";
+    renderNamesWarn();
+  }
+
+  // ---------- orders: shulker names ----------
+  // No names, one name for every shulker, or a name per planned shulker (in delivery order, as planCart lays them
+  // out). The rows are updated in place so typing isn't interrupted when the cart or the index refreshes; names
+  // typed for a shulker are kept by its index while the cart changes.
+
+  var names = { mode: "none", all: "", each: [], rows: [] };
+
+  function resetNames() {
+    names.all = "";
+    names.each = [];
+    el.namesAll.value = "";
+    names.rows.forEach(function (r) { r.input.value = ""; });
+    setNamesMode("none");
+  }
+
+  function setNamesMode(mode) {
+    names.mode = mode;
+    Array.prototype.forEach.call(el.namesSeg.querySelectorAll(".seg-btn"), function (b) {
+      b.setAttribute("aria-pressed", b.getAttribute("data-mode") === mode ? "true" : "false");
+    });
+    el.namesAll.hidden = mode !== "all";
+    el.namesEach.hidden = mode !== "each";
+    renderNames();
+  }
+
+  el.namesSeg.addEventListener("click", function (ev) {
+    var b = ev.target && ev.target.closest ? ev.target.closest(".seg-btn") : null;
+    if (!b) return;
+    setNamesMode(b.getAttribute("data-mode"));
+    if (names.mode === "all") el.namesAll.focus();
+  });
+
+  el.namesAll.addEventListener("input", function () {
+    names.all = el.namesAll.value;
+    renderNamesWarn();
+  });
+
+  /** What a planned shulker will hold: "Diamond ×128, Golden Apple ×64", "Packed shulker: …", "Empty red shulker". */
+  function unitSummary(u) {
+    if (u.kind === "shulker") {
+      var g = state.shulkerByKey && state.shulkerByKey.get(u.key);
+      return "Packed shulker: " + (g ? g.item.name : u.key);
+    }
+    if (u.kind === "empty") {
+      var it = itemByKey(u.key);
+      var colour = (it ? it.id : "").replace(/^minecraft:/, "").replace(/_?shulker_box$/, "").replace(/_/g, " ");
+      return "Empty " + (colour ? colour + " " : "") + "shulker";
+    }
+    var totals = new Map();
+    u.lots.forEach(function (lot) { totals.set(lot.key, (totals.get(lot.key) || 0) + lot.count); });
+    var top = Array.from(totals.entries()).sort(function (a, b) { return b[1] - a[1]; });
+    var text = top.slice(0, 3).map(function (t) { return itemName(t[0]) + " ×" + grouped(t[1]); }).join(", ");
+    return top.length > 3 ? text + ", +" + (top.length - 3) + " more" : text;
+  }
+
+  function nameRow(i) {
+    var row = document.createElement("div");
+    row.className = "names-row";
+    var label = document.createElement("label");
+    label.className = "names-label";
+    label.htmlFor = "names-each-" + i;
+    label.textContent = "Shulker " + (i + 1);
+    var what = document.createElement("span");
+    what.className = "names-what";
+    var input = document.createElement("input");
+    input.type = "text";
+    input.id = "names-each-" + i;
+    input.className = "mc-input";
+    input.maxLength = 50;
+    input.placeholder = "unnamed";
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.value = names.each[i] || "";
+    input.addEventListener("input", function () {
+      names.each[i] = input.value;
+      renderNamesWarn();
+    });
+    row.appendChild(label);
+    row.appendChild(what);
+    row.appendChild(input);
+    return { row: row, what: what, input: input, text: null };
+  }
+
+  function renderNames() {
+    var units = plan.units;
+    if (names.mode === "each") {
+      while (names.rows.length < units.length) {
+        var r = nameRow(names.rows.length);
+        names.rows.push(r);
+        el.namesRows.appendChild(r.row);
+      }
+      while (names.rows.length > units.length) {
+        var gone = names.rows.pop();
+        if (gone.row.contains(document.activeElement)) gone.input.blur();
+        gone.row.remove();
+      }
+      units.forEach(function (u, i) {
+        var text = unitSummary(u);
+        var r = names.rows[i];
+        if (r.text !== text) {
+          r.text = text;
+          r.what.textContent = text;
+          r.what.title = text;
+        }
+      });
+      var hint = el.namesRows.querySelector(".names-empty");
+      if (!units.length && !hint) el.namesRows.appendChild(line("note names-empty", "Add items to the cart to name its shulkers."));
+      if (units.length && hint) hint.remove();
+    }
+    renderNamesWarn();
+  }
+
+  /** How many planned shulkers would get a name. */
+  function namedCount() {
+    var n = plan.units.length;
+    if (names.mode === "all") return names.all.trim() ? n : 0;
+    if (names.mode !== "each") return 0;
+    var c = 0;
+    for (var i = 0; i < n; i++) if (names.each[i] && names.each[i].trim()) c++;
+    return c;
+  }
+
+  /** The order's names field: null, {mode: "all", name} or {mode: "each", names: [one per planned shulker]}. */
+  function namesBody() {
+    if (names.mode === "all") return names.all.trim() ? { mode: "all", name: names.all.trim() } : null;
+    if (names.mode !== "each") return null;
+    var list = [];
+    // At most 54 (the server's cap): a bigger cart is refused for its size anyway, and that error should be the one shown
+    for (var i = 0; i < Math.min(plan.units.length, 54); i++) list.push((names.each[i] || "").trim());
+    return list.some(function (v) { return v; }) ? { mode: "each", names: list } : null;
+  }
+
+  /** Warnings from the stash's bot (heartbeat "naming"). Only a warning: the order can still be placed. */
+  function renderNamesWarn() {
+    var s = currentStash();
+    var n = namedCount();
+    var text = "";
+    if (s && n > 0) {
+      var nm = s.naming && typeof s.naming === "object" ? s.naming : null;
+      if (!nm) {
+        text = "This bot can't name shulkers; they'll arrive unnamed.";
+      } else if (nm.anvil === false && typeof nm.anvilSource === "string") {
+        // A newer bot finds an anvil in the stash area, or places one from stock, when none is set.
+        text = "No anvil yet: the bot will look for one in the stash area, or place one from the stash. " +
+          "If it can't, the shulkers arrive unnamed.";
+      } else if (nm.anvil === false) {
+        text = "No anvil set; the shulkers will arrive unnamed. Set one on the bot: in Meteor, stash-manager → select-anvil; " +
+          "on the proxy, stash anvil here.";
+      } else if (typeof nm.xpLevels === "number" && nm.xpLevels >= 0 && nm.xpLevels < n) {
+        text = "May run out of XP: about 1 level per shulker. The bot has " + plural(String(nm.xpLevels), "level") + " for " +
+          plural(String(n), "named shulker") + "; any it can't name arrive unnamed.";
+      }
+    }
+    if (el.namesWarn.textContent !== text) el.namesWarn.textContent = text;
+    el.namesWarn.hidden = !text;
+    renderCraftInfo();
+  }
+
+  /** Info from the stash's bot (heartbeat "crafting"): whether it may craft missing empty shulker boxes. */
+  function renderCraftInfo() {
+    var s = currentStash();
+    var c = s && s.crafting && typeof s.crafting === "object" ? s.crafting : null;
+    var text = "";
+    if (c && c.enabled === true) {
+      text = c.table === true
+        ? "The bot may craft missing empty shulker boxes from the stash's materials."
+        : "Crafting is on, but no crafting table is set: the bot can't craft shulker boxes.";
+    }
+    if (el.craftInfo.textContent !== text) el.craftInfo.textContent = text;
+    el.craftInfo.hidden = !text;
   }
 
   // ---------- orders: delivery chest and shulker view ----------
@@ -2300,8 +2719,9 @@
     return p;
   }
 
-  /** Shows an item in a pooled slot (null clears it). item is what the tooltip shows. */
-  function fillSlot(p, id, item, countText) {
+  /** Shows an item in a pooled slot (null clears it). item is what the tooltip shows; contents a shulker's. */
+  function fillSlot(p, id, item, countText, contents) {
+    setFace(p, id ? shulkerFace(contents) : null);
     var url = id ? iconUrl(id, state.mc) : null;
     if (url !== p.url) {
       p.url = url;
@@ -2416,7 +2836,7 @@
         continue;
       }
       var info = unitInfo(u, i, units.length);
-      fillSlot(p, info.id, tipItem(info.id, info.title, info.details.concat([info.used + "/" + SHULKER_SLOTS + " slots"])), "");
+      fillSlot(p, info.id, tipItem(info.id, info.title, info.details.concat([info.used + "/" + SHULKER_SLOTS + " slots"])), "", info.contents);
       p.fill.style.transform = "scaleX(" + info.used / SHULKER_SLOTS + ")";
       p.slot.classList.add("bar-on");
       p.slot.classList.toggle("full", info.used >= SHULKER_SLOTS);
@@ -2488,7 +2908,7 @@
       var item = lineItem(l.type, l.key);
       var row = document.createElement("div");
       row.className = "cart-line" + (i === cart.badLine ? " bad" : "");
-      row.appendChild(iconImg(item ? item.id : "minecraft:barrier", 32));
+      row.appendChild(item ? iconWithContents(item.id, l.type === "shulker" ? item.contents : null, 32) : iconImg("minecraft:barrier", 32));
       var name = document.createElement("span");
       name.className = "cart-name";
       name.textContent = item ? displayName(l.type, item) : l.key + " (no longer in the stash)";
@@ -2544,6 +2964,7 @@
     var need = shulkersNeeded(cart.lines);
     plan.units = units || [];
     renderPlan();
+    renderNames();
     noticeFull();
     if (!units) {
       // A stored cart (or a new index with a smaller maxStack) can be over the limit.
@@ -2584,13 +3005,13 @@
     var sent = cart.lines.slice();
     api("/api/v1/orders", {
       method: "POST",
-      body: { server: s.server, stash: s.stash, note: el.cartNote.value.slice(0, 200), lines: sent }
+      body: { server: s.server, stash: s.stash, names: namesBody(), lines: sent }
     }).then(function () {
       cart.lines = [];
       cart.badLine = -1;
       plan.selected = null;
       saveCart();
-      el.cartNote.value = "";
+      resetNames();
       el.cartStatus.textContent = s.online ? "Order placed." : "Order placed. It will start when the bot reconnects.";
       toast("Order placed");
       renderCart();
@@ -2910,7 +3331,7 @@
     wrap.className = "qty-panel";
     var head = document.createElement("div");
     head.className = "qty-head";
-    head.appendChild(iconImg(item.id, 32));
+    head.appendChild(iconWithContents(item.id, type === "shulker" ? item.contents : null, 32));
     var name = document.createElement("div");
     name.className = "qty-name";
     name.textContent = displayName(type, item);
@@ -3118,6 +3539,27 @@
         });
         head.appendChild(cancel);
       }
+      if (o.status === "failed" || o.status === "cancelled") {
+        var retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "mc-button small";
+        retry.textContent = "Retry";
+        retry.title = "Place this order again as a new order";
+        retry.addEventListener("click", function () {
+          retry.disabled = true;
+          orders.retryErrors.delete(o.id);
+          api("/api/v1/orders/" + encodeURIComponent(o.id) + "/retry", { method: "POST", body: {} }).then(function () {
+            toast("Order placed again");
+            scheduleOrdersPoll(0);
+          }, function (e) {
+            var why = e && e.body && e.body.error ? str(e.body.error) : "HTTP " + (e && e.status ? e.status : "error");
+            orders.retryErrors.set(o.id, why);
+            toast("Could not retry: " + why);
+            renderOrderList();
+          });
+        });
+        head.appendChild(retry);
+      }
       if (canForceCancel(o)) {
         var force = document.createElement("button");
         force.type = "button";
@@ -3164,12 +3606,29 @@
         hide(msg);
         card.appendChild(msg);
       }
-      if (o.note) {
-        var note = document.createElement("div");
-        note.className = "note";
-        note.textContent = "Note: " + str(o.note);
-        card.appendChild(note);
+      var nm = o.names && typeof o.names === "object" ? o.names : null;
+      if (nm && nm.mode === "all" && typeof nm.name === "string" && nm.name) {
+        card.appendChild(line("order-names", "Named: " + nm.name));
+      } else if (nm && nm.mode === "each" && Array.isArray(nm.names)) {
+        var named = [];
+        nm.names.forEach(function (v, i) { if (typeof v === "string" && v.trim()) named.push("Shulker " + (i + 1) + ": " + v); });
+        if (named.length) {
+          var nd = document.createElement("details");
+          nd.className = "order-names";
+          var openKey = "names:" + o.id;
+          nd.open = orders.expanded.has(openKey);
+          nd.addEventListener("toggle", function () {
+            if (nd.open) orders.expanded.add(openKey);
+            else orders.expanded.delete(openKey);
+          });
+          var ns = document.createElement("summary");
+          ns.textContent = "Named each (" + named.length + ")";
+          nd.appendChild(ns);
+          named.forEach(function (t) { nd.appendChild(line("order-line", t)); });
+          card.appendChild(nd);
+        }
       }
+      if (orders.retryErrors.has(o.id)) card.appendChild(line("note warn", "Retry refused: " + orders.retryErrors.get(o.id)));
 
       var lines = linesSummary(o);
       var details = document.createElement("details");
@@ -3379,12 +3838,17 @@
       head.className = "dash-bot-head";
       var dot = document.createElement("span");
       setDot(dot, !!b.online);
+      dot.classList.add("only-desktop");
       head.appendChild(dot);
       var name = document.createElement("span");
       name.className = "dash-bot-name";
       name.textContent = botName(b);
       head.appendChild(name);
-      head.appendChild(line("note", (b.online ? "online" : "offline") + " · last seen " + ago(num(b.lastSeen, null))));
+      var chip = document.createElement("span");
+      chip.className = "status-chip " + (b.online ? "ok" : "off");
+      chip.textContent = b.online ? "Online" : "Offline";
+      head.appendChild(chip);
+      head.appendChild(line("note", "last seen " + ago(num(b.lastSeen, null))));
       card.appendChild(head);
       if (str(b.summary)) {
         var doing = line("dash-bot-doing", "Now: ");
@@ -3393,7 +3857,7 @@
       }
       var plugin = b.plugin && typeof b.plugin === "object" ? b.plugin : {};
       var proxy = b.proxy && typeof b.proxy === "object" ? b.proxy : {};
-      card.appendChild(line("note", "Plugin " + (str(plugin.id) || "?") + " " + str(plugin.version) + " · proxy " + (str(proxy.version) || "?") +
+      card.appendChild(line("note dash-bot-meta", "Plugin " + (str(plugin.id) || "?") + " " + str(plugin.version) + " · proxy " + (str(proxy.version) || "?") +
         (str(proxy.mc) ? " (MC " + str(proxy.mc) + ")" : "") + " · id " + str(b.botId)));
       var stashes = Array.isArray(b.stashes) ? b.stashes : [];
       var st = document.createElement("div");
@@ -3989,11 +4453,18 @@
       var t = document.createElement("button");
       t.type = "button";
       t.className = "mc-button toggle";
+      t.setAttribute("role", "switch");
+      t.setAttribute("aria-label", str(node.label) || node.path);
+      var tText = document.createElement("span");
+      tText.className = "toggle-text";
+      t.appendChild(tText);
       var cur = false;
       var isNull = false;
       var show = function () {
-        t.textContent = isNull ? "(none)" : cur ? "ON" : "OFF";
+        tText.textContent = isNull ? "(none)" : cur ? "ON" : "OFF";
         t.classList.toggle("on", !isNull && cur);
+        t.classList.toggle("is-null", isNull);
+        t.setAttribute("aria-checked", !isNull && cur ? "true" : "false");
       };
       t.addEventListener("click", function () {
         cur = isNull ? true : !cur;
@@ -4298,6 +4769,12 @@
     window.clearTimeout(sudo.timer);
     var left = sudo.until - Date.now();
     el.sudoBox.hidden = left <= 0 || auth.blocked;
+    // Mobile chip: "Admin · N min — Lock" while unlocked, "Unlock admin" otherwise.
+    var chip = $("admin-chip");
+    chip.hidden = !!auth.blocked;
+    chip.classList.toggle("on", left > 0);
+    chip.textContent = left > 0 ? "Admin \u00b7 " + Math.ceil(left / 60000) + " min \u2014 Lock" : "Unlock admin";
+    chip.title = left > 0 ? "Admin mode is on. Tap to lock it now." : "Type the password to unlock admin mode for 15 minutes.";
     if (left <= 0) return;
     var min = Math.ceil(left / 60000);
     el.sudoText.textContent = "Admin unlocked for " + min + " min";
@@ -4356,6 +4833,225 @@
       // storage blocked: it still applies until the page is reloaded
     }
     renderStreamer(true);
+  });
+
+  // ---------- appearance: theme picker (this browser only) ----------
+  // The choice lives in localStorage ("sm-theme") through theme-init.js, which applies it before the CSS loads.
+  // It is not a bot setting: not part of the Settings form, never sent to the server.
+
+  var THEME_CHOICES = [
+    { id: "classic", name: "Classic", desc: "Blocky bevels, like now" },
+    { id: "modern", name: "Modern", desc: "Soft rounded cards" },
+    { id: "light", name: "Light", desc: "Flat and calm" },
+    { id: "dark", name: "Dark", desc: "Easy on the eyes" },
+    { id: "midnight", name: "Midnight", desc: "OLED black, stream-safe" },
+    { id: "contrast", name: "High contrast", desc: "Maximum legibility" },
+    { id: "system", name: "Match system", desc: "" }
+  ];
+  var THEME_NAMES = {};
+  THEME_CHOICES.forEach(function (c) { THEME_NAMES[c.id] = c.name; });
+  var themeCards = [];
+
+  /** A swatch circle in a theme's own colours: the data-theme attribute scopes that theme's tokens to it. */
+  function themeSwatch(theme, token) {
+    var s = document.createElement("span");
+    s.className = "swatch sw-" + token;
+    s.setAttribute("data-theme", theme);
+    return s;
+  }
+
+  /** Spans, not divs: a button holds phrasing content only. */
+  function themeSpan(cls, text) {
+    var s = document.createElement("span");
+    s.className = cls;
+    s.textContent = text;
+    return s;
+  }
+
+  function buildThemeCards() {
+    var grid = $("theme-grid");
+    if (!grid) return;
+    var themes = window.SM_THEMES;
+    if (!themes) {
+      grid.appendChild(line("note", "Themes are unavailable: theme-init.js did not load."));
+      return;
+    }
+    THEME_CHOICES.forEach(function (c) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "theme-card";
+      b.dataset.choice = c.id;
+      var sw = document.createElement("span");
+      sw.className = "swatches";
+      sw.setAttribute("aria-hidden", "true");
+      if (c.id === "system") {
+        sw.appendChild(themeSwatch("classic", "surface"));
+        sw.appendChild(themeSwatch("dark", "surface"));
+        sw.appendChild(themeSwatch("dark", "accent"));
+      } else {
+        sw.appendChild(themeSwatch(c.id, "bg"));
+        sw.appendChild(themeSwatch(c.id, "surface"));
+        sw.appendChild(themeSwatch(c.id, "accent"));
+      }
+      b.appendChild(sw);
+      var text = document.createElement("span");
+      text.className = "theme-text";
+      text.appendChild(themeSpan("theme-name", c.name));
+      var desc = themeSpan("theme-desc", c.desc);
+      text.appendChild(desc);
+      b.appendChild(text);
+      b.addEventListener("click", function () { themes.set(c.id); });
+      grid.appendChild(b);
+      themeCards.push({ id: c.id, button: b, desc: desc });
+    });
+    themes.onChange(renderThemeCards);
+    renderThemeCards(themes.saved());
+  }
+
+  function renderThemeCards(pref) {
+    themeCards.forEach(function (card) {
+      card.button.setAttribute("aria-pressed", card.id === pref ? "true" : "false");
+      if (card.id === "system") {
+        card.desc.textContent = "Follows this device: " + THEME_NAMES[window.SM_THEMES.resolve("system")] + " now";
+      }
+    });
+  }
+
+  buildThemeCards();
+
+  // Header palette button: open Settings the way its nav button does, then show the Appearance section.
+  $("theme-btn").addEventListener("click", function () {
+    var nav = el.dashNav.querySelector('.nav-btn[data-page="settings"]');
+    if (nav) nav.click();
+    var section = $("appearance");
+    if (section) section.scrollIntoView({ block: "start" });
+    var pressed = document.querySelector('#theme-grid .theme-card[aria-pressed="true"]') || document.querySelector("#theme-grid .theme-card");
+    if (pressed) pressed.focus({ preventScroll: true });
+  });
+
+  // ---------- mobile layout: bottom tabs, More sheet, account menu, admin chip ----------
+  // Extra triggers only: every one of them calls the same control or function as the desktop layout.
+
+  var mobile = {
+    nav: $("bottom-nav"),
+    more: $("bnav-more"),
+    sheet: $("more-sheet"),
+    rescan: $("more-rescan"),
+    account: $("account-btn"),
+    accountMenu: $("account-menu")
+  };
+  var MORE_PAGES = ["settings", "proxy", "console"];
+
+  /** Opens a page exactly as its desktop nav button does (that button stays the single source of truth). */
+  function openNavPage(page) {
+    var nav = el.dashNav.querySelector('.nav-btn[data-page="' + page + '"]');
+    if (nav) nav.click();
+    window.scrollTo(0, 0);
+  }
+
+  /** Mirrors the desktop nav (selected page, hidden pages) onto the bottom tabs and the More sheet. */
+  function syncMobileNav() {
+    var sel = el.dashNav.querySelector(".nav-btn.selected");
+    var page = sel ? sel.dataset.page : "";
+    var mirror = function (btn) {
+      var top = el.dashNav.querySelector('.nav-btn[data-page="' + btn.dataset.page + '"]');
+      btn.hidden = !top || top.hidden;
+      if (btn.dataset.page === page) btn.setAttribute("aria-current", "page");
+      else btn.removeAttribute("aria-current");
+    };
+    Array.prototype.forEach.call(mobile.nav.querySelectorAll(".bnav-btn[data-page]"), mirror);
+    Array.prototype.forEach.call(mobile.sheet.querySelectorAll(".sheet-item[data-page]"), mirror);
+    if (MORE_PAGES.indexOf(page) >= 0) mobile.more.setAttribute("aria-current", "page");
+    else mobile.more.removeAttribute("aria-current");
+  }
+  new MutationObserver(syncMobileNav).observe(el.dashNav, { subtree: true, attributes: true, attributeFilter: ["class", "hidden"] });
+  syncMobileNav();
+
+  mobile.nav.addEventListener("click", function (e) {
+    var b = e.target.closest ? e.target.closest(".bnav-btn[data-page]") : null;
+    if (b) openNavPage(b.dataset.page);
+  });
+
+  function sheetFocusables() {
+    return Array.prototype.filter.call(mobile.sheet.querySelectorAll("button"), function (b) { return !b.hidden && !b.disabled; });
+  }
+
+  function openSheet() {
+    mobile.rescan.hidden = el.rescanBox.hidden;
+    mobile.rescan.disabled = el.rescanBtn.disabled;
+    mobile.sheet.hidden = false;
+    mobile.more.setAttribute("aria-expanded", "true");
+    var f = sheetFocusables();
+    var cur = mobile.sheet.querySelector(".sheet-item[aria-current]");
+    (cur || f[1] || f[0]).focus();
+  }
+
+  function closeSheet(refocus) {
+    if (mobile.sheet.hidden) return;
+    mobile.sheet.hidden = true;
+    mobile.more.setAttribute("aria-expanded", "false");
+    if (refocus) mobile.more.focus();
+  }
+
+  mobile.more.addEventListener("click", function () {
+    if (mobile.sheet.hidden) openSheet();
+    else closeSheet(true);
+  });
+  $("more-close").addEventListener("click", function () { closeSheet(true); });
+  mobile.sheet.addEventListener("click", function (e) {
+    if (e.target === mobile.sheet) {
+      closeSheet(true); // backdrop
+      return;
+    }
+    var item = e.target.closest ? e.target.closest(".sheet-item") : null;
+    if (!item) return;
+    closeSheet(false);
+    if (item === mobile.rescan) el.rescanBtn.click();
+    else openNavPage(item.dataset.page);
+  });
+  mobile.sheet.addEventListener("keydown", function (e) {
+    if (e.key !== "Tab") return;
+    var f = sheetFocusables();
+    if (!f.length) return;
+    var first = f[0];
+    var last = f[f.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  });
+
+  function setAccountMenu(open, refocus) {
+    mobile.accountMenu.hidden = !open;
+    mobile.account.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) mobile.accountMenu.querySelector("button").focus();
+    else if (refocus) mobile.account.focus();
+  }
+
+  mobile.account.addEventListener("click", function () { setAccountMenu(mobile.accountMenu.hidden, false); });
+  $("account-link").addEventListener("click", function () {
+    setAccountMenu(false, false);
+    el.linkOpen.click();
+  });
+  $("account-logout").addEventListener("click", function () {
+    setAccountMenu(false, false);
+    el.logoutBtn.click();
+  });
+  document.addEventListener("click", function (e) {
+    if (!mobile.accountMenu.hidden && !(e.target.closest && e.target.closest(".account"))) setAccountMenu(false, false);
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") return;
+    if (!mobile.sheet.hidden) closeSheet(true);
+    if (!mobile.accountMenu.hidden) setAccountMenu(false, true);
+  });
+
+  $("admin-chip").addEventListener("click", function () {
+    if (sudo.until > Date.now()) el.sudoLock.click(); // the existing "Lock now"
+    else askPassword().then(function () {}, function () {}); // the existing password prompt
   });
 
   // A selection that only starts outside a hidden value would still copy it: refuse that copy.
@@ -4434,6 +5130,42 @@
     return box;
   }
 
+  /** Health / food: pips (desktop), a thin bar (mobile) and "n / 20". */
+  function vital(value, cls) {
+    var v = Math.max(0, Math.min(20, Math.round(num(value, 0))));
+    var box = document.createElement("span");
+    box.className = "vital vital-" + cls;
+    var p = pips(value, cls);
+    p.classList.add("only-desktop");
+    box.appendChild(p);
+    var meter = document.createElement("span");
+    meter.className = "meter only-mobile";
+    var fill = document.createElement("span");
+    fill.className = "meter-fill";
+    fill.style.width = v * 5 + "%"; // CSSOM, allowed by the CSP
+    meter.appendChild(fill);
+    box.appendChild(meter);
+    var n = document.createElement("span");
+    n.className = "vital-num";
+    n.textContent = v + " / 20";
+    box.appendChild(n);
+    return box;
+  }
+
+  /** A sensitive value that reads "Hidden (streamer)" in streamer mode (the value itself is not rendered then). */
+  function streamerValue(text) {
+    var wrap = document.createElement("span");
+    wrap.className = "sv";
+    var v = hiddenSpan(text);
+    v.classList.add("sv-value");
+    wrap.appendChild(v);
+    var h = document.createElement("span");
+    h.className = "sv-hidden";
+    h.textContent = "Hidden (streamer)";
+    wrap.appendChild(h);
+    return wrap;
+  }
+
   function stat(label, valueNode) {
     var d = document.createElement("div");
     d.className = "act-stat";
@@ -4458,13 +5190,20 @@
     // --- status card ---
     var c = a.connection && typeof a.connection === "object" ? a.connection : {};
     var head = document.createDocumentFragment();
+    var actBot = currentBot();
+    if (actBot) head.appendChild(line("act-bot only-mobile", botName(actBot)));
     var badge = document.createElement("span");
     var stateName = str(c.state) || "offline";
     badge.className = "conn-badge conn-" + stateName;
     badge.textContent = stateName === "queue" ? "In queue" + (typeof c.queuePosition === "number" ? " #" + c.queuePosition : "") +
       (str(c.queueEta) ? " · ETA " + str(c.queueEta) : "") : stateName.charAt(0).toUpperCase() + stateName.slice(1);
     head.appendChild(badge);
-    if (str(c.server)) head.appendChild(hide(line("act-server", str(c.server))));
+    if (str(c.server)) {
+      var srv = document.createElement("div");
+      srv.className = "act-server";
+      srv.appendChild(streamerValue(str(c.server)));
+      head.appendChild(srv);
+    }
     var age = d.receivedAt ? serverNow() - num(d.receivedAt, 0) : null;
     var upd = line("note act-updated" + (age !== null && age > 60000 ? " warn" : ""), age === null ? "" :
       "last update " + durationText(age) + " ago" + (age > 60000 ? " (stale: the bot isn't reporting)" : ""));
@@ -4474,10 +5213,10 @@
     var stats = document.createDocumentFragment();
     if (str(c.dimension)) stats.appendChild(stat("Dimension", str(c.dimension).replace(/^minecraft:/, "")));
     if (typeof c.x === "number") {
-      stats.appendChild(stat("Position", hiddenSpan(Math.round(c.x) + ", " + Math.round(num(c.y, 0)) + ", " + Math.round(num(c.z, 0)))));
+      stats.appendChild(stat("Position", streamerValue(Math.round(c.x) + ", " + Math.round(num(c.y, 0)) + ", " + Math.round(num(c.z, 0)))));
     }
-    if (typeof c.health === "number") stats.appendChild(stat("Health", pips(c.health, "hearts")));
-    if (typeof c.food === "number") stats.appendChild(stat("Food", pips(c.food, "food")));
+    if (typeof c.health === "number") stats.appendChild(stat("Health", vital(c.health, "hearts")));
+    if (typeof c.food === "number") stats.appendChild(stat("Food", vital(c.food, "food")));
     if (typeof c.ping === "number") stats.appendChild(stat("Ping", c.ping + " ms"));
     if (typeof c.uptimeSeconds === "number") stats.appendChild(stat("Uptime", durationText(c.uptimeSeconds * 1000)));
     if (typeof c.spectators === "number") stats.appendChild(stat("Spectators", String(c.spectators)));
@@ -4556,10 +5295,30 @@
         if (proxyOk) b.type = "button";
         b.className = "module-chip" + (m.enabled ? " on" : "");
         var dot = document.createElement("span");
-        dot.className = "dot " + (m.enabled ? "dot-on" : "dot-off");
+        dot.className = "dot only-desktop " + (m.enabled ? "dot-on" : "dot-off");
         b.appendChild(dot);
-        b.appendChild(document.createTextNode(" " + str(m.name)));
+        var mName = document.createElement("span");
+        mName.className = "module-name";
+        mName.textContent = " " + str(m.name);
+        b.appendChild(mName);
         if (str(m.status)) b.appendChild(hide(line("module-status", str(m.status))));
+        // Mobile: a switch showing the state. Read-only: the dashboard has no way to toggle a module from here.
+        var sw = document.createElement("span");
+        sw.className = "switch only-mobile";
+        sw.setAttribute("aria-checked", m.enabled ? "true" : "false");
+        if (proxyOk) {
+          sw.setAttribute("aria-hidden", "true"); // inside a button: the state is read from the text below
+          var srState = document.createElement("span");
+          srState.className = "sr-only";
+          srState.textContent = m.enabled ? ", on" : ", off";
+          b.appendChild(srState);
+        } else {
+          sw.setAttribute("role", "switch");
+          sw.setAttribute("aria-readonly", "true");
+          sw.setAttribute("aria-disabled", "true");
+          sw.setAttribute("aria-label", str(m.name));
+        }
+        b.appendChild(sw);
         b.title = (m.enabled ? "On" : "Off") + (proxyOk ? " · click for its settings" : "");
         if (proxyOk) b.addEventListener("click", function () { jumpToModule(str(m.name)); });
         grid.appendChild(b);

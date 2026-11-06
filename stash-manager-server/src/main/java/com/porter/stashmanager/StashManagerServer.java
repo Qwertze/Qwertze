@@ -112,7 +112,7 @@ public final class StashManagerServer {
 
         // Only once the port is ours: clean up the old icon cache, then queue every missing icon.
         int migrated = icons.migrateCache();
-        if (migrated > 0) System.out.println("Icon cache: removed " + migrated + " retry marker(s) and GIF/WebP icon(s); they will be fetched again as PNG.");
+        if (migrated > 0) System.out.println("Icon cache: removed " + migrated + " stale file(s); they will be fetched again.");
         icons.prefetch(store.allIconIds());
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {

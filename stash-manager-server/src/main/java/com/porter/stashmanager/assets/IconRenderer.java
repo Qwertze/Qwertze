@@ -32,9 +32,10 @@ import java.util.zip.ZipFile;
  * decoded textures are cached in memory (a few MB for a full stash). Instances are thread-safe: any number of
  * threads may call {@link #render} concurrently. Close the renderer to release the jar.
  *
- * <p>{@link #render} returns empty for items it cannot draw faithfully, chiefly block-entity ("special")
- * renders: chests, shulker boxes, beds, banners, heads, shields, conduit, decorated pot, copper golem statue.
- * Callers should fall back to another icon source for those.
+ * <p>Block-entity ("special") item models are drawn from their entity models by {@link SpecialModels}: shulker
+ * boxes, chests, beds, banners (base colour), skeleton/wither/zombie/creeper/player heads, shields, the conduit
+ * and the decorated pot. {@link #render} returns empty for the rest (dragon and piglin heads, copper golem
+ * statues): callers should fall back to another icon source for those.
  */
 public final class IconRenderer implements AutoCloseable {
     public static final int DEFAULT_SIZE = 64;
@@ -132,7 +133,14 @@ public final class IconRenderer implements AutoCloseable {
         for (Part part : parts) {
             Model m = resolveModel(part.modelId);
             if (m == null) return null;
-            int[] img = ModelRasterizer.render(m, part.tints, this::texture, size);
+            int[] img;
+            if (part.special != null) {
+                List<SpecialModels.Quad> quads = SpecialModels.build(part.special, this::texture);
+                if (quads == null) return null;
+                img = ModelRasterizer.quads(quads, m, this::texture, size);
+            } else {
+                img = ModelRasterizer.render(m, part.tints, this::texture, size);
+            }
             if (img == null) return null;
             if (out == null) out = img;
             else ModelRasterizer.over(out, img);
@@ -146,8 +154,14 @@ public final class IconRenderer implements AutoCloseable {
         return bi;
     }
 
-    /** One layer of an item: a model id plus the definition's tint colours (index = tintindex). */
-    private record Part(String modelId, int[] tints) {
+    /**
+     * One layer of an item: a model id plus the definition's tint colours (index = tintindex). For a special
+     * model, modelId is its "base" model (display transforms only) and special is its "model" object.
+     */
+    private record Part(String modelId, int[] tints, JsonObject special) {
+        Part(String modelId, int[] tints) {
+            this(modelId, tints, null);
+        }
     }
 
     /**
@@ -211,7 +225,13 @@ public final class IconRenderer implements AutoCloseable {
             }
             case "special" -> {
                 JsonObject sm = node.getAsJsonObject("model");
-                return "special renderer (" + (sm == null ? "?" : stripNs(str(sm, "type", "?"))) + ")";
+                String base = str(node, "base", null);
+                if (sm == null || base == null) return "special renderer (" + SpecialModels.typeOf(sm) + ") without base";
+                if (SpecialModels.build(sm, this::texture) == null) {
+                    return "special renderer (" + SpecialModels.typeOf(sm) + ") not supported";
+                }
+                out.add(new Part(base, new int[0], sm));
+                return null;
             }
             case "empty", "bundle/selected_item" -> {
                 return null; // draws nothing on its own

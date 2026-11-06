@@ -245,10 +245,25 @@ public final class StashIndex {
 
     /**
      * The JSON body of a heartbeat for an index. {@code delivery} is the delivery container's position (x, y, z) or null;
-     * {@code orderBlocker} is why orders can't be taken now, or null. Both are sent even when null.
+     * {@code orderBlocker} is why orders can't be taken now, or null. Both are sent even when null. {@code naming} is
+     * {anvil ready (0/1), XP levels or -1}, or null to leave it out. {@code crafting} is {enabled (0/1), crafting table ready (0/1)},
+     * or null to leave it out.
      */
-    public static byte[] heartbeat(Built b, int[] delivery, String orderBlocker, long rescanDone, String rescanBlocked) {
+    public static byte[] heartbeat(Built b, int[] delivery, String orderBlocker, long rescanDone, String rescanBlocked, int[] naming, int[] crafting, String anvilSource) {
         JsonObject o = new JsonObject();
+        if (naming != null) {
+            JsonObject n = new JsonObject();
+            n.addProperty("anvil", naming[0] != 0);
+            n.addProperty("xpLevels", naming[1]);
+            if (anvilSource != null) n.addProperty("anvilSource", anvilSource);
+            o.add("naming", n);
+        }
+        if (crafting != null) {
+            JsonObject c = new JsonObject();
+            c.addProperty("enabled", crafting[0] != 0);
+            c.addProperty("table", crafting[1] != 0);
+            o.add("crafting", c);
+        }
         if (rescanDone >= 0) o.addProperty("rescanDone", rescanDone);
         if (rescanBlocked == null) o.add("rescanBlocked", com.google.gson.JsonNull.INSTANCE);
         else o.addProperty("rescanBlocked", clamp(rescanBlocked, 100));

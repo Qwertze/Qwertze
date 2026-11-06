@@ -113,6 +113,12 @@ final class Compactor {
 
         /** The plan, or where its shulker stands, changed: the sorter saves what a restart needs to finish it. */
         void changed();
+
+        /**
+         * No empty shulker is left: crafts one when crafting is on.
+         * @return null when a craft was started (the sorter carries it on), "" when crafting is off, else why it can't be done
+         */
+        String craftEmpty(String purpose);
     }
 
     private static final int COOLDOWN = 20 * 60 * 10;
@@ -526,8 +532,13 @@ final class Compactor {
             boolean available = findPlanShulker() >= 0 || findEmptyShulker() != null;
             plan = null;
             if (!available) {
+                String crafting = owner.craftEmpty("compacting " + best.name);
+                if (crafting == null) {
+                    blocker = "crafting an empty shulker";
+                    return false;
+                }
                 blocker = "no empty shulker";
-                why("no empty shulker for " + best.name + " (" + best.target + " stacks waiting)");
+                why("no empty shulker for " + best.name + " (" + best.target + " stacks waiting)" + (crafting.isEmpty() ? "" : "; couldn't craft one: " + crafting));
                 return false;
             }
         }

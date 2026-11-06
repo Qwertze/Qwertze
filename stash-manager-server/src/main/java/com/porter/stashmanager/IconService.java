@@ -47,7 +47,7 @@ import java.util.stream.Stream;
  * <p>Pipeline: ids from stored indexes are queued (deduped) by {@link #prefetch} or by a browser request.
  * One resolver thread takes up to 50 wiki titles at a time and resolves them with a single MediaWiki
  * {@code api.php?action=query&prop=imageinfo} call; 4 download threads then fetch the image URLs, or fall back
- * to the mcasset.cloud item/block textures. Every image is decoded and re-encoded as a PNG of its first frame,
+ * to the mcasset.cloud item/block textures when the wiki definitely has no icon. Every image is decoded and re-encoded as a PNG of its first frame,
  * at most 64 px, so animated GIFs never reach the browser.
  *
  * <p>Rate limits make work wait; they never write a marker. {@code .retry} (2 min) is written only after real
@@ -183,16 +183,40 @@ public final class IconService implements AutoCloseable {
     // ---------- startup migration ----------
 
     /**
+     * Version of the on-disk wiki cache. Bump it when cached wiki-pipeline icons can be wrong, so they are
+     * fetched again; {@link #migrateCache} then removes them once.
+     * <ul>
+     *   <li>1 (no marker file): original.</li>
+     *   <li>2: a failed wiki image download used to fall through to mcasset's flat block texture
+     *       (block/&lt;id&gt;.png) and cache it for good, so block items, shulker boxes in particular, showed a
+     *       flat face. Every wiki-cache PNG and .miss marker is removed. Game renders (game-&lt;version&gt;/)
+     *       are kept: shulker boxes and other block-entity items were never cached there.</li>
+     * </ul>
+     */
+    static final int CACHE_VERSION = 2;
+    static final String CACHE_VERSION_FILE = ".cache-version";
+
+    /**
      * Removes .retry markers and non-PNG icons (from before every icon was normalized to PNG) so they get
-     * fetched again. Existing PNGs and .miss markers stay. Returns the number of files removed.
+     * fetched again. If the cache predates {@link #CACHE_VERSION}, also removes every wiki-cache PNG and .miss
+     * marker (not the game-&lt;version&gt; renders), then records the new version. Returns the number of files
+     * removed.
      */
     public int migrateCache() {
-        if (!Files.isDirectory(dir)) return 0;
+        if (!Files.isDirectory(dir)) {
+            // A new cache starts at the current version, so the next start doesn't treat it as outdated.
+            writeCacheVersion();
+            return 0;
+        }
+        boolean outdated = cacheVersion() < CACHE_VERSION;
         List<Path> stale;
         try (Stream<Path> walk = Files.walk(dir, 2)) {
             stale = walk.filter(Files::isRegularFile).filter(p -> {
+                if (p.getParent().equals(dir)) return false; // .cache-version and other top-level files
+                if (p.getParent().getFileName().toString().startsWith("game-")) return false; // never wiki icons
                 String name = p.getFileName().toString();
-                return name.endsWith(".retry") || name.endsWith(".gif") || name.endsWith(".webp") || name.endsWith(".jpg");
+                if (name.endsWith(".retry") || name.endsWith(".gif") || name.endsWith(".webp") || name.endsWith(".jpg")) return true;
+                return outdated && (name.endsWith(".png") || name.endsWith(".miss"));
             }).toList();
         } catch (IOException e) {
             return 0;
@@ -204,7 +228,42 @@ public final class IconService implements AutoCloseable {
             } catch (IOException ignored) {
             }
         }
+        if (outdated) {
+            writeCacheVersion();
+            System.out.println("Icon cache: upgraded to version " + CACHE_VERSION + " (wiki icons are fetched again).");
+        }
         return removed;
+    }
+
+    private void writeCacheVersion() {
+        try {
+            AtomicFiles.write(dir.resolve(CACHE_VERSION_FILE), Integer.toString(CACHE_VERSION).getBytes(StandardCharsets.US_ASCII));
+        } catch (IOException e) {
+            System.err.println("Could not write " + dir.resolve(CACHE_VERSION_FILE) + ": " + e.getMessage());
+        }
+    }
+
+    /** The cache version on disk: 1 when there is no marker (or it is unreadable). */
+    int cacheVersion() {
+        try {
+            Path f = dir.resolve(CACHE_VERSION_FILE);
+            if (!Files.isRegularFile(f)) return 1;
+            return Integer.parseInt(Files.readString(f, StandardCharsets.US_ASCII).trim());
+        } catch (IOException | NumberFormatException e) {
+            return 1;
+        }
+    }
+
+    /**
+     * Items drawn by a block-entity renderer in game. Their mcasset block texture is a flat face or particle
+     * sprite (block/black_shulker_box.png is one side of the box), never the inventory icon, so the wiki
+     * pipeline does not use mcasset for them.
+     */
+    private static final Pattern BLOCK_ENTITY_ITEM = Pattern.compile(
+        "^(?:[a-z_]+_)?(?:shulker_box|chest|bed|banner|head|skull|copper_golem_statue)$|^(?:shield|conduit|decorated_pot)$");
+
+    static boolean blockEntityItem(String path) {
+        return BLOCK_ENTITY_ITEM.matcher(path).matches();
     }
 
     // ---------- requests ----------
@@ -528,19 +587,39 @@ public final class IconService implements AutoCloseable {
 
     // ---------- downloads ----------
 
+    /**
+     * The wiki icon first. mcasset textures are a last resort, used only when the wiki definitely has no icon:
+     * a temporary wiki failure (API or image download) writes a .retry marker instead, because the mcasset
+     * block texture of a block is a flat face and would otherwise be cached for good. Block-entity items never
+     * use mcasset (see {@link #BLOCK_ENTITY_ITEM}).
+     */
     private void download(Job j, String wikiUrl, boolean wikiTransient) {
         try {
-            boolean anyTransient = wikiTransient;
-            List<String> sources = new ArrayList<>(3);
-            if (wikiUrl != null) sources.add(wikiUrl);
+            if (wikiUrl != null) {
+                imageLimiter.acquire();
+                Fetched f = fetchImage(wikiUrl);
+                if (f.kind == Kind.OK) {
+                    statWiki.incrementAndGet();
+                    finish(j, Kind.OK, f.data);
+                    return;
+                }
+                if (f.kind == Kind.TRANSIENT) wikiTransient = true;
+            }
+            if (wikiTransient) {
+                finish(j, Kind.TRANSIENT, null);
+                return;
+            }
+            if (blockEntityItem(j.path)) {
+                finish(j, Kind.DEFINITE_MISS, null);
+                return;
+            }
+            boolean anyTransient = false;
             String assets = "https://assets.mcasset.cloud/" + j.info.mcVersion() + "/assets/minecraft/textures/";
-            sources.add(assets + "item/" + j.path + ".png");
-            sources.add(assets + "block/" + j.path + ".png");
-            for (String url : sources) {
+            for (String url : List.of(assets + "item/" + j.path + ".png", assets + "block/" + j.path + ".png")) {
                 imageLimiter.acquire();
                 Fetched f = fetchImage(url);
                 if (f.kind == Kind.OK) {
-                    (url.equals(wikiUrl) ? statWiki : statAssets).incrementAndGet();
+                    statAssets.incrementAndGet();
                     finish(j, Kind.OK, f.data);
                     return;
                 }

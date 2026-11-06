@@ -88,7 +88,7 @@ Endpoints (`/api/v1/auth/...`):
 ## Browser endpoints (website login required)
 
 - `GET /api/v1/stashes`: `[{ "server", "stash", "player", "online", "lastSeen", "indexedAt", "itemTypes", "itemTotal" }]`. `online` means a heartbeat or index arrived in the last 45 seconds.
-- `GET /api/v1/index?server=..&stash=..`: the stored index exactly as it was pushed, plus `"receivedAt"`. Returns `404` if there isn't one.
+- `GET /api/v1/index?server=..&stash=..`: the stored index as it was pushed, plus `"receivedAt"`, with the creative-tab fallback filled in (see "Additions: creative tabs for bots that don't send them"). Returns `404` if there isn't one.
 - `GET /icon/<namespace>/<path>.png?v=<mcVersion>-<token>`: the item icon, always a static PNG. Only ids that appear in a stored index get one; any `name`/`mc` parameters are ignored.
   - `v` is set by the page to the index's Minecraft version plus a source token (today `g1`). Changing the token or the version changes the URL, so the browser doesn't reuse icons it cached under an older scheme. If some stored index has that version, the server renders from that version's game jar; otherwise it uses the version of the first index containing the id.
   - Sources, in order: a 64 px render from the local Minecraft client jar (cached per version in `icons/game-<mcVersion>/`), then the wiki pipeline (Minecraft Wiki, then mcasset.cloud; cached in `icons/<namespace>/`). The `iconSource` setting can limit this to one source. Icons are rendered or fetched for every id of an index as soon as it arrives.
@@ -166,7 +166,7 @@ An `item` line whose item is a shulker box (any `minecraft:*shulker_box`) means 
 
 **Availability** of a line is: the index count (for an `item` line, adjusted for shulker boxes as above) or the group `count` (for a `shulker` line), minus the counts of the same type and key in every open order (`pending`, `accepted`, `in_progress`) for that stash. The server doesn't cross-check the two: diamonds inside a packed shulker are also part of `items["minecraft:diamond"].count`, so a `shulker` line and an `item` line for those diamonds can both be reserved.
 
-Order fields: `id` (`o-` followed by 12 random hex digits), `server`, `stash`, `lines`, `note` (at most 200 characters, untrusted), `createdAt`, `updatedAt`, `status`, `phase` (free text from the bot, such as "gathering 3/10"), `progress` (`{ "done": n, "total": m }` or null), `message` (the bot's reason for a failure, or info), `cancelRequested` (bool) and `result` (`{ "shulkers": n, "lines": [{ "key", "delivered" }] }` or null).
+Order fields: `id` (`o-` followed by 12 random hex digits), `server`, `stash`, `lines`, `names` (shulker names or null, see "Additions: shulker names"), `createdAt`, `updatedAt`, `status`, `phase` (free text from the bot, such as "gathering 3/10"), `progress` (`{ "done": n, "total": m }` or null), `message` (the bot's reason for a failure, or info), `cancelRequested` (bool) and `result` (`{ "shulkers": n, "lines": [{ "key", "delivered" }] }` or null).
 
 `status` goes through:
 
@@ -177,10 +177,11 @@ Order fields: `id` (`o-` followed by 12 random hex digits), `server`, `stash`, `
 
 ### Browser (access check, plus the browser-write guard on the POSTs)
 
-- `POST /api/v1/orders`: `{ server, stash, lines, note }`. Returns `200 { ok, order }`. Each line is validated against the current index. The key must exist, and the count must be at least 1 and no more than what is available minus what other open orders have reserved (pending, accepted or in progress). Lines with the same type and key are merged. There are at most 200 lines, and each `count` must be a whole number from 1 to 2147483647. A stash can have at most 20 open orders. If validation fails, the reply is `400` with `{ error, line }`, where `line` is the index of the offending line in the request (null when the problem isn't a single line, such as the open-order limit or a missing index).
+- `POST /api/v1/orders`: `{ server, stash, lines, names }`. Returns `200 { ok, order }`. `names` is optional (see "Additions: shulker names"). Orders no longer have a note: a `note` field in the body is ignored, and no order JSON contains one (orders stored with a note lose it when they are loaded). Each line is validated against the current index. The key must exist, and the count must be at least 1 and no more than what is available minus what other open orders have reserved (pending, accepted or in progress). Lines with the same type and key are merged. There are at most 200 lines, and each `count` must be a whole number from 1 to 2147483647. A stash can have at most 20 open orders. If validation fails, the reply is `400` with `{ error, line }`, where `line` is the index of the offending line in the request (null when the problem isn't a single line, such as the open-order limit or a missing index).
 - `GET /api/v1/orders?server=..&stash=..`: `200 { orders, available }`. `orders` is that stash's orders, newest first (the last 100 are kept; open orders are never pruned). `available` is `{ items: { <key>: n }, shulkers: { <key>: n } }`, what can still be ordered for each key of the current index (availability as above, after open orders). Both are empty when the stash has no index.
 - `POST /api/v1/orders/<id>/force-cancel`: for an `accepted` or `in_progress` order whose cancel was requested but which the bot never confirmed. It becomes `cancelled` straight away with the message "cancelled from the website (bot didn't confirm)", which releases its reservations; the bot's later status reports for it get `409`, which the addon treats as done. Returns `200 { ok, order }`; `409` if no cancel was requested, the order is `pending`, or it is already finished; `404` if there is no such order. The page offers it once the cancel has waited 60 seconds (orders carry `cancelRequestedAt`, null for orders from before that field, which then use `updatedAt`) or while the bot is offline.
 - `POST /api/v1/orders/clear`: `{ server, stash }`. Removes every finished order (`delivered`, `failed`, `cancelled`) of that stash, from memory and from disk. Open orders (`pending`, `accepted`, `in_progress`) are never removed, since they hold reservations and the bot may be working on them. Returns `200 { ok, removed: n }` (`0` for a stash with no orders).
+- `POST /api/v1/orders/<id>/retry`: for a `failed` or `cancelled` order. Creates a new `pending` order with the same `server`, `stash`, `lines` and `names`, validated exactly like `POST /api/v1/orders` (the same `400 { error, line }` replies against the current index and open orders, the 54-shulker cap and the 20-open-orders limit), and returns `200 { ok, order }` with the new order. `409` for any other status, `404` for an unknown id. The old order is left as it is.
 - `POST /api/v1/orders/<id>/cancel`: when the order is `pending`, it becomes `cancelled` straight away. When it is `accepted` or `in_progress`, `cancelRequested` is set to true and the bot stops at a safe point and reports `cancelled`. Returns `200 { ok, order }`; `409` if the order is already finished, `404` if there is no such order.
 
 ### Addon (Bearer key)
@@ -208,6 +209,66 @@ Order fields: `id` (`o-` followed by 12 random hex digits), `server`, `stash`, `
   5. The loads are concatenated and fill 27-slot shulkers in sequence, so the bins are `ceil(loads / 27)` and a load's slot is its position in its bin. Items may share a shulker.
 
   The units are delivered in the order 1, 2, 5. The page labels this as the planned layout: the bot plans again from what it can actually reach, so it may deliver less.
+
+## Additions: shulker names
+
+An order can ask for the shulkers it delivers to be renamed in an anvil.
+
+**`names`** is part of the order JSON everywhere: the create body, the stored order, what `claim` returns to the bot, and the browser GETs. Returned orders always carry it (`null` when there is none).
+
+- `null` or absent: no naming.
+- `{ "mode": "all", "name": "<text>" }`: every shulker the order delivers gets this name.
+- `{ "mode": "each", "names": ["<text>", "", ...] }`: the i-th delivered shulker (0-based) gets `names[i]` when it is present and not blank. A blank entry, or an index past the end, leaves that shulker unnamed.
+
+The server validates and normalises `names` on create and returns `400 { error, line: null }` on bad input:
+
+- Every name is trimmed and may then be at most 50 characters (the anvil's limit). It may not contain `§` or a control character (U+0000 to U+001F, U+007F to U+009F).
+- `mode: "all"` needs a string `name`; a blank one makes `names` null.
+- `mode: "each"` needs an array of at most 54 entries, each a string or `null` (`null` counts as blank). Blank entries are stored as `""`, trailing blank entries are dropped, and a list that is all blank makes `names` null.
+- `names` that isn't an object or null, an unknown or missing `mode`, or a wrong type gets `400`.
+
+Bots check every name again and skip one that fails.
+
+**Which shulker is "i".** The units are counted in the delivery order of "Additions: delivery status and order size": shulker lines, then empty-shulker lines, then the packed bins. Every delivered unit counts, including whole packed shulkers and empty shulkers. The website shows the planned layout and, in `each` mode, a name box for each planned shulker with what it will hold. The bot re-plans from what it can actually reach, so it may deliver fewer shulkers; names map by index and extra names go unused.
+
+**What the bot does.** It has an anvil position, set like the delivery container (the plugin's `stash anvil here | <x> <y> <z> [dimension] | clear`, the addon's `select-anvil`, `clear-anvil`, `show-anvil` and `anvil-color`). Before delivering a named shulker it renames it in that anvil, checking the XP cost against its levels. If it can't (no anvil set, the block isn't an anvil or can't be reached, too few levels, a name that fails the rules, no result within about 30 s), it delivers the shulker unnamed: naming never fails or pauses an order. The order's problems then get one combined note, `"<n> shulker(s) delivered unnamed: <reason(s)>"`.
+
+**Heartbeat.** The body gains an optional `naming: { "anvil": <bool>, "xpLevels": <int> }`:
+
+- `anvil` is true when an anvil position is set and (if its chunk is loaded) it is an anvil block.
+- `xpLevels` is the bot's current level, or `-1` when unknown. It must be a whole number >= -1; a missing or null `xpLevels` is stored as `-1`.
+- `anvilSource` (optional) says where the bot's anvil comes from: `"set"` (an anvil position is set), `"found"` (it found a placed anvil in the stash area), `"placed"` (it placed one from stock), or `"none"` (none yet). Newer bots (plugin 1.8.1, addon 0.4.0-dev.4) send it: when no anvil is set they look for one in the stash area, or place one from the stash, and deliver unnamed only when neither works. A missing or null `anvilSource` (older bots) is stored as `null`.
+- Bots without naming support leave it out.
+
+A `naming` that isn't an object or null, or whose `anvil` isn't a boolean, `xpLevels` isn't a whole number >= -1, or `anvilSource` isn't one of `"set"`, `"found"`, `"placed"`, `"none"` (or null/absent), gets `400`. The server keeps it in memory like `delivery`: a heartbeat that leaves it out keeps the stored value, and an explicit `null` clears it. `GET /api/v1/stashes` entries return it as `naming` (`{ anvil, xpLevels, anvilSource }`, with `anvilSource` `null` when the bot didn't send it; or `null` if `naming` was never sent).
+
+The website warns on the order form, when names are wanted, if the stash's bot reports `naming: null` ("this bot can't name shulkers; they'll arrive unnamed"), `anvil: false` ("no anvil yet: the bot will look for one in the stash area, or place one from the stash" for a bot that sends `anvilSource`; "no anvil set" for an older one), or `xpLevels` below the number of named shulkers ("may run out of XP: about 1 level per shulker"). It is only a warning; the order can still be placed.
+
+## Additions: crafting
+
+Bots can craft missing empty shulker boxes from the stash's materials at a crafting table.
+
+**Heartbeat.** The body gains an optional `crafting: { "enabled": <bool>, "table": <bool> }`:
+
+- `enabled` is true when auto-crafting is on.
+- `table` is true when a crafting table position is set and (if its chunk is loaded) it is a crafting table.
+- Both are required. Bots without crafting support leave the field out.
+
+A `crafting` that isn't an object or null, or whose `enabled` or `table` is missing or isn't a boolean, gets `400`. The server keeps it in memory like `naming`: a heartbeat that leaves it out keeps the stored value, and an explicit `null` clears it. `GET /api/v1/stashes` entries return it as `crafting` (`{ enabled, table }`, or `null` if never sent).
+
+The website shows a neutral note on the order form for the stash's bot: with `enabled` and `table` both true, "The bot may craft missing empty shulker boxes from the stash's materials."; with `enabled` true and `table` false, "Crafting is on, but no crafting table is set: the bot can't craft shulker boxes." Nothing is shown when `enabled` is false or `crafting` is `null`.
+
+## Additions: creative tabs for bots that don't send them
+
+Proxy bots (the AquariusProxy plugin) send `tab: "other"` for every item. So that the website can still show the creative tabs, the server ships one generated table per Minecraft version at `src/main/resources/creative-tabs/<mc>.json` (1.21.4 and 1.21.11 today):
+
+```json
+{ "version": "1.21.4", "tabs": ["building_blocks", "colored_blocks", ...], "items": { "minecraft:stone": ["building_blocks", 12], ... } }
+```
+
+The tables follow the addon's rules (CATEGORY tabs only; an item in several tabs gets the first in vanilla tab order; the order is its first index in that tab's display list).
+
+Whenever the server returns an index to the browser (`GET /api/v1/index`), every item whose `tab` is missing, null or `"other"` is looked up by its base item `id`, and `tab` and `tabOrder` are filled from the table for the index's `mcVersion`: an exact match, otherwise the nearest lower version with the same `major.minor`, otherwise the newest table. An item missing from the table stays as it is (`other`), and a real tab sent by the bot always wins. This is done when an index is received or loaded, on the copy that is served, and the file on disk keeps what the bot sent, so indexes already stored and bots that were never updated are fixed too. With no table at all, nothing changes.
 
 ## Additions: manual rescan
 

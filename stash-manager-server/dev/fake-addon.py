@@ -4,8 +4,12 @@
 Standard library only. Run it isolated so nothing is imported from the current folder:
 
     python -I dev/fake-addon.py --url http://127.0.0.1:8768 --data <dataDir> push
+    python -I dev/fake-addon.py --url ... --data ... push --shulker-colours --mc 1.21.4   # icon test index
     python -I dev/fake-addon.py --url ... --data ... heartbeat
     python -I dev/fake-addon.py --url ... --data ... --no-delivery --blocker "no delivery box" heartbeat
+    python -I dev/fake-addon.py --url ... --data ... --naming true:30 heartbeat   # anvil set, 30 XP levels
+    python -I dev/fake-addon.py --url ... --data ... --naming null serve          # a bot that can't name shulkers
+    python -I dev/fake-addon.py --url ... --data ... --crafting true:true heartbeat   # crafting on, table set
     python -I dev/fake-addon.py --url ... --data ... claim
     python -I dev/fake-addon.py --url ... --data ... status o-0123456789ab in_progress --phase "gathering" --done 1 --total 3
     python -I dev/fake-addon.py --url ... --data ... serve        # heartbeats for 2 min; answers rescan requests
@@ -111,6 +115,58 @@ def build_index(tabs=True, mc="1.21.11", player=None, extra_diamonds=0, containe
         index["shulkers"] = shulkers
     index["indexHash"] = hashlib.sha1(json.dumps(items, sort_keys=True).encode()).hexdigest()
     return index
+
+
+COLOURS = ["white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray", "light_gray", "cyan",
+           "purple", "blue", "brown", "green", "red", "black"]
+
+
+def add_colour_shulkers(index):
+    """Every shulker colour (some only empty, some filled with one item, some mixed) plus the other
+    block-entity items, for checking icons: push --shulker-colours."""
+    items = index["items"]
+    shulkers = index.setdefault("shulkers", [])
+    have = {i["key"] for i in items}
+    fills = {
+        "white": [("minecraft:stone", 64)] * 27,
+        "orange": [("minecraft:torch", 64)] * 10,
+        "light_blue": [("minecraft:diamond", 64)] * 5 + [("minecraft:golden_apple", 64)] * 2,
+        "yellow": [("minecraft:golden_apple", 64)] * 3 + [("minecraft:ender_pearl", 16)] * 9 + [("minecraft:redstone", 64)],
+        "lime": [("minecraft:oak_planks", 64)] * 27,
+        "gray": [("minecraft:redstone", 64)] * 12,
+        "cyan": [("minecraft:totem_of_undying", 1)] * 27,
+        "purple": [("minecraft:ender_pearl", 16)] * 27,
+        "blue": [("minecraft:diamond", 64), ("minecraft:stone", 64)],
+        "green": [("minecraft:grass_block", 64)] * 6,
+        "black": [("minecraft:diamond_pickaxe", 1), ("minecraft:totem_of_undying", 1), ("minecraft:golden_apple", 64)],
+    }
+    for n, colour in enumerate(COLOURS):
+        key = f"minecraft:{colour}_shulker_box"
+        name = colour.replace("_", " ").title() + " Shulker Box"
+        groups = []
+        if colour in fills:
+            contents = [{"slot": s, "key": k, "count": c} for s, (k, c) in enumerate(fills[colour])]
+            groups.append({"key": shulker_key(key, contents), "id": key, "itemKey": key, "name": name,
+                           "count": 1 + n % 3, "contents": contents})
+        empty = 0 if colour in ("lime", "purple") else 2 + n
+        total = empty + sum(g["count"] for g in groups)
+        if key in have:
+            for i in items:
+                if i["key"] == key:
+                    i["count"] = i["count"] + total
+        else:
+            items.append(item(key, name, total, "colored_blocks", 300 + n, max_stack=1))
+        shulkers.extend(groups)
+    for n, (key, name, tab) in enumerate([
+            ("minecraft:trapped_chest", "Trapped Chest", "redstone_blocks"), ("minecraft:ender_chest", "Ender Chest", "functional_blocks"),
+            ("minecraft:red_bed", "Red Bed", "colored_blocks"), ("minecraft:white_banner", "White Banner", "colored_blocks"),
+            ("minecraft:black_banner", "Black Banner", "colored_blocks"), ("minecraft:skeleton_skull", "Skeleton Skull", "functional_blocks"),
+            ("minecraft:player_head", "Player Head", "functional_blocks"), ("minecraft:dragon_head", "Dragon Head", "functional_blocks"),
+            ("minecraft:shield", "Shield", "combat"), ("minecraft:conduit", "Conduit", "functional_blocks"),
+            ("minecraft:decorated_pot", "Decorated Pot", "functional_blocks")]):
+        if key not in have:
+            items.append(item(key, name, 1 + n, tab, 400 + n, max_stack=1 if "banner" not in key else 16))
+    index["indexHash"] = hashlib.sha1(json.dumps(items, sort_keys=True).encode()).hexdigest()
 
 
 # ---------- signed requests (PROTOCOL.md, "Signed requests (HMAC)") ----------
@@ -220,11 +276,17 @@ def show(label, status, body):
 # Bot status sent with every heartbeat (PROTOCOL.md, "Additions: delivery status and order size").
 DELIVERY = {"x": 120, "y": 64, "z": -340, "dimension": "minecraft:overworld"}
 BLOCKER = None
+NAMING = ...  # PROTOCOL.md, "Additions: shulker names": ... = not sent (an older bot), None = null, else {anvil, xpLevels}
+CRAFTING = ...  # PROTOCOL.md, "Additions: crafting": ... = not sent, None = null, else {enabled, table}
 
 
 def heartbeat(c, index_hash, extra=None):
     body = {"server": SERVER, "stash": STASH, "player": PLAYER, "indexHash": index_hash,
             "delivery": DELIVERY, "orderBlocker": BLOCKER}
+    if NAMING is not ...:
+        body["naming"] = NAMING
+    if CRAFTING is not ...:
+        body["crafting"] = CRAFTING
     body.update(extra or {})
     return c.post("/api/v1/heartbeat", body)
 
@@ -736,7 +798,7 @@ class DashBot:
 
 
 def main():
-    global SERVER, STASH, PLAYER, DELIVERY, BLOCKER
+    global SERVER, STASH, PLAYER, DELIVERY, BLOCKER, NAMING, CRAFTING
     p = argparse.ArgumentParser(description="Fake Qwerte addon for the Stash Manager server")
     p.add_argument("--url", default="http://127.0.0.1:8765")
     p.add_argument("--key")
@@ -748,11 +810,16 @@ def main():
     p.add_argument("--no-delivery", action="store_true", help="heartbeats say no delivery container is set (delivery: null)")
     p.add_argument("--delivery", help="delivery container as x,y,z[,dimension] (default 120,64,-340,minecraft:overworld)")
     p.add_argument("--blocker", help="orderBlocker to report, e.g. \"no delivery box\" (default: null)")
+    p.add_argument("--naming", help="heartbeat naming: anvil:xpLevels such as true:30 or false:0, or null (default: not sent)")
+    p.add_argument("--crafting", help="heartbeat crafting: enabled:table such as true:true or true:false, or null (default: not sent)")
     sub = p.add_subparsers(dest="cmd", required=True)
     push = sub.add_parser("push", help="push the sample index")
     push.add_argument("--no-tabs", action="store_true", help="an old-style index without tab/tabOrder/shulkers")
+    push.add_argument("--other-tabs", action="store_true", help="like a proxy bot: every item has tab \"other\" (the server fills them in)")
     push.add_argument("--mc", default="1.21.11")
     push.add_argument("--extra-diamonds", type=int, default=0)
+    push.add_argument("--shulker-colours", action="store_true",
+                      help="add every shulker colour (empty, filled, mixed) and the other block-entity items")
     sub.add_parser("heartbeat")
     sub.add_parser("claim")
     st = sub.add_parser("status")
@@ -790,11 +857,27 @@ def main():
         DELIVERY = {"x": int(parts[0]), "y": int(parts[1]), "z": int(parts[2]),
                     "dimension": parts[3] if len(parts) > 3 else "minecraft:overworld"}
     BLOCKER = args.blocker
+    if args.naming == "null":
+        NAMING = None
+    elif args.naming:
+        anvil, _, xp = args.naming.partition(":")
+        NAMING = {"anvil": anvil == "true", "xpLevels": int(xp or "-1")}
+    if args.crafting == "null":
+        CRAFTING = None
+    elif args.crafting:
+        enabled, _, table = args.crafting.partition(":")
+        CRAFTING = {"enabled": enabled == "true", "table": table == "true"}
     c = Client(args.url, load_key(args), bearer=args.bearer)
     sample_hash = build_index()["indexHash"]
 
     if args.cmd == "push":
         index = build_index(tabs=not args.no_tabs, mc=args.mc, extra_diamonds=args.extra_diamonds)
+        if args.shulker_colours:
+            add_colour_shulkers(index)
+        if args.other_tabs:
+            for i in index["items"]:
+                i["tab"], i["tabOrder"] = "other", 1000000
+            index["indexHash"] = hashlib.sha1(json.dumps(index["items"], sort_keys=True).encode()).hexdigest()
         show("index", *c.post("/api/v1/index", index))
     elif args.cmd == "heartbeat":
         show("heartbeat", *heartbeat(c, sample_hash))
@@ -822,6 +905,9 @@ def main():
             return
         order = body["order"]
         oid = order["id"]
+        names = order.get("names")
+        if names:
+            print("names: " + json.dumps(names))
         total = args.steps
         for step in range(1, total + 1):
             hs, hb = heartbeat(c, sample_hash)

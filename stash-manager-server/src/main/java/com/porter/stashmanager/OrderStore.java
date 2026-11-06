@@ -29,7 +29,8 @@ final class OrderStore {
     static final int MAX_LINES = 200;
     static final int MAX_OPEN = 20;
     static final int KEEP = 100;
-    static final int MAX_NOTE = 200;
+    /** The anvil's limit for a custom name. */
+    static final int MAX_NAME = 50;
     static final int MAX_PHASE = 100;
     static final int MAX_MESSAGE = 300;
     /** The most shulkers one order may need: one double chest (the addon's Order.MAX_BINS). */
@@ -62,7 +63,7 @@ final class OrderStore {
         String server;
         String stash;
         List<Line> lines;
-        String note;
+        JsonObject names; // normalized (see normalizeNames), or null for no naming
         long createdAt;
         long updatedAt;
         String status;
@@ -87,7 +88,7 @@ final class OrderStore {
                 ls.add(lo);
             }
             o.add("lines", ls);
-            o.addProperty("note", note);
+            o.add("names", names == null ? null : names.deepCopy());
             o.addProperty("createdAt", createdAt);
             o.addProperty("updatedAt", updatedAt);
             o.addProperty("status", status);
@@ -110,7 +111,12 @@ final class OrderStore {
                 JsonObject l = e.getAsJsonObject();
                 r.lines.add(new Line(l.get("type").getAsString(), l.get("key").getAsString(), l.get("count").getAsLong()));
             }
-            r.note = str(o, "note");
+            // "note" from orders stored before notes were removed is dropped here and never written again.
+            try {
+                r.names = normalizeNames(o.get("names"));
+            } catch (OrderException e) {
+                r.names = null;
+            }
             r.createdAt = o.get("createdAt").getAsLong();
             r.updatedAt = o.get("updatedAt").getAsLong();
             r.status = o.get("status").getAsString();
@@ -215,7 +221,7 @@ final class OrderStore {
     // ---------- browser ----------
 
     /** Validates (against the current index and open orders), merges duplicate lines, stores and returns the order. */
-    Order place(String server, String stash, List<Line> requested, String note) throws OrderException, IOException {
+    Order place(String server, String stash, List<Line> requested, JsonObject names) throws OrderException, IOException {
         if (requested.isEmpty()) throw new OrderException(400, "an order needs at least one line", -1);
         if (requested.size() > MAX_LINES) throw new OrderException(400, "at most " + MAX_LINES + " lines", -1);
         IndexStore.OrderCounts counts = index.orderCounts(server, stash);
@@ -261,7 +267,7 @@ final class OrderStore {
             o.server = server;
             o.stash = stash;
             o.lines = new ArrayList<>(merged.values());
-            o.note = note == null ? "" : note;
+            o.names = names == null ? null : names.deepCopy();
             o.createdAt = now;
             o.updatedAt = now;
             o.status = "pending";
@@ -271,6 +277,102 @@ final class OrderStore {
             save(b);
             return o;
         }
+    }
+
+    /**
+     * POST /api/v1/orders/{id}/retry: a new pending order with the old one's server, stash, lines and names, checked
+     * like any new order. Only failed and cancelled orders (409 otherwise, 404 for an unknown id). The old one stays.
+     */
+    Order retry(String id) throws OrderException, IOException {
+        Book b = byOrderId.get(id);
+        if (b == null) throw new OrderException(404, "no such order", -1);
+        List<Line> lines;
+        JsonObject names;
+        synchronized (b) {
+            Order old = find(b, id);
+            if (old == null) throw new OrderException(404, "no such order", -1);
+            if (!old.status.equals("failed") && !old.status.equals("cancelled")) {
+                throw new OrderException(409, "only failed or cancelled orders can be retried (this one is " + old.status + ")", -1);
+            }
+            lines = new ArrayList<>(old.lines);
+            names = old.names;
+        }
+        return place(b.server, b.stash, lines, names);
+    }
+
+    /**
+     * Validates and normalizes an order's names (PROTOCOL.md, "Additions: shulker names"). Returns null for no naming
+     * (absent, null, a blank "all" name, or an "each" list that is all blank), otherwise {mode: "all", name} or
+     * {mode: "each", names: [...]} with every name trimmed, blank entries as "", and trailing blank entries dropped.
+     * Throws 400 for a wrong type, an unknown mode, a name over 50 characters or with § or a control character, or
+     * an "each" list of more than 54 entries.
+     */
+    static JsonObject normalizeNames(JsonElement e) throws OrderException {
+        if (e == null || e.isJsonNull()) return null;
+        if (!e.isJsonObject()) throw new OrderException(400, "names must be an object or null", -1);
+        JsonObject o = e.getAsJsonObject();
+        JsonElement mode = o.get("mode");
+        String m = mode != null && mode.isJsonPrimitive() && mode.getAsJsonPrimitive().isString() ? mode.getAsString() : null;
+        if ("all".equals(m)) {
+            JsonElement n = o.get("name");
+            if (n == null || !n.isJsonPrimitive() || !n.getAsJsonPrimitive().isString()) {
+                throw new OrderException(400, "names.name must be a string", -1);
+            }
+            String name = checkName(n.getAsString(), "names.name");
+            if (name.isEmpty()) return null;
+            JsonObject out = new JsonObject();
+            out.addProperty("mode", "all");
+            out.addProperty("name", name);
+            return out;
+        }
+        if ("each".equals(m)) {
+            JsonElement list = o.get("names");
+            if (list == null || !list.isJsonArray()) throw new OrderException(400, "names.names must be an array", -1);
+            JsonArray a = list.getAsJsonArray();
+            if (a.size() > MAX_SHULKERS) throw new OrderException(400, "names.names has more than " + MAX_SHULKERS + " entries", -1);
+            List<String> names = new ArrayList<>();
+            int last = -1;
+            for (int i = 0; i < a.size(); i++) {
+                JsonElement n = a.get(i);
+                String name;
+                if (n.isJsonNull()) {
+                    name = "";
+                } else if (n.isJsonPrimitive() && n.getAsJsonPrimitive().isString()) {
+                    name = checkName(n.getAsString(), "names.names[" + i + "]");
+                } else {
+                    throw new OrderException(400, "names.names[" + i + "] must be a string", -1);
+                }
+                names.add(name);
+                if (!name.isEmpty()) last = i;
+            }
+            if (last < 0) return null;
+            JsonArray outList = new JsonArray();
+            for (int i = 0; i <= last; i++) outList.add(names.get(i));
+            JsonObject out = new JsonObject();
+            out.addProperty("mode", "each");
+            out.add("names", outList);
+            return out;
+        }
+        throw new OrderException(400, "names.mode must be \"all\" or \"each\"", -1);
+    }
+
+    /** The trimmed name ("" when blank), or 400 when it is too long or has § or a control character. */
+    private static String checkName(String raw, String field) throws OrderException {
+        String name = raw.strip();
+        if (name.length() > MAX_NAME) throw new OrderException(400, field + " is longer than " + MAX_NAME + " characters", -1);
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c == '§') throw new OrderException(400, field + " can't contain §", -1);
+            if (Character.isISOControl(c)) throw new OrderException(400, field + " can't contain control characters", -1);
+            // Invisible or direction-changing characters (bidi overrides, zero-width, line separators) and broken surrogates
+            int type = Character.getType(c);
+            if (type == Character.FORMAT || type == Character.LINE_SEPARATOR || type == Character.PARAGRAPH_SEPARATOR
+                || (type == Character.SURROGATE && !(Character.isHighSurrogate(c) && i + 1 < name.length() && Character.isLowSurrogate(name.charAt(i + 1)))
+                    && !(Character.isLowSurrogate(c) && i > 0 && Character.isHighSurrogate(name.charAt(i - 1))))) {
+                throw new OrderException(400, field + " can't contain invisible or direction-changing characters", -1);
+            }
+        }
+        return name;
     }
 
     /**

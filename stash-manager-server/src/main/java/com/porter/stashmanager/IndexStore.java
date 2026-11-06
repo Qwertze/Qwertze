@@ -33,6 +33,7 @@ public final class IndexStore {
     private static final int MAX_NAME_PART = 64;
 
     private final Path dir;
+    private final CreativeTabs tabs;
     private final Map<StashKey, Stash> stashes = new ConcurrentHashMap<>();
     private final Object createLock = new Object();
 
@@ -41,6 +42,10 @@ public final class IndexStore {
 
     /** What the icon proxy needs to fetch an id's icon. */
     public record IconInfo(String englishName, String mcVersion) {
+    }
+
+    /** A prepared index plus the bytes to write to disk (as the bot sent it, without the creative-tab fallback). */
+    private record Built(Prepared p, byte[] disk) {
     }
 
     /** A stored index ready to serve: the bytes and their ETag. */
@@ -104,12 +109,29 @@ public final class IndexStore {
     }
 
     /**
+     * Whether the bot can name shulkers: an anvil is set (and looks like one), its XP level (-1 = unknown), and where
+     * its anvil comes from ("set", "found", "placed" or "none"; null for an older bot that doesn't report it).
+     */
+    public record Naming(boolean anvil, int xpLevels, String anvilSource) {
+        public static final java.util.Set<String> ANVIL_SOURCES = java.util.Set.of("set", "found", "placed", "none");
+
+        public Naming(boolean anvil, int xpLevels) {
+            this(anvil, xpLevels, null);
+        }
+    }
+
+    /** Whether the bot can craft: auto-crafting is on, and a crafting table is set (and, if loaded, really is one). */
+    public record Crafting(boolean enabled, boolean table) {
+    }
+
+    /**
      * The bot-status fields of one heartbeat. A field is only changed when the heartbeat carried it
-     * (hasDelivery / hasBlocker), so an older addon that never sends them leaves them null.
+     * (hasDelivery / hasBlocker / hasNaming / hasCrafting), so an older addon that never sends them leaves them null.
      */
     public record BotStatus(boolean hasDelivery, Delivery delivery, boolean hasBlocker, String orderBlocker,
-                            long rescanDone, boolean hasRescanBlocked, String rescanBlocked) {
-        public static final BotStatus NONE = new BotStatus(false, null, false, null, -1, false, null);
+                            long rescanDone, boolean hasRescanBlocked, String rescanBlocked, boolean hasNaming, Naming naming,
+                            boolean hasCrafting, Crafting crafting) {
+        public static final BotStatus NONE = new BotStatus(false, null, false, null, -1, false, null, false, null, false, null);
     }
 
     /** A stash's stored player and when it was last seen, for adopting owners on load. */
@@ -144,6 +166,8 @@ public final class IndexStore {
         String player;
         long lastSeen;
         Delivery delivery;
+        Naming naming;
+        Crafting crafting;
         String orderBlocker;
         long rescanRequested; // latest rescan request id, 0 = none
         long rescanDone;      // highest id the bot acknowledged
@@ -161,14 +185,19 @@ public final class IndexStore {
     }
 
     public IndexStore(Path dataDir) {
+        this(dataDir, CreativeTabs.bundled());
+    }
+
+    IndexStore(Path dataDir, CreativeTabs tabs) {
         this.dir = dataDir.resolve("indexes");
+        this.tabs = tabs;
     }
 
     // ---------- loading ----------
 
     public void load() throws IOException {
         Files.createDirectories(dir);
-        record Loaded(Path file, Prepared p) {
+        record Loaded(Path file, Prepared p, byte[] disk) {
         }
         Map<StashKey, Loaded> newest = new HashMap<>();
         List<Path> superseded = new ArrayList<>();
@@ -184,12 +213,13 @@ public final class IndexStore {
                     JsonObject index = json.getAsJsonObject();
                     long receivedAt = isNumber(index, "receivedAt") ? index.get("receivedAt").getAsLong()
                         : Files.getLastModifiedTime(file).toMillis();
-                    Prepared p = prepare(index, receivedAt);
+                    Built b = prepare(index, receivedAt, tabs);
+                    Prepared p = b.p;
                     StashKey key = new StashKey(p.server, p.stash);
                     Loaded old = newest.get(key);
                     if (old == null || old.p.receivedAt < p.receivedAt) {
                         if (old != null) superseded.add(old.file);
-                        newest.put(key, new Loaded(file, p));
+                        newest.put(key, new Loaded(file, p, b.disk));
                     } else {
                         superseded.add(file);
                     }
@@ -213,7 +243,7 @@ public final class IndexStore {
             Path expected = dir.resolve(fileName(s.server, s.stash));
             keep.add(expected.getFileName());
             if (!l.file.getFileName().equals(expected.getFileName())) {
-                AtomicFiles.write(expected, l.p.bytes);
+                AtomicFiles.write(expected, l.disk);
                 superseded.add(l.file);
             }
         }
@@ -361,8 +391,10 @@ public final class IndexStore {
     /**
      * Merges items with the same key (counts are summed, the first entry's other fields kept), adds receivedAt,
      * serializes, and derives the fields the server needs. index must already pass {@link #validate}.
+     * The disk bytes are the index as the bot sent it; the served bytes also have the creative-tab fallback
+     * filled in (PROTOCOL.md, "creative tabs for bots that don't send them"), so a newer table fixes stored indexes.
      */
-    private static Prepared prepare(JsonObject index, long receivedAt) {
+    private static Built prepare(JsonObject index, long receivedAt, CreativeTabs tabs) {
         JsonArray items = index.getAsJsonArray("items");
         Map<String, JsonObject> byKey = new LinkedHashMap<>();
         Map<String, Long> counts = new HashMap<>();
@@ -423,10 +455,11 @@ public final class IndexStore {
             Map.copyOf(filledByItemKey), Map.copyOf(filledById));
 
         index.addProperty("receivedAt", receivedAt);
-        byte[] bytes = Json.GSON.toJson(index).getBytes(StandardCharsets.UTF_8);
+        byte[] disk = Json.GSON.toJson(index).getBytes(StandardCharsets.UTF_8);
+        byte[] bytes = tabs.fill(index) > 0 ? Json.GSON.toJson(index).getBytes(StandardCharsets.UTF_8) : disk;
         String mc = stringOrNull(index, "mcVersion");
         if (mc == null || !IconService.MC_VERSION.matcher(mc).matches()) mc = IconService.DEFAULT_MC;
-        return new Prepared(
+        return new Built(new Prepared(
             index.get("server").getAsString(),
             index.get("stash").getAsString(),
             stringOrNull(index, "player"),
@@ -440,7 +473,7 @@ public final class IndexStore {
             Map.copyOf(idNames),
             mc,
             orderCounts,
-            containers(index));
+            containers(index)), disk);
     }
 
     /** {known, total, stale} from the index's containers object (missing numbers are 0), or null. */
@@ -458,7 +491,8 @@ public final class IndexStore {
     /** Stores a validated index and writes it to disk. Serialization and the disk write happen outside the state lock. */
     public void putIndex(JsonObject index) throws IOException, FullException {
         long now = System.currentTimeMillis();
-        Prepared p = prepare(index, now);
+        Built b = prepare(index, now, tabs);
+        Prepared p = b.p;
         Stash s = getOrCreate(p.server, p.stash);
         long version;
         synchronized (s) {
@@ -470,7 +504,7 @@ public final class IndexStore {
         synchronized (s.writeLock) {
             // A newer index may already be on disk; never let an older one overwrite it.
             if (version <= s.writtenVersion) return;
-            AtomicFiles.write(dir.resolve(fileName(s.server, s.stash)), p.bytes);
+            AtomicFiles.write(dir.resolve(fileName(s.server, s.stash)), b.disk);
             s.writtenVersion = version;
         }
     }
@@ -483,6 +517,8 @@ public final class IndexStore {
             if (player != null) s.player = player;
             if (status.hasDelivery()) s.delivery = status.delivery();
             if (status.hasBlocker()) s.orderBlocker = status.orderBlocker();
+            if (status.hasNaming()) s.naming = status.naming();
+            if (status.hasCrafting()) s.crafting = status.crafting();
             if (status.hasRescanBlocked()) s.rescanBlocked = status.rescanBlocked();
             if (status.rescanDone() > s.rescanDone) s.rescanDone = status.rescanDone();
             boolean needIndex = s.index == null || indexHash == null || !indexHash.equals(s.index.indexHash);
@@ -536,6 +572,24 @@ public final class IndexStore {
                     o.add("delivery", d);
                 } else {
                     o.add("delivery", com.google.gson.JsonNull.INSTANCE);
+                }
+                if (s.naming != null) {
+                    JsonObject n = new JsonObject();
+                    n.addProperty("anvil", s.naming.anvil());
+                    n.addProperty("xpLevels", s.naming.xpLevels());
+                    if (s.naming.anvilSource() != null) n.addProperty("anvilSource", s.naming.anvilSource());
+                    else n.add("anvilSource", com.google.gson.JsonNull.INSTANCE);
+                    o.add("naming", n);
+                } else {
+                    o.add("naming", com.google.gson.JsonNull.INSTANCE);
+                }
+                if (s.crafting != null) {
+                    JsonObject c = new JsonObject();
+                    c.addProperty("enabled", s.crafting.enabled());
+                    c.addProperty("table", s.crafting.table());
+                    o.add("crafting", c);
+                } else {
+                    o.add("crafting", com.google.gson.JsonNull.INSTANCE);
                 }
                 o.addProperty("orderBlocker", s.orderBlocker);
                 o.addProperty("rescanPending", rescanPending(s));

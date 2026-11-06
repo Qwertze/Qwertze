@@ -1,0 +1,58 @@
+/* Stash Manager themes: design tokens only. Loaded before style.css, which uses nothing but these variables for
+   its UI chrome. The theme is picked per browser (localStorage "sm-theme") and set on <html data-theme> by
+   theme-init.js before this file loads. Classic is the default. */
+
+:root, [data-theme="classic"] {
+  --bg:#3b2a1e; --surface:#c6c6c6; --surface-2:#b5b5b5; --text:#111111; --muted:#3a3a3a;
+  --border:#1a1a1a; --border-w:2px; --accent:#3355cc; --on-accent:#ffffff;
+  --radius:0px; --pill:0px; --shadow:inset -3px -3px 0 #555555, inset 3px 3px 0 #ffffff;
+  --bar:#1f1f1f; --bar-text:#f2f2f2; --nav:#1f1f1f; --nav-text:#d6d6d6; --nav-active:#ffffff; --nav-active-bg:#4a4a4a;
+  --track-off:#6b6b6b; --hp:#d32f2f; --food:#b8732e; --chip-bg:#d9d9d9;
+  --ok-bg:#2e7d32; --ok-fg:#ffffff; --warn-bg:#c9a227; --warn-fg:#1a1a1a; --danger-bg:#b71c1c; --danger-fg:#ffffff;
+  --font:'Space Mono', ui-monospace, monospace;
+}
+[data-theme="modern"] {
+  --bg:#eef1f6; --surface:#ffffff; --surface-2:#f5f7fb; --text:#0f172a; --muted:#475569;
+  --border:#e2e8f0; --border-w:1px; --accent:#4f46e5; --on-accent:#ffffff;
+  --radius:16px; --pill:999px; --shadow:0 1px 2px rgba(15,23,42,.06), 0 6px 16px rgba(15,23,42,.06);
+  --bar:#ffffff; --bar-text:#0f172a; --nav:#ffffff; --nav-text:#475569; --nav-active:#4338ca; --nav-active-bg:#eef2ff;
+  --track-off:#cbd5e1; --hp:#ef4444; --food:#f59e0b; --chip-bg:#f1f5f9;
+  --ok-bg:#dcfce7; --ok-fg:#14532d; --warn-bg:#fef3c7; --warn-fg:#78350f; --danger-bg:#fee2e2; --danger-fg:#7f1d1d;
+  --font:'Inter', system-ui, sans-serif;
+}
+[data-theme="light"] {
+  --bg:#fafaf9; --surface:#ffffff; --surface-2:#f5f5f4; --text:#1c1917; --muted:#57534e;
+  --border:#d6d3d1; --border-w:1px; --accent:#0f766e; --on-accent:#ffffff;
+  --radius:8px; --pill:999px; --shadow:none;
+  --bar:#fafaf9; --bar-text:#1c1917; --nav:#ffffff; --nav-text:#57534e; --nav-active:#0f766e; --nav-active-bg:#ccfbf1;
+  --track-off:#d6d3d1; --hp:#dc2626; --food:#d97706; --chip-bg:#f5f5f4;
+  --ok-bg:#dcfce7; --ok-fg:#14532d; --warn-bg:#fef3c7; --warn-fg:#78350f; --danger-bg:#fee2e2; --danger-fg:#7f1d1d;
+  --font:'IBM Plex Sans', system-ui, sans-serif;
+}
+[data-theme="dark"] {
+  --bg:#0e1116; --surface:#171b22; --surface-2:#1f2530; --text:#e6e9ef; --muted:#a3adbb;
+  --border:#2a3140; --border-w:1px; --accent:#60a5fa; --on-accent:#0b1220;
+  --radius:12px; --pill:999px; --shadow:none;
+  --bar:#0e1116; --bar-text:#e6e9ef; --nav:#12161c; --nav-text:#a3adbb; --nav-active:#93c5fd; --nav-active-bg:#1e2a3d;
+  --track-off:#3a4252; --hp:#f87171; --food:#fbbf24; --chip-bg:#1f2530;
+  --ok-bg:#14301f; --ok-fg:#86efac; --warn-bg:#3a2e10; --warn-fg:#fcd34d; --danger-bg:#3b1416; --danger-fg:#fca5a5;
+  --font:'Inter', system-ui, sans-serif;
+}
+[data-theme="midnight"] {
+  --bg:#000000; --surface:#0a0a0a; --surface-2:#141414; --text:#f5f5f5; --muted:#a3a3a3;
+  --border:#262626; --border-w:1px; --accent:#f59e0b; --on-accent:#111111;
+  --radius:10px; --pill:999px; --shadow:none;
+  --bar:#000000; --bar-text:#f5f5f5; --nav:#000000; --nav-text:#a3a3a3; --nav-active:#fbbf24; --nav-active-bg:#1c1405;
+  --track-off:#333333; --hp:#ef4444; --food:#f59e0b; --chip-bg:#141414;
+  --ok-bg:#0b2414; --ok-fg:#86efac; --warn-bg:#2a1d05; --warn-fg:#fcd34d; --danger-bg:#2a0b0b; --danger-fg:#fca5a5;
+  --font:'JetBrains Mono', ui-monospace, monospace;
+}
+[data-theme="contrast"] {
+  --bg:#ffffff; --surface:#ffffff; --surface-2:#f0f0f0; --text:#000000; --muted:#1f1f1f;
+  --border:#000000; --border-w:2px; --accent:#0033cc; --on-accent:#ffffff;
+  --radius:4px; --pill:999px; --shadow:none;
+  --bar:#000000; --bar-text:#ffffff; --nav:#000000; --nav-text:#ffffff; --nav-active:#ffdd00; --nav-active-bg:#222222;
+  --track-off:#767676; --hp:#a00000; --food:#7a4a00; --chip-bg:#ffffff;
+  --ok-bg:#006b1f; --ok-fg:#ffffff; --warn-bg:#ffdd00; --warn-fg:#000000; --danger-bg:#a00000; --danger-fg:#ffffff;
+  --font:'Atkinson Hyperlegible', system-ui, sans-serif;
+}

@@ -1,5 +1,7 @@
 package com.porter.qwerte.modules;
 
+import com.porter.qwerte.craft.AnvilFinder;
+import com.porter.qwerte.craft.CraftPlanner;
 import com.porter.qwerte.stash.Kit;
 import com.porter.qwerte.stash.Kits;
 import com.porter.qwerte.stash.Order;
@@ -7,6 +9,7 @@ import com.porter.qwerte.stash.Stash;
 import com.porter.qwerte.stash.Stash.Box;
 import com.porter.qwerte.stash.StashIndex;
 import meteordevelopment.meteorclient.utils.Utils;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.world.item.ItemStack;
 
@@ -55,9 +58,27 @@ final class OrderRunner {
         Set<Integer> carry();
 
         void say(String text);
+
+        /** Why a shulker can't be named now (no anvil set, not an anvil any more, no XP levels), or null when it can. */
+        String anvilProblem();
+
+        /** The anvil position, or null. */
+        BlockPos anvilPos();
+
+        /** The crafter of the sorter. */
+        Crafter crafter();
+
+        /** enable-crafting is on. */
+        boolean craftingOn();
+
+        /** Why nothing can be crafted now (no crafting table, it is gone, it failed for this order), or null. */
+        String craftBlocker();
+
+        /** No anvil is set or remembered, or the one that was is gone: one is to be found or placed before naming. */
+        boolean anvilMissing();
     }
 
-    sealed interface Intent permits Idle, Build, Fetch, Deliver {}
+    sealed interface Intent permits Idle, Build, Fetch, Deliver, Rename, Craft, FindAnvil {}
 
     /** Nothing for the sorter to do for the order now. */
     record Idle() implements Intent {}
@@ -70,6 +91,15 @@ final class OrderRunner {
 
     /** Open the delivery container and put the order's shulkers in. */
     record Deliver(Box box) implements Intent {}
+
+    /** Walk to the anvil and give the shulker in this inventory slot the name. A failure is told with {@link #nameFailed}. */
+    record Rename(BlockPos anvil, String name, int slot) implements Intent {}
+
+    /** Craft this many plain shulker boxes (0: carry on with the crafting in hand). A failure is told with {@link #craftEnded}. */
+    record Craft(int count) implements Intent {}
+
+    /** Look for an anvil in the stash area, or take one from the stash and place it. The outcome is told with {@link #anvilFound}. */
+    record FindAnvil() implements Intent {}
 
     enum State { Running, Delivered, Failed, Cancelled }
 
@@ -89,6 +119,18 @@ final class OrderRunner {
         Kit kit;
         boolean have, built, confirmed, verified, verifying, replanned;
         int fullTries, starts, fetches, begins, base;
+        // The name this shulker is to get (null: none), and how naming it went
+        String name, unnamedReason;
+        boolean nameDone, named;
+        int nameTries;
+        // How often crafting an empty shulker for this unit was started
+        int craftTries;
+        // How often an anvil was looked for on behalf of this unit
+        int anvilTries;
+        // The shulker's own name before it was renamed (null: it had none), to recognise it afterwards
+        net.minecraft.network.chat.Component origName;
+        // The key the shulker has with its new name (packed and empty shulkers), kept in the saved plan
+        String namedKey;
         Map<String, Integer> content = Map.of();
         // Lot totals by key, to recognise a finished shulker before the kit exists
         Map<String, Integer> lotTotals;
@@ -119,6 +161,11 @@ final class OrderRunner {
     private static final long REREAD_TIMEOUT_MS = 10 * 60 * 1000L;
     private static final int MAX_FULL_TRIES = 2;
     private static final int MAX_STARTS = 8;
+    private static final int MAX_NAME_TRIES = 2;
+    private static final int MAX_CRAFT_TRIES = 2;
+    private static final String SHULKER_BOX = "minecraft:shulker_box";
+    /** The server keeps this much of an order's message. */
+    private static final int MESSAGE_MAX = 300;
 
     private final KitBuilder kits;
     private final Owner owner;
@@ -130,7 +177,15 @@ final class OrderRunner {
     private int shulkersDelivered;
     private final Map<String, Integer> delivered = new LinkedHashMap<>();
     private final List<String> problems = new ArrayList<>();
+    // Shulkers delivered without the name they were meant to get, and the distinct reasons
+    private int unnamed;
+    private final List<String> unnamedReasons = new ArrayList<>();
     private String message = "";
+    // Shulker boxes crafted for this order, and why crafting was given up on for it (null: not)
+    private int craftedTotal;
+    private String craftFailure;
+    // No anvil could be found or placed for this order: later shulkers go unnamed at once
+    private boolean anvilNone;
     private String phase = "starting";
     private boolean cancelRequested, parked;
     private long pausedSince;
@@ -183,6 +238,13 @@ final class OrderRunner {
         shulkersDelivered = 0;
         delivered.clear();
         problems.clear();
+        unnamed = 0;
+        unnamedReasons.clear();
+        craftedTotal = 0;
+        craftFailure = null;
+        anvilNone = false;
+        endCrafting("the order was left");
+        owner.crafter().release();
         cancelRequested = false;
         parked = false;
         pausedSince = 0;
@@ -219,7 +281,12 @@ final class OrderRunner {
         shulkersDelivered = 0;
         delivered.clear();
         problems.clear();
+        unnamed = 0;
+        unnamedReasons.clear();
         message = "";
+        craftedTotal = 0;
+        craftFailure = null;
+        anvilNone = false;
         cancelRequested = false;
         parked = false;
         pausedSince = 0;
@@ -239,6 +306,8 @@ final class OrderRunner {
                 problems.clear();
                 delivered.clear();
                 shulkersDelivered = 0;
+                unnamed = 0;
+                unnamedReasons.clear();
                 return why;
             }
         }
@@ -264,12 +333,20 @@ final class OrderRunner {
             for (Stash.ActiveOrder.UnitPlan p : saved.units) {
                 List<Order.Lot> lots = new ArrayList<>();
                 for (int i = 0; i < p.lotKeys.size(); i++) lots.add(new Order.Lot(p.lotKeys.get(i), p.lotCounts.get(i)));
-                plan.add(new Unit(p.kind == 0 ? Kind.Shulker : p.kind == 1 ? Kind.Empty : Kind.Bin, p.key, lots));
+                Unit restored = new Unit(p.kind == 0 ? Kind.Shulker : p.kind == 1 ? Kind.Empty : Kind.Bin, p.key, lots);
+                restored.nameDone = p.nameDone;
+                restored.named = p.named;
+                restored.unnamedReason = p.nameFailure == null || p.nameFailure.isEmpty() ? null : p.nameFailure;
+                restored.namedKey = p.namedKey == null || p.namedKey.isEmpty() ? null : p.namedKey;
+                plan.add(restored);
             }
             start = Math.min(saved.done, plan.size());
             // What was delivered before counts even if the rest cannot be done now
             shulkersDelivered = saved.shulkersDelivered;
             delivered.putAll(saved.delivered);
+            unnamed = saved.unnamed;
+            unnamedReasons.addAll(saved.unnamedReasons);
+            craftedTotal = saved.crafted;
         }
         else {
             String why = planFresh(stash, o, plan, notes);
@@ -278,6 +355,10 @@ final class OrderRunner {
 
         String why = checkEmpties(plan.subList(start, plan.size()));
         if (why != null) return why;
+
+        // The names follow the plan by position; a resume keeps the names it saved
+        Order.Names names = resumed && !saved.namesMode.isEmpty() ? Order.Names.of(saved.namesMode, saved.namesAll, saved.namesEach) : o.names;
+        for (int i = 0; i < plan.size(); i++) plan.get(i).name = names == null ? null : names.nameFor(i);
 
         units.clear();
         units.addAll(plan);
@@ -300,6 +381,11 @@ final class OrderRunner {
                     p.lotCounts.add(lot.count());
                 }
                 active.units.add(p);
+            }
+            if (names != null) {
+                active.namesMode = names.mode();
+                active.namesAll = names.all();
+                active.namesEach.addAll(names.each());
             }
             stash.activeOrder = active;
             stash.save();
@@ -379,7 +465,10 @@ final class OrderRunner {
         return null;
     }
 
-    /** Whether the empty shulkers in the stash are enough for the units still to do, kind by kind. */
+    /**
+     * Whether the empty shulkers in the stash are enough for the units still to do, kind by kind. Plain shulker boxes that
+     * are short can be crafted, when crafting is on and the plan for them goes through.
+     */
     private String checkEmpties(List<Unit> remaining) {
         int bins = 0;
         Map<String, Integer> need = new HashMap<>();
@@ -396,13 +485,128 @@ final class OrderRunner {
             if (k != null) have.merge(k, 1, Integer::sum);
             total++;
         }
-        int asked = 0;
+        int asked = 0, plainShort = 0;
+        String old = null;
         for (var e : need.entrySet()) {
-            asked += e.getValue();
-            if (have.getOrDefault(e.getKey(), 0) < e.getValue()) return "need " + e.getValue() + " empty shulkers of one kind, have " + have.getOrDefault(e.getKey(), 0);
+            int got = have.getOrDefault(e.getKey(), 0);
+            asked += Math.min(e.getValue(), got);
+            if (got >= e.getValue()) continue;
+            if (!e.getKey().equals(SHULKER_BOX)) return "need " + e.getValue() + " empty shulkers of one kind, have " + got;
+            plainShort += e.getValue() - got;
+            if (old == null) old = "need " + e.getValue() + " empty shulkers of one kind, have " + got;
         }
-        if (bins > total - asked) return "need " + (bins + asked) + " empty shulkers, have " + total;
+        int binShort = Math.max(0, bins - (total - asked));
+        int shortfall = plainShort + binShort;
+        if (shortfall == 0) return null;
+        if (binShort > 0) old = "need " + (bins + asked) + " empty shulkers, have " + total;
+
+        if (!owner.craftingOn()) return old;
+        String blocked = owner.craftBlocker();
+        if (blocked != null) return old + "; couldn't craft: " + blocked;
+        var result = owner.crafter().preview(SHULKER_BOX, shortfall, craftedTotal, craftPool(remaining), true);
+        if (!result.ok()) return old + "; couldn't craft: " + result.refusal();
+        if (result.plan().count() < shortfall) return old + "; couldn't craft enough: " + (result.plan().limited() == null ? CraftPlanner.NOT_ENOUGH : result.plan().limited());
         return null;
+    }
+
+    /**
+     * What crafts may use up: the stash, less the items the units still to do need for their shulkers. One pool, used by
+     * the plan, the replan and the run.
+     */
+    Map<String, Long> craftPool() {
+        return craftPool(index < units.size() ? units.subList(index, units.size()) : List.of());
+    }
+
+    private Map<String, Long> craftPool(List<Unit> remaining) {
+        Map<String, Long> pool = owner.crafter().survey();
+        for (Unit u : remaining) {
+            for (Order.Lot lot : u.lots) {
+                String key = lot.key();
+                int hash = key.indexOf('#');
+                pool.merge(hash < 0 ? key : key.substring(0, hash), -(long) lot.count(), Long::sum);
+            }
+        }
+        pool.values().removeIf(n -> n <= 0);
+        return pool;
+    }
+
+    /**
+     * Crafting in hand is given up on when the order ends: the crafter is aborted, and the sorter drives the session to its
+     * end by the normal path (the grid is emptied, what was gathered is put back).
+     */
+    private void endCrafting(String why) {
+        Crafter crafter = owner.crafter();
+        if (crafter.active()) crafter.abort(why);
+    }
+
+    /** The order cannot go on (the crafting window cannot be closed): it ends with this reason. */
+    void abortOrder(String why) {
+        if (!running()) return;
+        finish(shulkersDelivered > 0 ? State.Delivered : State.Failed, why);
+    }
+
+    /** The index keys of the lots the units still to do need: stacks of these are the last to be taken for a craft. */
+    Set<String> lotKeys() {
+        Set<String> keys = new HashSet<>();
+        for (int i = Math.max(0, index); i < units.size(); i++) for (Order.Lot lot : units.get(i).lots) keys.add(lot.key());
+        return keys;
+    }
+
+    /** An anvil was looked for: found, placed, or not to be had (then the shulkers of this order go unnamed). */
+    void anvilFound(boolean ok) {
+        if (order == null) return;
+        if (!ok) anvilNone = true;
+        epoch++;
+    }
+
+    /** Shulker boxes crafted for the order so far. */
+    int crafted() {
+        return craftedTotal;
+    }
+
+    /** The crafting the sorter ran for the order is over: this many boxes were made, and this is why not more. */
+    void craftEnded(Crafter.Outcome outcome) {
+        if (order == null) return;
+        craftedTotal += outcome.crafted();
+        Stash stash = owner.stash();
+        if (stash != null && stash.activeOrder != null && stash.activeOrder.id.equals(order.id)) {
+            stash.activeOrder.crafted = craftedTotal;
+            stash.markDirty();
+            stash.save();
+        }
+        if (outcome.failure() != null) {
+            com.porter.qwerte.QwerteAddon.LOG.info("orders: crafting ended: {}", outcome.failure());
+            // Nothing made: not tried again for this order
+            if (outcome.crafted() == 0) craftFailure = outcome.failure();
+            else problems.add("crafting stopped: " + outcome.failure());
+        }
+        epoch++;
+    }
+
+    /**
+     * The craft step for a unit that needs an empty plain shulker box and has none, or null (crafting is off).
+     * When crafting was tried and failed, the unit is skipped with the reason and an Idle is returned.
+     */
+    private Intent craftFor(Unit u, int pending) {
+        if (!owner.craftingOn()) return null;
+        String why = craftFailure != null ? craftFailure : u.craftTries >= MAX_CRAFT_TRIES ? "tries used up" : owner.craftBlocker();
+        if (why != null) {
+            skip("no empty shulker; couldn't craft one: " + why);
+            return new Idle();
+        }
+        u.craftTries++;
+        phase = "crafting " + (index + 1) + "/" + units.size();
+        return new Craft(Math.max(1, pending));
+    }
+
+    /** Empty boxes still wanted by the units from here on: bins and plain empty lines. */
+    private int pendingEmpties() {
+        int n = 0;
+        for (int i = index; i < units.size(); i++) {
+            Unit u = units.get(i);
+            if (u.kind == Kind.Bin && !u.built || u.kind == Kind.Empty && u.key.equals(SHULKER_BOX)) n++;
+        }
+        return n;
     }
 
     /** The server wants this order stopped. It is acted on at the next safe point. */
@@ -513,20 +717,77 @@ final class OrderRunner {
 
     private boolean matches(Unit u, ItemStack stack) {
         if (stack.isEmpty() || !Utils.isShulker(stack.getItem())) return false;
+        // The shulker with the name the order gave it is still the order's
+        boolean ours = isOurName(u, stack);
         switch (u.kind) {
             case Bin -> {
-                if (stack.has(DataComponents.CUSTOM_NAME)) return false;
+                if (stack.has(DataComponents.CUSTOM_NAME) && !ours) return false;
                 if (u.kit != null) return u.kit.matchesFinished(Kits.inside(stack));
                 return matchesLots(u, stack);
             }
             case Shulker -> {
-                return u.key.equals(StashIndex.groupKey(stack));
+                return keyMatches(u, stack, ours);
             }
             default -> {
                 for (ItemStack s : Kits.inside(stack)) if (s != null && !s.isEmpty()) return false;
-                return u.key.equals(StashIndex.keyOf(stack));
+                return keyMatches(u, stack, ours);
             }
         }
+    }
+
+    private static String keyOf(Unit u, ItemStack stack) {
+        return u.kind == Kind.Shulker ? StashIndex.groupKey(stack) : u.kind == Kind.Empty ? StashIndex.keyOf(stack) : null;
+    }
+
+    /**
+     * The stack is the unit's by key: as planned, as seen after the rename, or (when it has the order's name) as it was
+     * before the name: with its own name from before the rename, with none, or already the same as the name.
+     */
+    private boolean keyMatches(Unit u, ItemStack stack, boolean ours) {
+        String k = keyOf(u, stack);
+        if (k == null) return false;
+        if (u.key.equals(k) || k.equals(u.namedKey)) return true;
+        if (!ours) return false;
+        ItemStack plain = stack.copy();
+        if (u.origName != null) {
+            plain.set(DataComponents.CUSTOM_NAME, u.origName);
+            if (u.key.equals(keyOf(u, plain))) return true;
+        }
+        plain.remove(DataComponents.CUSTOM_NAME);
+        return u.key.equals(keyOf(u, plain));
+    }
+
+    /** The shulker carries its name: noted, and kept in the saved plan. */
+    private void noteNamed(Unit u, ItemStack stack) {
+        u.nameDone = u.named = true;
+        u.namedKey = keyOf(u, stack);
+        saveUnit(u);
+    }
+
+    /** Keeps how naming went for this unit in the saved plan, for a resume. */
+    private void saveUnit(Unit u) {
+        Stash stash = owner.stash();
+        int i = units.indexOf(u);
+        if (stash == null || order == null || stash.activeOrder == null || !stash.activeOrder.id.equals(order.id) || i < 0 || i >= stash.activeOrder.units.size()) return;
+        Stash.ActiveOrder.UnitPlan p = stash.activeOrder.units.get(i);
+        p.nameDone = u.nameDone;
+        p.named = u.named;
+        p.nameFailure = u.unnamedReason == null ? "" : u.unnamedReason;
+        p.namedKey = u.namedKey == null ? "" : u.namedKey;
+        stash.markDirty();
+        stash.save();
+    }
+
+    /** The id of the order in hand, or null. */
+    String orderId() {
+        return order == null ? null : order.id;
+    }
+
+    /** The stack carries the custom name this unit is to be given. */
+    private static boolean isOurName(Unit u, ItemStack stack) {
+        if (u.name == null || !Order.valid(u.name)) return false;
+        net.minecraft.network.chat.Component custom = stack.get(DataComponents.CUSTOM_NAME);
+        return custom != null && custom.getString().equals(u.name);
     }
 
     /** A finished shulker of a bin whose kit is not built yet (after a restart): exactly the planned totals. */
@@ -571,6 +832,8 @@ final class OrderRunner {
         if (!running() || index >= units.size()) return;
         Unit u = units.get(index);
         if (u.have && countIn(u, contents) > u.base) u.confirmed = true;
+        // It reached the container with the name: it was named, whatever was noted about it before
+        if (u.name != null && !u.named) for (ItemStack s : contents) if (matches(u, s) && isOurName(u, s)) u.named = true;
     }
 
     private int countIn(Unit u, ItemStack[] contents) {
@@ -623,6 +886,12 @@ final class OrderRunner {
             return new Idle();
         }
 
+        // Crafting in hand carries on until it is over
+        if (owner.crafter().active()) {
+            phase = "crafting " + (index + 1) + "/" + units.size();
+            return new Craft(0);
+        }
+
         skips = 0;
         for (int guard = 0; guard < 64; guard++) {
             // Units that cannot be done are skipped a few per tick, not all at once
@@ -649,6 +918,12 @@ final class OrderRunner {
                 // Back in the inventory: whatever was seen in the container was not it
                 u.confirmed = false;
                 u.verifying = false;
+                // It already shows the name (an earlier try that looked like a failure, a resume): named
+                if (u.name != null && !u.named && isOurName(u, mc.player.getInventory().getItem(slot))) noteNamed(u, mc.player.getInventory().getItem(slot));
+                if (!u.nameDone) {
+                    Intent rename = naming(u, slot);
+                    if (rename != null) return rename;
+                }
                 if (full) {
                     full = false;
                     u.fullTries++;
@@ -670,6 +945,11 @@ final class OrderRunner {
                 if (u.confirmed) {
                     for (var e : u.content.entrySet()) delivered.merge(e.getKey(), e.getValue(), Integer::sum);
                     shulkersDelivered++;
+                    if (u.name != null && !u.named) {
+                        unnamed++;
+                        String reason = u.unnamedReason == null ? "naming didn't finish" : u.unnamedReason;
+                        if (!unnamedReasons.contains(reason)) unnamedReasons.add(reason);
+                    }
                     advance();
                 }
                 else if (!u.verified) {
@@ -691,6 +971,12 @@ final class OrderRunner {
                     continue;
                 }
                 if (!kits.active()) {
+                    // No empty shulker to build in: one is crafted, when crafting is on
+                    if (owner.craftingOn() && owner.crafter().craftedBase() < 0 && kits.emptyShulkers().isEmpty()) {
+                        Intent craft = craftFor(u, pendingEmpties());
+                        if (craft instanceof Idle) continue;
+                        if (craft != null) return craft;
+                    }
                     if (u.kit == null) u.kit = buildKit(u);
                     epoch++;
                     if (u.kit == null) {
@@ -747,6 +1033,11 @@ final class OrderRunner {
                 continue;
             }
             Fetch fetch = locate(u);
+            if (fetch == null && u.kind == Kind.Empty && u.key.equals(SHULKER_BOX)) {
+                Intent craft = craftFor(u, pendingEmpties());
+                if (craft instanceof Idle) continue;
+                if (craft != null) return craft;
+            }
             if (fetch == null) {
                 skip(u.kind == Kind.Shulker ? "a packed shulker is no longer in the stash" : "no empty shulker of that kind is left");
                 continue;
@@ -756,6 +1047,58 @@ final class OrderRunner {
             return fetch;
         }
         return new Idle();
+    }
+
+    /**
+     * The rename step for a finished shulker that is to be named, or null when it is named already, is not to be named,
+     * or can't be. Naming never fails or pauses the order: such a shulker is delivered unnamed, and the reason is noted.
+     */
+    private Intent naming(Unit u, int slot) {
+        if (u.name == null) {
+            u.nameDone = true;
+            return null;
+        }
+        ItemStack stack = mc.player.getInventory().getItem(slot);
+        if (isOurName(u, stack)) {
+            noteNamed(u, stack);
+            return null;
+        }
+        String why = !Order.valid(u.name) ? "a name that breaks the rules" : null;
+        // No anvil set or remembered, or it is gone: one is found in the area, or taken from the stash and placed (once per
+        // shulker). When that fails the shulker goes unnamed with the reason, and so do the rest of the order's
+        if (why == null && owner.anvilMissing()) {
+            if (anvilNone || u.anvilTries >= 1) why = AnvilFinder.NONE;
+            else {
+                u.anvilTries++;
+                phase = "finding an anvil " + (index + 1) + "/" + units.size();
+                return new FindAnvil();
+            }
+        }
+        if (why == null) why = owner.anvilProblem();
+        BlockPos anvil = owner.anvilPos();
+        if (why == null && anvil == null) why = AnvilFinder.NONE;
+        if (why == null && u.nameTries >= MAX_NAME_TRIES) why = "naming didn't finish";
+        if (why != null) {
+            u.nameDone = true;
+            u.unnamedReason = why;
+            saveUnit(u);
+            com.porter.qwerte.QwerteAddon.LOG.info("orders: shulker {} goes unnamed: {}", index + 1, why);
+            return null;
+        }
+        u.nameTries++;
+        u.origName = stack.get(DataComponents.CUSTOM_NAME);
+        phase = "naming " + (index + 1) + "/" + units.size();
+        return new Rename(anvil, u.name, slot);
+    }
+
+    /** The rename of the current shulker is given up on for this reason: it is delivered unnamed. */
+    void nameFailed(String reason) {
+        if (!running() || index >= units.size()) return;
+        Unit u = units.get(index);
+        u.nameDone = true;
+        u.unnamedReason = reason;
+        saveUnit(u);
+        epoch++;
     }
 
     private boolean orderKitActive() {
@@ -841,7 +1184,28 @@ final class OrderRunner {
             String reason = survey.why().get(e.getKey());
             problems.add(StashIndex.nameOf(e.getKey()) + ": " + e.getValue() + " missing, not enough of any one variant left" + (reason == null ? "" : " (some " + reason + ")"));
         }
-        return n == 0 ? null : new Kit("order " + order.id + " #" + (index + 1), stacks, true);
+        if (n == 0) return null;
+
+        // What the kit builder can really take may differ from this survey (it has its own scan of the same stash): a lot it
+        // cannot supply is dropped, so the lots that can be supplied still pack and ship short, with a note
+        Kit probe = new Kit("order " + order.id + " #" + (index + 1), stacks, true);
+        Map<Kit.Key, Integer> supply = kits.supply(probe);
+        Map<Kit.Key, Integer> left = new HashMap<>(supply);
+        ItemStack[] trimmed = new ItemStack[Kit.SLOTS];
+        int m = 0;
+        Map<String, Integer> cut = new LinkedHashMap<>();
+        for (int i = 0; i < n; i++) {
+            ItemStack st = stacks[i];
+            Kit.Key key = probe.key(st);
+            int have = left.getOrDefault(key, 0);
+            int take = Math.min(st.getCount(), have);
+            left.put(key, have - take);
+            if (take < st.getCount()) cut.merge(StashIndex.nameOf(StashIndex.keyOf(st)), st.getCount() - take, Integer::sum);
+            if (take > 0) trimmed[m++] = st.copyWithCount(take);
+        }
+        for (var e : cut.entrySet()) problems.add(e.getKey() + ": " + e.getValue() + " couldn't be taken out of the stash, shipped short");
+        if (m == 0) return null;
+        return m == n && cut.isEmpty() ? probe : new Kit(probe.name, trimmed, true);
     }
 
     private void skip(String why) {
@@ -857,6 +1221,9 @@ final class OrderRunner {
         if (stash != null && stash.activeOrder != null && order != null && stash.activeOrder.id.equals(order.id)) {
             stash.activeOrder.done = index;
             stash.activeOrder.shulkersDelivered = shulkersDelivered;
+            stash.activeOrder.unnamed = unnamed;
+            stash.activeOrder.unnamedReasons.clear();
+            stash.activeOrder.unnamedReasons.addAll(unnamedReasons);
             stash.activeOrder.delivered.clear();
             stash.activeOrder.delivered.putAll(delivered);
             stash.markDirty();
@@ -1040,10 +1407,23 @@ final class OrderRunner {
         if (order == null || state != State.Running) return;
         kits.dropOrderKit();
         state = end;
+        endCrafting("the order ended");
+        owner.crafter().release();
+        if (craftedTotal > 0) text = (text.isEmpty() ? "" : text + "; ") + "crafted " + craftedTotal + " Shulker Box";
+        String unnamedNote = Order.unnamedNote(unnamed, unnamedReasons);
+        if (!unnamedNote.isEmpty() && !text.contains(unnamedNote)) text = text.isEmpty() ? unnamedNote : text + "; " + unnamedNote;
+        text = cut(text);
         message = text;
         phase = end.name().toLowerCase();
         epoch++;
         say("Order " + order.id + " " + phase + (text.isEmpty() ? "." : ": " + text));
+    }
+
+    /** The message cut at 300 characters on a word, as the plugin does. */
+    private static String cut(String note) {
+        if (note.length() <= MESSAGE_MAX) return note;
+        int cut = note.lastIndexOf(' ', MESSAGE_MAX - 4);
+        return note.substring(0, cut > MESSAGE_MAX / 2 ? cut : MESSAGE_MAX - 4) + " ...";
     }
 
     private void say(String text) {

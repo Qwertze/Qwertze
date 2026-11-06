@@ -133,7 +133,8 @@ final class AddonRoutes {
     }
 
     /**
-     * The optional delivery / orderBlocker fields (PROTOCOL.md, "Additions: delivery status and order size").
+     * The optional delivery / orderBlocker fields (PROTOCOL.md, "Additions: delivery status and order size") and
+     * naming (PROTOCOL.md, "Additions: shulker names") and crafting (PROTOCOL.md, "Additions: crafting").
      * A field that is absent leaves the stored value alone; an explicit null clears it.
      */
     static IndexStore.BotStatus botStatus(JsonObject o) {
@@ -173,7 +174,47 @@ final class AddonRoutes {
             if (rescanBlocked == null) throw new IllegalArgumentException("rescanBlocked must be a string or null");
             rescanBlocked = rescanBlocked.isEmpty() ? null : Http.truncate(rescanBlocked, MAX_STATUS);
         }
-        return new IndexStore.BotStatus(hasDelivery, delivery, hasBlocker, blocker, rescanDone, hasRescanBlocked, rescanBlocked);
+        boolean hasNaming = o.has("naming");
+        IndexStore.Naming naming = null;
+        if (hasNaming && !o.get("naming").isJsonNull()) {
+            if (!o.get("naming").isJsonObject()) throw new IllegalArgumentException("naming must be {anvil, xpLevels} or null");
+            JsonObject n = o.getAsJsonObject("naming");
+            JsonElement anvil = n.get("anvil");
+            if (anvil == null || !anvil.isJsonPrimitive() || !anvil.getAsJsonPrimitive().isBoolean()) {
+                throw new IllegalArgumentException("naming.anvil must be true or false");
+            }
+            int xp = -1;
+            if (n.has("xpLevels") && !n.get("xpLevels").isJsonNull()) {
+                Integer x = wholeInt(n.get("xpLevels"));
+                if (x == null || x < -1) throw new IllegalArgumentException("naming.xpLevels must be a whole number >= -1");
+                xp = x;
+            }
+            String anvilSource = null; // absent or null: an older bot that doesn't report it
+            if (n.has("anvilSource") && !n.get("anvilSource").isJsonNull()) {
+                JsonElement src = n.get("anvilSource");
+                anvilSource = src.isJsonPrimitive() && src.getAsJsonPrimitive().isString() ? src.getAsString() : null;
+                if (anvilSource == null || !IndexStore.Naming.ANVIL_SOURCES.contains(anvilSource)) {
+                    throw new IllegalArgumentException("naming.anvilSource must be \"set\", \"found\", \"placed\" or \"none\"");
+                }
+            }
+            naming = new IndexStore.Naming(anvil.getAsBoolean(), xp, anvilSource);
+        }
+        boolean hasCrafting = o.has("crafting");
+        IndexStore.Crafting crafting = null;
+        if (hasCrafting && !o.get("crafting").isJsonNull()) {
+            if (!o.get("crafting").isJsonObject()) throw new IllegalArgumentException("crafting must be {enabled, table} or null");
+            JsonObject c = o.getAsJsonObject("crafting");
+            JsonElement enabled = c.get("enabled"), table = c.get("table");
+            if (enabled == null || !enabled.isJsonPrimitive() || !enabled.getAsJsonPrimitive().isBoolean()) {
+                throw new IllegalArgumentException("crafting.enabled must be true or false");
+            }
+            if (table == null || !table.isJsonPrimitive() || !table.getAsJsonPrimitive().isBoolean()) {
+                throw new IllegalArgumentException("crafting.table must be true or false");
+            }
+            crafting = new IndexStore.Crafting(enabled.getAsBoolean(), table.getAsBoolean());
+        }
+        return new IndexStore.BotStatus(hasDelivery, delivery, hasBlocker, blocker, rescanDone, hasRescanBlocked, rescanBlocked,
+            hasNaming, naming, hasCrafting, crafting);
     }
 
     /** A whole number in int range (1.0 is fine, 1.5 isn't), or null. */

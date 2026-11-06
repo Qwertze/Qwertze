@@ -145,14 +145,69 @@ final class ModelRasterizer {
                 faces.add(face);
             }
         }
+        return rasterAll(faces, size);
+    }
+
+    // ------------------------------------------------------------------ special (entity) models
+
+    /**
+     * Renders {@link SpecialModels} quads (block space 0..1) with a base model's display.gui transform and
+     * light setting. Returns null if nothing can be drawn.
+     */
+    static int[] quads(List<SpecialModels.Quad> quads, IconRenderer.Model base,
+                       Function<String, Optional<IconRenderer.Tex>> textures, int size) {
+        double[][] rot = mul(mul(rotXm(Math.toRadians(base.guiRotation()[0])), rotYm(Math.toRadians(base.guiRotation()[1]))),
+                rotZm(Math.toRadians(base.guiRotation()[2])));
+        float[] sc = base.guiScale(), tr = base.guiTranslation();
+        List<Face> faces = new ArrayList<>();
+        for (SpecialModels.Quad q : quads) {
+            Optional<IconRenderer.Tex> tex = textures.apply(q.texture());
+            if (tex.isEmpty()) continue;
+            double[] p0 = view(rot, sc, tr, q.p());
+            double[] a = mul(rot, new double[]{q.a()[0] * sc[0], q.a()[1] * sc[1], q.a()[2] * sc[2]});
+            double[] b = mul(rot, new double[]{q.b()[0] * sc[0], q.b()[1] * sc[1], q.b()[2] * sc[2]});
+            if (Math.abs(cross(a, b)[0]) + Math.abs(cross(a, b)[1]) + Math.abs(cross(a, b)[2]) < 1e-12) continue; // degenerate
+            // Normals transform with the inverse scale; a negative scale component flips them like the geometry.
+            double[] n = mul(rot, new double[]{q.n()[0] / nz(sc[0]), q.n()[1] / nz(sc[1]), q.n()[2] / nz(sc[2])});
+            n = normalize(n);
+            if (n[2] <= 1e-6) continue; // facing away from the viewer
+            Face face = new Face();
+            face.px = (p0[0] + 0.5) * size; face.py = (0.5 - p0[1]) * size; face.pz = p0[2];
+            face.ax = a[0] * size; face.ay = -a[1] * size; face.az = a[2];
+            face.bx = b[0] * size; face.by = -b[1] * size; face.bz = b[2];
+            face.u0 = q.u0(); face.v0 = q.v0(); face.u1 = q.u1(); face.v1 = q.v1();
+            face.rotation = 0;
+            face.tex = tex.get();
+            face.tint = q.tint();
+            face.shade = base.frontLight() ? 1f : light(n);
+            face.translucent = hasTranslucency(face.tex);
+            face.depth = face.pz + 0.5 * face.az + 0.5 * face.bz;
+            faces.add(face);
+        }
+        return rasterAll(faces, size);
+    }
+
+    /** Block-space point (0..1) -> centred, display-scaled, rotated and translated view space. */
+    private static double[] view(double[][] rot, float[] sc, float[] tr, double[] p) {
+        double[] q = mul(rot, new double[]{(p[0] - 0.5) * sc[0], (p[1] - 0.5) * sc[1], (p[2] - 0.5) * sc[2]});
+        return new double[]{q[0] + tr[0] / 16.0, q[1] + tr[1] / 16.0, q[2] + tr[2] / 16.0};
+    }
+
+    private static double nz(float s) {
+        return Math.abs(s) < 1e-6 ? 1e-6 : s;
+    }
+
+    /** Z-buffered opaque pass in list order (later faces win ties), then translucent faces back to front. */
+    private static int[] rasterAll(List<Face> faces, int size) {
         if (faces.isEmpty()) return null;
 
         int[] color = new int[size * size];
         float[] zbuf = new float[size * size];
         java.util.Arrays.fill(zbuf, Float.NEGATIVE_INFINITY);
         for (Face f : faces) raster(f, size, color, zbuf, false);
-        faces.sort((x, y) -> Double.compare(x.depth, y.depth)); // far to near
-        for (Face f : faces) if (f.translucent) raster(f, size, color, zbuf, true);
+        List<Face> sorted = new ArrayList<>(faces);
+        sorted.sort((x, y) -> Double.compare(x.depth, y.depth)); // far to near
+        for (Face f : sorted) if (f.translucent) raster(f, size, color, zbuf, true);
         return color;
     }
 

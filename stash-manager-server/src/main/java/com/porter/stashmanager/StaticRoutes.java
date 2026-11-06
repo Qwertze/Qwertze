@@ -54,6 +54,7 @@ final class StaticRoutes {
             case "svg" -> "image/svg+xml";
             case "png" -> "image/png";
             case "ico" -> "image/x-icon";
+            case "woff2" -> "font/woff2";
             case "json" -> "application/json; charset=utf-8";
             default -> "application/octet-stream";
         };
