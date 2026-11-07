@@ -71,8 +71,40 @@ final class Auth {
         return MessageDigest.isEqual(a.getBytes(java.nio.charset.StandardCharsets.UTF_8), b.getBytes(java.nio.charset.StandardCharsets.UTF_8));
     }
 
+    /**
+     * A short fingerprint of a stored hash, kept with each session: a session made with a password that has since
+     * changed no longer matches and ends (even one that was being logged in while the password changed).
+     */
+    static String tag(String stored) {
+        if (stored == null) return null;
+        try {
+            byte[] d = MessageDigest.getInstance("SHA-256").digest(stored.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return java.util.HexFormat.of().formatHex(d, 0, 8);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** The iterations new hashes get. Only tests lower it (so a test can create many users quickly). */
+    static volatile int iterations = ITERATIONS;
+    private static volatile String dummy;
+
     static String hash(String password) {
-        return hash(password, ITERATIONS);
+        return hash(password, iterations);
+    }
+
+    /**
+     * A hash of a random password, to verify against when a login names an unknown user, so it takes as long as a
+     * real check and the answer time doesn't tell which names exist.
+     */
+    static String dummyHash() {
+        String d = dummy;
+        if (d == null || !d.contains("$" + iterations + "$")) {
+            byte[] b = new byte[18];
+            RANDOM.nextBytes(b);
+            dummy = d = hash(Base64.getEncoder().encodeToString(b), iterations);
+        }
+        return d;
     }
 
     /** Package-private so tests can use fewer iterations. */

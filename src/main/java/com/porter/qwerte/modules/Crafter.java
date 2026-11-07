@@ -13,6 +13,7 @@ import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.item.ItemStack;
 
 import java.util.ArrayDeque;
@@ -135,6 +136,8 @@ final class Crafter {
     private Request req;
     private CraftPlanner.Plan plan;
     private boolean active, tableDone;
+    // The session crafts in the 2x2 grid of the inventory window (a crafting table is made that way), not at a table
+    private boolean inventoryGrid;
     private long startedAt;
     private int replans;
     private String failure;
@@ -181,6 +184,15 @@ final class Crafter {
 
     boolean active() {
         return active;
+    }
+
+    /** The running session crafts in the inventory's 2x2 grid: the sorter opens no table for it. */
+    void useInventoryGrid() {
+        if (active) inventoryGrid = true;
+    }
+
+    boolean inventoryGrid() {
+        return active && inventoryGrid;
     }
 
     boolean holds(int slot) {
@@ -244,6 +256,7 @@ final class Crafter {
 
     private void clearSession() {
         active = false;
+        inventoryGrid = false;
         req = null;
         plan = null;
         tableDone = false;
@@ -279,6 +292,8 @@ final class Crafter {
         Recipes recipes = recipes();
         if (recipes == null) return new CraftPlanner.Result(null, "no recipe table for this version");
         CraftPlanner.Caps caps = owner.caps();
+        // The caps are for shulker boxes: chests for the delivery storage (and the anvil) only keep the grid fill limit
+        if (!item.equals("minecraft:shulker_box")) caps = new CraftPlanner.Caps(Integer.MAX_VALUE, caps.opsPerTask(), Integer.MAX_VALUE);
         if (ignoreOps) caps = new CraftPlanner.Caps(caps.perOrder(), Integer.MAX_VALUE, caps.perHour());
         return CraftPlanner.plan(recipes, item, count, pool, owner.neverUse(), caps, doneOrder, craftedLastHour());
     }
@@ -292,7 +307,9 @@ final class Crafter {
             if (pool.getOrDefault(r.item(), 0L) < 1) return "none in the stash";
             clearSession();
             req = r;
-            plan = new CraftPlanner.Plan(r.item(), 1, List.of(), Map.of(r.item(), 1), 0, null);
+            int n = Math.max(1, r.count());
+            if (pool.getOrDefault(r.item(), 0L) < n) return "not enough in the stash";
+            plan = new CraftPlanner.Plan(r.item(), n, List.of(), Map.of(r.item(), n), 0, null);
             active = true;
             startedAt = System.currentTimeMillis();
             snapshotBefore();
@@ -415,7 +432,7 @@ final class Crafter {
 
     /** A container the stash may take ingredients from: the same sources orders use. */
     boolean source(Box box) {
-        if (box.excluded || box.delivery || box.dropOff || box.unreachable || box.stale || !box.known() || !owner.usable(box)) return false;
+        if (box.excluded || box.foreign || box.delivery || box.dropOff || box.unreachable || box.stale || !box.known() || !owner.usable(box)) return false;
         // Kit chests and chests for whole shulkers are never taken from; use-named-shulkers is only about unpacking named shulkers
         return !Kits.isKitBox(box) && !owner.keepWhole(box);
     }
@@ -625,7 +642,8 @@ final class Crafter {
     /** The table job is over: it went through, or for this reason it did not. */
     void tableEnded(String why) {
         if (!active) return;
-        for (; stamped < craftedTarget; stamped++) stamps.addLast(System.currentTimeMillis());
+        // Only shulker boxes count towards the hourly cap
+        for (; stamped < craftedTarget; stamped++) if (req != null && req.item().equals("minecraft:shulker_box")) stamps.addLast(System.currentTimeMillis());
         adoptStrays();
         syncHeld();
         if (why != null) {
@@ -645,12 +663,32 @@ final class Crafter {
         return stepIdx < plan.steps().size() ? plan.steps().get(stepIdx) : null;
     }
 
-    private static int menuToInv(int menuSlot) {
+    // The 3x3 table window has the grid in slots 1-9 and the inventory in 10-45; the inventory window the 2x2 grid in 1-4 and the
+    // inventory in 9-44 (armor 5-8, off hand 45 are never touched)
+    private static boolean small(AbstractContainerMenu menu) {
+        return menu instanceof InventoryMenu;
+    }
+
+    private static int gridSlots(boolean small) {
+        return small ? 4 : 9;
+    }
+
+    private static int invFirst(boolean small) {
+        return small ? 9 : 10;
+    }
+
+    private static int menuToInv(boolean small, int menuSlot) {
+        if (small) return menuSlot >= 36 ? menuSlot - 36 : menuSlot;
         return menuSlot >= 37 ? menuSlot - 37 : menuSlot - 1;
     }
 
-    private static boolean inventorySlot(int menuSlot) {
-        return menuSlot >= 10 && menuSlot <= 45;
+    private static boolean inventorySlot(boolean small, int menuSlot) {
+        return menuSlot >= invFirst(small) && menuSlot <= invFirst(small) + 35;
+    }
+
+    /** The cell (0 to 8, in row order of the 3x3 grid) a grid slot of the window stands for. */
+    private static int gridIndexOf(boolean small, int gridSlot) {
+        return small ? ((gridSlot - 1) / 2) * 3 + (gridSlot - 1) % 2 : gridSlot - 1;
     }
 
     /** The next click in the open crafting table, or why it can't go on. Works the same from any point. */
@@ -664,11 +702,11 @@ final class Crafter {
             if (credit(cursor)) step = currentStep();
             if (step != null && layout != null && layoutStep == stepIdx) {
                 String id = idOf(cursor);
-                for (int i = 0; i < 9; i++) {
-                    if (id.equals(layout[i]) && menu.getSlot(1 + i).getItem().isEmpty()) {
+                for (int k = 1; k <= gridSlots(small(menu)); k++) {
+                    if (id.equals(layout[gridIndexOf(small(menu), k)]) && menu.getSlot(k).getItem().isEmpty()) {
                         fills++;
                         if (fills > plan.ops() * 2 + 16) return Act.fail(com.porter.qwerte.craft.CraftHealth.GRID);
-                        return Act.click(1 + i, 1);
+                        return Act.click(k, 1);
                     }
                 }
             }
@@ -682,13 +720,14 @@ final class Crafter {
         }
         homeStuck = 0;
 
+        boolean small = small(menu);
         if (step == null) {
-            for (int i = 0; i < 9; i++) if (!menu.getSlot(1 + i).getItem().isEmpty()) return Act.click(1 + i, 0);
+            for (int k = 1; k <= gridSlots(small); k++) if (!menu.getSlot(k).getItem().isEmpty()) return Act.click(k, 0);
             return Act.done();
         }
 
         if (layout == null || layoutStep != stepIdx || layoutCraft != craftIdx) {
-            layout = layoutFor(step);
+            layout = layoutFor(step, small);
             layoutStep = stepIdx;
             layoutCraft = craftIdx;
             if (layout == null) return Act.fail(com.porter.qwerte.craft.CraftHealth.MISSING);
@@ -696,15 +735,17 @@ final class Crafter {
         }
 
         // Wrong things in the grid come out
-        for (int i = 0; i < 9; i++) {
-            ItemStack here = menu.getSlot(1 + i).getItem();
+        for (int k = 1; k <= gridSlots(small); k++) {
+            ItemStack here = menu.getSlot(k).getItem();
             if (here.isEmpty()) continue;
-            if (layout[i] == null || !layout[i].equals(idOf(here)) || here.getCount() > 1) return Act.click(1 + i, 0);
+            String want = layout[gridIndexOf(small, k)];
+            if (want == null || !want.equals(idOf(here)) || here.getCount() > 1) return Act.click(k, 0);
         }
         // Then each empty cell that needs something gets it, from a held stack
-        for (int i = 0; i < 9; i++) {
-            if (layout[i] == null || !menu.getSlot(1 + i).getItem().isEmpty()) continue;
-            int src = findSource(menu, layout[i]);
+        for (int k = 1; k <= gridSlots(small); k++) {
+            String want = layout[gridIndexOf(small, k)];
+            if (want == null || !menu.getSlot(k).getItem().isEmpty()) continue;
+            int src = findSource(menu, want);
             if (src < 0) return Act.fail(com.porter.qwerte.craft.CraftHealth.MISSING);
             srcSlot = src;
             return Act.click(src, 0);
@@ -736,7 +777,7 @@ final class Crafter {
     boolean clean(AbstractContainerMenu menu) {
         if (!menu.getCarried().isEmpty()) return false;
         if (menu.slots.size() != 46) return true;
-        for (int i = 1; i <= 9; i++) if (!menu.getSlot(i).getItem().isEmpty()) return false;
+        for (int i = 1; i <= gridSlots(small(menu)); i++) if (!menu.getSlot(i).getItem().isEmpty()) return false;
         return true;
     }
 
@@ -752,31 +793,33 @@ final class Crafter {
             Act put = putAway(menu, cursor);
             return put.kind() == Act.CLICK ? put : null;
         }
-        for (int i = 1; i <= 9; i++) if (!menu.getSlot(i).getItem().isEmpty()) return Act.click(i, 0);
+        for (int i = 1; i <= gridSlots(small(menu)); i++) if (!menu.getSlot(i).getItem().isEmpty()) return Act.click(i, 0);
         return null;
     }
 
     /** Where a stack on the cursor goes: back where it was taken from, onto a stack it fits on, or an empty carry slot. */
     private Act putAway(AbstractContainerMenu menu, ItemStack cursor) {
         Set<Integer> carry = owner.carry();
+        boolean small = small(menu);
+        int first = invFirst(small), last = first + 35;
         int spot = -1;
-        if (srcSlot >= 0 && inventorySlot(srcSlot) && usableSlot(carry, menuToInv(srcSlot))) {
+        if (srcSlot >= 0 && inventorySlot(small, srcSlot) && usableSlot(carry, menuToInv(small, srcSlot))) {
             ItemStack there = menu.getSlot(srcSlot).getItem();
             if (there.isEmpty() || (ItemStack.isSameItemSameComponents(there, cursor) && there.getCount() < there.getMaxStackSize())) spot = srcSlot;
         }
         if (spot < 0) {
-            for (int m = 10; m <= 45 && spot < 0; m++) {
+            for (int m = first; m <= last && spot < 0; m++) {
                 ItemStack there = menu.getSlot(m).getItem();
-                if (usableSlot(carry, menuToInv(m)) && !there.isEmpty() && ItemStack.isSameItemSameComponents(there, cursor) && there.getCount() < there.getMaxStackSize()) spot = m;
+                if (usableSlot(carry, menuToInv(small, m)) && !there.isEmpty() && ItemStack.isSameItemSameComponents(there, cursor) && there.getCount() < there.getMaxStackSize()) spot = m;
             }
         }
         if (spot < 0) {
-            for (int m = 10; m <= 45 && spot < 0; m++) {
-                if (carry.contains(menuToInv(m)) && menu.getSlot(m).getItem().isEmpty()) spot = m;
+            for (int m = first; m <= last && spot < 0; m++) {
+                if (carry.contains(menuToInv(small, m)) && menu.getSlot(m).getItem().isEmpty()) spot = m;
             }
         }
         if (spot < 0) return ++homeStuck > 40 ? Act.fail(com.porter.qwerte.craft.CraftHealth.NO_ROOM) : Act.waiting();
-        int inv = menuToInv(spot);
+        int inv = menuToInv(small, spot);
         mine.add(inv);
         // A crafted box of the wanted kind is kept for its use
         if (req != null && req.reserve() && Utils.isShulker(cursor.getItem()) && idOf(cursor).equals(req.item())) reserved.add(inv);
@@ -791,8 +834,9 @@ final class Crafter {
     /** A held stack of the item in the inventory part of the menu, the smallest first. */
     private int findSource(AbstractContainerMenu menu, String id) {
         int best = -1;
-        for (int m = 10; m <= 45; m++) {
-            if (!mine.contains(menuToInv(m))) continue;
+        boolean small = small(menu);
+        for (int m = invFirst(small); m <= invFirst(small) + 35; m++) {
+            if (!mine.contains(menuToInv(small, m))) continue;
             ItemStack s = menu.getSlot(m).getItem();
             if (s.isEmpty() || !idOf(s).equals(id)) continue;
             if (best < 0 || s.getCount() < menu.getSlot(best).getItem().getCount()) best = m;
@@ -801,13 +845,16 @@ final class Crafter {
     }
 
     /** Which item goes in each grid cell for the next craft of the step: of the alternatives, the one held most of. */
-    private String[] layoutFor(CraftPlanner.Step step) {
+    private String[] layoutFor(CraftPlanner.Step step, boolean small) {
         Map<String, Integer> have = carried();
         String[] out = new String[9];
         Recipes.Recipe r = step.recipe();
         for (int i = 0; i < r.cells().size(); i++) {
             List<String> alts = r.cells().get(i);
             if (alts == null) continue;
+            // The inventory window's grid is 2x2: a cell in the third row or column has no place
+            int g = r.gridIndex(i);
+            if (small && (g % 3 > 1 || g / 3 > 1)) return null;
             String pick = null;
             int most = 0;
             for (String a : alts) {

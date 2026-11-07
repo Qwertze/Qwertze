@@ -32,6 +32,9 @@ final class BotHub {
     static final long EXPIRE_QUEUED_MS = 10_000;
     static final long UNKNOWN_SENT_MS = 60_000;
     static final long WATCH_MS = 10_000;
+    /** The live viewer's chunk radius and frame rate, sent to the bot in bot/next (PROTOCOL.md, "Additions: live viewer"). */
+    static final int VIEWER_RADIUS = 8;
+    static final int VIEWER_HZ = 5;
     static final int CONSOLE_KEEP = 200;
     static final int EVENTS_KEEP = 500;
     static final int JOBS_KEEP = 500;
@@ -73,6 +76,7 @@ final class BotHub {
         final String id;
         String command; // null once the bot says the input was sensitive
         final long at;
+        String by; // the website user who sent it (Users.OWNER_ID or a sub-user's id), or null
         String status = "queued";
         String error;
         final List<JsonObject> outputs = new ArrayList<>();
@@ -96,6 +100,8 @@ final class BotHub {
         /** The scopes the bot says it can show (bot/hello "scopes"); only "plugin" is pushed unasked. */
         Set<String> declaredScopes = new LinkedHashSet<>();
         long helloAt;
+        /** Bumped by every bot/hello: a long-poll from before it (a restarted bot's dangling request) gives up. */
+        long helloGen;
         long lastPoll;
         long lastSeen;
         int waiting;
@@ -104,6 +110,11 @@ final class BotHub {
         long needSentAt;
         long watchActivityUntil;
         Boolean watchingActivitySent;
+        /** Until when a browser has the live viewer open, and the viewer session (16 hex) the bot must send. */
+        long watchViewerUntil;
+        String viewerSession;
+        Boolean watchingViewerSent;
+        String viewerSessionSent;
         JsonObject activity;     // the latest cleaned snapshot, or null
         long activityAt;         // when it arrived
         final ArrayDeque<JsonObject> events = new ArrayDeque<>(); // newest last
@@ -167,6 +178,10 @@ final class BotHub {
             b.need.clear(); // a new session pushes everything by itself
             b.watchingSent = null;
             b.watchingActivitySent = null;
+            b.watchingViewerSent = null;
+            b.viewerSessionSent = null;
+            b.helloGen++;
+            b.notifyAll(); // ends a long-poll from the bot's previous run, so it can't take what this run must be told
         }
         return true;
     }
@@ -244,17 +259,25 @@ final class BotHub {
         try {
             synchronized (b) {
                 b.waiting++;
+                long gen = b.helloGen;
                 try {
                     long end = now() + POLL_WAIT_MS;
                     while (true) {
+                        // A hello since this poll began: it belongs to the bot's previous run (its socket is
+                        // probably dead). Answer 204 without handing out jobs or watch changes.
+                        if (b.helloGen != gen) return new Poll(204, null);
                         long now = now();
                         b.lastPoll = now;
                         b.lastSeen = now;
                         expire(b, now);
                         boolean watching = b.watchUntil > now;
                         boolean watchingActivity = b.watchActivityUntil > now;
+                        boolean watchingViewer = b.watchViewerUntil > now;
+                        String viewerSession = watchingViewer ? b.viewerSession : null;
                         boolean watchChanged = b.watchingSent == null || b.watchingSent != watching
-                            || b.watchingActivitySent == null || b.watchingActivitySent != watchingActivity;
+                            || b.watchingActivitySent == null || b.watchingActivitySent != watchingActivity
+                            || b.watchingViewerSent == null || b.watchingViewerSent != watchingViewer
+                            || !java.util.Objects.equals(viewerSession, b.viewerSessionSent);
                         // A need is repeated at most every 10 s, so a bot that can't answer it doesn't spin.
                         boolean needDue = !b.need.isEmpty() && now - b.needSentAt >= 10_000;
                         if (!b.queue.isEmpty() || needDue || watchChanged) {
@@ -283,8 +306,18 @@ final class BotHub {
                             if (!need.isEmpty()) b.needSentAt = now;
                             out.addProperty("watching", watching);
                             out.addProperty("watchingActivity", watchingActivity);
+                            out.addProperty("watchingViewer", watchingViewer);
+                            if (watchingViewer) {
+                                JsonObject v = new JsonObject();
+                                v.addProperty("radius", VIEWER_RADIUS);
+                                v.addProperty("hz", VIEWER_HZ);
+                                v.addProperty("session", viewerSession);
+                                out.add("viewer", v);
+                            }
                             b.watchingSent = watching;
                             b.watchingActivitySent = watchingActivity;
+                            b.watchingViewerSent = watchingViewer;
+                            b.viewerSessionSent = viewerSession;
                             return new Poll(200, out);
                         }
                         long left = end - now;
@@ -292,6 +325,7 @@ final class BotHub {
                         // Wake up in time to tell the bot when the browser stops watching.
                         long wait = Math.min(left, watching ? Math.max(1, b.watchUntil - now + 1) : left);
                         if (watchingActivity) wait = Math.min(wait, Math.max(1, b.watchActivityUntil - now + 1));
+                        if (watchingViewer) wait = Math.min(wait, Math.max(1, b.watchViewerUntil - now + 1));
                         if (!b.need.isEmpty()) wait = Math.min(wait, Math.max(1, b.needSentAt + 10_000 - now));
                         b.wait(wait);
                     }
@@ -391,6 +425,44 @@ final class BotHub {
         }
     }
 
+    /**
+     * A browser has this bot's live viewer open (every open stream calls this every few seconds, and once more when it
+     * closes, so watching lingers 10 s over a reconnect). When watching starts, or with fresh=true (the server has no
+     * snapshot for this bot), a new viewer session is minted: the bot's next frame must be full. The long-poll is told
+     * at once. Returns the current session.
+     */
+    String watchViewer(Bot b, boolean fresh) {
+        synchronized (b) {
+            long now = now();
+            boolean was = b.watchViewerUntil > now;
+            b.watchViewerUntil = now + WATCH_MS;
+            if (!was || fresh || b.viewerSession == null) {
+                b.viewerSession = newSession();
+                b.notifyAll();
+            }
+            return b.viewerSession;
+        }
+    }
+
+    /** The viewer session the bot must use now, or null when nobody is watching. */
+    String viewerSession(Bot b) {
+        synchronized (b) {
+            return b.watchViewerUntil > now() ? b.viewerSession : null;
+        }
+    }
+
+    boolean watchingViewer(Bot b) {
+        synchronized (b) {
+            return b.watchViewerUntil > now();
+        }
+    }
+
+    private static String newSession() {
+        byte[] bytes = new byte[8];
+        RANDOM.nextBytes(bytes);
+        return HexFormat.of().formatHex(bytes);
+    }
+
     /** bot/activity: stores the snapshot and adds its new events (de-duplicated by at, source and text). */
     void activity(Bot b, JsonObject snapshot, JsonArray events) {
         long now = now();
@@ -476,6 +548,11 @@ final class BotHub {
 
     /** Queues a console command; returns its job id. */
     String queueCommand(Bot b, String command) {
+        return queueCommand(b, command, null);
+    }
+
+    /** The same, remembering which website user sent it (a "list"-mode user only sees their own). */
+    String queueCommand(Bot b, String command, String by) {
         long now = now();
         synchronized (b) {
             JsonObject p = new JsonObject();
@@ -485,6 +562,7 @@ final class BotHub {
             // sensitive; the bot's sensitive:true hides every other kind once it answers.
             ConsoleEntry e = new ConsoleEntry(++b.consoleSeq, j.id, looksSensitive(command) ? null : command, now);
             e.rev = ++b.consoleRev;
+            e.by = by;
             j.console = e;
             b.console.addLast(e);
             while (b.console.size() > CONSOLE_KEEP) b.console.pollFirst();
@@ -529,12 +607,18 @@ final class BotHub {
 
     /** Console entries changed after revision {@code after}, oldest first, plus the newest revision. */
     JsonObject console(Bot b, long after) {
+        return console(b, after, null);
+    }
+
+    /** The same, only the entries sent by onlyBy (null: everyone's). */
+    JsonObject console(Bot b, long after, String onlyBy) {
         JsonObject out = new JsonObject();
         JsonArray entries = new JsonArray();
         synchronized (b) {
             expire(b, now());
             for (ConsoleEntry e : b.console) {
                 if (e.rev <= after) continue;
+                if (onlyBy != null && !onlyBy.equals(e.by)) continue;
                 JsonObject o = new JsonObject();
                 o.addProperty("seq", e.seq);
                 o.addProperty("rev", e.rev);

@@ -329,6 +329,28 @@ New in 0.4.0-dev and still being tested.
 - Pick the delivery container with `select-delivery` and a right-click on the container. It is never sorted into.
 - An order in progress is saved with the stash, so it carries on after a disconnect.
 
+### Stash Window
+New in 0.4.0-dev and still being tested.
+- A window (keybind `open-window`, the `.stash-window` command, or the module's button) to search the containers you have
+  opened. It works on its own: no server, no login, no network. It remembers chests, barrels and shulker boxes you open,
+  including what shulker boxes inside them hold, and saves them under `meteor-client/qwerte/local-index/`.
+- Optionally turn on `connect-to-server`, set `server-url` and log in to see the stash of your Stash Manager server with
+  your website account's permissions. Plain `http://` outside your own network is refused unless `allow-insecure-http` is on.
+- With a server connected, the window also has the server's pages, each shown only when your account's permissions allow
+  it: Orders, Live (the map), Build Planner, Bots, Activity, Settings, Proxy, Console and, for the owner, Users. The Build
+  Planner works from your game's `schematics` folder (or an uploaded file) and can order a build's materials part by part.
+- The window is laid out like the website's stash page: a header bar, the creative tabs, the item grid with small counts in
+  the corner of each slot, a search box and sort select under it, and the details of a clicked item in a drawer over the right
+  side of the grid (closed, it takes no room). Drag
+  its header to move it, drag its edges or corners to resize it (the grid gets more or fewer columns), double-click the
+  header to maximize it. Its place and size are remembered. It follows Minecraft's GUI scale (`window-scale` in the module
+  overrides that; Meteor's own GUI scale does not apply to it) and uses the game's font, at about the website's size next to
+  the slots (`window-text-scale`: Auto, Small, Normal or Large).
+- `window-theme` (or the Theme select in the window's header) picks its colours: Classic (the default), Modern, Light, Dark,
+  Midnight, High contrast or Mac, the same palettes as the website. Classic matches the website's default.
+- The session token of a server login is stored in plain text in Meteor's `modules.nbt`. Do not share your `meteor-client`
+  folder or Meteor profiles, and use the window's Log out to end (revoke) the session.
+
 ## Installation
 
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) for Minecraft **1.21.11** or **1.21.4**.
@@ -549,6 +571,7 @@ station. If you'd rather work hands-on, turn off `auto-walk`, `auto-water` and `
 | General | `barrels` | on | Include barrels as well as chests. |
 | General | `reach` | 4.5 | How close a container has to be to open it. |
 | General | `delay` | 3 | Ticks between inventory clicks. Raise it if the server rejects clicks. |
+| General | `container-delay` | 0 | Extra ticks of pause around opening containers: none is opened until this many ticks after the last one was closed, and the first click in a freshly opened one waits this long too. Higher is slower but gentler on servers (2b2t can kick or rubber-band when containers are opened very quickly). 0 is as fast as possible. |
 | General | `quiet` | 3 | Seconds to wait after you or another module stops using the client before carrying on. Doubles for each repeated interruption within 5 minutes, up to 60 seconds. |
 | General | `walk` | off | Walk to containers out of reach with Baritone. |
 | General | `rotate` | on | Face containers when opening them. |
@@ -647,6 +670,10 @@ versions/<minecraft>.properties   Minecraft, Meteor and Baritone versions for ea
 Shared code is in `src/main`. The little that differs between Minecraft versions is in `src/<minecraft>`, and only the
 folder for the version being built is compiled. The addon version, Fabric Loader and Loom versions live in
 `gradle/libs.versions.toml`.
+
+The 1.21.11 build also has one mixin, `ClientPacketListenerMixin` in `src/1.21.11/java/com/porter/qwerte/mixin/` (listed in
+`src/1.21.11/resources/qwerte.mixins.json`). It works around a game crash when a name-only player head is looked up while
+chests are read on a busy server. The 1.21.4 build has no mixin: its `qwerte.mixins.json` lists none.
 
 To add another Minecraft version, add a `versions/<minecraft>.properties` and a `src/<minecraft>/java` folder with the
 four compat classes, then build with `-Pmc=<minecraft>`.

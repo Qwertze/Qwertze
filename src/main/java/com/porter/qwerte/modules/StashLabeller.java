@@ -474,7 +474,7 @@ final class StashLabeller {
         List<ItemStack> sources = new ArrayList<>();
         for (int slot : owner.activeCarried()) sources.add(mc.player.getInventory().getItem(slot));
         for (Box b : stash.boxes) {
-            if (!b.known() || b.unreachable || b.excluded) continue;
+            if (!b.known() || b.unreachable || b.excluded || b.foreign) continue;
             if (!(b.dropOff || b.labels.isEmpty() || owner.isMisc(b))) continue;
             for (ItemStack stack : b.contents) if (!stack.isEmpty()) sources.add(stack);
         }

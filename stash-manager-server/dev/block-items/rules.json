@@ -1,0 +1,21 @@
+{
+  "_comment": "Hand-made classification for blocks whose asItem() is air. ignore = never counted; fluid = water/lava (source blocks become buckets); map = block -> item to count instead. GenBlockItems fails if an air-item block is in none of these and has no class rule (potted plants and candle cakes are handled by class).",
+  "ignore": [
+    "minecraft:air", "minecraft:cave_air", "minecraft:void_air",
+    "minecraft:piston_head", "minecraft:moving_piston",
+    "minecraft:fire", "minecraft:soul_fire",
+    "minecraft:nether_portal", "minecraft:end_portal", "minecraft:end_gateway",
+    "minecraft:bubble_column", "minecraft:frosted_ice"
+  ],
+  "fluid": ["minecraft:water", "minecraft:lava"],
+  "map": {
+    "minecraft:tall_seagrass": "minecraft:seagrass",
+    "minecraft:kelp_plant": "minecraft:kelp",
+    "minecraft:bamboo_sapling": "minecraft:bamboo",
+    "minecraft:attached_melon_stem": "minecraft:melon_seeds",
+    "minecraft:attached_pumpkin_stem": "minecraft:pumpkin_seeds",
+    "minecraft:cave_vines_plant": "minecraft:glow_berries",
+    "minecraft:twisting_vines_plant": "minecraft:twisting_vines",
+    "minecraft:weeping_vines_plant": "minecraft:weeping_vines"
+  }
+}

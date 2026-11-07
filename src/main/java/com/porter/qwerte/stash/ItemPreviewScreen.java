@@ -1,5 +1,6 @@
 package com.porter.qwerte.stash;
 
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.inventory.DispenserScreen;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.SimpleContainer;
@@ -19,24 +20,37 @@ public class ItemPreviewScreen extends DispenserScreen {
     // Not a container id the server will ever have open for us, in case anything slips through
     private static final int FAKE_CONTAINER_ID = 254;
 
-    private ItemPreviewScreen(DispenserMenu menu, Component title) {
+    // Where Esc goes back to; null closes to the game
+    private final Screen returnTo;
+
+    private ItemPreviewScreen(DispenserMenu menu, Component title, Screen returnTo) {
         super(menu, mc.player.getInventory(), title);
+        this.returnTo = returnTo;
     }
 
     public static void open(ItemStack stack, int total, String stashName) {
+        show(stack, total, String.format("%s x%,d @ %s", StackInfo.label(stack), total, stashName), null);
+    }
+
+    /** Like {@link #open(ItemStack, int, String)} but with the whole title given, and Esc returns to {@code returnTo}. */
+    public static void open(ItemStack stack, int total, String title, Screen returnTo) {
+        show(stack, total, title, returnTo);
+    }
+
+    private static void show(ItemStack stack, int total, String title, Screen returnTo) {
+        if (mc.player == null) return;
         SimpleContainer container = new SimpleContainer(9);
         ItemStack shown = stack.copyWithCount(Math.max(1, Math.min(total, stack.getMaxStackSize())));
         container.setItem(4, shown);
 
         DispenserMenu menu = new DispenserMenu(FAKE_CONTAINER_ID, mc.player.getInventory(), container);
-        Component title = Component.literal(String.format("%s x%,d @ %s", StackInfo.label(stack), total, stashName));
-        mc.setScreen(new ItemPreviewScreen(menu, title));
+        mc.setScreen(new ItemPreviewScreen(menu, Component.literal(title), returnTo));
     }
 
     @Override
     public void onClose() {
         // The default also tells the server to close a container it never opened for us
-        mc.setScreen(null);
+        mc.setScreen(returnTo);
     }
 
     @Override

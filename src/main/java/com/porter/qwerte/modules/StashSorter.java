@@ -9,12 +9,18 @@ import com.porter.qwerte.stash.KitPreviewScreen;
 import com.porter.qwerte.stash.Kits;
 import com.porter.qwerte.stash.StackInfo;
 import com.porter.qwerte.stash.StackInfo.BulkKey;
+import com.porter.qwerte.stash.DeliveryBook;
+import com.porter.qwerte.stash.DeliveryRoom;
+import com.porter.qwerte.stash.StashIndex;
 import com.porter.qwerte.stash.StashWatch;
 import com.porter.qwerte.stash.Containers;
 import com.porter.qwerte.stash.Stash;
+import com.porter.qwerte.stash.StashSafety;
 import com.porter.qwerte.stash.Stash.Box;
 import com.porter.qwerte.utils.BaritoneHelper;
 import com.porter.qwerte.craft.AnvilFinder;
+import com.porter.qwerte.craft.TableFinder;
+import com.porter.qwerte.utils.ChestStack;
 import com.porter.qwerte.utils.PlaceSearch;
 import meteordevelopment.meteorclient.MeteorClient;
 import meteordevelopment.meteorclient.events.entity.player.InteractBlockEvent;
@@ -252,6 +258,15 @@ public class StashSorter extends Module {
         .defaultValue(3)
         .range(0, 20)
         .sliderRange(0, 10)
+        .build()
+    );
+
+    private final Setting<Integer> containerDelay = sgGeneral.add(new IntSetting.Builder()
+        .name("container-delay")
+        .description("Extra ticks of pause around opening containers: a container is not opened until this many ticks after the last one was closed, and the first click in a freshly opened one waits this long too. 0 is as fast as possible. A higher value is slower but gentler on the server; 2b2t can kick or rubber-band when containers are opened very quickly.")
+        .defaultValue(0)
+        .range(0, 100)
+        .sliderRange(0, 40)
         .build()
     );
 
@@ -562,7 +577,7 @@ public class StashSorter extends Module {
         Pattern.compile("^(\\w{3,16}) -> (?:me|you): (.+)$")
     };
 
-    private enum Job { Survey, Take, Deposit, Dump, Fetch, Clean, Fill, Compact, Deliver, Return, KitTake, KitUnpack, KitFill, FetchSigns, Label, Gather, Ground, Explore, Unbundle, Name, CraftTake, CraftUnpack, Craft, AnvilPlace }
+    private enum Job { Survey, Take, Deposit, Dump, Fetch, Clean, Fill, Compact, Deliver, Return, KitTake, KitUnpack, KitFill, FetchSigns, Label, Gather, Ground, Explore, Unbundle, Name, CraftTake, CraftUnpack, Craft, AnvilPlace, ChestPlace }
 
     private enum Step { Walking, Opening, Working }
 
@@ -594,6 +609,11 @@ public class StashSorter extends Module {
     // How long the container job in hand has been running, and the most it may
     private int jobTicks;
     private static final int JOB_WATCHDOG_TICKS = 20 * 60 * 4;
+    // A read has three short stages (walk at most WALK_TIMEOUT, open at most OPEN_TIMEOUT, read): this is the last resort
+    // for one that still hangs, well under the general watchdog
+    private static final int SURVEY_WATCHDOG_TICKS = 20 * 90;
+    // A walk to a container to read that gets no closer than a block in this long (30 s) is given up on; not a setting
+    private static final int SURVEY_WALK_STALL_TICKS = 20 * 30;
     private int wait;
     private int swapStep;
     private int swapCarry, swapSlot;
@@ -607,6 +627,8 @@ public class StashSorter extends Module {
     private Gate gate = Gate.Running;
     private int ticks;
     private int lastOwnAct = -100;
+    // The tick the last container of ours was closed, for container-delay
+    private int lastCloseTick = -100_000;
     private int cleanupTries;
     private int jobInterruptions;
     private Handle returnTo;
@@ -879,7 +901,7 @@ public class StashSorter extends Module {
 
         @Override
         public boolean drivingInput() {
-            return labeller.drivingInput() || ledgeSneaking;
+            return labeller.drivingInput() || placer.drivingInput() || ledgeSneaking;
         }
 
         @Override
@@ -1091,6 +1113,9 @@ public class StashSorter extends Module {
     private int passMin = Integer.MAX_VALUE;
     // Containers that could not be read when visited: not tried again until something changes
     private final Set<Box> failedSurvey = new HashSet<>();
+    // When each of them is tried again: 1 min, 2 min, then every 5 min
+    private final com.porter.qwerte.utils.SurveyRetry<Box> surveyRetry = new com.porter.qwerte.utils.SurveyRetry<>();
+    private final com.porter.qwerte.utils.WalkProgress walkProgress = new com.porter.qwerte.utils.WalkProgress();
 
     // Carried stacks nothing has room for right now: slot to item id, left out of the plans until something changes
     private final Map<Integer, String> stuckCarried = new HashMap<>();
@@ -1528,6 +1553,21 @@ public class StashSorter extends Module {
         public boolean anvilMissing() {
             return StashSorter.this.anvilMissing();
         }
+
+        @Override
+        public DeliveryRoom deliveryRoom() {
+            return deliveryRoomNow();
+        }
+
+        @Override
+        public int deliveryChests() {
+            return Math.max(1, book().chests());
+        }
+
+        @Override
+        public Box deliveryChest(boolean verify) {
+            return deliveryChestFor(verify);
+        }
     });
     private int collectedSlot = -1;
     private int seenKits;
@@ -1703,7 +1743,7 @@ public class StashSorter extends Module {
         // With a perimeter the containers come from exploring it, and the checks wait until that is done
         if (!stash.hasArea() && !checkStash()) return;
 
-        int unknown = (int) stash.boxes.stream().filter(b -> !b.excluded && (!b.known() || b.stale)).count();
+        int unknown = (int) stash.boxes.stream().filter(b -> !b.excluded && !b.foreign && (!b.known() || b.stale)).count();
         if (!sorting()) info("Stash \"%s\": %d containers, scan only: reading %d unknown or stale ones, then watching for changes.", stash.name, stash.boxes.size(), unknown);
         else if (!existed) info("New stash \"%s\": scanning %d containers, then sorting.", stash.name, stash.boxes.size());
         else if (unknown > 0) info("Stash \"%s\": %d containers, scanning %d new ones first.", stash.name, stash.boxes.size(), unknown);
@@ -1731,6 +1771,17 @@ public class StashSorter extends Module {
         // An order stops where it is: its saved plan carries on at the next claim
         orderRunner.reset();
 
+        // A crafting table being made in the inventory's 2x2 grid: what is in the grid is taken back
+        if (mc.player != null && crafter.inventoryGrid()) {
+            var invMenu = mc.player.inventoryMenu;
+            for (int i = 0; i < 30; i++) {
+                Crafter.Act back = crafter.drain(invMenu);
+                if (back == null || back.kind() != Crafter.Act.CLICK) break;
+                mc.gameMode.handleInventoryMouseClick(invMenu.containerId, back.slot(), back.button(), ClickType.PICKUP, mc.player);
+            }
+            String left = gridLeftovers();
+            if (!left.isEmpty()) alert("Stopped with items left in the inventory's crafting grid, no room to take them back: %s.", left);
+        }
         // Only a window of ours, never one the player opened
         if (mc.player != null && mc.player.containerMenu != mc.player.inventoryMenu && ourMenu(mc.player.containerMenu)) {
             // A crafting table is never closed with items in the grid: they are taken back first
@@ -1776,7 +1827,14 @@ public class StashSorter extends Module {
         crafter.reset();
         craftForOrder = false;
         anvilSession = false;
+        tableSession = false;
+        placingTable = false;
         anvilSlot = -1;
+        placer.abort("stopped");
+        placer.restoreHand();
+        chestSession = false;
+        chestHolding = false;
+        recheckOnly = false;
 
         syncHeld();
         if (stash != null && stash.isDirty()) stash.save();
@@ -1905,6 +1963,8 @@ public class StashSorter extends Module {
             return;
         }
         ticks++;
+        // Whatever the sorter is doing, a skipped container whose time has come is made eligible again
+        releaseDueSurveys();
         if (handle != null) lastOwnAct = ticks;
         // Time spent giving way does not count against the time allowed to finish a saved shulker step
         if (resuming && gate != Gate.Running) resumeStarted++;
@@ -1949,6 +2009,7 @@ public class StashSorter extends Module {
             if (areaDirty) applyArea();
             // Chunks of the perimeter that loaded since, with containers in them
             if (ticks % 100 == 0 && stash.hasArea()) {
+                pruneForeign("periodic check");
                 int added = scanArea();
                 // Containers that are gone, where the chunk is loaded to tell
                 boolean gone = stash.boxes.removeIf(this::blockGone);
@@ -2014,15 +2075,19 @@ public class StashSorter extends Module {
             anvilPlaceTick();
             return;
         }
+        if (job == Job.ChestPlace) {
+            chestPlaceTick();
+            return;
+        }
         stepTicks++;
 
         // A container job that has run 4 minutes of its own time (giving way is not counted, nothing runs then) is over
-        if (target != null && ++jobTicks > JOB_WATCHDOG_TICKS) {
+        if (target != null && ++jobTicks > (job == Job.Survey ? SURVEY_WATCHDOG_TICKS : JOB_WATCHDOG_TICKS)) {
             Box stuck = target;
             debug("Watchdog: %s at %s ran %d s (step %s, %d actions), ending it.", job, xyz(stuck.pos), jobTicks / 20, step, actions);
             if (job == Job.Survey) {
                 stuck.stale = true;
-                failedSurvey.add(stuck);
+                surveyFailed(stuck, "reading it took " + jobTicks / 20 + "s (stuck in step " + step + ")");
             }
             else stalled.add(stuck);
             // The walk is let go of too
@@ -2120,7 +2185,18 @@ public class StashSorter extends Module {
         }
         ownedMenu = null;
         lastOwnAct = ticks;
+        lastCloseTick = ticks;
         yielder.inventoryChangedByUs();
+    }
+
+    /** True while container-delay still holds back the next open click. */
+    private boolean openHeld() {
+        return com.porter.qwerte.utils.ContainerPacing.openHeld(ticks, lastCloseTick, containerDelay.get());
+    }
+
+    /** Ticks to wait before the first click in a window that has just opened. */
+    private int firstClickWait() {
+        return com.porter.qwerte.utils.ContainerPacing.firstClickWait(delay.get(), containerDelay.get());
     }
 
     /**
@@ -2152,6 +2228,20 @@ public class StashSorter extends Module {
         if (ourGoal == null) walkInside = stash != null && stash.hasArea() && stash.inArea(mc.player.getX(), mc.player.getY(), mc.player.getZ(), AREA_MARGIN);
         debug(() -> String.format("Walking to within %d of %s.", range, xyz(pos)));
         setGoal(BaritoneHelper.moveNear(pos, range));
+    }
+
+    /**
+     * The same walk, but only until the container is within reach: one up high is opened from below, the way a player
+     * would, instead of looking for a spot next to it that may not be there.
+     */
+    private void walkReach(Box box) {
+        if (!BARITONE) return;
+        BaritoneHelper.protect(List.of());
+        usedBaritone = true;
+        BaritoneHelper.confine(safeWalk.get());
+        if (ourGoal == null) walkInside = stash != null && stash.hasArea() && stash.inArea(mc.player.getX(), mc.player.getY(), mc.player.getZ(), AREA_MARGIN);
+        debug(() -> String.format("Walking to within reach (%.1f) of %s.", reach.get(), xyz(box.pos)));
+        setGoal(BaritoneHelper.moveInReach(box.parts, reach.get()));
     }
 
     /**
@@ -2261,6 +2351,7 @@ public class StashSorter extends Module {
         releaseGoal();
         ledgeGuard(false);
         if (job == Job.Label) labeller.yielded();
+        if (job == Job.ChestPlace) placer.release();
         if (job != null) {
             yielder.interrupted();
             jobInterruptions++;
@@ -2282,6 +2373,14 @@ public class StashSorter extends Module {
      */
     private boolean cleanupStep() {
         AbstractContainerMenu menu = mc.player.containerMenu;
+        // The inventory's 2x2 grid of a crafting table being made is emptied too
+        if (crafter.inventoryGrid() && menu == mc.player.inventoryMenu && cleanupTries < CURSOR_TRIES * 2) {
+            Crafter.Act back = crafter.drain(menu);
+            if (back != null && back.kind() == Crafter.Act.CLICK) {
+                if (cleanupTries++ % 4 == 0) craftClick(menu, back.slot(), back.button());
+                return false;
+            }
+        }
         if (menu != mc.player.inventoryMenu && ourMenu(menu)) {
             // A crafting table is never closed with items in the grid: they are taken back first
             if (menu instanceof net.minecraft.world.inventory.CraftingMenu && crafter.active() && cleanupTries < CURSOR_TRIES * 2) {
@@ -2489,6 +2588,31 @@ public class StashSorter extends Module {
     }
 
     /**
+     * A container the scan could not read: skipped, said so with the reason and when it is tried again, and the scan
+     * carries on with the others.
+     */
+    private void surveyFailed(Box box, String why) {
+        failedSurvey.add(box);
+        // One failure per job: the skip paths and finishJob can both get here for the same read
+        int delay = surveyRetry.failOnce(box, ticks);
+        if (delay < 0) return;
+        step(String.format("skipped %s at %s: %s; will retry in %s.", blockName(box), xyz(box.pos), why, com.porter.qwerte.utils.SurveyRetry.describe(delay)));
+    }
+
+    /**
+     * Containers whose retry time has come are read again. Runs every tick between jobs, so it does not depend on the
+     * sorter being idle or on a particular tick.
+     */
+    private void releaseDueSurveys() {
+        if (failedSurvey.isEmpty()) return;
+        for (Box box : surveyRetry.due(ticks)) {
+            if (!failedSurvey.remove(box)) continue;
+            idle = false;
+            QwerteAddon.LOG.info("[stash-sorter] retrying the read of {} at {} (failed {} times).", blockName(box), xyz(box.pos), surveyRetry.failures(box));
+        }
+    }
+
+    /**
      * Bot mode, waiting for something to sort: a container that changed, or a drop-off due for a check.
      */
     private boolean wakeUp() {
@@ -2499,8 +2623,7 @@ public class StashSorter extends Module {
         if (!staleBoxes.isEmpty()) why = "a used chest is queued for a re-read";
         else if (areaDirty) why = "the stash area changed";
         else {
-            // A container that couldn't be read is tried again about once a minute
-            if (ticks % (20 * 60) == 0 && !failedSurvey.isEmpty()) failedSurvey.clear();
+            // Containers that couldn't be read are tried again on their schedule (releaseDueSurveys, every tick)
             for (Box box : stash.boxes) {
                 if (box.excluded || box.unreachable || failedSurvey.contains(box) || signPending(box)) continue;
                 if (!box.known() || box.stale) {
@@ -2562,7 +2685,8 @@ public class StashSorter extends Module {
             compacted.clear();
             packTried.clear();
             futile.clear();
-            failedSurvey.clear();
+            // Boxes still waiting for their retry time stay skipped: a version bump does not cut the schedule short
+            failedSurvey.removeIf(b -> !surveyRetry.waiting(b, ticks));
             unconfirmedRuns.clear();
             stuckCarried.clear();
             stuckWarned = false;
@@ -2630,7 +2754,7 @@ public class StashSorter extends Module {
 
         // Exploring: whatever unknown or old is within reach is read before moving on to the next waypoint
         if (exploring && stash.hasArea()) {
-            Box close = nearest(stash.boxes.stream().filter(b -> (!b.known() || b.stale) && !b.excluded && !b.unreachable && !failedSurvey.contains(b)
+            Box close = nearest(stash.boxes.stream().filter(b -> (!b.known() || b.stale) && !b.excluded && !b.foreign && !b.unreachable && !failedSurvey.contains(b)
                 && !signPending(b) && inReach(b)).toList());
             if (close != null) return start(Job.Survey, close);
         }
@@ -3247,7 +3371,15 @@ public class StashSorter extends Module {
         return isActive() && sortItems.get();
     }
 
+    // An order run by this client from the Stash Window (LocalOrders), no server: orders are wanted like stash-manager's accept-orders
+    private boolean localOrders;
+
+    void localOrders(boolean on) {
+        localOrders = on;
+    }
+
     private boolean ordersWanted() {
+        if (localOrders) return true;
         StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
         return manager != null && manager.takingOrders();
     }
@@ -3264,7 +3396,7 @@ public class StashSorter extends Module {
     boolean needsReading() {
         if (stash == null) return false;
         if (explorePending && stash.hasArea() && BARITONE) return true;
-        return stash.boxes.stream().anyMatch(b -> !b.excluded && !b.unreachable && !failedSurvey.contains(b) && (!b.known() || b.stale));
+        return stash.boxes.stream().anyMatch(b -> !b.excluded && !b.foreign && !b.unreachable && !failedSurvey.contains(b) && (!b.known() || b.stale));
     }
 
     /** stash-manager is driving the loop. */
@@ -3347,7 +3479,13 @@ public class StashSorter extends Module {
             case OrderRunner.Idle idleStep -> false;
             case OrderRunner.Build build -> runKit(build.intent());
             case OrderRunner.Fetch fetch -> fetch(fetch.box(), fetch.slot());
-            case OrderRunner.Deliver deliver -> start(Job.Deliver, deliver.box());
+            case OrderRunner.Deliver deliver -> {
+                recheckOnly = false;
+                lastDeliveryBox = deliver.box();
+                yield start(Job.Deliver, deliver.box());
+            }
+            case OrderRunner.Expand expand -> startExpand();
+            case OrderRunner.Recheck recheck -> startRecheck(recheck.box());
             case OrderRunner.Rename rename -> startName(rename);
             case OrderRunner.Craft craft -> startOrderCraft(craft);
             case OrderRunner.FindAnvil find -> startFindAnvil();
@@ -3358,7 +3496,7 @@ public class StashSorter extends Module {
     private static final int CRAFT_JOB_TICKS = 20 * 180, CRAFT_OPEN_TICKS = 20 * 15, CRAFT_OPEN_TRIES = 4, CRAFT_OPEN_RETRY = 40;
     private static final int CRAFT_COOLDOWN_TICKS = 20 * 60 * 5;
     // The reasons crafting is refused or given up on, worded as the proxy plugin has them
-    private static final String NO_TABLE = "needs a crafting table (select-crafting-table)", TABLE_GONE = "the crafting table is gone",
+    private static final String TABLE_GONE = "the crafting table is gone",
         TABLE_NOT_REACHED = "couldn't reach the crafting table", TABLE_NOT_OPENED = "couldn't open the crafting table",
         TABLE_CLOSED = "the crafting table closed before it was done", TABLE_OTHER_DIMENSION = "the crafting table is in another dimension";
     private static final String SHULKER_BOX_ID = "minecraft:shulker_box";
@@ -3386,11 +3524,20 @@ public class StashSorter extends Module {
 
     /** Why nothing can be crafted now (no table, it is gone, it failed for this order), or null. */
     private String craftBlocker() {
-        if (stash == null || stash.craftingTablePos == null) return NO_TABLE;
+        if (stash == null) return TableFinder.NONE;
         if (mc.level == null || mc.player == null) return "no world";
         if (!stash.dimension.isEmpty() && !stash.dimension.equals(Stash.currentDimension())) return TABLE_OTHER_DIMENSION;
-        if (mc.level.isLoaded(stash.craftingTablePos) && !isTable(stash.craftingTablePos)) return TABLE_GONE;
-        return craftHealth.problem(orderRunner.orderId(), stash.craftingTablePos);
+        // A table that is set or remembered and still there: only trouble it caused for this order stops the craft
+        if (!tableMissing()) return craftHealth.problem(orderRunner.orderId(), stash.craftingTablePos);
+        // None, or it is gone: crafting goes on when one can be found, taken from the stash or crafted (nothing is done here)
+        TableFinder.Decision d = tablePreCheck.get(System.currentTimeMillis(), TABLE_PRECHECK_MS, this::decideTable);
+        return d.step() == TableFinder.Step.FAIL ? d.failure() : null;
+    }
+
+    /** No crafting table is set or remembered, or the one that was is gone. */
+    private boolean tableMissing() {
+        if (stash == null || stash.craftingTablePos == null) return true;
+        return mc.level != null && mc.level.isLoaded(stash.craftingTablePos) && !isTable(stash.craftingTablePos);
     }
 
     /** For the heartbeat: a crafting table is set and, where its chunk is loaded, it is one. */
@@ -3405,6 +3552,13 @@ public class StashSorter extends Module {
         return s == null ? null : s.craftingTablePos;
     }
 
+    /** For the heartbeat: where the table in use came from: "set", "found", "placed", "crafted" or "none". */
+    String craftingTableSource() {
+        Stash s = ensureStash();
+        if (s == null || s.craftingTablePos == null) return "none";
+        return s.craftingTableSource.isEmpty() ? "set" : s.craftingTableSource;
+    }
+
     /**
      * For stash-manager: sets the crafting table, or clears it if it is this one.
      * @return 1 when set, 0 when cleared, -1 when the block is no crafting table, -2 when no stash is loaded
@@ -3413,11 +3567,14 @@ public class StashSorter extends Module {
         if (mc.level == null || ensureStash() == null) return -2;
         if (stash.craftingTablePos != null && stash.craftingTablePos.equals(pos)) {
             stash.craftingTablePos = null;
+            stash.craftingTableSource = "";
             stash.save();
             return 0;
         }
         if (!isTable(pos)) return -1;
         stash.craftingTablePos = pos.immutable();
+        stash.craftingTableSource = "set";
+        tableChanged();
         stash.save();
         return 1;
     }
@@ -3426,8 +3583,210 @@ public class StashSorter extends Module {
     boolean clearCraftingTable() {
         if (ensureStash() == null || stash.craftingTablePos == null) return false;
         stash.craftingTablePos = null;
+        stash.craftingTableSource = "";
         stash.save();
         return true;
+    }
+
+    // Finding a crafting table to craft at (before a craft that needs one). In order: the one picked by hand, a remembered one, a
+    // placed table found in the stash area, one taken from the stash and placed, one crafted in the inventory's 2x2 grid and placed.
+    // Nothing works: the craft fails with TableFinder.NONE. The placing is the anvil's (Job.AnvilPlace) with a table in hand.
+    private enum TableResume { Order, Compaction, Expand }
+
+    private enum TablePrep { READY, GATHERING, PLACING, FAILED }
+
+    private final TableFinder.Throttle tableThrottle = new TableFinder.Throttle();
+    private boolean tableSession, placingTable, tableCrafted;
+    private TableResume tableResume = TableResume.Order;
+    // Why the table could not be had, as the failure text ("no crafting table available: <cause>"), and why placing failed
+    private String tableWhy = TableFinder.NONE, placeWhy = "";
+    // Slots that held a crafting table before the table session began: never the one placed
+    private final Set<Integer> tablePre = new HashSet<>();
+    // The pre-check of a craft (can a table be had?) is kept for a few seconds, the world and the stash are not combed on every ask
+    private static final long TABLE_PRECHECK_MS = 3000;
+    private final TableFinder.Memo<TableFinder.Decision> tablePreCheck = new TableFinder.Memo<>();
+    private int tableWaitTicks;
+
+    /** The table position, or what it can be had from, changed: the kept answers are dropped. */
+    private void tableChanged() {
+        tableThrottle.reset();
+        tablePreCheck.reset();
+    }
+
+    private TableFinder.World tableWorld() {
+        return new TableFinder.World() {
+            @Override
+            public boolean isTable(TableFinder.Pos p) {
+                BlockPos at = new BlockPos(p.x(), p.y(), p.z());
+                return !mc.level.isLoaded(at) || StashSorter.this.isTable(at);
+            }
+
+            @Override
+            public TableFinder.Pos search() {
+                long now = System.currentTimeMillis();
+                TableFinder.Pos from = new TableFinder.Pos(mc.player.getBlockX(), mc.player.getBlockY(), mc.player.getBlockZ());
+                java.util.function.Supplier<TableFinder.Pos> look = () -> {
+                    PlaceSearch.View view = placeView();
+                    List<TableFinder.Pos> tables = new ArrayList<>();
+                    for (BlockPos t : scanArea(st -> st.is(Blocks.CRAFTING_TABLE), true)) tables.add(new TableFinder.Pos(t.getX(), t.getY(), t.getZ()));
+                    return TableFinder.nearest(tables, from, p -> {
+                        BlockPos t = new BlockPos(p.x(), p.y(), p.z());
+                        if (stash.hasArea() && !stash.inArea(t)) return false;
+                        // One the bot can stand next to
+                        for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) for (int dy = -1; dy <= 1; dy++) {
+                            if ((dx != 0 || dz != 0) && view.standable(t.getX() + dx, t.getY() + dy, t.getZ() + dz)) return true;
+                        }
+                        return false;
+                    });
+                };
+                TableFinder.Pos hit = tableThrottle.get(now, look);
+                // An answer from the last 10 seconds that is not a table any more is looked for again
+                if (hit != null && !isTable(hit)) {
+                    tableThrottle.reset();
+                    hit = tableThrottle.get(now, look);
+                }
+                return hit;
+            }
+
+            @Override
+            public boolean stockHasTable() {
+                return orderRunner.craftPool().getOrDefault(TableFinder.TABLE_ID, 0L) > 0;
+            }
+
+            @Override
+            public TableFinder.Material craftMaterial() {
+                StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+                return TableFinder.material(Crafter.recipes(), orderRunner.craftPool(), manager == null ? Set.of() : manager.craftNeverUse());
+            }
+        };
+    }
+
+    private TableFinder.Decision decideTable() {
+        TableFinder.Memory memory = stash.craftingTablePos == null ? null
+            : new TableFinder.Memory(new TableFinder.Pos(stash.craftingTablePos.getX(), stash.craftingTablePos.getY(), stash.craftingTablePos.getZ()),
+                TableFinder.Source.of(stash.craftingTableSource.isEmpty() ? "set" : stash.craftingTableSource));
+        return TableFinder.decide(memory, tableWorld());
+    }
+
+    /** What is in the inventory window's crafting grid and on its cursor, as text ("" when nothing). */
+    private String gridLeftovers() {
+        if (mc.player == null) return "";
+        var menu = mc.player.inventoryMenu;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 1; i <= 4; i++) {
+            ItemStack s = menu.getSlot(i).getItem();
+            if (!s.isEmpty()) sb.append(sb.length() > 0 ? ", " : "").append(s.getCount()).append("x ").append(s.getHoverName().getString());
+        }
+        ItemStack c = menu.getCarried();
+        if (!c.isEmpty()) sb.append(sb.length() > 0 ? ", " : "").append(c.getCount()).append("x ").append(c.getHoverName().getString()).append(" (cursor)");
+        return sb.toString();
+    }
+
+    private static boolean tableItem(ItemStack s) {
+        return !s.isEmpty() && s.is(Items.CRAFTING_TABLE);
+    }
+
+    /** The inventory slot of a crafting table item gathered or crafted for placing, or -1. */
+    private int tableItemSlot(boolean fromSession) {
+        var inv = mc.player.getInventory();
+        if (placingTable && anvilSlot >= 0 && tableItem(inv.getItem(anvilSlot))) return anvilSlot;
+        if (!fromSession) return -1;
+        // Only what the table session itself held, and never a slot that held a table before it began (an order line may need those)
+        for (int slot : crafter.lastHeld()) {
+            if (tableItem(inv.getItem(slot)) && !tablePre.contains(slot) && (stashHeld.containsKey(slot) || orderHeld.containsKey(slot))) return slot;
+        }
+        return -1;
+    }
+
+    /**
+     * A craft needs a table and none is set or remembered: finds one placed, or starts getting one to place. The caller drives what
+     * was started: GATHERING is a crafter session to be run, PLACING a job already started. When it is over {@link #tableAcquired}
+     * tells whoever asked.
+     */
+    private TablePrep prepareTable(TableResume resume) {
+        if (stash == null || mc.level == null || mc.player == null) return TablePrep.FAILED;
+        tableResume = resume;
+        // A table taken out or crafted earlier and not yet placed (the job was interrupted)
+        int held = tableItemSlot(false);
+        if (held >= 0) tableCrafted = false;
+        if (held >= 0 && startTablePlace(held)) return TablePrep.PLACING;
+
+        TableFinder.Decision decision = decideTable();
+        if (decision.forget()) {
+            info("The crafting table I knew is gone, looking for another.");
+            stash.craftingTablePos = null;
+            stash.craftingTableSource = "";
+            stash.save();
+            tableChanged();
+        }
+        tablePre.clear();
+        var invNow = mc.player.getInventory();
+        for (int i = 0; i < invNow.getContainerSize(); i++) if (tableItem(invNow.getItem(i))) tablePre.add(i);
+        switch (decision.step()) {
+            case USE -> {
+                return TablePrep.READY;
+            }
+            case FOUND -> {
+                stash.craftingTablePos = new BlockPos(decision.pos().x(), decision.pos().y(), decision.pos().z());
+                stash.craftingTableSource = "found";
+                stash.save();
+                info("Found a crafting table in the stash area, using it for crafting from now on.");
+                return TablePrep.READY;
+            }
+            case PLACE_FROM_STOCK -> {
+                String why = crafter.begin(new Crafter.Request(TableFinder.TABLE_ID, 1, "placing", false, 0, orderRunner::craftPool, orderRunner::lotKeys, true));
+                if (why != null) {
+                    warning("No crafting table to place: %s.", why);
+                    tableWhy = TableFinder.failure("couldn't take one from the stash: " + why);
+                    return TablePrep.FAILED;
+                }
+                tableCrafted = false;
+                info("No crafting table in the area, taking one out of the stash to place.");
+            }
+            case CRAFT -> {
+                String why = crafter.begin(new Crafter.Request(TableFinder.TABLE_ID, 1, "placing", false, 0, orderRunner::craftPool, orderRunner::lotKeys, false));
+                if (why != null) {
+                    warning("No crafting table to craft: %s.", why);
+                    tableWhy = TableFinder.failure("couldn't craft one: " + why);
+                    return TablePrep.FAILED;
+                }
+                crafter.useInventoryGrid();
+                tableCrafted = true;
+                info("No crafting table in the area or the stash, crafting one from %s in the inventory grid.", decision.material() == TableFinder.Material.LOGS ? "logs" : "planks");
+            }
+            default -> {
+                warning("%s.", decision.failure());
+                tableWhy = decision.failure();
+                return TablePrep.FAILED;
+            }
+        }
+        craftForOrder = resume == TableResume.Order;
+        tableSession = true;
+        return TablePrep.GATHERING;
+    }
+
+    private boolean startTablePlace(int slot) {
+        return startPlaceItem(slot, true);
+    }
+
+    /** The table is there (or not): whoever asked is told, and carries on. */
+    private void tableAcquired(boolean ok) {
+        switch (tableResume) {
+            case Order -> {
+                if (ok) orderRunner.tableReady();
+                else orderRunner.craftEnded(new Crafter.Outcome(SHULKER_BOX_ID, 0, tableWhy));
+            }
+            case Compaction -> {
+                if (!ok) {
+                    craftCooldownUntil = ticks + CRAFT_COOLDOWN_TICKS;
+                    craftCooldownWhy = tableWhy;
+                }
+            }
+            case Expand -> {
+                if (ok) startExpand(true);
+                else expandFailed("no chests left in the stash, and " + tableWhy);
+            }
+        }
     }
 
     private final Crafter crafter = new Crafter(new Crafter.Owner() {
@@ -3528,6 +3887,38 @@ public class StashSorter extends Module {
     /** The crafting session is over: the order (or the compactor) is told how it went. */
     private void endCraft() {
         Crafter.Outcome outcome = crafter.finish();
+        if (tableSession) {
+            // The crafting table was only gathered or crafted: it is placed now
+            tableSession = false;
+            craftForOrder = false;
+            int slot = outcome.failure() == null ? tableItemSlot(true) : -1;
+            if (slot < 0 || !startTablePlace(slot)) {
+                String cause = outcome.failure() == null ? "the crafting table couldn't be taken" : outcome.failure();
+                warning("No crafting table to place: %s.", cause);
+                tableWhy = TableFinder.failure(cause);
+                tableAcquired(false);
+            }
+            // What the session held is not looked at again
+            crafter.clearLastHeld();
+            version++;
+            idle = false;
+            return;
+        }
+        if (chestSession) {
+            // The chests for the delivery storage were only gathered or crafted: they are put up now
+            chestSession = false;
+            craftForOrder = false;
+            ChestStack.Result res = outcome.failure() == null ? stackPlan() : null;
+            if (outcome.failure() != null) {
+                crafter.clearLastHeld();
+                expandFailed("no chests: " + outcome.failure());
+            }
+            else if (res.plan() == null) expandFailed(res.blocked());
+            else if (!startChestPlace(res.plan())) expandFailed("it couldn't be put up");
+            version++;
+            idle = false;
+            return;
+        }
         if (anvilSession) {
             // The anvil was only gathered: it is placed now
             anvilSession = false;
@@ -3552,6 +3943,7 @@ public class StashSorter extends Module {
             else if (outcome.crafted() > 0) info("Crafted %d Shulker Box.", outcome.crafted());
         }
         craftForOrder = false;
+        crafter.clearLastHeld();
         version++;
         idle = false;
     }
@@ -3559,6 +3951,28 @@ public class StashSorter extends Module {
     /** The order wants this many plain shulker boxes crafted. */
     private boolean startOrderCraft(OrderRunner.Craft craft) {
         if (!crafter.active()) {
+            // No table set or remembered: one is found, placed from the stash or crafted first (the order carries on after)
+            if (stash != null && tableMissing()) {
+                // The craft itself must be possible before a table is put in the world for it
+                var preview = crafter.preview(SHULKER_BOX_ID, craft.count(), orderRunner.crafted(), orderRunner.craftPool(), false);
+                if (!preview.ok()) {
+                    orderRunner.craftEnded(new Crafter.Outcome(SHULKER_BOX_ID, 0, preview.refusal()));
+                    return false;
+                }
+                switch (prepareTable(TableResume.Order)) {
+                    case GATHERING -> {
+                        return runCraft(crafter.next());
+                    }
+                    case PLACING -> {
+                        return true;
+                    }
+                    case FAILED -> {
+                        orderRunner.craftEnded(new Crafter.Outcome(SHULKER_BOX_ID, 0, tableWhy));
+                        return false;
+                    }
+                    default -> { }
+                }
+            }
             String why = crafter.begin(new Crafter.Request(SHULKER_BOX_ID, craft.count(), "order " + orderRunner.orderId(), true, orderRunner.crafted(), orderRunner::craftPool, orderRunner::lotKeys, false));
             if (why != null) {
                 orderRunner.craftEnded(new Crafter.Outcome(SHULKER_BOX_ID, 0, why));
@@ -3575,6 +3989,20 @@ public class StashSorter extends Module {
         if (ticks < craftCooldownUntil) return craftCooldownWhy;
         if (crafter.active()) return null;
         String why = craftBlocker();
+        if (why == null && tableMissing()) {
+            // The craft itself must be possible before a table is put in the world for it
+            var preview = crafter.preview(SHULKER_BOX_ID, 1, 0, crafter.survey(), false);
+            if (!preview.ok()) why = preview.refusal();
+            else {
+                switch (prepareTable(TableResume.Compaction)) {
+                    case GATHERING, PLACING -> {
+                        return null;
+                    }
+                    case FAILED -> why = tableWhy;
+                    default -> { }
+                }
+            }
+        }
         if (why == null) why = crafter.begin(new Crafter.Request(SHULKER_BOX_ID, 1, purpose, false, 0, crafter::survey));
         if (why != null) {
             craftCooldownUntil = ticks + CRAFT_COOLDOWN_TICKS;
@@ -3586,8 +4014,15 @@ public class StashSorter extends Module {
     }
 
     private boolean startCraftTable() {
+        if (crafter.inventoryGrid()) return startInventoryCraft();
         String bad = craftBlocker();
         BlockPos table = stash == null ? null : stash.craftingTablePos;
+        // The table was cleared (from the website) or forgotten while the session ran
+        if (table == null) {
+            crafter.tableEnded(TableFinder.failure("it was cleared while crafting"));
+            return false;
+        }
+        if (bad == null && tableMissing()) bad = TABLE_GONE;
         if (bad == null && !walkOn() && !inReachOf(table)) bad = TABLE_NOT_REACHED;
         if (bad != null) {
             crafter.tableEnded(bad);
@@ -3623,6 +4058,43 @@ public class StashSorter extends Module {
             walkInside = false;
             step = Step.Walking;
         }
+        return true;
+    }
+
+    /** Crafts in the 2x2 grid of the inventory window: no table, no walking, no window to open. */
+    private boolean startInventoryCraft() {
+        if (mc.player.containerMenu != mc.player.inventoryMenu) {
+            if (!ourMenu(mc.player.containerMenu)) {
+                crafter.tableEnded("another window is open");
+                return false;
+            }
+            if (!mc.player.containerMenu.getCarried().isEmpty()) recoverCursor();
+            closeOurWindow(mc.player.containerMenu);
+        }
+        craftPos = null;
+        craftFailure = null;
+        craftDone = false;
+        craftJobTicks = craftOpenTries = craftOpenClickAt = craftDrainTries = 0;
+        craftStuckTicks = 0;
+        tableWaitTicks = 0;
+        craftStuckReported = false;
+
+        job = Job.Craft;
+        target = null;
+        handle = null;
+        actions = 0;
+        jobCounted = false;
+        stepTicks = 0;
+        jobInterruptions = 0;
+        startSigSet = endSigSet = false;
+        settled = false;
+        openPos = null;
+        openMenuBefore = null;
+        recoveries = 0;
+        swapStep = 0;
+        step("crafting: a crafting table in the inventory grid; next: place it.");
+        step = Step.Working;
+        wait = delay.get();
         return true;
     }
 
@@ -3675,12 +4147,18 @@ public class StashSorter extends Module {
                 ownedMenu = open;
                 step = Step.Working;
                 stepTicks = 0;
-                wait = delay.get();
+                wait = firstClickWait();
                 return;
             }
             // Something else opened (one left over, a plugin window): closed, and the click made again
             if (!open.getCarried().isEmpty()) recoverCursor();
             mc.player.closeContainer();
+            lastCloseTick = ticks;
+        }
+
+        if (openHeld()) {
+            stepTicks--;
+            return;
         }
 
         if (stepTicks > CRAFT_OPEN_TICKS || (craftOpenTries >= CRAFT_OPEN_TRIES && stepTicks - craftOpenClickAt > CRAFT_OPEN_RETRY)) {
@@ -3716,7 +4194,8 @@ public class StashSorter extends Module {
 
     private void craftWork() {
         AbstractContainerMenu menu = mc.player.containerMenu;
-        if (!(menu instanceof net.minecraft.world.inventory.CraftingMenu) || menu != ownedMenu) {
+        boolean grid = crafter.inventoryGrid();
+        if (grid ? menu != mc.player.inventoryMenu : (!(menu instanceof net.minecraft.world.inventory.CraftingMenu) || menu != ownedMenu)) {
             craftEnd();
             return;
         }
@@ -3748,14 +4227,29 @@ public class StashSorter extends Module {
     private void craftEnd() {
         if (ourGoal != null) releaseGoal();
         AbstractContainerMenu menu = mc.player.containerMenu;
-        if (menu instanceof net.minecraft.world.inventory.CraftingMenu && menu == ownedMenu && !crafter.clean(menu)) {
+        boolean grid = crafter.inventoryGrid();
+        // The inventory window can't be drained while another window is open: it is waited for (our own is closed), up to 10 seconds
+        if (grid && menu != mc.player.inventoryMenu) {
+            if (ourMenu(menu)) {
+                if (!menu.getCarried().isEmpty()) recoverCursor();
+                closeOurWindow(menu);
+                return;
+            }
+            if (++tableWaitTicks <= 20 * 10) return;
+            if (craftFailure == null) craftFailure = "another window is open";
+            String left = gridLeftovers();
+            if (!left.isEmpty()) alert("Another window is open, so I left items in the inventory's crafting grid: %s. They come back to your inventory when you close it.", left);
+        }
+        boolean mine = grid ? menu == mc.player.inventoryMenu : menu instanceof net.minecraft.world.inventory.CraftingMenu && menu == ownedMenu;
+        if (mine && !crafter.clean(menu)) {
             Crafter.Act back = crafter.drain(menu);
             if (back != null && back.kind() == Crafter.Act.CLICK) {
                 craftDrainTries++;
                 craftClick(menu, back.slot(), back.button());
                 return;
             }
-            if (craftDrainTries++ % 200 == 0) alert("No room for what is in the crafting table, keeping the window open. Please make room in your inventory.");
+            if (craftDrainTries++ % 200 == 0) alert(grid ? "No room for what is in the inventory's crafting grid. Please make room in your inventory."
+                : "No room for what is in the crafting table, keeping the window open. Please make room in your inventory.");
             // After about two minutes the order step ends with a clear reason; the window stays open and the alert goes on
             if (++craftStuckTicks > 20 * 120 && !craftStuckReported) {
                 craftStuckReported = true;
@@ -3764,7 +4258,7 @@ public class StashSorter extends Module {
             }
             return;
         }
-        if (menu != mc.player.inventoryMenu && ourMenu(menu)) closeOurWindow(menu);
+        if (!grid && menu != mc.player.inventoryMenu && ourMenu(menu)) closeOurWindow(menu);
         ownedMenu = null;
         openPos = null;
         openMenuBefore = null;
@@ -3777,7 +4271,15 @@ public class StashSorter extends Module {
         }
         // Table trouble is remembered for the order the way the plugin does: no result, not taken, couldn't reach or open, or
         // two closes in a row. Not after a single close
-        craftHealth.note(orderRunner.orderId(), craftPos, why);
+        if (!grid) craftHealth.note(orderRunner.orderId(), craftPos, why);
+        // A found, placed or crafted table that can't be reached or opened is forgotten, so the next craft searches again; a hand-set one never
+        if (!grid && (TABLE_NOT_REACHED.equals(why) || TABLE_NOT_OPENED.equals(why)) && stash.craftingTablePos != null && stash.craftingTablePos.equals(craftPos)
+            && !stash.craftingTableSource.isEmpty() && !stash.craftingTableSource.equals("set")) {
+            stash.craftingTablePos = null;
+            stash.craftingTableSource = "";
+            stash.save();
+            tableChanged();
+        }
         crafter.tableEnded(why);
         craftFailure = null;
         craftDone = false;
@@ -3872,6 +4374,627 @@ public class StashSorter extends Module {
         return true;
     }
 
+    // ------------------------------------------------------------------------------------------------------------------
+    // Delivery storage (0.4.0-dev.5; the proxy plugin 1.9.0 has the same): the delivery container and the double chests put up above
+    // it (DeliveryBook keeps which are full). With auto-expand-delivery on, when every chest is full another double chest is taken
+    // from the stash (or crafted, with crafting on) and put up one block above the top row by ChestPlacer: the first half by a
+    // sneaking click on the top of the chest below, the second by a sneaking click on the side of the first (ChestStack has the
+    // rules). A chest a player emptied is found by its lid (StashWatch, the lid animation) and looked at once; where the lid was
+    // out of sight, by looking again now and then while the order waits for space. The chests are boxes flagged delivery: never
+    // sorted into, read, taken from, indexed or searched, saved with the stash.
+
+    private static final String CHEST_ID = "minecraft:chest";
+    private static final long EXPAND_RETRY_MS = 60_000L, EXPAND_EVAL_MS = 5_000L;
+    // Chests are being gathered or crafted for the storage, and are carried until they are put up
+    private boolean chestSession, chestHolding;
+    // The Deliver job is a look at a full chest (Recheck), not a delivery; the chest the last shulker went into
+    private boolean recheckOnly;
+    private Box lastDeliveryBox;
+    private ChestStack.Plan chestPlanNow;
+    // Why another chest could not be put up the last time (no chests to be had, placing failed), and when; the last evaluation
+    private String expandFailure, expandEval;
+    private long expandFailureAt, expandEvalAt;
+    private final StashWatch deliveryWatch = new StashWatch(true);
+
+    private final ChestPlacer placer = new ChestPlacer(new ChestPlacer.Owner() {
+        @Override
+        public Set<Integer> keep() {
+            return parseSlots(keepSlots.get());
+        }
+
+        @Override
+        public boolean rotate() {
+            return rotate.get();
+        }
+
+        @Override
+        public int delay() {
+            return delay.get();
+        }
+
+        @Override
+        public boolean walk() {
+            return walkOn();
+        }
+
+        @Override
+        public void walkTo(BlockPos stand) {
+            if (!BARITONE) return;
+            walkNear(stand, 0);
+            // The stand may be outside the stash area: that is not a reason to refuse the way
+            walkInside = false;
+        }
+
+        @Override
+        public void releaseGoal() {
+            StashSorter.this.releaseGoal();
+        }
+
+        @Override
+        public boolean moving() {
+            return BARITONE && BaritoneHelper.isMoving();
+        }
+
+        @Override
+        public boolean leftArea() {
+            return StashSorter.this.leftArea();
+        }
+
+        @Override
+        public boolean running() {
+            return gate == Gate.Running && orderRunner.running() && !orderRunner.calledOff();
+        }
+
+        @Override
+        public void moved(int from, int to, ItemStack was) {
+            // The tracking of the stack goes with it, or what is left of it would count as the player's own
+            stashHeld.remove(from);
+            orderHeld.remove(from);
+            Box source = heldFrom.remove(from);
+            stashHeld.put(to, was);
+            if (orderWork()) orderHeld.put(to, was.copy());
+            if (source != null) heldFrom.put(to, source);
+        }
+
+        @Override
+        public void pause(int ticks) {
+            wait = ticks;
+        }
+
+        @Override
+        public void debug(String text) {
+            StashSorter.this.debug("%s", text);
+        }
+    });
+
+    private static BlockPos bp(DeliveryBook.Pos p) {
+        return new BlockPos(p.x(), p.y(), p.z());
+    }
+
+    private static DeliveryBook.Pos dp(BlockPos p) {
+        return new DeliveryBook.Pos(p.getX(), p.getY(), p.getZ());
+    }
+
+    private DeliveryBook book() {
+        return new DeliveryBook(stash == null ? new ArrayList<>() : stash.deliveryStorage);
+    }
+
+    private static boolean autoExpand() {
+        StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+        return manager != null && manager.autoExpandDelivery();
+    }
+
+    private boolean plainChest(ItemStack s) {
+        return s.is(net.minecraft.world.item.Items.CHEST) && !s.has(DataComponents.CONTAINER);
+    }
+
+    /** The chests carried to be put up. */
+    private int carriedChests() {
+        int n = 0;
+        for (int i = 0; i < 36; i++) {
+            ItemStack s = mc.player.getInventory().getItem(i);
+            if (plainChest(s) && (stashHeld.containsKey(i) || orderHeld.containsKey(i))) n += s.getCount();
+        }
+        return n;
+    }
+
+    /** A chest put up for the delivery storage is turned into something else by hand: it leaves the storage. */
+    private void forgetExtra(Box box) {
+        if (!box.deliveryExtra || stash == null) return;
+        DeliveryBook book = book();
+        DeliveryBook.Entry e = book.find(dp(box.pos));
+        if (e != null && !e.primary) book.remove(e);
+        box.deliveryExtra = false;
+        stash.markDirty();
+    }
+
+    /**
+     * A box stops being a delivery box: every flag delivery set goes back (including noCompact), and a box that was never
+     * read is removed instead of being kept as an ordinary container nobody has seen.
+     */
+    private void unflagDelivery(Box b) {
+        b.delivery = false;
+        b.deliveryExtra = false;
+        b.excluded = b.wasExcluded;
+        b.dropOff = b.wasDropOff;
+        b.wasExcluded = false;
+        b.wasDropOff = false;
+        b.noCompact = false;
+        if (b.neverRead()) {
+            stash.boxes.remove(b);
+            surveyRetry.succeed(b);
+            failedSurvey.remove(b);
+            QwerteAddon.LOG.info("[stash-sorter] removed the never-read container at {} that stopped being a delivery container.", xyz(b.pos));
+        }
+        stash.markDirty();
+    }
+
+    /**
+     * Keeps the stash's boxes for the delivery storage in step with the book: the delivery container (the book follows it; a
+     * different one forgets the chests put up above the old one) and the chests put up above it, flagged delivery and excluded.
+     */
+    private void syncDelivery() {
+        Stash s = stash;
+        if (s == null || mc.level == null) return;
+        s.ensureDelivery();
+        Box primary = null;
+        for (Box b : s.boxes) if (b.delivery && !b.deliveryExtra) primary = b;
+        DeliveryBook book = book();
+        if (primary == null) {
+            for (Box b : new ArrayList<>(s.boxes)) if (b.deliveryExtra) unflagDelivery(b);
+            if (!s.deliveryStorage.isEmpty()) {
+                book.syncPrimary(null);
+                s.markDirty();
+            }
+            return;
+        }
+        int before = s.deliveryStorage.size();
+        List<DeliveryBook.Pos> parts = new ArrayList<>();
+        for (BlockPos p : primary.parts) parts.add(dp(p));
+        book.syncPrimary(parts);
+        if (book.dedupe() || s.deliveryStorage.size() != before) s.markDirty();
+
+        Set<Box> mine = new HashSet<>();
+        mine.add(primary);
+        for (DeliveryBook.Entry e : book.sorted()) {
+            if (e.primary) continue;
+            BlockPos at = bp(e.first());
+            Box eb = s.boxAt(at);
+            // A chest that is gone (broken by a player) leaves the storage
+            if (mc.level.isLoaded(at) && !(mc.level.getBlockEntity(at) instanceof ChestBlockEntity)) {
+                book.remove(e);
+                if (eb != null) s.boxes.remove(eb);
+                s.markDirty();
+                continue;
+            }
+            if (eb == null) {
+                eb = mc.level.isLoaded(at) ? makeBox(at) : new Box(at, new ArrayList<>(List.of(at)));
+                s.boxes.add(eb);
+                s.markDirty();
+            }
+            // A single chest that became a double (or half of one broken): the halves are what the world says
+            if (mc.level.isLoaded(at)) {
+                Box fresh = makeBox(at);
+                if (fresh.parts.size() != eb.parts.size() || !fresh.parts.containsAll(eb.parts)) {
+                    eb.parts.clear();
+                    eb.parts.addAll(fresh.parts);
+                    eb.contents = null;
+                    List<DeliveryBook.Pos> p2 = new ArrayList<>();
+                    for (BlockPos p : fresh.parts) p2.add(dp(p));
+                    e.at = new DeliveryBook(new ArrayList<>()).add(p2).at;
+                    s.markDirty();
+                }
+            }
+            if (!eb.delivery || !eb.deliveryExtra || !eb.excluded || eb.dropOff) {
+                // What the user had set on it comes back when it leaves the storage
+                if (!eb.delivery) {
+                    eb.wasExcluded = eb.excluded;
+                    eb.wasDropOff = eb.dropOff;
+                }
+                eb.delivery = true;
+                eb.deliveryExtra = true;
+                eb.excluded = true;
+                eb.dropOff = false;
+                eb.noCompact = true;
+                s.markDirty();
+            }
+            mine.add(eb);
+        }
+        int dropped = 0;
+        for (Box b : new ArrayList<>(s.boxes)) {
+            if (!b.deliveryExtra || mine.contains(b)) continue;
+            // The same chest as one of the storage's (a duplicate box): gone; any other is an ordinary container again
+            boolean twin = false;
+            for (Box m : mine) for (BlockPos q : b.parts) if (m.parts.contains(q)) twin = true;
+            if (twin) {
+                s.boxes.remove(b);
+                s.markDirty();
+                continue;
+            }
+            dropped++;
+            unflagDelivery(b);
+        }
+        if (dropped > 0) alert("%d extra delivery chest%s now ordinary stash containers; their contents will be sorted.", dropped, dropped == 1 ? " is" : "s are");
+    }
+
+    /** A different delivery container, or none: the chests put up above the old one are an ordinary stash again. */
+    private void dropDeliveryExtras() {
+        if (stash == null) return;
+        int n = 0;
+        for (Box b : new ArrayList<>(stash.boxes)) if (b.deliveryExtra) {
+            n++;
+            unflagDelivery(b);
+        }
+        if (n > 0) alert("%d extra delivery chest%s now ordinary stash containers; their contents will be sorted.", n, n == 1 ? " is" : "s are");
+        stash.deliveryStorage.clear();
+        stash.markDirty();
+    }
+
+    private final ChestStack.View stackView = new ChestStack.View() {
+        @Override
+        public boolean loaded(int x, int z) {
+            return mc.level.isLoaded(new BlockPos(x, 0, z));
+        }
+
+        @Override
+        public boolean air(int x, int y, int z) {
+            BlockPos p = new BlockPos(x, y, z);
+            BlockPos feet = mc.player.blockPosition();
+            boolean body = feet.getX() == x && feet.getZ() == z && (feet.getY() == y || feet.getY() + 1 == y);
+            return mc.level.getBlockState(p).isAir() && !body;
+        }
+
+        @Override
+        public boolean conductor(int x, int y, int z) {
+            BlockPos p = new BlockPos(x, y, z);
+            BlockState st = mc.level.getBlockState(p);
+            return !st.isAir() && st.isRedstoneConductor(mc.level, p);
+        }
+
+        @Override
+        public String name(int x, int y, int z) {
+            return BuiltInRegistries.BLOCK.getKey(mc.level.getBlockState(new BlockPos(x, y, z)).getBlock()).getPath();
+        }
+
+        @Override
+        public boolean standable(int x, int y, int z) {
+            return placeView().standable(x, y, z);
+        }
+
+        @Override
+        public int minY() {
+            return mc.level.getMinSectionY() << 4;
+        }
+
+        @Override
+        public int maxY() {
+            return (mc.level.getMaxSectionY() + 1) << 4;
+        }
+    };
+
+    /** Where the next row goes, or why it can't. */
+    private ChestStack.Result stackPlan() {
+        List<DeliveryBook.Entry> row = book().topRow();
+        if (row.isEmpty()) return new ChestStack.Result(null, "no delivery container is set");
+        DeliveryBook.Entry top = row.get(0);
+        List<DeliveryBook.Pos> parts = top.parts();
+        BlockPos p0 = bp(parts.get(0));
+        if (!mc.level.isLoaded(p0)) return new ChestStack.Result(null, "the delivery chest isn't loaded");
+        BlockState st = mc.level.getBlockState(p0);
+        int fx = 0, fz = 0;
+        if (st.hasProperty(ChestBlock.FACING)) {
+            Direction d = st.getValue(ChestBlock.FACING);
+            fx = d.getStepX();
+            fz = d.getStepZ();
+        }
+        return ChestStack.next(parts, fx, fz, !(st.getBlock() instanceof BarrelBlock), book().sorted().get(0).y(), dp(mc.player.blockPosition()), stackView);
+    }
+
+    private String expandBlockerNow() {
+        long now = System.currentTimeMillis();
+        String failed = expandFailure;
+        if (failed != null && now - expandFailureAt < EXPAND_RETRY_MS) return failed;
+        if (now - expandEvalAt < EXPAND_EVAL_MS) return expandEval;
+        expandEval = computeExpandBlocker();
+        expandEvalAt = now;
+        return expandEval;
+    }
+
+    private String computeExpandBlocker() {
+        ChestStack.Result res = stackPlan();
+        if (res.plan() == null) return res.blocked();
+        int need = res.plan().second() != null ? 2 : 1;
+        int have = carriedChests();
+        if (have >= need) return null;
+        Map<String, Long> pool = orderRunner.craftPool();
+        if (pool.getOrDefault(CHEST_ID, 0L) >= need - have) return null;
+        if (!craftingOn()) return "no chests left in the stash (crafting is off)";
+        String blocker = craftBlocker();
+        if (blocker != null) return "no chests left in the stash, and " + blocker;
+        com.porter.qwerte.craft.CraftPlanner.Result plan = crafter.preview(CHEST_ID, need - have, 0, pool, false);
+        return plan.ok() ? null : "no chests left in the stash, and " + plan.refusal();
+    }
+
+    /** What the delivery storage can take now, as the order runner asks. */
+    private DeliveryRoom deliveryRoomNow() {
+        if (stash == null || mc.level == null) return DeliveryRoom.ROOM;
+        syncDelivery();
+        DeliveryBook book = book();
+        if (book.chests() == 0) return DeliveryRoom.ROOM;
+        // Only worked out when every chest is full (the supply check reads the whole stash)
+        String blocker = autoExpand() && book.firstUsable() == null ? expandBlockerNow() : null;
+        return book.room(autoExpand(), blocker, System.currentTimeMillis(), DeliveryBook.RECHECK_MS);
+    }
+
+    /** The chest the next shulker goes into: the lowest with room, or (verify) the one the last went into. */
+    private Box deliveryChestFor(boolean verify) {
+        if (stash == null) return null;
+        if (verify && lastDeliveryBox != null && lastDeliveryBox.delivery && stash.boxes.contains(lastDeliveryBox)) return lastDeliveryBox;
+        DeliveryBook book = book();
+        for (DeliveryBook.Entry e : book.sorted()) {
+            if (e.full) continue;
+            Box b = stash.boxAt(bp(e.first()));
+            if (b == null || !b.delivery) continue;
+            // A chest put up above the container that can't be reached is passed over like a full one
+            if (b.deliveryExtra && b.unreachable) {
+                book.markFull(e, System.currentTimeMillis());
+                continue;
+            }
+            return b;
+        }
+        return null;
+    }
+
+    private void deliveryChestFull(Box box) {
+        if (box == null || stash == null) return;
+        DeliveryBook book = book();
+        DeliveryBook.Entry e = book.find(dp(box.pos));
+        if (e == null) return;
+        book.markFull(e, System.currentTimeMillis());
+        stash.markDirty();
+    }
+
+    /** The heartbeat's deliveryStorage (null when no delivery container is set): chests, full ones, whether another can go up. */
+    StashIndex.DeliveryStorage deliveryStorage() {
+        try {
+            Stash s = stash;
+            if (s == null || mc.level == null || mc.player == null || s.deliveryPos == null) return null;
+            DeliveryBook book = new DeliveryBook(s.deliveryStorage);
+            int chests = book.chests(), full = book.fullCount();
+            boolean auto = autoExpand();
+            String blocked = null;
+            if (chests > 0) {
+                if (!auto) blocked = full >= chests ? "auto expand is off" : null;
+                else if (expandFailure != null && System.currentTimeMillis() - expandFailureAt < EXPAND_RETRY_MS) blocked = expandFailure;
+                else if (book.firstUsable() == null) blocked = storageBlocker();
+            }
+            return new StashIndex.DeliveryStorage(auto, chests, full, auto && blocked == null && chests > 0, blocked);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    private String storageCached;
+    private long storageAt;
+
+    /** The geometry blocker, only worked out when every chest is full and cached for a few seconds (asked for every tick). */
+    private String storageBlocker() {
+        long now = System.currentTimeMillis();
+        if (now - storageAt < EXPAND_EVAL_MS) return storageCached;
+        storageAt = now;
+        try {
+            ChestStack.Result res = stackPlan();
+            storageCached = res.plan() == null ? res.blocked() : expandEval;
+        } catch (RuntimeException e) {
+            storageCached = null;
+        }
+        return storageCached;
+    }
+
+    /** "3 chests, 1 full, can expand" or "... blocked: why". */
+    String deliveryStorageLine() {
+        StashIndex.DeliveryStorage d = deliveryStorage();
+        if (d == null) return "no delivery container set";
+        String tail = d.blocked() != null ? "blocked: " + d.blocked() : d.autoExpand() ? "can expand" : "auto expand is off";
+        return d.chests() + (d.chests() == 1 ? " chest, " : " chests, ") + d.full() + " full, " + tail;
+    }
+
+    /** Another player opened a delivery chest and closed it again (StashWatch): a full one is to be looked at. */
+    private void deliveryTouched(Box box) {
+        if (stash == null) return;
+        if (book().lidClosedByOther(dp(box.pos))) {
+            debug("Another player used the delivery chest at %s.", box.pos.toShortString());
+            stash.markDirty();
+        }
+    }
+
+    // Looking at a full chest again
+
+    private boolean startRecheck(Box box) {
+        if (box == null || !box.delivery) return false;
+        recheckOnly = true;
+        step("order: looking at a delivery chest that may have been emptied.");
+        boolean started = start(Job.Deliver, box);
+        if (!started) {
+            recheckOnly = false;
+            // Not tried again every tick: it counts as looked at now, and the next look is due later
+            deliveryChestFull(box);
+        }
+        return started;
+    }
+
+    /** The open delivery chest was read: it has room again, or it is still full. */
+    private void recheckRead() {
+        recheckOnly = false;
+        if (target == null) return;
+        DeliveryBook book = book();
+        DeliveryBook.Entry e = book.find(dp(target.pos));
+        if (e == null) return;
+        boolean room = false;
+        for (ItemStack s : target.contents) if (s.isEmpty()) room = true;
+        if (room) book.markRoom(e, System.currentTimeMillis());
+        else book.markFull(e, System.currentTimeMillis());
+        stash.markDirty();
+        info("Order: a delivery chest was looked at again: %s.", room ? "it has room" : "still full");
+    }
+
+    // Putting a double chest up
+
+    /** Chests could not be had or put up: said, and remembered for a minute before it is tried again. */
+    private void expandFailed(String why) {
+        expandFailure = why;
+        expandFailureAt = System.currentTimeMillis();
+        expandEvalAt = 0;
+        chestHolding = false;
+        warning("Delivery storage: couldn't put another chest up (%s). The order waits for space.", why);
+        step("delivery storage: couldn't put another chest up: " + why + "; the order waits for space.");
+    }
+
+    /** Starts putting another row of chests up (OrderRunner.Expand). @return true when a job was started */
+    private boolean startExpand() {
+        return startExpand(false);
+    }
+
+    /** @param again the crafting table it waited for is ready: not counted as another try */
+    private boolean startExpand(boolean again) {
+        if (stash == null || mc.level == null || crafter.active() || kitBuilder.active()) return false;
+        syncDelivery();
+        ChestStack.Result res = stackPlan();
+        if (res.plan() == null) {
+            expandFailed(res.blocked());
+            return false;
+        }
+        ChestStack.Plan plan = res.plan();
+        if (!again) orderRunner.expandStarted();
+        // Chests already standing in the new row (a try cut short before) are taken as they are
+        boolean firstUp = mc.level.getBlockState(bp(plan.first())).getBlock() instanceof ChestBlock;
+        boolean secondUp = plan.second() != null && mc.level.getBlockState(bp(plan.second())).getBlock() instanceof ChestBlock;
+        int toPlace = (firstUp ? 0 : 1) + (plan.second() == null || secondUp ? 0 : 1);
+        if (toPlace == 0) {
+            registerChests(plan);
+            return false;
+        }
+        int have = carriedChests();
+        chestHolding = true;
+        if (have >= toPlace) return startChestPlace(plan);
+
+        int need = toPlace - have;
+        Map<String, Long> pool = orderRunner.craftPool();
+        boolean inStock = pool.getOrDefault(CHEST_ID, 0L) >= need;
+        if (!inStock && !craftingOn()) {
+            expandFailed("no chests left in the stash (crafting is off)");
+            return false;
+        }
+        String why = inStock ? null : craftBlocker();
+        if (why == null && !inStock && tableMissing()) {
+            // The craft itself must be possible before a table is put in the world for it
+            var preview = crafter.preview(CHEST_ID, need, 0, pool, false);
+            if (!preview.ok()) why = preview.refusal();
+            else {
+                switch (prepareTable(TableResume.Expand)) {
+                    case GATHERING -> {
+                        return runCraft(crafter.next());
+                    }
+                    case PLACING -> {
+                        return true;
+                    }
+                    case FAILED -> why = tableWhy;
+                    default -> { }
+                }
+            }
+        }
+        if (why == null) why = crafter.begin(new Crafter.Request(CHEST_ID, need, "delivery storage", false, 0, orderRunner::craftPool, orderRunner::lotKeys, inStock));
+        if (why != null) {
+            expandFailed(inStock ? why : "no chests left in the stash, and " + why);
+            return false;
+        }
+        chestSession = true;
+        craftForOrder = false;
+        info("Delivery storage: taking %d chest%s out of the stash to put up.", need, need == 1 ? "" : "s");
+        boolean started = runCraft(crafter.next());
+        if (!started && chestSession && job == null && !crafter.active()) {
+            chestSession = false;
+            chestHolding = false;
+            expandFailed("taking the chests out of the stash didn't start");
+        }
+        return started;
+    }
+
+    private boolean startChestPlace(ChestStack.Plan plan) {
+        chestPlanNow = plan;
+        chestJobTicks = 0;
+        boolean firstUp = mc.level.getBlockState(bp(plan.first())).getBlock() instanceof ChestBlock;
+        placer.begin(plan, firstUp);
+        job = Job.ChestPlace;
+        target = null;
+        handle = null;
+        actions = 0;
+        jobCounted = false;
+        stepTicks = 0;
+        jobInterruptions = 0;
+        startSigSet = endSigSet = false;
+        settled = false;
+        openPos = null;
+        openMenuBefore = null;
+        recoveries = 0;
+        swapStep = 0;
+        step("order: putting another chest up for the delivery storage" + (plan.second() != null ? " (a double chest)" : "") + "; next: carry on with the order.");
+        return true;
+    }
+
+    private int chestJobTicks;
+    private static final int CHEST_JOB_TICKS = 20 * 90;
+
+    private void chestPlaceTick() {
+        stepTicks++;
+        lastOwnAct = ticks;
+        // The whole job is bounded: whatever the placer is stuck on, it ends
+        if (++chestJobTicks > CHEST_JOB_TICKS) placer.abort("it took too long");
+        ChestPlacer.Outcome out = placer.tick();
+        if (out != null) chestPlaceDone(out);
+    }
+
+    private void chestPlaceDone(ChestPlacer.Outcome out) {
+        ChestStack.Plan plan = chestPlanNow;
+        releaseGoal();
+        job = null;
+        target = null;
+        wait = delay.get();
+        chestHolding = false;
+        chestPlanNow = null;
+        if (out.placed() && plan != null) {
+            if (out.partial()) warning("Delivery storage: the second half of the chest couldn't be put up (%s), the first stands alone.", out.failure());
+            registerChests(plan);
+        }
+        else expandFailed(out.failure() == null ? "it couldn't be put up" : out.failure());
+        version++;
+        idle = false;
+    }
+
+    /** The chests of the row stand: the book and the stash know them, the delivery storage has more. */
+    private void registerChests(ChestStack.Plan plan) {
+        DeliveryBook book = book();
+        addPlacedChest(book, plan.first());
+        if (plan.second() != null) addPlacedChest(book, plan.second());
+        expandFailure = null;
+        expandEvalAt = 0;
+        syncDelivery();
+        stash.markDirty();
+        stash.save();
+        version++;
+        info("Delivery storage: %d chests now.", book.chests());
+    }
+
+    private void addPlacedChest(DeliveryBook book, DeliveryBook.Pos at) {
+        BlockPos p = bp(at);
+        if (!(mc.level.getBlockState(p).getBlock() instanceof ChestBlock)) return;
+        Box one = makeBox(p);
+        List<DeliveryBook.Pos> parts = new ArrayList<>();
+        for (BlockPos q : one.parts) parts.add(dp(q));
+        // A double chest put up half by half is one chest: the second half merges into the entry of the first
+        book.addOrMerge(parts);
+    }
+
     // Finding an anvil to name at (Job.AnvilPlace). In order: the one picked by hand, a remembered one, a placed anvil found in
     // the stash area, one taken from the stash and placed. Nothing works: the rename fails with AnvilFinder.NONE
     private static final String[] ANVIL_IDS = { "minecraft:anvil", "minecraft:chipped_anvil", "minecraft:damaged_anvil" };
@@ -3909,6 +5032,16 @@ public class StashSorter extends Module {
     /** Placed anvils in the stash area: the perimeter if one is set, else the radius and height around us. Loaded chunks only. */
     private List<AnvilFinder.Pos> placedAnvils() {
         List<AnvilFinder.Pos> out = new ArrayList<>();
+        for (BlockPos p : scanArea(st -> st.is(net.minecraft.tags.BlockTags.ANVIL), false)) out.add(new AnvilFinder.Pos(p.getX(), p.getY(), p.getZ()));
+        return out;
+    }
+
+    /**
+     * Blocks in the stash area that pass the test: the perimeter if one is set, else the radius and height around us. Loaded chunks
+     * only. {@code bounded}: at most TableFinder.SEARCH_SPAN blocks across (x and z), around us.
+     */
+    private List<BlockPos> scanArea(java.util.function.Predicate<BlockState> test, boolean bounded) {
+        List<BlockPos> out = new ArrayList<>();
         if (mc.level == null) return out;
         int minX, maxX, minY, maxY, minZ, maxZ;
         if (stash.hasArea()) {
@@ -3920,6 +5053,10 @@ public class StashSorter extends Module {
             int r = radius.get(), h = height.get();
             minX = at.getX() - r; maxX = at.getX() + r; minY = at.getY() - h; maxY = at.getY() + h; minZ = at.getZ() - r; maxZ = at.getZ() + r;
         }
+        if (bounded) {
+            int[] xs = TableFinder.span(minX, maxX, mc.player.getBlockX()), zs = TableFinder.span(minZ, maxZ, mc.player.getBlockZ());
+            minX = xs[0]; maxX = xs[1]; minZ = zs[0]; maxZ = zs[1];
+        }
         int minSection = mc.level.getMinSectionY();
         for (int cx = minX >> 4; cx <= maxX >> 4; cx++) {
             for (int cz = minZ >> 4; cz <= maxZ >> 4; cz++) {
@@ -3929,15 +5066,15 @@ public class StashSorter extends Module {
                     int baseY = (minSection + i) * 16;
                     if (baseY + 15 < minY || baseY > maxY) continue;
                     var section = sections[i];
-                    // Whole sections without an anvil in their palette are skipped
-                    if (section.hasOnlyAir() || !section.maybeHas(st -> st.is(net.minecraft.tags.BlockTags.ANVIL))) continue;
+                    // Whole sections without such a block in their palette are skipped
+                    if (section.hasOnlyAir() || !section.maybeHas(test)) continue;
                     for (int x = 0; x < 16; x++) {
                         for (int y = 0; y < 16; y++) {
                             for (int z = 0; z < 16; z++) {
-                                if (!section.getBlockState(x, y, z).is(net.minecraft.tags.BlockTags.ANVIL)) continue;
+                                if (!test.test(section.getBlockState(x, y, z))) continue;
                                 int wx = cx * 16 + x, wy = baseY + y, wz = cz * 16 + z;
                                 if (wx < minX || wx > maxX || wy < minY || wy > maxY || wz < minZ || wz > maxZ) continue;
-                                out.add(new AnvilFinder.Pos(wx, wy, wz));
+                                out.add(new BlockPos(wx, wy, wz));
                             }
                         }
                     }
@@ -4020,6 +5157,13 @@ public class StashSorter extends Module {
     }
 
     private boolean startAnvilPlace(int slot) {
+        return startPlaceItem(slot, false);
+    }
+
+    /** Places the anvil, or the crafting table (the same job and spot search), from this inventory slot. */
+    private boolean startPlaceItem(int slot, boolean table) {
+        placingTable = table;
+        placeWhy = "";
         anvilSlot = slot;
         anvilSpot = anvilStand = null;
         anvilPlaced = anvilWalking = false;
@@ -4038,7 +5182,7 @@ public class StashSorter extends Module {
         openMenuBefore = null;
         recoveries = 0;
         swapStep = 0;
-        step("order: placing an anvil to name the shulkers at; next: carry on with the order.");
+        step(table ? "placing a crafting table to craft at; next: carry on." : "order: placing an anvil to name the shulkers at; next: carry on with the order.");
         return true;
     }
 
@@ -4048,11 +5192,11 @@ public class StashSorter extends Module {
         var inv = mc.player.getInventory();
 
         if (anvilPlaced) {
-            if (isAnvil(anvilSpot)) anvilPlaceDone(true);
+            if (placingTable ? isTable(anvilSpot) : isAnvil(anvilSpot)) anvilPlaceDone(true);
             else if (stepTicks - anvilPlacedAt > 40) anvilPlaceDone(false);
             return;
         }
-        if (stepTicks > ANVIL_PLACE_TICKS || anvilSlot < 0 || !anvilItem(inv.getItem(anvilSlot))) {
+        if (stepTicks > ANVIL_PLACE_TICKS || anvilSlot < 0 || !(placingTable ? tableItem(inv.getItem(anvilSlot)) : anvilItem(inv.getItem(anvilSlot)))) {
             anvilPlaceDone(false);
             return;
         }
@@ -4081,7 +5225,8 @@ public class StashSorter extends Module {
         if (anvilSpot == null) {
             PlaceSearch.Result found = PlaceSearch.search(pos(mc.player.blockPosition()), placeView(), anvilSkip);
             if (found.found() == null) {
-                QwerteAddon.LOG.info("anvil: no spot within {} blocks: {}", PlaceSearch.RADIUS, found.why());
+                QwerteAddon.LOG.info("{}: no spot within {} blocks: {}", placingTable ? "crafting table" : "anvil", PlaceSearch.RADIUS, found.why());
+                placeWhy = "no room to place it (" + found.why() + ")";
                 anvilPlaceDone(false);
                 return;
             }
@@ -4092,7 +5237,7 @@ public class StashSorter extends Module {
                     anvilPlaceDone(false);
                     return;
                 }
-                info("No spot for the anvil beside me, walking %d steps to the nearest one.", found.found().steps());
+                info("No spot for the %s beside me, walking %d steps to the nearest one.", placingTable ? "crafting table" : "anvil", found.found().steps());
                 walkNear(anvilStand, 1);
                 anvilWalking = true;
                 anvilWalkStart = stepTicks;
@@ -4107,7 +5252,8 @@ public class StashSorter extends Module {
             int hotbar = -1;
             for (int i = 0; i < 9 && hotbar == -1; i++) if (!keep.contains(i) && inv.getItem(i).isEmpty()) hotbar = i;
             if (hotbar == -1) {
-                warning("No free hotbar slot to place the anvil from.");
+                warning("No free hotbar slot to place the %s from.", placingTable ? "crafting table" : "anvil");
+                placeWhy = "no free hotbar slot to place it from";
                 anvilPlaceDone(false);
                 return;
             }
@@ -4149,13 +5295,23 @@ public class StashSorter extends Module {
 
     private void anvilPlaceDone(boolean ok) {
         releaseGoal();
-        if (ok) {
+        boolean table = placingTable;
+        if (ok && table) {
+            stash.craftingTablePos = anvilSpot.immutable();
+            stash.craftingTableSource = tableCrafted ? "crafted" : "placed";
+            stash.save();
+            tableChanged();
+            info(tableCrafted ? "Crafted a crafting table and placed it, remembered for next time." : "Placed a crafting table to craft at, remembered for next time.");
+        }
+        else if (ok) {
             stash.anvilPos = anvilSpot.immutable();
             stash.anvilSource = "placed";
             stash.save();
             info("Placed an anvil to name shulkers at, remembered for next time.");
         }
-        else warning("Couldn't place an anvil.");
+        else warning(table ? "Couldn't place a crafting table." : "Couldn't place an anvil.");
+        if (table && !ok) tableWhy = TableFinder.failure(placeWhy.isEmpty() ? "it couldn't be placed" : placeWhy);
+        placingTable = false;
         // An anvil item that was not placed is carried like anything else and put back
         anvilSlot = -1;
         crafter.clearLastHeld();
@@ -4164,7 +5320,8 @@ public class StashSorter extends Module {
         job = null;
         target = null;
         wait = delay.get();
-        orderRunner.anvilFound(ok);
+        if (table) tableAcquired(ok);
+        else orderRunner.anvilFound(ok);
         version++;
         idle = false;
     }
@@ -4266,12 +5423,18 @@ public class StashSorter extends Module {
                 ownedMenu = open;
                 step = Step.Working;
                 stepTicks = 0;
-                wait = delay.get();
+                wait = firstClickWait();
                 return;
             }
             // Something else opened (one left over, a plugin window): closed, and the click made again
             if (!open.getCarried().isEmpty()) recoverCursor();
             mc.player.closeContainer();
+            lastCloseTick = ticks;
+        }
+
+        if (openHeld()) {
+            stepTicks--;
+            return;
         }
 
         if (stepTicks > NAME_OPEN_TICKS || (nameOpenTries >= NAME_OPEN_TRIES && stepTicks - nameOpenClickAt > NAME_OPEN_RETRY)) {
@@ -4505,6 +5668,11 @@ public class StashSorter extends Module {
     /** Puts the order's finished shulker into the delivery container, stopping when it is full. */
     private boolean deliverOne() {
         if (!mc.player.containerMenu.getCarried().isEmpty()) return recoverBounded();
+        // A look at a full chest that may have been emptied, not a delivery
+        if (recheckOnly) {
+            recheckRead();
+            return false;
+        }
 
         // What the container held before, to see afterwards that it gained the shulker
         if (actions == 0) orderRunner.deliveryOpened(target.contents);
@@ -4512,6 +5680,7 @@ public class StashSorter extends Module {
         for (int slot : carriedSlots()) {
             if (!orderRunner.claims(mc.player.getInventory().getItem(slot))) continue;
             if (!canFit(mc.player.getInventory().getItem(slot))) {
+                deliveryChestFull(target);
                 orderRunner.deliveryFull();
                 return false;
             }
@@ -5010,7 +6179,13 @@ public class StashSorter extends Module {
             for (int i = 0; i < 36; i++) if (Utils.isShulker(mc.player.getInventory().getItem(i).getItem())) shulkerSlotsBefore.add(i);
             handle = Handle.Work;
             handleTicks = 0;
-            wait = delay.get();
+            wait = firstClickWait();
+            return;
+        }
+
+        // container-delay: the open click waits, and the wait does not count toward the open timeout
+        if (openHeld()) {
+            handleTicks--;
             return;
         }
 
@@ -5549,7 +6724,7 @@ public class StashSorter extends Module {
 
     private List<Box> staleBoxes() {
         if (stash == null) return List.of();
-        return stash.boxes.stream().filter(b -> b.stale && !b.excluded && !b.unreachable && !failedSurvey.contains(b) && !signPending(b)).toList();
+        return stash.boxes.stream().filter(b -> b.stale && !b.excluded && !b.foreign && !b.unreachable && !failedSurvey.contains(b) && !signPending(b)).toList();
     }
 
     /**
@@ -5601,7 +6776,7 @@ public class StashSorter extends Module {
         handleTicks = 0;
 
         String what = plan != null ? plan.name : rebuilt == Job.Clean && mainItem != null ? new ItemStack(mainItem).getItemName().getString() : fillSample.isEmpty() ? "items" : StackInfo.label(fillSample);
-        int unread = (int) stash.boxes.stream().filter(b -> !b.excluded && (b.stale || !b.known())).count();
+        int unread = (int) stash.boxes.stream().filter(b -> !b.excluded && !b.foreign && (b.stale || !b.known())).count();
         step(String.format("resuming: shulker of %s (%d stacks) at %s; next: %s, then re-read %d containers.", what, r.placed == null ? 0 : (plan != null ? plan.placedSize : r.placedStacks), xyz(r.placed),
             returnTo == Handle.Collect ? "pick it up, store it" : finishOnly ? "break and pick it up, store it" : "open it, finish packing, break and pick it up, store it", unread));
         return true;
@@ -5703,7 +6878,7 @@ public class StashSorter extends Module {
             stash.markDirty();
             if (mc.level != null) stash.save();
         }
-        int unread = stash == null ? 0 : (int) stash.boxes.stream().filter(b -> !b.excluded && (b.stale || !b.known())).count();
+        int unread = stash == null ? 0 : (int) stash.boxes.stream().filter(b -> !b.excluded && !b.foreign && (b.stale || !b.known())).count();
         step(String.format("resume finished; next: re-read %d containers.", unread));
     }
 
@@ -6106,11 +7281,34 @@ public class StashSorter extends Module {
         openPos = null;
         openMenuBefore = null;
 
+        // Plainly not a container (air, no block entity in a loaded chunk): dropped at once, nothing is walked to. It comes
+        // back if the scan finds a container there
+        if (next == Job.Survey && !box.delivery && mc.level.isLoaded(box.pos) && inStashDimension()) {
+            if (!containerBlockHere(box.pos)) {
+                QwerteAddon.LOG.info("[stash-sorter] dropped the container at {}: there is no chest or barrel there any more.", xyz(box.pos));
+                step(String.format("skipped %s: there is no chest or barrel there; forgotten.", xyz(box.pos)));
+                stash.boxes.remove(box);
+                stash.markDirty();
+                failedSurvey.remove(box);
+                surveyRetry.succeed(box);
+                job = null;
+                target = null;
+                return false;
+            }
+            if (!isContainer(box.pos)) {
+                // A barrel with the barrels setting off: kept in the stash, only not read
+                job = null;
+                target = null;
+                surveyFailed(box, "barrels are switched off in the settings");
+                return false;
+            }
+        }
+
         if (inReach(box)) {
             step = Step.Opening;
         }
         else if (walkOn()) {
-            walkNear(box.pos, 2);
+            walkReach(box);
             step = Step.Walking;
         }
         else {
@@ -6122,6 +7320,7 @@ public class StashSorter extends Module {
         }
 
         stepTicks = 0;
+        walkProgress.reset(0, walkDistance(box));
         announce(next, box);
         return true;
     }
@@ -6146,7 +7345,10 @@ public class StashSorter extends Module {
                 case Survey -> {
                     int total = (int) stash.boxes.stream().filter(b -> !b.excluded).count();
                     int done = (int) stash.boxes.stream().filter(b -> !b.excluded && b.known() && !b.stale).count();
-                    stepProgress("read", done, total, () -> String.format("reading containers: %d/%d; next: %s at %s.", done, total, blockName(box), xyz(box.pos)));
+                    Supplier<String> line = () -> String.format("reading containers: %d/%d; next: %s at %s.", done, total, blockName(box), xyz(box.pos));
+                    // The last ones are always said, the bucketed progress could skip them
+                    if (total - done <= 1) step(line.get());
+                    else stepProgress("read", done, total, line);
                 }
                 case Take -> {
                     List<Box> homes = List.of();
@@ -6225,7 +7427,10 @@ public class StashSorter extends Module {
             futile.put(futileKey(target, job), futileSig(target));
         }
         if (actions > 0 && target != null) signAbortRuns.remove(target);
-        if (job == Job.Survey && target != null && target.known()) scanned++;
+        if (job == Job.Survey && target != null && target.known()) {
+            scanned++;
+            if (!target.stale) surveyRetry.succeed(target);
+        }
 
         int visits = target == null ? 0 : boxVisits.getOrDefault(target, 0);
         if (jobCounted && visits >= 3 && job != Job.Survey && target != null && loopReported.add(target)) {
@@ -6240,7 +7445,9 @@ public class StashSorter extends Module {
             circular.add(target);
             stalled.add(target);
         }
-        else if (job == Job.Survey && target != null && (!target.known() || target.stale) && !signAbort) failedSurvey.add(target);
+        else if (job == Job.Survey && target != null && (!target.known() || target.stale) && !signAbort) {
+            surveyFailed(target, "the window closed before it could be read");
+        }
         else if (job != null && job != Job.Survey && target != null && !target.unreachable) {
             if (unconfirmed && !signAbort) {
                 if (unconfirmedRuns.merge(target, 1, Integer::sum) >= 2) stalled.add(target);
@@ -6266,12 +7473,32 @@ public class StashSorter extends Module {
 
     // Steps
 
+    /**
+     * Distance from the eyes to the nearest part of the container, for telling whether a walk is getting closer.
+     */
+    private double walkDistance(Box box) {
+        return Math.sqrt(mc.player.getEyePosition().distanceToSqr(Vec3.atCenterOf(nearestPart(box))));
+    }
+
     private void tickWalking() {
         if (inReach(target)) {
             releaseGoal();
             step = Step.Opening;
             stepTicks = 0;
             return;
+        }
+
+        // A read does not spend long on a walk that is going nowhere (looping, blocked, no way in): the box is skipped
+        // and tried again later, instead of the whole WALK_TIMEOUT or the watchdog
+        if (job == Job.Survey) {
+            walkProgress.update(stepTicks, walkDistance(target));
+            // A chunk that isn't loaded can't be walked into by a path, so it gets half the time
+            if (walkProgress.stalled(stepTicks, mc.level.isLoaded(target.pos) ? SURVEY_WALK_STALL_TICKS : SURVEY_WALK_STALL_TICKS / 2)) {
+                releaseGoal();
+                surveyFailed(target, String.format("could not reach it (walk made no progress for %ds)", walkProgress.idleTicks(stepTicks) / 20));
+                finishJob();
+                return;
+            }
         }
 
         // Started inside the perimeter and now outside it: a way that leads out of the stash area isn't taken
@@ -6301,6 +7528,12 @@ public class StashSorter extends Module {
                 wait = delay.get();
                 return;
             }
+            if (job == Job.Survey) {
+                // Skipped for now, not for good: the way may open up (a door, a chunk, a player in the way)
+                surveyFailed(target, stopped ? "could not reach it (no path)" : "could not reach it (walk timed out after " + WALK_TIMEOUT / 20 + "s)");
+                finishJob();
+                return;
+            }
             reportUnreachable(target, Cause.Path);
             target.unreachable = true;
             finishJob();
@@ -6318,7 +7551,7 @@ public class StashSorter extends Module {
                 step = Step.Working;
                 stepTicks = 0;
                 read(target);
-                wait = delay.get();
+                wait = firstClickWait();
                 return;
             }
 
@@ -6326,14 +7559,23 @@ public class StashSorter extends Module {
                 xyz(target.pos), open.getClass().getSimpleName(), open.slots.size() - 36, target.parts.size() * 27));
             if (!open.getCarried().isEmpty()) recoverCursor();
             mc.player.closeContainer();
+            lastCloseTick = ticks;
+        }
+
+        // container-delay: the open click waits, and the wait does not count toward the open timeout
+        if (openHeld()) {
+            stepTicks--;
+            return;
         }
 
         if (stepTicks > OPEN_TIMEOUT) {
-            reportUnreachable(target, Cause.Open);
             // A read that never gets a window (someone has it open, or it closes at once) is tried again later, not given
             // up on for good
-            if (job == Job.Survey) failedSurvey.add(target);
-            else target.unreachable = true;
+            if (job == Job.Survey) surveyFailed(target, "could not open it (no window after " + OPEN_TIMEOUT / 20 + "s)");
+            else {
+                reportUnreachable(target, Cause.Open);
+                target.unreachable = true;
+            }
             finishJob();
             return;
         }
@@ -6392,7 +7634,7 @@ public class StashSorter extends Module {
         }
 
         boolean busy = switch (job) {
-            case Survey, Clean, Fill, KitUnpack, KitFill, Label, Ground, Explore, Unbundle, Name, CraftUnpack, Craft, AnvilPlace -> false;
+            case Survey, Clean, Fill, KitUnpack, KitFill, Label, Ground, Explore, Unbundle, Name, CraftUnpack, Craft, AnvilPlace, ChestPlace -> false;
             case FetchSigns -> labeller.fetchSignsOne(target, actions);
             case Gather -> compactor.gatherOne(target);
             case KitTake -> kitBuilder.takeOne(target);
@@ -6486,6 +7728,7 @@ public class StashSorter extends Module {
         stalled.clear();
         cancelRetries.clear();
         stashWatch.clear();
+        deliveryWatch.clear();
         signHeld.clear();
         signAborted.clear();
         signAbortRuns.clear();
@@ -6497,6 +7740,7 @@ public class StashSorter extends Module {
         futile.clear();
         noOpReported.clear();
         failedSurvey.clear();
+        surveyRetry.clear();
         unconfirmedRuns.clear();
         closedEarlyReported.clear();
         boxVisits.clear();
@@ -6749,6 +7993,7 @@ public class StashSorter extends Module {
         to.excluded |= from.excluded;
         to.dropOff |= from.dropOff;
         to.delivery |= from.delivery;
+        to.deliveryExtra |= from.deliveryExtra;
         to.wasExcluded |= from.wasExcluded;
         to.wasDropOff |= from.wasDropOff;
     }
@@ -7296,7 +8541,8 @@ public class StashSorter extends Module {
 
         // With a perimeter, nothing outside it belongs to the stash
         // (the delivery container is wherever the user put it: outside the perimeter is fine)
-        if (stash.hasArea() && stash.boxes.removeIf(box -> !box.delivery && box.parts.stream().noneMatch(stash::inArea))) stash.markDirty();
+        pruneForeign("scan");
+        pruneStrays("scan");
         if (stash.boxes.removeIf(this::blockGone)) stash.markDirty();
 
         // A chest next to a saved one may have made it a double (or a double been halved): bring the parts up to date
@@ -7316,6 +8562,8 @@ public class StashSorter extends Module {
             for (int j = 0; j < i; j++) {
                 if (stash.boxes.get(j).has(stash.boxes.get(i).pos)) {
                     carryMarks(stash.boxes.get(i), stash.boxes.get(j));
+                    surveyRetry.succeed(stash.boxes.get(i));
+                    failedSurvey.remove(stash.boxes.get(i));
                     stash.boxes.remove(i);
                     stash.markDirty();
                     break;
@@ -7337,6 +8585,83 @@ public class StashSorter extends Module {
 
         if (added > 0) stash.markDirty();
         return added;
+    }
+
+    /**
+     * Containers outside the stash perimeter (a damaged or foreign save, a pick outside it): one never read is dropped
+     * (nothing is known of it, and walking to one far away wastes the scan); one that was read is kept in the file but
+     * flagged foreign, so scanning and sorting skip it. The delivery container may be anywhere.
+     */
+    private void pruneForeign(String where) {
+        if (stash == null) return;
+        if (!stash.hasArea() || !inStashDimension()) {
+            for (Box box : stash.boxes) box.foreign = false;
+            return;
+        }
+        boolean any = stash.boxes.removeIf(box -> {
+            StashSafety.Outside what = StashSafety.outside(box.delivery, box.parts.stream().noneMatch(stash::inArea), box.neverRead());
+            if (what == StashSafety.Outside.INSIDE) {
+                box.foreign = false;
+                return false;
+            }
+            if (what == StashSafety.Outside.SKIP) {
+                if (!box.foreign) QwerteAddon.LOG.info("[stash-sorter] kept the read container at {} ({}): it is outside the stash area {}; it is skipped, not deleted.", xyz(box.pos), where, stash.areaText());
+                box.foreign = true;
+                return false;
+            }
+            surveyRetry.succeed(box);
+            QwerteAddon.LOG.info("[stash-sorter] dropped the never-read container at {} ({}): it is outside the stash area {}.", xyz(box.pos), where, stash.areaText());
+            return true;
+        });
+        if (any) {
+            stash.markDirty();
+            failedSurvey.removeIf(b -> !stash.boxes.contains(b));
+        }
+    }
+
+    /**
+     * A stash with no area: never-read containers more than 20000 blocks from every read, non-delivery one are strays
+     * (a bad save) and are removed, after the stash file is backed up. Needs at least 5 such reference containers.
+     */
+    private void pruneStrays(String where) {
+        if (stash == null || stash.hasArea() || !inStashDimension()) return;
+        List<StashSafety.Spot> spots = new ArrayList<>();
+        for (Box b : stash.boxes) spots.add(new StashSafety.Spot(new StashSafety.Pt(b.pos.getX(), b.pos.getZ()), !b.neverRead(), b.delivery));
+        List<Integer> idx = StashSafety.strays(spots);
+        if (idx.isEmpty()) return;
+        if (!stash.backUpFile("Removing stray containers from the stash file")) {
+            QwerteAddon.LOG.warn("[stash-sorter] {} stray never-read container(s) found ({}) but the stash file could not be backed up, so none were removed.", idx.size(), where);
+            return;
+        }
+        List<Box> gone = new ArrayList<>();
+        for (int i : idx) gone.add(stash.boxes.get(i));
+        for (Box b : gone) {
+            QwerteAddon.LOG.info("[stash-sorter] removed the stray never-read container at {} ({}): over {} blocks from every read container. Box: parts={}, excluded={}, dropOff={}, noCompact={}, lastRead={}.",
+                xyz(b.pos), where, StashSafety.STRAY_DISTANCE, b.parts.stream().map(StashSorter::xyz).toList(), b.excluded, b.dropOff, b.noCompact, b.lastRead);
+            stash.boxes.remove(b);
+            surveyRetry.succeed(b);
+            failedSurvey.remove(b);
+        }
+        stash.markDirty();
+    }
+
+    /**
+     * Something a stash can hold is still at this block, whatever the barrels setting says: that setting only decides what
+     * is added and read, never what is forgotten.
+     */
+    private boolean containerBlockHere(BlockPos pos) {
+        BlockEntity entity = mc.level.getBlockEntity(pos);
+        return entity instanceof ChestBlockEntity || entity instanceof BarrelBlockEntity;
+    }
+
+    /**
+     * The stash is known to belong to the dimension we are in (the perimeter's, else the stash's own). Nothing is
+     * forgotten for lying outside the perimeter or for a missing block unless this holds.
+     */
+    private boolean inStashDimension() {
+        if (stash == null || mc.level == null) return false;
+        String dim = !stash.areaDimension.isEmpty() ? stash.areaDimension : stash.dimension;
+        return !dim.isEmpty() && dim.equals(Stash.currentDimension());
     }
 
     private boolean isContainer(BlockPos pos) {
@@ -7393,9 +8718,15 @@ public class StashSorter extends Module {
             return true;
         }
 
+        // A refused delivery spot leaves no box behind
+        if (pick.get() == Pick.Delivery && !deliverySpotSettable(pos)) return true;
         if (ensureStash() == null) stash = new Stash(stashName.get(), Stash.currentServer());
         Box box = stash.boxAt(pos);
         if (box == null) {
+            if (stash.hasArea() && pick.get() != Pick.Delivery && !stash.inArea(pos)) {
+                notice("%s is outside the stash area, it isn't added.", pos.toShortString());
+                return true;
+            }
             box = makeBox(pos.immutable());
             stash.boxes.add(box);
         }
@@ -7405,13 +8736,17 @@ public class StashSorter extends Module {
             notice(box.noCompact ? "%s is never used to gather for compacting." : "%s can be used for compacting again.", box.pos.toShortString());
         }
         else if (pick.get() == Pick.Delivery) {
-            boolean set = markDelivery(box);
-            notice(set ? "%s is where orders are delivered. It is never sorted." : "%s is a normal container again.", box.pos.toShortString());
+            if (box.deliveryExtra) notice("%s is already one of the delivery chests (put up above the delivery container). Change the delivery container to forget them.", box.pos.toShortString());
+            else {
+                boolean set = markDelivery(box);
+                notice(set ? "%s is where orders are delivered. It is never sorted." : "%s is a normal container again.", box.pos.toShortString());
+            }
         }
         else if (pick.get() == Pick.Exclude) {
             box.excluded = !box.excluded;
             box.dropOff = false;
             if (box.delivery && box.pos.equals(stash.deliveryPos)) stash.deliveryPos = null;
+            forgetExtra(box);
             box.delivery = false;
             notice(box.excluded ? "%s won't be sorted." : "%s will be sorted again.", box.pos.toShortString());
         }
@@ -7419,6 +8754,7 @@ public class StashSorter extends Module {
             box.dropOff = !box.dropOff;
             box.excluded = false;
             if (box.delivery && box.pos.equals(stash.deliveryPos)) stash.deliveryPos = null;
+            forgetExtra(box);
             box.delivery = false;
             notice(box.dropOff ? "%s is a drop-off, it'll be emptied into the stash." : "%s is a normal container again.", box.pos.toShortString());
         }
@@ -7436,7 +8772,15 @@ public class StashSorter extends Module {
     /** Whether the container's block is really gone (its chunk is loaded and it is no container). */
     private boolean blockGone(Box box) {
         if (!mc.level.isLoaded(box.pos)) return false;
-        if (!box.delivery) return !isContainer(box.pos);
+        if (!box.delivery) {
+            if (containerBlockHere(box.pos)) return false;
+            surveyRetry.succeed(box);
+            failedSurvey.remove(box);
+            return true;
+        }
+
+        // A chest put up for the delivery storage: gone when it is no chest (syncDelivery takes it out of the storage)
+        if (box.deliveryExtra) return !(mc.level.getBlockEntity(box.pos) instanceof ChestBlockEntity);
 
         // The delivery container counts as long as it is a chest or barrel, whatever the barrels setting says
         var entity = mc.level.getBlockEntity(box.pos);
@@ -7447,22 +8791,35 @@ public class StashSorter extends Module {
     }
 
     private boolean markDelivery(Box box) {
+        // A chest put up for the delivery storage is not the container: it is left as it is
+        if (box.deliveryExtra) return true;
         boolean set = !box.delivery;
+        // A different container (or none) forgets the chests put up above the old one
+        dropDeliveryExtras();
+        List<Box> unread = new ArrayList<>();
         for (Box other : stash.boxes) {
             if (other.delivery) {
                 other.delivery = false;
                 other.excluded = other.wasExcluded;
                 other.dropOff = other.wasDropOff;
                 other.wasExcluded = other.wasDropOff = false;
+                // Not a delivery box any more: a never-read one is removed rather than kept as an ordinary container
+                if (other.neverRead()) unread.add(other);
             }
+        }
+        for (Box gone : unread) {
+            stash.boxes.remove(gone);
+            surveyRetry.succeed(gone);
+            failedSurvey.remove(gone);
+            QwerteAddon.LOG.info("[stash-sorter] removed the never-read container at {} that stopped being a delivery container.", xyz(gone.pos));
         }
         if (set) {
             box.wasExcluded = box.excluded;
             box.wasDropOff = box.dropOff;
             box.delivery = true;
             box.excluded = true;
+            box.dropOff = false;
         }
-        box.dropOff = false;
         stash.deliveryPos = set ? box.pos : null;
         return set;
     }
@@ -7470,13 +8827,16 @@ public class StashSorter extends Module {
     /**
      * For stash-manager: marks or unmarks the container at this block as the delivery container.
      * @return 1 when it is now the delivery container, 0 when it was unmarked, -1 when it isn't a container, -2 when no
-     *         stash is loaded
+     *         stash is loaded, -3 when the position is not loaded and more than 128 blocks from the player
      */
     int toggleDelivery(BlockPos pos) {
         if (mc.level == null || ensureStash() == null) return -2;
+        if (!deliverySpotSettable(pos)) return -3;
         if (!isContainer(pos)) return -1;
 
         Box box = stash.boxAt(pos);
+        // A chest put up for the delivery storage is already a delivery chest
+        if (box != null && box.deliveryExtra) return 1;
         if (box == null) {
             box = makeBox(pos.immutable());
             stash.boxes.add(box);
@@ -7485,6 +8845,15 @@ public class StashSorter extends Module {
         stash.save();
         version++;
         return set ? 1 : 0;
+    }
+
+    /** A delivery spot is refused when it is not loaded and far from the player (a mistyped or stale position). */
+    private boolean deliverySpotSettable(BlockPos pos) {
+        if (mc.player == null) return false;
+        boolean ok = StashSafety.spotSettable(mc.level.isLoaded(pos), new StashSafety.Pt(pos.getX(), pos.getZ()),
+            new StashSafety.Pt(mc.player.getBlockX(), mc.player.getBlockZ()));
+        if (!ok) notice("%s is not loaded and more than %d blocks from you, so it is not made the delivery container. Go there first.", pos.toShortString(), StashSafety.FAR_LIMIT);
+        return ok;
     }
 
     /** For stash-manager: no delivery container any more. @return false when there was none or no stash */
@@ -7569,6 +8938,8 @@ public class StashSorter extends Module {
     private void applyArea() {
         areaDirty = false;
         if (mc.player == null || mc.level == null || stash == null) return;
+        // An area change drops only never-read containers outside it; read ones are kept and skipped
+        pruneForeign("area change");
         addNearbyBoxes();
         orderBoxes();
         stash.save();
@@ -7587,6 +8958,7 @@ public class StashSorter extends Module {
         exploreRan = false;
         unreachableReported.clear();
         failedSurvey.clear();
+        surveyRetry.clear();
         futile.clear();
         noOpReported.clear();
         cancelRetries.clear();
@@ -7900,6 +9272,8 @@ public class StashSorter extends Module {
         if (!key.equals(triedKey)) {
             triedKey = key;
             stash = Stash.load(stashName.get());
+            pruneForeign("load");
+            pruneStrays("load");
             // Another stash, name or server: its exploration and what failed with the last one don't carry over
             forgetExploration();
             areaDirty = false;
@@ -7969,6 +9343,7 @@ public class StashSorter extends Module {
             swapBackFrom = swapBackTo = -1;
             hotbarDisplaced = ItemStack.EMPTY;
             stashWatch.clear();
+        deliveryWatch.clear();
             ownTouch.clear();
             readAt.clear();
             staleBoxes.clear();
@@ -8023,6 +9398,7 @@ public class StashSorter extends Module {
             // Safeguard for the sneak: it never outlives the module
             if (ledgeSneaking && !running()) ledgeGuard(false);
             labeller.restoreHand();
+            placer.restoreHand();
             restoreHotbar();
 
             // A new player entity means joining, dying or changing dimension: whatever was held is not ours to claim now
@@ -8033,13 +9409,27 @@ public class StashSorter extends Module {
                     hotbarDisplaced = ItemStack.EMPTY;
                     // Dead, or in another dimension: a sign being put up is lost with the old player
                     labeller.abandon();
+                    placer.abandon();
+                    chestSession = false;
+                    chestHolding = false;
                     if (job == Job.Label) {
                         job = null;
                         target = null;
                     }
-                    if (job == Job.Ground || job == Job.Explore || job == Job.Unbundle || job == Job.Name || job == Job.Craft || job == Job.AnvilPlace) job = null;
+                    // A crafting table being gathered, crafted or placed is lost with the old player: whoever waited for it is told
+                    boolean tableWork = tableSession || (placingTable && job == Job.AnvilPlace);
+                    if (job == Job.Ground || job == Job.Explore || job == Job.Unbundle || job == Job.Name || job == Job.Craft || job == Job.AnvilPlace || job == Job.ChestPlace) job = null;
                     anvilSlot = -1;
                     anvilSession = false;
+                    tableSession = false;
+                    placingTable = false;
+                    if (tableWork) {
+                        if (crafter.active()) crafter.finish();
+                        crafter.clearLastHeld();
+                        craftForOrder = false;
+                        tableWhy = TableFinder.failure("the player changed (respawn or dimension)");
+                        tableAcquired(false);
+                    }
                     // Another dimension or a new life: nothing was explored there, and the area may not be used at all
                     forgetExploration();
                     // Another world or dimension: the ground is another ground
@@ -8171,6 +9561,10 @@ public class StashSorter extends Module {
         if (watch.get() && clock % LID_POLL_TICKS == 0) {
             stashWatch.tickLids(stash, clock, watchDelay.get() * 20L, this::openedByUs, this::accessed);
         }
+        // The delivery chests are watched whatever the setting says: a player who emptied one makes it usable again
+        if (clock % LID_POLL_TICKS == 0 && !stash.deliveryStorage.isEmpty()) {
+            deliveryWatch.tickLids(stash, clock, 20L * 5, this::openedByUs, this::deliveryTouched);
+        }
 
         if (isActive() && signsWatched() && clock % SIGN_POLL_TICKS == 0) {
             stashWatch.pollSigns(stash, clock, b -> job == Job.Label && b == target);
@@ -8238,6 +9632,7 @@ public class StashSorter extends Module {
             clearStalled();
             compacted.remove(box);
             failedSurvey.remove(box);
+            surveyRetry.succeed(box);
             idle = false;
             info("A player used the chest at %s, re-checking it.", box.pos.toShortString());
         }
@@ -8576,6 +9971,8 @@ public class StashSorter extends Module {
             if (orderKit() && kitBuilder.holds(slot)) continue;
             // What a craft gathered, and the boxes it made for an order
             if (crafter.holds(slot) || crafter.reserved(slot) || slot == anvilSlot) continue;
+            // The chests gathered for the delivery storage, until they are put up
+            if (chestHolding && plainChest(mc.player.getInventory().getItem(slot))) continue;
             if (!idOf(mc.player.getInventory().getItem(slot)).equals(stuckCarried.get(slot))) slots.add(slot);
         }
         return slots;

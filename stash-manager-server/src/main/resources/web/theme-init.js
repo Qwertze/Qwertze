@@ -3,7 +3,7 @@
 (function () {
   var KEY = "sm-theme";
   // Each theme's --bar colour (from themes.css), for <meta name="theme-color">: the CSS isn't loaded yet here.
-  var BAR = { classic: "#1f1f1f", modern: "#ffffff", light: "#fafaf9", dark: "#0e1116", midnight: "#000000", contrast: "#000000" };
+  var BAR = { classic: "#1f1f1f", modern: "#ffffff", light: "#fafaf9", dark: "#0e1116", midnight: "#000000", mac: "#161618", contrast: "#000000" };
   var root = document.documentElement;
   var media = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
   var listeners = [];

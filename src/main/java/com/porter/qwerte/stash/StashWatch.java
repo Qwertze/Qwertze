@@ -32,6 +32,16 @@ public final class StashWatch {
     }
 
     private final Map<Box, Lid> lids = new HashMap<>();
+    // Watching the chests of the delivery storage (excluded from sorting, so the other watch skips them) and nothing else
+    private final boolean deliveryOnly;
+
+    public StashWatch() {
+        this(false);
+    }
+
+    public StashWatch(boolean deliveryOnly) {
+        this.deliveryOnly = deliveryOnly;
+    }
 
     // Signs whose text differs from the container's labels: since when it last changed, and what it said then
     private final Map<Box, Long> signDirtyAt = new HashMap<>();
@@ -58,7 +68,7 @@ public final class StashWatch {
      */
     public void tickLids(Stash stash, long now, long delay, Predicate<Box> byUs, Consumer<Box> reread) {
         for (Box box : new ArrayList<>(stash.boxes)) {
-            if (box.excluded) continue;
+            if (deliveryOnly ? !box.delivery : box.excluded) continue;
             Boolean open = isOpen(box);
             if (open == null) continue;
 

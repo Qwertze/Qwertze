@@ -268,7 +268,7 @@ public final class Kits {
         if (stash == null) return 0;
         int count = 0;
         for (Box box : stash.boxes) {
-            if (!box.known()) continue;
+            if (!box.known() || box.foreign) continue;
             for (ItemStack stack : box.contents) {
                 if (!stack.isEmpty() && Utils.isShulker(stack.getItem()) && kit.matchesFinished(inside(stack))) count++;
             }

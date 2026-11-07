@@ -56,3 +56,14 @@
   --ok-bg:#006b1f; --ok-fg:#ffffff; --warn-bg:#ffdd00; --warn-fg:#000000; --danger-bg:#a00000; --danger-fg:#ffffff;
   --font:'Atkinson Hyperlegible', system-ui, sans-serif;
 }
+[data-theme="mac"] {
+  --bg:#0e0e10; --surface:#1c1c1e; --surface-2:#26262a; --text:#ebe9e6; --muted:#a09fa4;
+  --border:#38383d; --border-w:1px; --accent:#f2a48c; --on-accent:#1f1310;
+  --radius:8px; --pill:999px; --shadow:none;
+  --bar:#161618; --bar-text:#ebe9e6; --nav:transparent; --nav-text:#a09fa4; --nav-active:#1f1310; --nav-active-bg:#f2a48c;
+  --track-off:#48484d; --hp:#ff6961; --food:#f5b45f; --chip-bg:#2a2a2e;
+  --ok-bg:#163a22; --ok-fg:#7ee2a0; --warn-bg:#3a2f12; --warn-fg:#f7cd6e; --danger-bg:#3d1719; --danger-fg:#ffa39c;
+  --font:'JetBrains Mono', ui-monospace, monospace;
+  /* Mac only (style.css): the smoky panel glass and the window-control dots. */
+  --mac-glass:rgba(30,30,33,.80); --mac-red:#ff5f57; --mac-yellow:#febc2e; --mac-green:#28c840;
+}

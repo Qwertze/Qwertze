@@ -13,7 +13,7 @@ final class IconRoutes {
     }
 
     void register(Router router) {
-        router.prefix(Router.GET, "/icon/", Router.Guard.SESSION, this::icon);
+        router.prefix(Router.GET, "/icon/", Router.Guard.SESSION, Router.Perm.ICONS, this::icon);
     }
 
     private void icon(HttpExchange ex) throws IOException {

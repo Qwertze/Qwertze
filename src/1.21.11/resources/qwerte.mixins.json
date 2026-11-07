@@ -1,0 +1,12 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.porter.qwerte.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "ClientPacketListenerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

@@ -40,6 +40,8 @@ public class Stash {
         public boolean dropOff;
         // Where finished orders are delivered. Also excluded, so nothing is ever sorted into or out of it
         public boolean delivery;
+        // A chest the bot put up above the delivery container for the delivery storage (0.4.0-dev.5): also delivery and excluded
+        public boolean deliveryExtra;
         // What excluded was before this became the delivery container, restored when it stops being one
         public boolean wasExcluded, wasDropOff;
         // When its contents were last read (milliseconds); 0 for stashes saved before this was kept, which counts as old
@@ -56,6 +58,8 @@ public class Stash {
         // Its contents are from an earlier visit and are due to be read again. Not saved. Searching and planning go on
         // with what is known, but nothing is taken from it until it has been read
         public boolean stale;
+        // Read before, but outside the stash area: kept in the file, skipped by scanning and sorting. Not saved
+        public boolean foreign;
 
         public Box(BlockPos pos, List<BlockPos> parts) {
             this.pos = pos;
@@ -64,6 +68,11 @@ public class Stash {
 
         public boolean known() {
             return contents != null;
+        }
+
+        /** No contents and no read time: it was never read. */
+        public boolean neverRead() {
+            return StashSafety.neverRead(contents != null, lastRead);
         }
 
         public int free() {
@@ -76,7 +85,7 @@ public class Stash {
          * Joins in sorting: not excluded, read at least once and possible to open.
          */
         public boolean sortable() {
-            return known() && !unreachable && !excluded;
+            return known() && !unreachable && !excluded && !foreign;
         }
 
         public boolean has(BlockPos pos) {
@@ -177,6 +186,8 @@ public class Stash {
     }
 
     public ActiveOrder activeOrder;
+    // The delivery storage (0.4.0-dev.5): the delivery container and the chests put up above it, which are full. Positions only
+    public final List<DeliveryBook.Entry> deliveryStorage = new ArrayList<>();
     public final List<Orphan> orphans = new ArrayList<>();
     // The stacks the sorter took out of the stash and carries, by inventory slot, so they are still known as the stash's
     // after a restart
@@ -203,6 +214,9 @@ public class Stash {
     public String anvilSource = "";
     // The crafting table orders craft at. Not a container: never a box, never indexed. Stays until the user clears it
     public BlockPos craftingTablePos;
+    // How the table came to be remembered: "set" (picked by hand), "found" (placed, found in the area), "placed" (taken from the
+    // stash and placed) or "crafted" (made in the inventory grid and placed). "" counts as set
+    public String craftingTableSource = "";
 
     /**
      * Makes sure the delivery container is among the boxes: the box flagged as one gives the position, else the saved
@@ -210,7 +224,7 @@ public class Stash {
      */
     public void ensureDelivery() {
         for (Box b : boxes) {
-            if (b.delivery) {
+            if (b.delivery && !b.deliveryExtra) {
                 deliveryPos = b.pos;
                 return;
             }
@@ -223,6 +237,16 @@ public class Stash {
         boxes.add(box);
         dirty = true;
     }
+    /**
+     * Copies this stash's file aside (name.nbt.prune-bak-..., the last three kept) before a change that removes
+     * containers. @return false when there is no file or the copy failed: then nothing may be removed
+     */
+    public boolean backUpFile(String why) {
+        Path path = file(name, server);
+        if (!Files.exists(path)) return false;
+        return backUp(path, why, ".prune-bak-");
+    }
+
     // The dimension the stash is in, noted when a container of it is first read; empty for stashes saved before
     public String dimension = "";
     private static Object cachedLevel;
@@ -452,6 +476,7 @@ public class Stash {
             tag.putBoolean("dropOff", box.dropOff);
             if (box.lastRead > 0) tag.putLong("readAt", box.lastRead);
             if (box.delivery) tag.putBoolean("delivery", true);
+            if (box.deliveryExtra) tag.putBoolean("deliveryExtra", true);
             if (box.wasExcluded) tag.putBoolean("wasExcluded", true);
             if (box.wasDropOff) tag.putBoolean("wasDropOff", true);
             if (box.noCompact) tag.putBoolean("noCompact", true);
@@ -503,6 +528,21 @@ public class Stash {
         root.put("held", heldList);
 
         if (inFlight != null) root.put("inFlight", writeInFlight(inFlight, ops));
+
+        if (!deliveryStorage.isEmpty()) {
+            ListTag chests = new ListTag();
+            for (DeliveryBook.Entry e : deliveryStorage) {
+                if (e == null || e.at == null || e.at.length < 3) continue;
+                CompoundTag tag = new CompoundTag();
+                tag.putIntArray("at", e.at);
+                if (e.primary) tag.putBoolean("primary", true);
+                if (e.full) tag.putBoolean("full", true);
+                if (e.check) tag.putBoolean("check", true);
+                if (e.checkedAt > 0) tag.putLong("checkedAt", e.checkedAt);
+                chests.add(tag);
+            }
+            root.put("deliveryStorage", chests);
+        }
 
         if (activeOrder != null) {
             CompoundTag order = new CompoundTag();
@@ -570,6 +610,7 @@ public class Stash {
         if (anvilPos != null) root.put("anvilPos", positions(List.of(anvilPos)));
         if (anvilPos != null && !anvilSource.isEmpty()) root.putString("anvilSource", anvilSource);
         if (craftingTablePos != null) root.put("craftingTablePos", positions(List.of(craftingTablePos)));
+        if (craftingTablePos != null && !craftingTableSource.isEmpty()) root.putString("craftingTableSource", craftingTableSource);
         if (!dimension.isEmpty()) root.putString("dimension", dimension);
 
         try {
@@ -717,6 +758,8 @@ public class Stash {
                 List<BlockPos> at = readPositions(ct);
                 if (!at.isEmpty()) stash.craftingTablePos = at.getFirst();
             }
+            String tableSource = string(root.get("craftingTableSource"));
+            if (tableSource != null && stash.craftingTablePos != null) stash.craftingTableSource = tableSource;
             String dim = string(root.get("dimension"));
             if (dim != null) stash.dimension = dim;
             if (root.get("held") instanceof ListTag heldList) {
@@ -728,6 +771,18 @@ public class Stash {
                 }
             }
             if (root.get("inFlight") instanceof CompoundTag flight) stash.inFlight = readInFlight(flight, ops);
+            if (root.get("deliveryStorage") instanceof ListTag chests) {
+                for (Tag t : chests) {
+                    if (!(t instanceof CompoundTag tag) || !(tag.get("at") instanceof net.minecraft.nbt.IntArrayTag at) || at.getAsIntArray().length < 3 || at.getAsIntArray().length % 3 != 0) continue;
+                    DeliveryBook.Entry e = new DeliveryBook.Entry();
+                    e.at = at.getAsIntArray();
+                    e.primary = flag(tag, "primary");
+                    e.full = flag(tag, "full");
+                    e.check = flag(tag, "check");
+                    e.checkedAt = longNumber(tag.get("checkedAt"));
+                    stash.deliveryStorage.add(e);
+                }
+            }
             if (root.get("activeOrder") instanceof CompoundTag order) {
                 ActiveOrder active = new ActiveOrder();
                 active.id = text(order, "id");
@@ -800,6 +855,7 @@ public class Stash {
                 // Saved before read times existed: no tag, which counts as read long ago
                 box.lastRead = longNumber(tag.get("readAt"));
                 box.delivery = flag(tag, "delivery");
+                box.deliveryExtra = flag(tag, "deliveryExtra");
                 box.wasExcluded = flag(tag, "wasExcluded");
                 box.wasDropOff = flag(tag, "wasDropOff");
                 box.noCompact = flag(tag, "noCompact");
@@ -847,7 +903,7 @@ public class Stash {
         }
 
         // A stash that did not load fully could be saved over the original later: the original is kept first
-        if (errors[0]) backUp(path);
+        if (errors[0]) backUp(path, "Stash file had errors", ".bak-");
 
         stash.ensureDelivery();
         return stash;
@@ -860,21 +916,23 @@ public class Stash {
     }
 
     /** Copies a stash file that had errors to name.bak-yyyyMMdd-HHmmss, keeping the last three, and says so once. */
-    private static void backUp(Path path) {
+    private static boolean backUp(Path path, String why, String infix) {
         try {
             String stamp = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
-            Path copy = path.resolveSibling(path.getFileName() + ".bak-" + stamp);
+            Path copy = path.resolveSibling(path.getFileName() + infix + stamp);
             Files.copy(path, copy, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 
-            String prefix = path.getFileName() + ".bak-";
+            String prefix = path.getFileName() + infix;
             try (var files = Files.list(path.getParent())) {
                 var old = files.filter(f -> f.getFileName().toString().startsWith(prefix)).sorted().toList();
                 for (int i = 0; i < old.size() - 3; i++) Files.deleteIfExists(old.get(i));
             }
-            QwerteAddon.LOG.warn("Stash file had errors; a backup was saved as {}", copy.getFileName());
-            meteordevelopment.meteorclient.utils.player.ChatUtils.warning("Stash file had errors; a backup was saved as %s", copy.getFileName());
+            QwerteAddon.LOG.warn("{}; a backup was saved as {}", why, copy.getFileName());
+            meteordevelopment.meteorclient.utils.player.ChatUtils.warning("%s; a backup was saved as %s", why, copy.getFileName());
+            return true;
         } catch (IOException | RuntimeException e) {
             QwerteAddon.LOG.warn("Couldn't back up the stash file {}: {}", path.getFileName(), e.toString());
+            return false;
         }
     }
 

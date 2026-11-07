@@ -80,20 +80,27 @@ public final class StashManagerServer {
         SessionStore sessions = new SessionStore(dataDir);
         sessions.load();
         if (config.dashboardPassword() == null && sessions.size() > 0) {
-            // The password line was deleted (a reset): old logins must not survive it.
+            // The password line was deleted (a reset): old logins must not survive it, sub-users' included.
             sessions.removeAllExcept(null);
         }
-        Router router = new Router(new AccessControl(config), sessions, config);
-        AuthRoutes authRoutes = new AuthRoutes(config, sessions, new LoginLimiter());
-        authRoutes.register(router);
-        new AddonRoutes(store, link, icons, orders, owners).register(router);
-        new BrowserRoutes(store, config, link, urls, orders, owners, sessions).register(router);
-        new OrderRoutes(orders, owners).register(router);
+        Users users = new Users(dataDir);
+        try {
+            users.load();
+        } catch (IOException e) {
+            System.err.println("Can't read the website users: " + e.getMessage());
+            System.exit(1);
+            return;
+        }
+        AuditLog audit = new AuditLog(dataDir);
+        audit.load();
+        AuthRoutes.trustProxies(config.trustedProxies);
+        if (!config.trustedProxies.isEmpty()) System.out.println("  Trusted proxies (client address from X-Forwarded-For): " + String.join(", ", config.trustedProxies));
+        Auth.dummyHash(); // so the first login for an unknown name isn't slower than the rest
         BotHub hub = new BotHub();
-        new BotRoutes(hub).register(router);
-        new DashboardRoutes(hub, store, owners, sessions).register(router);
-        new IconRoutes(icons).register(router);
-        new StaticRoutes().register(router); // last: the catch-all
+        Routes built = routes(config, store, orders, owners, icons, link, urls, sessions, users, audit, hub, new LoginLimiter());
+        Router router = built.router();
+        AuthRoutes authRoutes = built.auth();
+        if (!users.list().isEmpty()) System.out.println("  Website users: the owner and " + users.list().size() + " sub-user(s).");
 
         HttpServer server;
         try {
@@ -105,7 +112,8 @@ public final class StashManagerServer {
             System.exit(1);
             return;
         }
-        ExecutorService pool = Executors.newFixedThreadPool(32, daemonThreads()) /* up to 8 bot long-polls wait at once */;
+        // Up to 8 bot long-polls and up to 8 live viewer streams (ViewerHub.MAX_STREAMS) hold a thread each.
+        ExecutorService pool = Executors.newFixedThreadPool(32, daemonThreads());
         server.setExecutor(pool);
         server.createContext("/", router);
         server.start();
@@ -117,6 +125,7 @@ public final class StashManagerServer {
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("Stopping Stash Manager...");
+            built.viewer().close();
             server.stop(1);
             icons.close();
             pool.shutdown();
@@ -144,6 +153,51 @@ public final class StashManagerServer {
             System.out.println("  No website password yet: open http://localhost:" + config.port + " on this PC to set one.");
             System.out.println("  Dashboard setup code: " + authRoutes.setupCode());
         }
+    }
+
+    record Routes(Router router, AuthRoutes auth, PlanStore plans, ViewerHub viewer, DeliveryContents delivery) {
+    }
+
+    /** Every route, in order (the static files last). Shared with the tests, so they check the real registrations. */
+    static Routes routes(Config config, IndexStore store, OrderStore orders, Owners owners, IconService icons, LinkState link,
+                         List<String> urls, SessionStore sessions, Users users, AuditLog audit, BotHub hub, LoginLimiter limiter) {
+        return routes(config, store, orders, owners, icons, link, urls, sessions, users, audit, hub, limiter, new PlanStore());
+    }
+
+    /** The same, with the build planner's plan store (tests give it their own clock). */
+    static Routes routes(Config config, IndexStore store, OrderStore orders, Owners owners, IconService icons, LinkState link,
+                         List<String> urls, SessionStore sessions, Users users, AuditLog audit, BotHub hub, LoginLimiter limiter,
+                         PlanStore plans) {
+        return routes(config, store, orders, owners, icons, link, urls, sessions, users, audit, hub, limiter, plans,
+            new ViewerHub(hub, audit));
+    }
+
+    /** The same, with the live viewer's hub (tests give it short rotate and heartbeat times). */
+    static Routes routes(Config config, IndexStore store, OrderStore orders, Owners owners, IconService icons, LinkState link,
+                         List<String> urls, SessionStore sessions, Users users, AuditLog audit, BotHub hub, LoginLimiter limiter,
+                         PlanStore plans, ViewerHub viewer) {
+        // A user's plans end with their last session, whatever ended it (logout, expiry, a reset).
+        plans.sessionCheck(id -> sessions.countByUser().getOrDefault(id, 0) > 0);
+        Router router = new Router(new AccessControl(config), sessions, config, users);
+        router.ids(new ServerIds(ServerIds.secret(config.dataDir()), store::servers,
+            () -> hub.all().stream().map(b -> b.botId).toList()));
+        AuthRoutes authRoutes = new AuthRoutes(config, sessions, limiter, users, audit);
+        authRoutes.ids(router.ids());
+        authRoutes.onSessionsEnded(plans::pruneNow);
+        authRoutes.register(router);
+        DeliveryContents delivery = new DeliveryContents(); // in memory only
+        new AddonRoutes(store, link, icons, orders, owners, delivery).register(router);
+        new BrowserRoutes(store, config, link, urls, orders, owners, sessions, audit, delivery).register(router);
+        new DeliveryRoutes(delivery, owners).register(router);
+        new OrderRoutes(orders, owners, audit).register(router);
+        new BotRoutes(hub).register(router);
+        new DashboardRoutes(hub, store, owners, sessions, audit).register(router);
+        new UserRoutes(users, sessions, audit, plans).register(router);
+        new PlannerRoutes(store, orders, plans, audit).register(router);
+        new ViewerRoutes(viewer).register(router);
+        new IconRoutes(icons).register(router);
+        new StaticRoutes().register(router); // last: the catch-all
+        return new Routes(router, authRoutes, plans, viewer, delivery);
     }
 
     private static void setDefault(String key, String value) {

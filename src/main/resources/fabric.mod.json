@@ -13,6 +13,9 @@
   "license": "GPL-3.0",
   "icon": "assets/qwerte/icon.png",
   "environment": "client",
+  "mixins": [
+    "qwerte.mixins.json"
+  ],
   "entrypoints": {
     "meteor": [
       "com.porter.qwerte.QwerteAddon"

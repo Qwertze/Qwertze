@@ -73,6 +73,9 @@ final class OrderStore {
         boolean cancelRequested;
         long cancelRequestedAt; // 0 when unknown (orders from before this field)
         JsonObject result;
+        String placedById; // Users.OWNER_ID or a sub-user's id; null for orders from before accounts (the owner's)
+        String placedByName; // the name at the time
+        String retriedAs; // the order this one was placed again as (Retry, or the planner's "order part again"), or null
 
         JsonObject toJson() {
             JsonObject o = new JsonObject();
@@ -98,6 +101,15 @@ final class OrderStore {
             o.addProperty("cancelRequested", cancelRequested);
             o.addProperty("cancelRequestedAt", cancelRequestedAt > 0 ? cancelRequestedAt : null);
             o.add("result", result == null ? null : result.deepCopy());
+            if (retriedAs != null && !PENDING.equals(retriedAs)) o.addProperty("retriedAs", retriedAs);
+            if (placedById == null) {
+                o.add("placedBy", null);
+            } else {
+                JsonObject by = new JsonObject();
+                by.addProperty("id", placedById);
+                by.addProperty("name", placedByName);
+                o.add("placedBy", by);
+            }
             return o;
         }
 
@@ -127,6 +139,12 @@ final class OrderStore {
             r.cancelRequestedAt = o.has("cancelRequestedAt") && o.get("cancelRequestedAt").isJsonPrimitive()
                 ? o.get("cancelRequestedAt").getAsLong() : 0;
             r.result = o.has("result") && o.get("result").isJsonObject() ? o.getAsJsonObject("result") : null;
+            r.retriedAs = str(o, "retriedAs");
+            if (o.has("placedBy") && o.get("placedBy").isJsonObject()) {
+                JsonObject by = o.getAsJsonObject("placedBy");
+                r.placedById = str(by, "id");
+                r.placedByName = str(by, "name");
+            }
             return r;
         }
 
@@ -218,10 +236,28 @@ final class OrderStore {
         return out;
     }
 
+    /**
+     * What the stash's open orders reserve, by line ref ("item:&lt;key&gt;" / "shulker:&lt;key&gt;"): the same numbers
+     * {@link #place} subtracts from the index. A copy; empty when the stash has no orders.
+     */
+    Map<String, Long> reservedFor(String server, String stash) {
+        Book b = books.get(new IndexStore.StashKey(server, stash));
+        if (b == null) return Map.of();
+        synchronized (b) {
+            return Map.copyOf(reserved(b));
+        }
+    }
+
     // ---------- browser ----------
 
     /** Validates (against the current index and open orders), merges duplicate lines, stores and returns the order. */
     Order place(String server, String stash, List<Line> requested, JsonObject names) throws OrderException, IOException {
+        return place(server, stash, requested, names, null, null);
+    }
+
+    /** The same, recording who placed it (byId null: unknown, counted as the owner's). */
+    Order place(String server, String stash, List<Line> requested, JsonObject names, String byId, String byName)
+        throws OrderException, IOException {
         if (requested.isEmpty()) throw new OrderException(400, "an order needs at least one line", -1);
         if (requested.size() > MAX_LINES) throw new OrderException(400, "at most " + MAX_LINES + " lines", -1);
         IndexStore.OrderCounts counts = index.orderCounts(server, stash);
@@ -271,6 +307,8 @@ final class OrderStore {
             o.createdAt = now;
             o.updatedAt = now;
             o.status = "pending";
+            o.placedById = byId;
+            o.placedByName = byId == null ? null : byName;
             b.orders.add(o);
             byOrderId.put(o.id, b);
             prune(b);
@@ -284,20 +322,56 @@ final class OrderStore {
      * like any new order. Only failed and cancelled orders (409 otherwise, 404 for an unknown id). The old one stays.
      */
     Order retry(String id) throws OrderException, IOException {
+        return retry(id, null, null);
+    }
+
+    /** The same; the new order is recorded as placed by byId (who pressed Retry). */
+    Order retry(String id, String byId, String byName) throws OrderException, IOException {
         Book b = byOrderId.get(id);
         if (b == null) throw new OrderException(404, "no such order", -1);
         List<Line> lines;
         JsonObject names;
+        Order old;
         synchronized (b) {
-            Order old = find(b, id);
+            old = find(b, id);
             if (old == null) throw new OrderException(404, "no such order", -1);
             if (!old.status.equals("failed") && !old.status.equals("cancelled")) {
                 throw new OrderException(409, "only failed or cancelled orders can be retried (this one is " + old.status + ")", -1);
             }
+            // Once only: a second Retry (or a planner part ordered again) would order the same lines twice.
+            if (old.retriedAs != null) {
+                throw new OrderException(409, PENDING.equals(old.retriedAs) ? "this order is being retried right now"
+                    : "this order was already placed again as " + old.retriedAs, -1);
+            }
+            old.retriedAs = PENDING;
             lines = new ArrayList<>(old.lines);
             names = old.names;
         }
-        return place(b.server, b.stash, lines, names);
+        Order again;
+        try {
+            again = place(b.server, b.stash, lines, names, byId, byName);
+        } catch (OrderException | IOException | RuntimeException e) {
+            synchronized (b) {
+                if (PENDING.equals(old.retriedAs)) old.retriedAs = null;
+            }
+            throw e;
+        }
+        markRetried(id, again.id);
+        return again;
+    }
+
+    private static final String PENDING = "\u0000pending";
+
+    /** Records that order id was placed again as newId (so it can't be retried again, and its status follows newId). */
+    void markRetried(String id, String newId) throws IOException {
+        Book b = byOrderId.get(id);
+        if (b == null) return;
+        synchronized (b) {
+            Order o = find(b, id);
+            if (o == null) return;
+            o.retriedAs = newId;
+            save(b);
+        }
     }
 
     /**
@@ -498,6 +572,36 @@ final class OrderStore {
             save(b);
             return o;
         }
+    }
+
+    /** Who placed an order: Users.OWNER_ID for old orders without a record; null for an unknown order. */
+    String placedBy(String id) {
+        Book b = byOrderId.get(id);
+        if (b == null) return null;
+        synchronized (b) {
+            Order o = find(b, id);
+            if (o == null) return null;
+            return o.placedById == null ? Users.OWNER_ID : o.placedById;
+        }
+    }
+
+    /** An order's status, or null for an unknown order (never placed, or cleared from the history). */
+    String statusOf(String id) {
+        // An order placed again stands for its successor: a failed part that was retried is live again.
+        for (int hops = 0; hops < 64 && id != null; hops++) {
+            Book b = byOrderId.get(id);
+            if (b == null) return null;
+            String next;
+            synchronized (b) {
+                Order o = find(b, id);
+                if (o == null) return null;
+                if (o.retriedAs == null) return o.status;
+                if (PENDING.equals(o.retriedAs)) return "pending";
+                next = o.retriedAs;
+            }
+            id = next;
+        }
+        return "pending";
     }
 
     /** The (server, stash) an order belongs to, or null. */

@@ -28,21 +28,65 @@ final class OrderRoutes {
 
     private final OrderStore orders;
     private final Owners owners;
+    private final AuditLog audit;
 
-    OrderRoutes(OrderStore orders, Owners owners) {
+    OrderRoutes(OrderStore orders, Owners owners, AuditLog audit) {
         this.orders = orders;
         this.owners = owners;
+        this.audit = audit;
+    }
+
+    /**
+     * The user may see this stash (in their stash scope). False after answering 404, as for a stash that doesn't
+     * exist, so a scoped user learns nothing about others.
+     */
+    /**
+     * A stash named by a request, checked: the real server address (an opaque id from a user in forced streamer mode
+     * is mapped back; a raw address from them is refused) when it is in the user's scope, else null after 404.
+     */
+    static String scoped(HttpExchange ex, String server, String stash) throws IOException {
+        String real = Router.serverParam(ex, server);
+        if (real == null) {
+            Http.error(ex, 404, "no such stash");
+            return null;
+        }
+        return inScope(ex, real, stash) ? real : null;
+    }
+
+    static boolean inScope(HttpExchange ex, String server, String stash) throws IOException {
+        Users.Principal p = Router.user(ex);
+        if (p == null || p.perms().seesStash(server, stash)) return true;
+        Http.error(ex, 404, "no such stash");
+        return false;
+    }
+
+    /**
+     * May the user change this order (cancel, retry, force-cancel)? Their own with order or plannerOrder, any with ordersAll; the
+     * order's stash must be in scope. False after answering 404 or 403.
+     */
+    private boolean mayChange(HttpExchange ex, String id) throws IOException {
+        IndexStore.StashKey where = orders.stashOf(id);
+        Users.Principal p = Router.user(ex);
+        if (where == null || !p.perms().seesStash(where.server(), where.stash())) {
+            Http.error(ex, 404, "no such order");
+            return false;
+        }
+        if (p.perms().ordersAll()) return true;
+        // order or plannerOrder: the user's own orders (build planner parts included).
+        if ((p.perms().order() || p.perms().plannerOrder()) && p.id().equals(orders.placedBy(id))) return true;
+        Router.forbid(ex, "change other users' orders", "ordersAll");
+        return false;
     }
 
     void register(Router router) {
         // claim is registered before the id patterns; the patterns only match o-<12 hex>.
         router.exact(Router.POST, "/api/v1/orders/claim", Router.Guard.ADDON_KEY, this::claim)
-            .exact(Router.POST, "/api/v1/orders", Router.Guard.BROWSER_WRITE, this::place)
-            .exact(Router.POST, "/api/v1/orders/clear", Router.Guard.BROWSER_WRITE, this::clear)
-            .exact(Router.GET, "/api/v1/orders", Router.Guard.SESSION, this::list)
-            .pattern(Router.POST, CANCEL, Router.Guard.BROWSER_WRITE, this::cancel)
-            .pattern(Router.POST, FORCE_CANCEL, Router.Guard.BROWSER_WRITE, this::forceCancel)
-            .pattern(Router.POST, RETRY, Router.Guard.BROWSER_WRITE, this::retry)
+            .exact(Router.POST, "/api/v1/orders", Router.Guard.BROWSER_WRITE, Router.Perm.ORDER, this::place)
+            .exact(Router.POST, "/api/v1/orders/clear", Router.Guard.BROWSER_WRITE, Router.Perm.ORDERS_ALL, this::clear)
+            .exact(Router.GET, "/api/v1/orders", Router.Guard.SESSION, Router.Perm.VIEW, this::list)
+            .pattern(Router.POST, CANCEL, Router.Guard.BROWSER_WRITE, Router.Perm.ORDER_OWN_OR_ALL, this::cancel)
+            .pattern(Router.POST, FORCE_CANCEL, Router.Guard.BROWSER_WRITE, Router.Perm.ORDER_OWN_OR_ALL, this::forceCancel)
+            .pattern(Router.POST, RETRY, Router.Guard.BROWSER_WRITE, Router.Perm.ORDER_OWN_OR_ALL, this::retry)
             .pattern(Router.POST, STATUS, Router.Guard.ADDON_KEY, this::status);
     }
 
@@ -61,6 +105,8 @@ final class OrderRoutes {
             Http.error(ex, 400, "server and stash are required");
             return;
         }
+        server = scoped(ex, server, stash);
+        if (server == null) return;
         // "note" (removed) is ignored if an old page still sends it.
         JsonObject names;
         try {
@@ -102,9 +148,10 @@ final class OrderRoutes {
             lines.add(line);
         }
         try {
-            OrderStore.Order order = orders.place(server, stash, lines, names);
+            Users.Principal who = Router.user(ex);
+            OrderStore.Order order = orders.place(server, stash, lines, names, who.id(), who.name());
             JsonObject out = Http.ok();
-            out.add("order", order.toJson());
+            out.add("order", shown(ex, order.toJson()));
             Http.json(ex, 200, out);
         } catch (OrderStore.OrderException e) {
             lineError(ex, e.status, e.getMessage(), e.line);
@@ -121,8 +168,12 @@ final class OrderRoutes {
             Http.error(ex, 400, "server and stash are required");
             return;
         }
+        server = scoped(ex, server, stash);
+        if (server == null) return;
         JsonObject out = Http.ok();
-        out.addProperty("removed", orders.clearFinished(server, stash));
+        int removed = orders.clearFinished(server, stash);
+        out.addProperty("removed", removed);
+        audit.add(Router.user(ex), "orders.clear", server + " / " + stash + ": " + removed, AuthRoutes.address(ex));
         Http.json(ex, 200, out);
     }
 
@@ -134,7 +185,17 @@ final class OrderRoutes {
             Http.error(ex, 400, "server and stash are required");
             return;
         }
-        Http.json(ex, 200, orders.listJson(server, stash));
+        server = scoped(ex, server, stash);
+        if (server == null) return;
+        JsonObject list = orders.listJson(server, stash);
+        if (Redact.on(ex)) Redact.orders(list, Router.user(ex).id());
+        Http.json(ex, 200, list);
+    }
+
+    /** An order as this user may see it (forced streamer mode: other users' names and position-like text hidden). */
+    private static JsonObject shown(HttpExchange ex, JsonObject order) {
+        if (Redact.on(ex)) Redact.order(order, Router.user(ex).id());
+        return order;
     }
 
     private void cancel(HttpExchange ex) throws IOException {
@@ -143,10 +204,12 @@ final class OrderRoutes {
             Http.error(ex, 404, "not found");
             return;
         }
+        if (!mayChange(ex, m.group(1))) return;
         try {
             OrderStore.Order order = orders.cancel(m.group(1));
+            audit.add(Router.user(ex), "order.cancel", order.id, AuthRoutes.address(ex));
             JsonObject out = Http.ok();
-            out.add("order", order.toJson());
+            out.add("order", shown(ex, order.toJson()));
             Http.json(ex, 200, out);
         } catch (OrderStore.OrderException e) {
             Http.error(ex, e.status, e.getMessage());
@@ -160,10 +223,18 @@ final class OrderRoutes {
             Http.error(ex, 404, "not found");
             return;
         }
+        if (!mayChange(ex, m.group(1))) return;
         try {
-            OrderStore.Order order = orders.retry(m.group(1));
+            Users.Principal who = Router.user(ex);
+            boolean own = who.id().equals(orders.placedBy(m.group(1)));
+            if (!who.perms().order() && !(who.perms().plannerOrder() && own)) {
+                Router.forbid(ex, "place orders", "order");
+                return;
+            }
+            OrderStore.Order order = orders.retry(m.group(1), who.id(), who.name());
+            audit.add(who, "order.retry", m.group(1) + " as " + order.id, AuthRoutes.address(ex));
             JsonObject out = Http.ok();
-            out.add("order", order.toJson());
+            out.add("order", shown(ex, order.toJson()));
             Http.json(ex, 200, out);
         } catch (OrderStore.OrderException e) {
             if (e.status == 400) lineError(ex, e.status, e.getMessage(), e.line);
@@ -178,10 +249,12 @@ final class OrderRoutes {
             Http.error(ex, 404, "not found");
             return;
         }
+        if (!mayChange(ex, m.group(1))) return;
         try {
             OrderStore.Order order = orders.forceCancel(m.group(1));
+            audit.add(Router.user(ex), "order.force-cancel", order.id, AuthRoutes.address(ex));
             JsonObject out = Http.ok();
-            out.add("order", order.toJson());
+            out.add("order", shown(ex, order.toJson()));
             Http.json(ex, 200, out);
         } catch (OrderStore.OrderException e) {
             Http.error(ex, e.status, e.getMessage());
@@ -210,7 +283,7 @@ final class OrderRoutes {
             return;
         }
         JsonObject out = Http.ok();
-        out.add("order", order.toJson());
+        out.add("order", shown(ex, order.toJson()));
         Http.json(ex, 200, out);
     }
 
@@ -255,7 +328,7 @@ final class OrderRoutes {
         try {
             OrderStore.Order order = orders.status(m.group(1), status, phase, progress, message, result);
             JsonObject out = Http.ok();
-            out.add("order", order.toJson());
+            out.add("order", shown(ex, order.toJson()));
             Http.json(ex, 200, out);
         } catch (OrderStore.OrderException e) {
             Http.error(ex, e.status, e.getMessage());

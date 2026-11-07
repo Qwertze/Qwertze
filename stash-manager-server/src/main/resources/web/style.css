@@ -1115,6 +1115,76 @@ body.dragging, body.dragging * { cursor: grabbing !important; }
 .theme-name { font-weight: 700; }
 .theme-desc { color: var(--muted); font-size: 12px; }
 
+/* ---------- logged-in user, permissions ---------- */
+
+.header .user-name { order: 11; font-size: 12px; color: var(--bar-text); max-width: 18ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-name[hidden], .menu-label[hidden] { display: none; }
+.menu-label { padding: 4px 12px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.field-hint { color: var(--muted); font-size: 12px; }
+.inset[hidden], .stash-picker[hidden] { display: none; }
+/* Users without the "order" permission: no cart buttons or cart hints on the item grid. */
+.no-order .slot-add, .no-order .order-hint { display: none !important; }
+.console-allow { margin-top: 2px; }
+.console-allow code { font-family: var(--font); background: var(--chip-bg); color: var(--text); border-radius: var(--radius); padding: 0 4px; }
+.read-only-note { padding: 2px 0; }
+
+/* ---------- dashboard: settings > account and users ---------- */
+
+.account-section, .users-section { flex: 0 0 auto; }
+.account-actions, .user-actions, .user-form-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.users-body { display: flex; flex-direction: column; gap: 8px; }
+.users-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.user-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--surface);
+  color: var(--text);
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius);
+  min-width: 0;
+}
+.user-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.user-title { color: var(--text); font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
+.user-row.is-disabled .user-title { color: var(--muted); }
+.user-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.user-form .settings-group-title { margin: 0; }
+.user-form .auth-field .mc-input, .user-form .auth-field .mc-select { max-width: 360px; }
+.user-check { white-space: normal; display: inline-flex; align-items: center; gap: 6px; }
+.perm-editor { display: flex; flex-direction: column; }
+.perm-editor > .note { margin-top: 6px; }
+.allow-input { width: 100%; max-width: 360px; resize: vertical; font-size: 13px; }
+.setting[hidden] { display: none; }
+.scope-picker { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.scope-list { display: flex; flex-direction: column; gap: 2px; padding-left: 18px; max-height: 220px; overflow-y: auto; }
+.scope-list[hidden] { display: none; }
+.audit > summary { cursor: pointer; color: var(--text); font-weight: 700; }
+.audit-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 6px 0; }
+.audit-list { display: flex; flex-direction: column; max-height: 50vh; overflow-y: auto; font-size: 12px; }
+.audit-row {
+  display: grid;
+  grid-template-columns: minmax(140px, auto) minmax(70px, 140px) minmax(100px, 160px) minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+.audit-row:last-child { border-bottom: none; }
+.audit-time { color: var(--muted); }
+.audit-user { overflow-wrap: anywhere; }
+.audit-action { font-weight: 700; justify-self: start; overflow-wrap: anywhere; }
+.audit-fail .audit-action { background: var(--danger-bg); color: var(--danger-fg); border-radius: var(--radius); padding: 0 4px; }
+.audit-detail { overflow-wrap: anywhere; }
+.audit-address { color: var(--muted); }
+
 /* ---------- dashboard: settings ---------- */
 
 .settings-body { display: flex; flex-direction: column; gap: 10px; }
@@ -1803,6 +1873,11 @@ html.streamer .sv-hidden { display: inline; color: var(--muted); font-style: ita
     left: calc(50% - var(--icon-size) / 2);
     top: calc(50% - var(--icon-size) / 2);
   }
+  /* The durability bar follows the centred icon (2/16 in, 13/16 down from its corner). */
+  #item-grid .dura {
+    left: calc(50% - var(--icon-size) / 2 + var(--icon-size) * 2 / 16);
+    top: calc(50% - var(--icon-size) / 2 + var(--icon-size) * 13 / 16);
+  }
   #item-grid .count { right: 2px; bottom: 1px; font-size: 13px; }
   #item-grid .slot img.face {
     left: calc(50% - var(--icon-size) * 0.3125);
@@ -1977,4 +2052,541 @@ html.streamer .sv-hidden { display: inline; color: var(--muted); font-style: ita
   .dash-bots { grid-template-columns: minmax(0, 1fr); }
   .dash-bot-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .dash-bot-actions .mc-button { width: 100%; }
+}
+
+/* Settings > Users on phones: stacked forms, full-width fields, two-column action buttons. */
+@media (max-width: 767px) {
+  .user-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .user-actions .mc-button, .account-actions .mc-button { width: 100%; }
+  .account-actions { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .user-form-actions .mc-button { flex: 1 1 0; }
+  .user-form .auth-field .mc-input, .user-form .auth-field .mc-select, .allow-input { max-width: none; }
+  .users-bar .mc-button { flex: 0 0 auto; }
+  .scope-list { max-height: none; padding-left: 8px; }
+  .audit-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2px 8px; padding: 6px 0; }
+  .audit-time, .audit-detail { grid-column: 1 / -1; }
+  .audit-list { max-height: 60vh; font-size: 13px; }
+}
+
+/* ---------- build planner ---------- */
+
+.planner-page h2.panel-label { margin: 0; font-size: inherit; font-weight: inherit; }
+.pl-drop {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-height: 72px;
+  padding: 12px;
+  border: var(--border-w) dashed var(--muted);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+.pl-drop.over { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.pl-drop.busy { opacity: 0.6; cursor: progress; }
+.pl-body { display: flex; flex-direction: column; gap: 8px; }
+.pl-body[hidden] { display: none; }
+.pl-facts { margin: 0; }
+.pl-facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; font-size: 13px; }
+.pl-facts dt { color: var(--muted); }
+.pl-facts dd { margin: 0; color: var(--text); overflow-wrap: anywhere; }
+.pl-option-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
+.pl-field { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pl-field .mc-select { max-width: 100%; }
+.inset .mc-input.pl-num { width: 6em; }
+.pl-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+.pl-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  background: var(--surface);
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius);
+}
+.pl-tile-label { color: var(--muted); font-size: 12px; }
+.pl-tile-value { color: var(--text); font-size: 18px; font-weight: 700; }
+.pl-tile-sub { color: var(--muted); font-size: 12px; }
+.pl-tile.bad .pl-tile-value { color: var(--danger-fg); }
+.pl-tile.bad { background: var(--danger-bg); border-color: var(--danger-fg); }
+.pl-tile.bad .pl-tile-label, .pl-tile.bad .pl-tile-sub { color: var(--danger-fg); }
+.pl-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.pl-actions .mc-button[hidden] { display: none; }
+.pl-table-wrap { overflow-x: auto; background: var(--surface); border: var(--border-w) solid var(--border); border-radius: var(--radius); }
+.pl-table { width: 100%; border-collapse: collapse; font-size: 13px; color: var(--text); }
+.pl-table th, .pl-table td { padding: 3px 6px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: middle; }
+.pl-table tbody tr:last-child td { border-bottom: none; }
+.pl-table th { color: var(--muted); font-weight: 400; font-size: 12px; position: sticky; top: 0; background: var(--surface-2); }
+.pl-sort {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+.pl-sort:hover, .pl-sort:focus-visible { color: var(--text); text-decoration: underline; }
+.pl-sort:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+th[aria-sort="ascending"] .pl-sort::after { content: " \25B2"; }
+th[aria-sort="descending"] .pl-sort::after { content: " \25BC"; }
+.pl-c-ex, .pl-c-icon { width: 1%; white-space: nowrap; }
+.pl-table .pl-c-num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pl-icon { display: block; width: 24px; height: 24px; image-rendering: pixelated; }
+.pl-name { color: var(--text); overflow-wrap: anywhere; }
+.pl-id { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.pl-missing { color: var(--danger-fg); background: var(--danger-bg); font-weight: 700; }
+.pl-excluded td { opacity: 0.5; }
+.pl-excluded .pl-missing { background: none; color: var(--muted); font-weight: 400; }
+.pl-empty { color: var(--muted); text-align: center; padding: 10px; }
+.pl-simple { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 4px 12px; font-size: 13px; }
+.pl-simple-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.pl-count { color: var(--muted); white-space: nowrap; }
+.pl-confirm { display: flex; flex-direction: column; gap: 8px; max-width: 560px; }
+.pl-parts { border-collapse: collapse; font-size: 13px; color: var(--text); }
+.pl-parts th, .pl-parts td { padding: 2px 10px 2px 0; text-align: left; border-bottom: 1px solid var(--border); }
+.pl-parts th { color: var(--muted); font-weight: 400; }
+.pl-confirm .unset { white-space: normal; font-size: 13px; }
+.pl-confirm .note.warn[hidden] { display: none; }
+@media (max-width: 800px) {
+  .pl-table .pl-id { display: none; }
+  .pl-table th, .pl-table td { padding: 3px 4px; }
+  .pl-option-row { gap: 8px; }
+}
+
+/* The game's durability bar on damaged items: 13/16 of the icon wide, 2/16 high, 2/16 in from the left and 13/16
+   down. Black backing, coloured top half; width and colour are set per item (green to red). In the game's own
+   colours in every theme, like the icons themselves. */
+.slot > .dura, .icon-wrap > .dura {
+  position: absolute;
+  left: calc(var(--icon-size, 32px) * 2 / 16);
+  top: calc(var(--icon-size, 32px) * 13 / 16);
+  width: calc(var(--icon-size, 32px) * 13 / 16);
+  height: max(2px, calc(var(--icon-size, 32px) * 2 / 16));
+  background: #000;
+  z-index: 2;
+  pointer-events: none;
+}
+.dura > .dura-fill {
+  display: block;
+  height: 50%;
+  width: 100%;
+}
+
+/* ---------- live viewer ---------- */
+/* The map is a canvas (game content: the vanilla map palette); its markers use the theme tokens, read by app.js.
+   Overlays (HUD, controls) are small chips over the map. Phones: chat is a bottom drawer; at 900px and up, a
+   320px side panel. */
+.viewer-page { gap: 8px; overflow: hidden; }
+.viewer-head { display: flex; align-items: center; gap: 8px; }
+.viewer-body { flex: 1 1 auto; min-height: 0; display: flex; gap: 8px; }
+.viewer-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 320px;
+  overflow: hidden;
+  background: var(--surface-2);
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius);
+}
+.viewer-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+  cursor: grab;
+  image-rendering: pixelated;
+}
+.viewer-canvas:active { cursor: grabbing; }
+
+.v-status {
+  padding: 2px 8px;
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--pill);
+  background: var(--chip-bg);
+  color: var(--text);
+  font-size: 12px;
+}
+.v-status.v-live { background: var(--ok-bg); color: var(--ok-fg); }
+.v-status.v-stale, .v-status.v-waiting, .v-status.v-connecting { background: var(--warn-bg); color: var(--warn-fg); }
+.v-status.v-offline, .v-status.v-closed { background: var(--danger-bg); color: var(--danger-fg); }
+
+.viewer-top {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  right: 92px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  pointer-events: none;
+}
+.v-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  background: var(--surface);
+  color: var(--text);
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--pill);
+  font-size: 12px;
+  line-height: 18px;
+  opacity: 0.94;
+}
+.v-chip[hidden] { display: none; }
+.v-bar-label { color: var(--muted); }
+.v-track { display: inline-block; width: 56px; height: 8px; background: var(--track-off); border-radius: var(--pill); overflow: hidden; }
+.v-fill { display: block; height: 100%; width: 0; }
+.v-fill.v-hp { background: var(--hp); }
+.v-fill.v-food { background: var(--food); }
+.v-num { min-width: 2.2em; text-align: right; font-variant-numeric: tabular-nums; }
+.v-coords { font-variant-numeric: tabular-nums; }
+
+.viewer-controls {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  width: 80px;
+}
+.viewer-controls .mc-button { padding: 2px 6px; font-size: 12px; }
+.viewer-controls .mc-button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
+.v-unread {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 4px;
+  border-radius: var(--pill);
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+  font-size: 11px;
+  text-align: center;
+}
+.v-unread[hidden] { display: none; }
+
+.v-debug {
+  position: absolute;
+  left: 6px;
+  bottom: 92px;
+  padding: 6px 8px;
+  background: var(--surface);
+  color: var(--text);
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.94;
+  pointer-events: none;
+}
+.v-debug[hidden] { display: none; }
+.v-debug-head { font-weight: 700; margin-bottom: 2px; }
+.v-note {
+  position: absolute;
+  left: 50%;
+  top: 45%;
+  transform: translate(-50%, -50%);
+  max-width: min(90%, 420px);
+  padding: 8px 10px;
+  background: var(--surface);
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius);
+  text-align: center;
+}
+.v-note[hidden] { display: none; }
+
+.viewer-bottom {
+  position: absolute;
+  left: 50%;
+  bottom: 6px;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  max-width: calc(100% - 8px);
+}
+.v-hotbar-row { display: flex; align-items: center; gap: 4px; }
+.v-hotbar, .v-gear { display: flex; gap: 2px; padding: 2px; background: var(--slot-dark); border-radius: 2px; }
+.v-gear[hidden] { display: none; }
+.v-gear-btn { padding: 2px 6px; font-size: 12px; }
+.v-hotbar-btns { display: flex; gap: 4px; }
+/* The main inventory (slots 9-35): three rows of nine over the gear strip and the hotbar, like the game's screen.
+   Game content: the slot colours in every theme. */
+.v-inv-box { display: flex; flex-direction: column; align-items: center; max-width: 100%; }
+.v-inv-box[hidden], .v-inv[hidden], .v-inv-note[hidden] { display: none; }
+.v-inv {
+  display: grid;
+  grid-template-columns: repeat(9, 34px);
+  gap: 2px;
+  padding: 2px;
+  background: var(--slot-dark);
+  border-radius: 2px;
+}
+.v-inv-note {
+  padding: 3px 8px;
+  background: var(--surface);
+  color: var(--muted);
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius);
+  font-size: 11px;
+  text-align: center;
+}
+.v-slot {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  flex: none;
+  background: var(--slot);
+  border: 2px solid;
+  border-color: var(--slot-dark) var(--slot-light) var(--slot-light) var(--slot-dark);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.v-slot img { width: 28px; height: 28px; image-rendering: pixelated; }
+.v-slot img[hidden] { display: none; }
+.v-slot.held { outline: 2px solid var(--slot-light); outline-offset: 0; z-index: 1; }
+/* The stash grid's durability bar on a 28px icon centred in the slot (1px in from the 30px inside). */
+.v-slot > .dura {
+  --icon-size: 28px;
+  position: absolute;
+  left: calc(1px + var(--icon-size) * 2 / 16);
+  top: calc(1px + var(--icon-size) * 13 / 16);
+  width: calc(var(--icon-size) * 13 / 16);
+  height: max(2px, calc(var(--icon-size) * 2 / 16));
+  background: #000;
+  z-index: 2;
+  pointer-events: none;
+}
+.v-slot > .v-count { z-index: 3; }
+.v-count {
+  position: absolute;
+  right: 1px;
+  bottom: -1px;
+  color: var(--slot-light);
+  font-size: 11px;
+  font-weight: 700;
+  text-shadow: 1px 1px 0 var(--slot-dark);
+  pointer-events: none;
+}
+
+.viewer-chat {
+  flex: 0 0 320px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: var(--surface);
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+}
+.v-chat-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.v-chat-lines { flex: 1 1 auto; min-height: 0; overflow-y: auto; font-size: 13px; overflow-wrap: anywhere; }
+.v-line { padding: 1px 0; }
+.v-time { color: var(--muted); margin-right: 6px; font-variant-numeric: tabular-nums; }
+.v-sender { font-weight: 700; margin-right: 6px; }
+.v-line.v-whisper .v-msg { font-style: italic; }
+.v-line.v-system .v-msg { color: var(--muted); }
+.v-line.v-death .v-msg { color: var(--hp); }
+
+@media (min-width: 900px) {
+  .v-narrow { display: none !important; }
+}
+@media (max-width: 899px) {
+  .viewer-body { flex-direction: column; }
+  .viewer-chat {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: calc(var(--bnav-h, 0px) + env(safe-area-inset-bottom));
+    height: 55vh;
+    z-index: 44;
+    flex: none;
+    border-radius: var(--radius) var(--radius) 0 0;
+    box-shadow: var(--shadow);
+  }
+  .viewer-chat:not(.open) { display: none; }
+}
+@media (max-width: 767px) {
+  .viewer-page { overflow: hidden; }
+  .viewer-wrap { flex: none; height: calc(100svh - 340px); min-height: 300px; } /* the hotbar stays above the bottom tabs */
+  .viewer-controls .mc-button { min-height: 36px; }
+  /* The open inventory on a phone: smaller slots (three rows take about 80px instead of 110px of the map), so the
+     map stays usable; the hotbar keeps its full size. */
+  .v-inv { grid-template-columns: repeat(9, 24px); }
+  .v-inv .v-slot { width: 24px; height: 24px; border-width: 1px; }
+  .v-inv .v-slot img { width: 20px; height: 20px; }
+  .v-inv .v-slot > .dura { --icon-size: 20px; }
+  .v-inv .v-count { font-size: 9px; }
+  /* 9 slots of 34px just fit a 375px screen: Gear goes above the hotbar. */
+  .v-hotbar-row { flex-direction: column-reverse; align-items: flex-end; }
+  .v-gear-btn { min-height: 32px !important; }
+}
+
+/* ---------- delivery chest preview: what is already there ---------- */
+/* Slots holding items left over from earlier orders: hatched and dimmed (game content, like the slots themselves). */
+.chest-slot.existing { cursor: help; }
+.chest-slot.existing img { opacity: 0.6; }
+.chest-slot.existing::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(135deg, rgba(0, 0, 0, 0.28) 0 3px, transparent 3px 7px);
+  pointer-events: none;
+  z-index: 3;
+}
+/* Planned shulkers past the first chest's free room (they go to the next chest), and slots beyond a 27-slot chest. */
+.chest-slot.overflow { box-shadow: inset 0 0 0 2px #ff5555; }
+.chest-slot.outside { opacity: 0.35; }
+.delivery-fit, .delivery-warn {
+  width: 0;
+  min-width: 100%; /* as wide as the chest grid, never wider */
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.delivery-fit { color: var(--muted); }
+.delivery-warn { padding: 4px 6px; border-radius: var(--radius); background: var(--warn-bg); color: var(--warn-fg); }
+.delivery-fit[hidden], .delivery-warn[hidden] { display: none; }
+
+/* Forced streamer mode (the owner's setting): the toggle shows on and can't be turned off. */
+.streamer-btn.locked { cursor: not-allowed; }
+
+/* ---------- Mac theme ---------- */
+/* Everything below is scoped to html[data-theme="mac"]; the colours are its tokens in themes.css. Smoky charcoal
+   panels, muted lowercase headings, window-control dots, peach pills for "on". Decoration only: no element is
+   added, no behaviour changes. */
+
+html[data-theme="mac"] body,
+html[data-theme="mac"] .auth-screen {
+  background-image:
+    radial-gradient(ellipse 70% 55% at 12% 0%, color-mix(in srgb, var(--accent) 9%, transparent), transparent),
+    radial-gradient(ellipse 60% 50% at 95% 100%, rgba(120, 132, 255, 0.06), transparent);
+  background-attachment: fixed;
+}
+
+/* Panels: translucent charcoal, a thin border, a soft drop shadow. */
+html[data-theme="mac"] .panel {
+  background: var(--mac-glass);
+  border-color: rgba(255, 255, 255, 0.09);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+/* Blur behind the floating panels only. Not on the page panels: a backdrop-filter would make them the containing
+   block of their position: fixed children (the mobile Save bar, the mobile viewer chat), and blur costs repaints
+   while the item grid scrolls. */
+html[data-theme="mac"] :is(.header, .modal, .window, .auth-box, .sheet, .account-menu) {
+  -webkit-backdrop-filter: blur(18px) saturate(1.3);
+  backdrop-filter: blur(18px) saturate(1.3);
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  html[data-theme="mac"] :is(.header, .modal, .window, .auth-box, .sheet, .account-menu) { --mac-glass: #1e1e21; }
+}
+@media (prefers-reduced-transparency: reduce) {
+  html[data-theme="mac"] { --mac-glass: var(--surface); }
+  html[data-theme="mac"] body, html[data-theme="mac"] .auth-screen { background-image: none; }
+  html[data-theme="mac"] :is(.header, .modal, .window, .auth-box, .sheet, .account-menu) {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+/* Window-control dots (red, yellow, green) at the top right of the main panels and the dialogs: background layers
+   over the glass, so they are not content, take no clicks and are never read out. "local": on the pages that
+   scroll inside their panel, the dots scroll away with the top of the page. A 30px strip at the top keeps
+   them clear of the panel's own heading row and its buttons. Desktop and tablet only: the phone layout is tight. */
+@media (min-width: 768px) {
+  html[data-theme="mac"] :is(main.panel, .modal, .window, .auth-box) {
+    background:
+      radial-gradient(circle closest-side, var(--mac-red) 92%, transparent) right 44px top var(--mac-dots-y, 10px) / 10px 10px no-repeat local,
+      radial-gradient(circle closest-side, var(--mac-yellow) 92%, transparent) right 28px top var(--mac-dots-y, 10px) / 10px 10px no-repeat local,
+      radial-gradient(circle closest-side, var(--mac-green) 92%, transparent) right 12px top var(--mac-dots-y, 10px) / 10px 10px no-repeat local,
+      var(--mac-glass);
+  }
+  html[data-theme="mac"] :is(.dash-page, .modal, .window, .auth-box) { padding-top: 30px; }
+  /* The stash panel: the creative tabs overlap its top 12px, so the dots sit on the "search" heading row instead. */
+  html[data-theme="mac"] #inventory { --mac-dots-y: 20px; }
+}
+
+/* Headings: muted labels at the top left. Only the fixed labels are lowercased: section, modal and box titles can
+   hold player, bot or shulker names, which are shown as written. */
+html[data-theme="mac"] :is(.panel-label, .section-title, .modal-title, .auth-title, .gui-title) {
+  color: var(--muted);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+html[data-theme="mac"] :is(.panel-label, .auth-title) { text-transform: lowercase; }
+html[data-theme="mac"] .panel-label { font-size: 13px; }
+html[data-theme="mac"] .auth-title { font-size: 16px; text-align: left; }
+html[data-theme="mac"] .title { letter-spacing: 0; }
+
+/* Buttons: dark and flat when off; fully rounded peach pills when primary, pressed or selected. */
+html[data-theme="mac"] .mc-button {
+  background: var(--chip-bg);
+  border-color: rgba(255, 255, 255, 0.08);
+  border-radius: var(--pill);
+}
+html[data-theme="mac"] .mc-button:not(.danger):hover { background: color-mix(in srgb, var(--chip-bg) 80%, var(--text)); border-color: rgba(255, 255, 255, 0.16); }
+html[data-theme="mac"] .mc-button:disabled { background: var(--chip-bg); border-color: rgba(255, 255, 255, 0.08); }
+html[data-theme="mac"] :is(.mc-button.primary, #rescan-btn, #cart-place, #settings-save, #proxy-save, #console-send, #auth-submit),
+html[data-theme="mac"] .mc-button[aria-pressed="true"]:not(.streamer-btn),
+html[data-theme="mac"] .seg-btn[aria-pressed="true"],
+html[data-theme="mac"] .dash-nav .nav-btn.selected,
+html[data-theme="mac"] .section-item.selected {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-color: var(--accent);
+}
+html[data-theme="mac"] :is(.mc-button.primary, #rescan-btn, #cart-place, #settings-save, #proxy-save, #console-send, #auth-submit):hover,
+html[data-theme="mac"] .mc-button[aria-pressed="true"]:not(.streamer-btn):hover,
+html[data-theme="mac"] .dash-nav .nav-btn.selected:hover {
+  background: color-mix(in srgb, var(--accent) 85%, #ffffff);
+  border-color: color-mix(in srgb, var(--accent) 85%, #ffffff);
+}
+html[data-theme="mac"] :is(.mc-button.primary, #rescan-btn, #cart-place, #settings-save, #proxy-save, #console-send, #auth-submit):disabled {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+/* Streamer mode on keeps its danger pair (it is a warning, not a plain toggle); the phone chip stays neutral. */
+html[data-theme="mac"].streamer .streamer-btn, html[data-theme="mac"].streamer .streamer-btn:not(.danger):hover { background: var(--danger-bg); color: var(--danger-fg); border-color: var(--danger-fg); }
+@media (max-width: 767px) {
+  html[data-theme="mac"].streamer .status-chips .streamer-btn, html[data-theme="mac"].streamer .status-chips .streamer-btn:not(.danger):hover { background: var(--chip-bg); color: var(--text); border-color: var(--border); }
+  /* Phone switches are a bare track, not a button. */
+  html[data-theme="mac"] .mc-button.toggle, html[data-theme="mac"] .mc-button.toggle:not(.danger):hover { background: transparent; border-color: transparent; }
+}
+html[data-theme="mac"] .dash-nav { padding: 2px 0; }
+html[data-theme="mac"] .dash-nav .nav-btn:not(.selected) { background: transparent; border-color: transparent; }
+html[data-theme="mac"] .dash-nav .nav-btn:not(.selected):hover { background: var(--chip-bg); }
+html[data-theme="mac"] .dash-nav .nav-btn.selected { font-weight: 600; }
+html[data-theme="mac"] .section-item { border-radius: var(--pill); }
+@media (prefers-reduced-motion: no-preference) {
+  html[data-theme="mac"] :is(.mc-button, .section-item, .theme-card) { transition: background-color 0.12s, border-color 0.12s, color 0.12s; }
+}
+
+/* Inner tiles and cards: the same faint border as the panels (theme cards keep theirs: it shows hover and the choice). */
+html[data-theme="mac"] :is(.inset, .dash-bot, .gui-box, .order-card) { border-color: rgba(255, 255, 255, 0.08); }
+
+/* Status: a small green dot for online, red for offline; same for the order bot line and the connection chip. */
+html[data-theme="mac"] .dot { width: 8px; height: 8px; border-width: 0; }
+html[data-theme="mac"] .dot-on { background: var(--mac-green); box-shadow: 0 0 0 2px color-mix(in srgb, var(--mac-green) 25%, transparent); }
+html[data-theme="mac"] .dot-off { background: var(--mac-red); }
+html[data-theme="mac"] .bot-line.ok::before { width: 8px; height: 8px; border-width: 0; background: var(--mac-green); vertical-align: 0; }
+html[data-theme="mac"] .conn-online::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--mac-green);
+  vertical-align: 1px;
 }

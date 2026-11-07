@@ -2,11 +2,13 @@ package com.porter.qwerte.modules;
 
 import com.porter.qwerte.craft.AnvilFinder;
 import com.porter.qwerte.craft.CraftPlanner;
+import com.porter.qwerte.stash.DeliveryRoom;
 import com.porter.qwerte.stash.Kit;
 import com.porter.qwerte.stash.Kits;
 import com.porter.qwerte.stash.Order;
 import com.porter.qwerte.stash.Stash;
 import com.porter.qwerte.stash.Stash.Box;
+import com.porter.qwerte.stash.SpaceWait;
 import com.porter.qwerte.stash.StashIndex;
 import meteordevelopment.meteorclient.utils.Utils;
 import net.minecraft.core.BlockPos;
@@ -71,14 +73,23 @@ final class OrderRunner {
         /** enable-crafting is on. */
         boolean craftingOn();
 
-        /** Why nothing can be crafted now (no crafting table, it is gone, it failed for this order), or null. */
+        /** Why nothing can be crafted now (no crafting table can be had, it failed for this order), or null. */
         String craftBlocker();
 
         /** No anvil is set or remembered, or the one that was is gone: one is to be found or placed before naming. */
         boolean anvilMissing();
+
+        /** What the delivery storage can take now (0.4.0-dev.5): room, a chest to look at, another chest to put up, or waiting. */
+        DeliveryRoom deliveryRoom();
+
+        /** How many chests the delivery storage has (at least 1). */
+        int deliveryChests();
+
+        /** The delivery chest the next shulker goes into: the lowest with room; with {@code verify} the one the last went into. */
+        Box deliveryChest(boolean verify);
     }
 
-    sealed interface Intent permits Idle, Build, Fetch, Deliver, Rename, Craft, FindAnvil {}
+    sealed interface Intent permits Idle, Build, Fetch, Deliver, Rename, Craft, FindAnvil, Expand, Recheck {}
 
     /** Nothing for the sorter to do for the order now. */
     record Idle() implements Intent {}
@@ -101,6 +112,12 @@ final class OrderRunner {
     /** Look for an anvil in the stash area, or take one from the stash and place it. The outcome is told with {@link #anvilFound}. */
     record FindAnvil() implements Intent {}
 
+    /** Every delivery chest is full: put another double chest up above the storage. What came of it shows in the next room. */
+    record Expand() implements Intent {}
+
+    /** Open this delivery chest, found full before and perhaps emptied since, and read what it holds. */
+    record Recheck(Box box) implements Intent {}
+
     enum State { Running, Delivered, Failed, Cancelled }
 
     /** A snapshot of the order for the server. */
@@ -119,6 +136,10 @@ final class OrderRunner {
         Kit kit;
         boolean have, built, confirmed, verified, verifying, replanned;
         int fullTries, starts, fetches, begins, base;
+        // How often delivery storage was asked to grow for this unit
+        int expands;
+        // Expand and Recheck steps in a row (bounded: a sorter that can't start them gets a wait)
+        int spins;
         // The name this shulker is to get (null: none), and how naming it went
         String name, unnamedReason;
         boolean nameDone, named;
@@ -160,6 +181,10 @@ final class OrderRunner {
     private static final long PAUSE_TIMEOUT_MS = 10 * 60 * 1000L;
     private static final long REREAD_TIMEOUT_MS = 10 * 60 * 1000L;
     private static final int MAX_FULL_TRIES = 2;
+    /** Times one shulker asks the delivery storage to grow before the order waits instead. */
+    private static final int MAX_EXPANDS = 6;
+    private static final int MAX_SPINS = 30;
+    private static final long SPIN_HOLD_MS = 60_000L;
     private static final int MAX_STARTS = 8;
     private static final int MAX_NAME_TRIES = 2;
     private static final int MAX_CRAFT_TRIES = 2;
@@ -190,6 +215,10 @@ final class OrderRunner {
     private boolean cancelRequested, parked;
     private long pausedSince;
     private boolean full;
+    // The wait for room in the delivery storage
+    private final SpaceWait spaceWait = new SpaceWait();
+    private long spinHoldUntil;
+    private String lastWaitWhy;
     private int skips;
     private boolean planned;
     private long offeredAt, rereadProgressAt;
@@ -213,6 +242,11 @@ final class OrderRunner {
     /** An order is being worked on and planned: it comes before the sorter's own work. */
     boolean planned() {
         return running() && planned;
+    }
+
+    /** The order is to be stopped (cancelled) or parked: nothing more is put down for it. */
+    boolean calledOff() {
+        return cancelRequested || parked;
     }
 
     /** An order is being worked on. */
@@ -249,6 +283,7 @@ final class OrderRunner {
         parked = false;
         pausedSince = 0;
         full = false;
+        spaceWait.reset();
         lastSurvey = null;
         planned = false;
         state = State.Running;
@@ -258,7 +293,8 @@ final class OrderRunner {
     Box deliveryBox() {
         Stash stash = owner.stash();
         if (stash == null) return null;
-        for (Box b : stash.boxes) if (b.delivery) return b;
+        // The delivery container itself, not the chests put up above it
+        for (Box b : stash.boxes) if (b.delivery && !b.deliveryExtra) return b;
         return null;
     }
 
@@ -291,6 +327,7 @@ final class OrderRunner {
         parked = false;
         pausedSince = 0;
         full = false;
+        spaceWait.reset();
         planned = false;
         offeredAt = System.currentTimeMillis();
         rereadProgressAt = offeredAt;
@@ -556,6 +593,14 @@ final class OrderRunner {
     void anvilFound(boolean ok) {
         if (order == null) return;
         if (!ok) anvilNone = true;
+        epoch++;
+    }
+
+    /** A crafting table was found, placed or crafted for the order's crafting: the order looks at its next step afresh. */
+    void tableReady() {
+        if (order == null) return;
+        // The try spent on the craft that waited for the table is given back
+        if (index >= 0 && index < units.size() && units.get(index).craftTries > 0) units.get(index).craftTries--;
         epoch++;
     }
 
@@ -827,6 +872,17 @@ final class OrderRunner {
         full = true;
     }
 
+    /** The sorter has started putting another chest up for this order's current shulker: only runs really started count towards MAX_EXPANDS. */
+    void expandStarted() {
+        if (running() && index < units.size()) units.get(index).expands++;
+    }
+
+    private Box recheckBox(DeliveryRoom room) {
+        Stash stash = owner.stash();
+        if (stash == null || room.recheck() == null) return null;
+        return stash.boxAt(new BlockPos(room.recheck().x(), room.recheck().y(), room.recheck().z()));
+    }
+
     /** The shulker is no longer carried: the open container is checked for it. */
     void deliveryClosed(ItemStack[] contents) {
         if (!running() || index >= units.size()) return;
@@ -928,7 +984,55 @@ final class OrderRunner {
                     full = false;
                     u.fullTries++;
                 }
-                if (u.fullTries >= MAX_FULL_TRIES) {
+                // The delivery storage: which chest has room, a chest a player may have emptied to look at, another to put up, or wait
+                DeliveryRoom room = owner.deliveryRoom();
+                if (room.kind() == DeliveryRoom.Kind.RECHECK || room.kind() == DeliveryRoom.Kind.EXPAND) {
+                    long at = System.currentTimeMillis();
+                    if (at < spinHoldUntil) room = DeliveryRoom.waitFor("delivery storage full: could not start looking at or building a chest");
+                    else if (++u.spins > MAX_SPINS) {
+                        spinHoldUntil = at + SPIN_HOLD_MS;
+                        u.spins = 0;
+                        room = DeliveryRoom.waitFor("delivery storage full: could not start looking at or building a chest");
+                    }
+                }
+                else if (room.kind() == DeliveryRoom.Kind.ROOM) {
+                    u.expands = 0;
+                    u.spins = 0;
+                }
+                if (room.kind() == DeliveryRoom.Kind.WAIT) {
+                    String why = room.why() == null ? "delivery storage full" : room.why();
+                    // Another reason is another chance to put a chest up
+                    if (!why.equals(lastWaitWhy)) {
+                        if (lastWaitWhy != null) u.expands = 0;
+                        lastWaitWhy = why;
+                    }
+                }
+                if (room.kind() == DeliveryRoom.Kind.RECHECK && room.recheck() != null) {
+                    Box look = recheckBox(room);
+                    if (look != null) {
+                        phase = "checking delivery space";
+                        return new Recheck(look);
+                    }
+                    // Not a reason to carry on (that would restart the wait): the chest is not there to look at
+                    room = DeliveryRoom.waitFor("delivery storage full: the chest to look at is gone");
+                }
+                if (room.kind() == DeliveryRoom.Kind.EXPAND) {
+                    if (u.expands < MAX_EXPANDS) {
+                        phase = "adding delivery storage";
+                        return new Expand();
+                    }
+                    room = DeliveryRoom.waitFor("delivery storage full: could not put another chest up");
+                }
+                SpaceWait.Decision wait = spaceWait.step(System.currentTimeMillis(), room, shulkersDelivered, units.size());
+                if (wait != null) {
+                    if (wait.timedOut()) {
+                        finish(shulkersDelivered > 0 ? State.Delivered : State.Failed, wait.endMessage());
+                        return new Idle();
+                    }
+                    phase = wait.phase();
+                    return new Idle();
+                }
+                if (u.fullTries >= MAX_FULL_TRIES + Math.max(0, owner.deliveryChests() - 1)) {
                     finish(shulkersDelivered > 0 ? State.Delivered : State.Failed, "delivery container full (" + shulkersDelivered + "/" + units.size() + ")");
                     return new Idle();
                 }
@@ -937,7 +1041,8 @@ final class OrderRunner {
                     return new Idle();
                 }
                 phase = "delivering " + (index + 1) + "/" + units.size();
-                return new Deliver(delivery);
+                Box chest = owner.deliveryChest(false);
+                return new Deliver(chest != null ? chest : delivery);
             }
 
             if (u.have) {
@@ -957,7 +1062,8 @@ final class OrderRunner {
                     u.verified = true;
                     u.verifying = true;
                     phase = "checking delivery " + (index + 1) + "/" + units.size();
-                    return new Deliver(delivery);
+                    Box chest = owner.deliveryChest(true);
+                    return new Deliver(chest != null ? chest : delivery);
                 }
                 else {
                     skip("a shulker left my inventory but wasn't seen in the delivery container");
@@ -1303,7 +1409,8 @@ final class OrderRunner {
             // The same sources the kit builder takes from: kit chests and chests for whole shulkers only when named shulkers
             // may be used (an order asks for the item on purpose)
             String skip = null;
-            if (box.excluded) skip = "in an excluded container";
+            if (box.foreign) skip = "in a container outside the stash area";
+            else if (box.excluded) skip = "in an excluded container";
             else if (box.delivery) skip = "in the delivery container";
             else if (box.dropOff) skip = "in a drop-off";
             else if (box.unreachable || !owner.usable(box)) skip = "in a chest I couldn't open";

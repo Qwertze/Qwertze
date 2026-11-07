@@ -15,6 +15,9 @@ Standard library only. Run it isolated so nothing is imported from the current f
     python -I dev/fake-addon.py --url ... --data ... serve        # heartbeats for 2 min; answers rescan requests
     python -I dev/fake-addon.py --url ... --data ... serve --rescan-blocked "sorter off"
     python -I dev/fake-addon.py --url ... --data ... dashboard    # a dashboard bot: settings + console for 2 min
+    python -I dev/fake-addon.py --url ... --data ... viewer       # a live-viewer bot: frames while watched, for 2 min
+    python -I dev/fake-addon.py --url ... --data ... viewer --bot-id b2 --hz 5 --radius 8 --max-frames 500
+    python -I dev/fake-addon.py --url ... --data ... delivery --used 20 --chests 3   # delivery storage contents
     python -I dev/fake-addon.py --url ... --data ... run          # claim and walk one order to delivered
     python -I dev/fake-addon.py --url ... --data ... run --fail   # ... or to failed
 
@@ -797,6 +800,340 @@ class DashBot:
         self.state_loop()
 
 
+# ---------- delivery storage contents (PROTOCOL.md, "Additions: delivery storage contents") ----------
+
+def delivery_chests(chests, used, unseen):
+    """Fake delivery chests in fill order: chest 0 has `used` stacks (named shulkers, an empty one, loose items), the
+    others are full; with `unseen`, the last one was never read."""
+    kinds = [
+        {"id": "minecraft:red_shulker_box", "name": "Gems", "count": 1, "maxStack": 1, "shulker": True,
+         "contents": [{"id": "minecraft:diamond", "count": 1728}]},
+        {"id": "minecraft:shulker_box", "name": "PvP Kit", "count": 1, "maxStack": 1, "shulker": True,
+         "contents": [{"id": "minecraft:diamond_sword", "count": 1}, {"id": "minecraft:golden_apple", "count": 64},
+                      {"id": "minecraft:totem_of_undying", "count": 1}]},
+        {"id": "minecraft:blue_shulker_box", "name": "Blue Shulker Box", "count": 1, "maxStack": 1, "shulker": True, "contents": []},
+        {"id": "minecraft:cobblestone", "name": "Cobblestone", "count": 64, "maxStack": 64},
+        {"id": "minecraft:diamond_pickaxe", "name": "<b>Pick \u2026", "count": 1, "maxStack": 1, "damage": 900, "maxDamage": 1561},
+    ]
+    now = int(time.time() * 1000)
+    out = []
+    for n in range(chests):
+        if n == 0:
+            items = [dict(kinds[i % len(kinds)], slot=i) for i in range(used)]
+            out.append({"n": 0, "size": 54, "full": used >= 54, "readAt": now - 90_000, "items": items})
+        elif unseen and n == chests - 1:
+            out.append({"n": n, "size": 27, "full": True, "readAt": 0, "items": None})
+        else:
+            items = [{"slot": i, "id": "minecraft:white_shulker_box", "name": "Order %d" % n, "count": 1, "maxStack": 1,
+                      "shulker": True, "contents": [{"id": "minecraft:oak_log", "count": 1728}]} for i in range(54)]
+            out.append({"n": n, "size": 54, "full": True, "readAt": now - 600_000, "items": items})
+    return out
+
+
+def delivery_hash(chests):
+    """sha1 of the canonical JSON of the chests without their readAt fields."""
+    bare = [{k: v for k, v in c.items() if k != "readAt"} for c in chests]
+    return hashlib.sha1(json.dumps(bare, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def delivery(c, args):
+    """Heartbeats with deliveryHash; sends POST /api/v1/delivery when the server says needDelivery."""
+    chests = delivery_chests(args.chests, args.used, args.unseen)
+    h = delivery_hash(chests)
+    storage = {"autoExpand": args.auto_expand, "chests": args.chests, "full": max(0, args.chests - 1), "canExpand": args.auto_expand,
+               "blocked": None if args.auto_expand else "auto expand is off"}
+    end = time.time() + args.seconds
+    sample_hash = build_index()["indexHash"]
+    while time.time() < end:
+        st, body = heartbeat(c, sample_hash, {"deliveryHash": h, "deliveryStorage": storage})
+        need = isinstance(body, dict) and body.get("needDelivery")
+        show("heartbeat (needDelivery %s)" % need, st, None)
+        if need:
+            report = {"version": 1, "server": SERVER, "stash": STASH, "player": PLAYER, "hash": h,
+                      "readAt": max(ch["readAt"] for ch in chests), "chests": chests}
+            show("delivery", *c.post("/api/v1/delivery", report))
+        time.sleep(args.interval)
+
+
+# ---------- live viewer (PROTOCOL.md, "Additions: live viewer") ----------
+
+MOBS = ["zombie", "skeleton", "creeper", "spider", "cow", "sheep", "pig", "chicken", "enderman", "villager"]
+ITEMS = ["minecraft:diamond", "minecraft:cobblestone", "minecraft:rotten_flesh", "minecraft:bone", "minecraft:arrow"]
+CHAT = ["hello", "anyone selling elytra?", "lag lol", "gg", "where is spawn", "nice base", "brb"]
+
+
+def fake_column(wx, wz):
+    """A deterministic fake world: (map colour id, top y) for a block column. Water, sand, grass, forest, stone."""
+    import math
+    hgt = 64 + 6 * math.sin(wx / 23.0) + 5 * math.cos(wz / 17.0) + 3 * math.sin((wx + wz) / 9.0)
+    y = int(hgt)
+    if y < 62:
+        return 12, 62, 62 - y  # water, its surface and depth
+    if y < 63:
+        return 2, y, 0         # sand
+    if y > 70:
+        return 11, y, 0        # stone
+    if (wx * 7 + wz * 13) % 11 == 0:
+        return 7, y + 4, 0     # a tree (foliage)
+    return 1, y, 0             # grass
+
+
+def fake_tile(cx, cz):
+    """(c, h) base64 strings for chunk (cx, cz): shaded against the column to the north, like a vanilla map."""
+    import base64
+    import struct
+    c = bytearray(256)
+    h = bytearray(512)
+    for lz in range(16):
+        for lx in range(16):
+            wx, wz = cx * 16 + lx, cz * 16 + lz
+            colour, y, depth = fake_column(wx, wz)
+            if colour == 12:
+                d = depth + ((wx + wz) & 1) * 0.5
+                shade = 2 if d < 2 else 1 if d < 4 else 0
+            else:
+                _, ny, _ = fake_column(wx, wz - 1)
+                shade = 3 if y > ny else 2 if y == ny else 1
+            i = lz * 16 + lx
+            c[i] = colour * 4 + shade
+            struct.pack_into("<h", h, i * 2, y)
+    return base64.b64encode(bytes(c)).decode(), base64.b64encode(bytes(h)).decode()
+
+
+class ViewerBot:
+    """A bot that streams viewer frames while the server says someone watches: it walks a circle, has 30 entities
+    around it (3 players, mobs, dropped items) and chats every 2 s. One request in flight, never queued."""
+
+    def __init__(self, c, bot_id, player, seconds, hz, radius, max_frames, ents, walk_radius):
+        self.c = c
+        self.bot_id = bot_id
+        self.player = player
+        self.end = time.time() + seconds
+        self.hz = hz
+        self.radius = radius
+        self.max_frames = max_frames
+        self.walk_radius = walk_radius
+        self.watching = False
+        self.session = None
+        self.need_full = True
+        self.seq = 0
+        self.frames = 0
+        self.sent_tiles = set()
+        self.pending_tiles = []
+        self.chat_ring = []
+        self.last_chat = 0
+        self.last_hud = 0
+        self.last_keepalive = 0
+        self.hud = None
+        self.lock = threading.Lock()
+        import random
+        self.rnd = random.Random(bot_id)
+        self.ents = []
+        for i in range(ents):
+            kind = "player" if i < 3 else "item" if i >= ents - 7 else "mob"
+            e = {"id": 1000 + i, "k": kind, "dx": self.rnd.uniform(-60, 60), "dz": self.rnd.uniform(-60, 60), "yaw": 0}
+            if kind == "player":
+                e["n"] = "Player%d" % (i + 1)
+            elif kind == "mob":
+                e["t"] = self.rnd.choice(MOBS)
+            else:
+                e["t"] = self.rnd.choice(ITEMS)
+                e["c"] = self.rnd.randint(1, 64)
+            self.ents.append(e)
+        self.started = time.time()
+
+    def log(self, *a):
+        print("[viewer %s]" % self.bot_id, *a, flush=True)
+
+    def hello(self):
+        st, body = self.c.post("/api/v1/bot/hello", {"botId": self.bot_id, "player": self.player,
+                                                       "plugin": {"id": "qwerte-stash", "version": "fake-viewer"},
+                                                       "proxy": {"version": "aquarius-fake", "mc": "1.21.4"},
+                                                       "caps": ["viewer"], "scopes": []})
+        self.log("hello", st)
+        return st == 200
+
+    def poll_loop(self):
+        q = urllib.parse.quote(self.bot_id)
+        while time.time() < self.end:
+            st, body = self.c.get("/api/v1/bot/next?botId=" + q)
+            if st == 200 and isinstance(body, dict):
+                with self.lock:
+                    w = bool(body.get("watchingViewer"))
+                    v = body.get("viewer") or {}
+                    if w and v.get("session") != self.session:
+                        self.session = v.get("session")
+                        self.radius = min(12, int(v.get("radius", self.radius)))
+                        self.hz = float(v.get("hz", self.hz))
+                        self.need_full = True
+                        self.log("watching, session", self.session)
+                    if not w and self.watching:
+                        self.log("not watching")
+                    self.watching = w
+            elif st == 204:
+                pass
+            elif st == 429:
+                time.sleep(3)
+            else:
+                self.log("next", st, body)
+                time.sleep(2)
+                self.hello()
+
+    def position(self, now):
+        import math
+        a = (now - self.started) * 4.0 / max(1.0, self.walk_radius)  # about 4 blocks/s
+        x = self.walk_radius * math.cos(a)
+        z = self.walk_radius * math.sin(a)
+        # Minecraft yaw: 0 = +z (south), 90 = -x (west); walking along the circle's tangent
+        dx, dz = -math.sin(a), math.cos(a)
+        yaw = math.degrees(math.atan2(-dx, dz))
+        return round(x, 1), 64.0, round(z, 1), round(yaw)
+
+    def ents_now(self, x, z, now):
+        import math
+        out = []
+        for e in self.ents:
+            if e["k"] != "item":
+                e["dx"] += self.rnd.uniform(-0.4, 0.4)
+                e["dz"] += self.rnd.uniform(-0.4, 0.4)
+                e["yaw"] = (e["yaw"] + self.rnd.randint(-10, 10)) % 360
+            ex, ez = x + e["dx"], z + e["dz"]
+            o = {"id": e["id"], "k": e["k"], "x": round(ex, 1), "y": 64.0, "z": round(ez, 1)}
+            for f in ("n", "t", "c"):
+                if f in e:
+                    o[f] = e[f]
+            if e["k"] != "item":
+                o["yaw"] = e["yaw"]
+            out.append(o)
+        players = [o for o in out if o["k"] == "player"]
+        rest = sorted([o for o in out if o["k"] != "player"], key=lambda o: (o["x"] - x) ** 2 + (o["z"] - z) ** 2)
+        return players + rest
+
+    def hud_now(self, now):
+        t = int(now) // 5
+        hotbar = [{"id": "minecraft:diamond_sword", "c": 1, "d": (t * 7) % 1561, "md": 1561}, {"id": "minecraft:golden_apple", "c": 12},
+                  {"id": "minecraft:ender_pearl", "c": 16}, None, {"id": "minecraft:cobblestone", "c": 64}, None, None,
+                  {"id": "minecraft:totem_of_undying", "c": 1}, {"id": "minecraft:cooked_beef", "c": 32}]
+        return {"hp": float(20 - t % 8), "food": 20 - t % 5, "sat": 3.5, "xp": 30, "xpP": round((t % 10) / 10.0, 2),
+                "armor": 15, "held": t % 9, "hotbar": hotbar,
+                "armorSlots": [{"id": "minecraft:diamond_helmet", "c": 1}, {"id": "minecraft:diamond_chestplate", "c": 1},
+                               {"id": "minecraft:diamond_leggings", "c": 1}, {"id": "minecraft:diamond_boots", "c": 1}],
+                "offhand": {"id": "minecraft:totem_of_undying", "c": 1},
+                # The main inventory (plugin 1.12.0+): 27 slots, one stack changing every 5 s, a worn pickaxe.
+                "inv": [{"id": "minecraft:diamond_pickaxe", "c": 1, "d": 1200, "md": 1561},
+                        {"id": "minecraft:dirt", "c": 1 + t % 64}, None, {"id": "minecraft:elytra", "c": 1, "d": 400, "md": 432}]
+                       + [None] * 21 + [{"id": "minecraft:shulker_box", "c": 1}, {"id": "minecraft:obsidian", "c": 64}]}
+
+    def chat_now(self, now):
+        if now - self.last_chat < 2:
+            return []
+        self.last_chat = now
+        n = int(now)
+        k = ["public", "public", "public", "whisper", "system", "death"][n % 6]
+        line = {"t": int(now * 1000), "k": k, "s": "Player%d" % (n % 3 + 1), "to": None, "m": self.rnd.choice(CHAT)}
+        if k == "whisper":
+            line["to"] = self.player
+        if k in ("system", "death"):
+            line["s"] = ""
+            line["m"] = "Player%d was slain by Zombie" % (n % 3 + 1) if k == "death" else "Server restarts in 1 hour"
+        self.chat_ring = (self.chat_ring + [line])[-20:]
+        return [line]
+
+    def frame(self, now):
+        x, y, z, yaw = self.position(now)
+        cx, cz = int(x) >> 4, int(z) >> 4
+        r = self.radius
+        want = {(cx + i, cz + j) for i in range(-r, r + 1) for j in range(-r, r + 1)}
+        near = sorted(want, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cz) ** 2)
+        body = {"botId": self.bot_id, "v": 1, "session": self.session, "seq": self.seq, "t": int(now * 1000)}
+        self.seq += 1
+        body["self"] = {"x": x, "y": y, "z": z, "yaw": yaw}
+        ents = self.ents_now(x, z, now)
+        if self.need_full:
+            body["full"] = True
+            body["world"] = {"dim": "minecraft:overworld", "minY": -64, "height": 384}
+            first = near[:300]
+            body["tiles"] = [self.tile(p) for p in first]
+            self.sent_tiles = set(first)
+            self.pending_tiles = [p for p in near[300:]]
+            body["ents"] = ents
+            self.hud = self.hud_now(now)
+            body["hud"] = self.hud
+            self.last_hud = now
+            self.chat_now(now)
+            body["chat"] = list(self.chat_ring)
+            return body
+        drop = [p for p in self.sent_tiles if p not in want]
+        for p in drop:
+            self.sent_tiles.discard(p)
+        missing = [p for p in near if p not in self.sent_tiles and p not in self.pending_tiles]
+        self.pending_tiles = [p for p in self.pending_tiles if p in want] + missing
+        batch, self.pending_tiles = self.pending_tiles[:150], self.pending_tiles[150:]
+        if batch:
+            body["tiles"] = [self.tile(p) for p in batch]
+            self.sent_tiles.update(batch)
+        if drop:
+            body["drop"] = [list(p) for p in drop]
+        body["ents"] = ents
+        hud = self.hud_now(now)
+        if hud != self.hud or now - self.last_hud >= 5:
+            self.hud = hud
+            self.last_hud = now
+            body["hud"] = hud
+        chat = self.chat_now(now)
+        if chat:
+            body["chat"] = chat
+        return body
+
+    def tile(self, p):
+        c, h = fake_tile(p[0], p[1])
+        return {"x": p[0], "z": p[1], "c": c, "h": h}
+
+    def frame_loop(self):
+        period = 1.0 / max(0.5, self.hz)
+        backoff = 0
+        while time.time() < self.end and (self.max_frames <= 0 or self.frames < self.max_frames):
+            tick = time.time()
+            with self.lock:
+                watching, session = self.watching, self.session
+            if not watching or not session:
+                time.sleep(0.2)
+                continue
+            body = self.frame(tick)
+            st, reply = self.c.post("/api/v1/bot/viewer", body)
+            self.frames += 1
+            if st == 200 and isinstance(reply, dict):
+                backoff = 0
+                self.need_full = False
+                if reply.get("resync"):
+                    self.need_full = True
+                if not reply.get("watching"):
+                    with self.lock:
+                        self.watching = False
+                    self.log("told to stop")
+            elif st == 429:
+                time.sleep(max(0.05, (reply or {}).get("retryMs", 200) / 1000.0) if isinstance(reply, dict) else 0.2)
+            elif st == 409:
+                self.hello()
+                time.sleep(2)
+                self.need_full = True
+            else:
+                backoff = min(10, backoff * 2 or 1)
+                self.log("frame", st, reply if not isinstance(reply, str) else reply[:200])
+                time.sleep(backoff)
+                self.need_full = True
+            left = period - (time.time() - tick)
+            if left > 0:
+                time.sleep(left)
+        self.log("done after", self.frames, "frames")
+
+    def run(self):
+        while time.time() < self.end and not self.hello():
+            time.sleep(3)
+        threading.Thread(target=self.poll_loop, daemon=True).start()
+        self.frame_loop()
+
+
 def main():
     global SERVER, STASH, PLAYER, DELIVERY, BLOCKER, NAMING, CRAFTING
     p = argparse.ArgumentParser(description="Fake Qwerte addon for the Stash Manager server")
@@ -843,6 +1180,21 @@ def main():
     db.add_argument("--proxy", action="store_true", help="also offer the proxy scope (a big fake AquariusProxy config) and plugin:autoreply")
     db.add_argument("--activity", action="store_true", help="also report activity (a queue, the sorter, an order, the pathfinder, events)")
     db.add_argument("--leak-secrets", action="store_true", help="a buggy bot: send values for secret settings (the server must drop them)")
+    vw = sub.add_parser("viewer", help="be a live-viewer bot: walk a circle, 30 entities, chat every 2 s, frames while watched")
+    vw.add_argument("--seconds", type=float, default=120)
+    vw.add_argument("--bot-id", default="fake-viewer-01")
+    vw.add_argument("--hz", type=float, default=5, help="frames per second while watched (the server's bot/next value wins)")
+    vw.add_argument("--radius", type=int, default=8, help="chunk radius (the server's bot/next value wins; at most 12)")
+    vw.add_argument("--max-frames", type=int, default=0, help="stop after this many frames (0: no limit)")
+    vw.add_argument("--ents", type=int, default=30, help="entities around the bot (3 players, 7 items, the rest mobs)")
+    vw.add_argument("--walk-radius", type=float, default=40, help="radius of the circle the bot walks, in blocks")
+    dl = sub.add_parser("delivery", help="heartbeats with deliveryHash; send the delivery storage contents when asked")
+    dl.add_argument("--seconds", type=float, default=120)
+    dl.add_argument("--interval", type=float, default=5)
+    dl.add_argument("--chests", type=int, default=1, help="delivery chests (1-16; after the first they are full)")
+    dl.add_argument("--used", type=int, default=20, help="stacks already in the first chest (0-54)")
+    dl.add_argument("--unseen", action="store_true", help="the last chest was never read (items: null)")
+    dl.add_argument("--auto-expand", action="store_true", help="deliveryStorage.autoExpand true")
     run = sub.add_parser("run", help="claim one order and walk it to a finished status")
     run.add_argument("--fail", action="store_true")
     run.add_argument("--steps", type=int, default=3)
@@ -883,6 +1235,10 @@ def main():
         show("heartbeat", *heartbeat(c, sample_hash))
     elif args.cmd == "dashboard":
         DashBot(c, args.bot_id, PLAYER, args.seconds, proxy=args.proxy, leak=args.leak_secrets, activity=args.activity).run()
+    elif args.cmd == "delivery":
+        delivery(c, args)
+    elif args.cmd == "viewer":
+        ViewerBot(c, args.bot_id, PLAYER, args.seconds, args.hz, args.radius, args.max_frames, args.ents, args.walk_radius).run()
     elif args.cmd == "serve":
         serve(c, args)
     elif args.cmd == "claim":

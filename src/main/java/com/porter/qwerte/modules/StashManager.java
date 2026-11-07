@@ -45,8 +45,8 @@ public class StashManager extends Module {
 
     private final Setting<String> serverUrl = sgGeneral.add(new StringSetting.Builder()
         .name("server-url")
-        .description("Address of the Stash Manager server, http or https.")
-        .defaultValue("http://127.0.0.1:8765")
+        .description("Address of the Stash Manager server, http or https, e.g. http://127.0.0.1:8765. Empty: no server, nothing is sent.")
+        .defaultValue("")
         .build()
     );
 
@@ -151,6 +151,13 @@ public class StashManager extends Module {
         .build()
     );
 
+    private final Setting<Boolean> autoExpandDelivery = sgDelivery.add(new BoolSetting.Builder()
+        .name("auto-expand-delivery")
+        .description("When every chest of the delivery storage is full, put another double chest up one block above the highest one (taken from the stash, or crafted when enable-crafting is on) and keep filling the lowest chest with room. A chest a player emptied is used again. Off: an order waits for space (paused for up to 2 hours, then it ends). It goes up for as long as the new chests could be opened and the bot can reach them: from the floor the first row above the delivery container, higher ones need something to stand on beside the stack. The chests are never sorted into or listed.")
+        .defaultValue(false)
+        .build()
+    );
+
     private final SettingGroup sgAnvil = settings.createGroup("Anvil");
 
     private final Setting<Boolean> selectAnvil = sgAnvil.add(new BoolSetting.Builder()
@@ -202,7 +209,7 @@ public class StashManager extends Module {
 
     private final Setting<Boolean> enableCrafting = sgCrafting.add(new BoolSetting.Builder()
         .name("enable-crafting")
-        .description("Orders and compaction may craft a plain Shulker Box when no empty one is left: shulker shells and a chest (made of planks, made of logs) are taken from the stash and crafted at the crafting table below. Shulker shells can't be crafted, so they have to be in the stash. Needs a crafting table set. Kits never craft.")
+        .description("Orders and compaction may craft a plain Shulker Box when no empty one is left: shulker shells and a chest (made of planks, made of logs) are taken from the stash and crafted at the crafting table below. Shulker shells can't be crafted, so they have to be in the stash. Needs a crafting table: the one set below, else one is found in the stash area, taken from the stash and placed, or crafted in the inventory grid from 4 planks (or logs) and placed. Kits never craft.")
         .defaultValue(false)
         .build()
     );
@@ -245,7 +252,7 @@ public class StashManager extends Module {
 
     private final Setting<Boolean> selectCraftingTable = sgCraftingTable.add(new BoolSetting.Builder()
         .name("select-crafting-table")
-        .description("Turn on, then right-click a crafting table to make it the table crafting is done at. Right-click the current one to clear it. It may be outside the stash area, and is never sorted or listed. Turns itself off after one click.")
+        .description("Turn on, then right-click a crafting table to make it the table crafting is done at (without one, the bot finds, places or crafts one itself). Right-click the current one to clear it. It may be outside the stash area, and is never sorted or listed. Turns itself off after one click.")
         .defaultValue(false)
         .onChanged(on -> {
             if (on && Modules.get().get(StashSorter.class).currentStash() == null) {
@@ -275,7 +282,7 @@ public class StashManager extends Module {
 
     private final Setting<Boolean> showCraftingTable = sgCraftingTable.add(new BoolSetting.Builder()
         .name("show-crafting-table")
-        .description("Outline the crafting table while this module is on.")
+        .description("Outline the crafting table while this module is on. The chat says whether it was set, found, placed or crafted.")
         .defaultValue(true)
         .build()
     );
@@ -330,6 +337,13 @@ public class StashManager extends Module {
     private List<BlockPos> deliveryParts = List.of();
     private BlockPos anvilPart, craftingTablePart;
     private String sentDelivery = "";
+    // The delivery contents report (0.4.0-dev.7): when to build and send it, the last stamp of the delivery chests, the hash of the
+    // last one built (the heartbeat's deliveryHash) and the one built and not yet taken
+    private final com.porter.qwerte.stash.DeliveryContents.Sync deliverySync = new com.porter.qwerte.stash.DeliveryContents.Sync();
+    private final com.porter.qwerte.stash.DeliveryContents.SentLog deliveryLog = new com.porter.qwerte.stash.DeliveryContents.SentLog();
+    private long deliveryStamp;
+    private String deliveryFor = "", deliveryHash;
+    private com.porter.qwerte.stash.DeliveryContents.Built deliveryPending;
     // The rescan id handled and not yet acknowledged to the server, or -1
     private long rescanDone = -1;
     // A website rescan is being carried out: the bot reads until nothing is stale or unread
@@ -394,6 +408,7 @@ public class StashManager extends Module {
                 warning("No stash is loaded. Scan one with stash-sorter first.");
                 this.selectDelivery.set(false);
             }
+            case -3 -> info("That spot is not loaded and more than 128 blocks away, so it is not made the delivery container.");
             case -1 -> info("That isn't a chest or barrel.");
             case 0 -> {
                 info("Delivery container cleared.");
@@ -420,6 +435,52 @@ public class StashManager extends Module {
         if (!showDelivery.get()) return;
         SettingColor color = deliveryColor.get();
         for (BlockPos part : deliveryParts) event.renderer.box(part, color, color, ShapeMode.Both, 0);
+    }
+
+    @Override
+    public net.minecraft.nbt.CompoundTag toTag() {
+        net.minecraft.nbt.CompoundTag tag = super.toTag();
+        if (tag != null) tag.putBoolean(URL_DEFAULT_MARKER, true);
+        return tag;
+    }
+
+    @Override
+    public Module fromTag(net.minecraft.nbt.CompoundTag tag) {
+        Module result = super.fromTag(tag);
+        // Before 0.4.0-dev.8 server-url defaulted to OLD_DEFAULT_URL, and Meteor saves only settings that differ from their default.
+        // A config saved by an older version, set up (api-key set) but on the old default, has no server-url saved: keep it working.
+        if (OldDefaultUrl.shouldRestore(tag.contains(URL_DEFAULT_MARKER), savedSetting(tag, "server-url"), apiKey.get())) {
+            serverUrl.set(OLD_DEFAULT_URL);
+        }
+        return result;
+    }
+
+    static final String OLD_DEFAULT_URL = "http://127.0.0.1:8765";
+    private static final String URL_DEFAULT_MARKER = "qwerteUrlDefaultBlank";
+
+    /** Whether the module's saved settings hold this setting (Meteor's layout: settings.groups[].settings[].name). */
+    private static boolean savedSetting(net.minecraft.nbt.CompoundTag tag, String name) {
+        if (!(tag.get("settings") instanceof net.minecraft.nbt.CompoundTag settings)) return false;
+        if (!(settings.get("groups") instanceof net.minecraft.nbt.ListTag groups)) return false;
+        for (net.minecraft.nbt.Tag g : groups) {
+            if (!(g instanceof net.minecraft.nbt.CompoundTag group)) continue;
+            if (!(group.get("settings") instanceof net.minecraft.nbt.ListTag list)) continue;
+            for (net.minecraft.nbt.Tag t : list) {
+                if (!(t instanceof net.minecraft.nbt.CompoundTag setting)) continue;
+                String n = net.minecraft.nbt.NbtOps.INSTANCE.getStringValue(setting.get("name") == null ? net.minecraft.nbt.StringTag.valueOf("") : setting.get("name")).result().orElse("");
+                if (name.equals(n)) return true;
+            }
+        }
+        return false;
+    }
+
+    /** The pure rule of the one-off migration of the old server-url default. */
+    static final class OldDefaultUrl {
+        private OldDefaultUrl() {}
+
+        static boolean shouldRestore(boolean savedByNewVersion, boolean urlSaved, String apiKey) {
+            return !savedByNewVersion && !urlSaved && apiKey != null && !apiKey.isBlank();
+        }
     }
 
     @Override
@@ -473,6 +534,7 @@ public class StashManager extends Module {
         rejectedStatus = "failed";
         ordersNote = "";
         sentDelivery = "";
+        resetDelivery();
         rescanDone = -1;
         rescanning = false;
         warnedOwner = null;
@@ -490,6 +552,12 @@ public class StashManager extends Module {
 
         driveSorter();
         updateOrdersNote();
+
+        // No server set (the default since 0.4.0-dev.8): the addon works without one, so this is a status, not a warning
+        if (serverUrl.get().isBlank()) {
+            setStatus("server URL not set");
+            return;
+        }
 
         String key = apiKey.get().trim();
         if (key.isEmpty()) {
@@ -533,6 +601,7 @@ public class StashManager extends Module {
         if (current == null) return;
         StashIndex.Built built = current;
         String id = built.server() + "|" + built.stash() + "|" + built.hash();
+        updateDelivery(now, built.player());
 
         if (needIndex || !id.equals(lastPushed)) {
             lastHeartbeat = now;
@@ -546,16 +615,93 @@ public class StashManager extends Module {
             lastHeartbeat = now;
             String sig = deliverySig();
             long done = rescanDone;
-            send(base, "/api/v1/heartbeat", StashIndex.heartbeat(built, deliveryPos(), orderBlocker(), done, rescanBlocked(), namingInfo(), craftingInfo(), anvilSource()), key, (code, body) -> {
+            send(base, "/api/v1/heartbeat", StashIndex.heartbeat(built, deliveryPos(), orderBlocker(), done, rescanBlocked(), namingInfo(), craftingInfo(), anvilSource(), deliveryStorage(), tableSource(), deliveryHash), key, (code, body) -> {
                 if (code != 200) return false;
                 sentDelivery = sig;
                 if (done >= 0 && rescanDone == done) rescanDone = -1;
                 readRescan(body);
                 needIndex = StashIndex.needsIndex(body);
+                deliverySync.onHeartbeatReply(body);
                 readOrders(body);
                 return true;
             });
+        } else if (deliveryPending != null && deliverySync.canSend(now)) {
+            sendDelivery(base, key, now);
         }
+    }
+
+    private void resetDelivery() {
+        deliverySync.reset();
+        deliveryStamp = 0;
+        deliveryFor = "";
+        deliveryHash = null;
+        deliveryPending = null;
+    }
+
+    /**
+     * The delivery contents report: built when a delivery chest was read (at most every 5 seconds) or the server asked, and kept to be
+     * sent when its hash differs from the last one the server took, or the server asked. Client thread. Never touches the index.
+     */
+    private void updateDelivery(long now, String player) {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        Stash stash = sorter == null ? null : sorter.currentStash();
+        // No world or no stash yet: nothing is known, so nothing changes
+        if (stash == null || mc.level == null) return;
+        String owner = stash.server + "|" + stash.name;
+        if (!owner.equals(deliveryFor)) {
+            resetDelivery();
+            deliveryFor = owner;
+        }
+        long stamp = StashIndex.deliveryStamp(stash);
+        if (stamp != deliveryStamp) {
+            deliveryStamp = stamp;
+            deliverySync.changed();
+        }
+        if (!deliverySync.due(now)) return;
+        com.porter.qwerte.stash.DeliveryContents.Built report;
+        try {
+            report = StashIndex.deliveryReport(stash, player);
+        } catch (RuntimeException e) {
+            QwerteAddon.LOG.warn("stash-manager: couldn't build the delivery contents: {}", e.toString());
+            report = null;
+        }
+        if (report == null) {
+            // Only a stash with no delivery container at all has nothing to report; one not resolved yet is looked at again
+            if (stash.deliveryPos != null) return;
+            deliverySync.none(now);
+            deliveryHash = null;
+            deliveryPending = null;
+            return;
+        }
+        deliveryHash = report.hash();
+        deliveryPending = deliverySync.built(report.hash(), now) ? report : null;
+    }
+
+    /**
+     * Sends the delivery report. It is isolated: whatever goes wrong (offline, a bad or missing signature, 404, 5xx) is the report's own
+     * business, tried again on its own timer, and never touches the shared backoff or the module's status.
+     */
+    private void sendDelivery(URI base, String key, long now) {
+        com.porter.qwerte.stash.DeliveryContents.Built report = deliveryPending;
+        send(base, "/api/v1/delivery", report.json(), key, (code, body) -> {
+            if (code == 200) {
+                deliverySync.sent(report.hash());
+                if (deliveryLog.sent(System.currentTimeMillis())) QwerteAddon.LOG.info("stash-manager: {}", com.porter.qwerte.stash.DeliveryContents.SentLog.line(report.chests()));
+                if (deliveryPending == report) deliveryPending = null;
+                return true;
+            }
+            // Refused for good: that hash is not sent again, even when the server asks, until the contents change
+            if (code == 400 || code == 413) {
+                QwerteAddon.LOG.warn("stash-manager: the server refused the delivery contents ({}): {}", code, body);
+                deliverySync.rejected(report.hash());
+                deliveryLog.failed();
+                if (deliveryPending == report) deliveryPending = null;
+                return true;
+            }
+            deliverySync.retryLater(System.currentTimeMillis());
+            deliveryLog.failed();
+            return false;
+        }, true);
     }
 
     /**
@@ -672,6 +818,12 @@ public class StashManager extends Module {
         return sorter == null ? "none" : sorter.anvilSource();
     }
 
+    /** Where the crafting table in use came from, for the heartbeat: "set", "found", "placed", "crafted" or "none". */
+    private String tableSource() {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        return sorter == null ? "none" : sorter.craftingTableSource();
+    }
+
     /** What the heartbeat says about crafting: whether it is on, and whether a crafting table is ready. */
     private int[] craftingInfo() {
         StashSorter sorter = Modules.get().get(StashSorter.class);
@@ -716,9 +868,14 @@ public class StashManager extends Module {
     }
 
     /** What the heartbeat says about delivery; when it changes, another heartbeat goes out at once. */
+    private String storageSig() {
+        StashIndex.DeliveryStorage d = deliveryStorage();
+        return d == null ? "-" : d.autoExpand() + "/" + d.chests() + "/" + d.full() + "/" + d.canExpand() + "/" + d.blocked();
+    }
+
     private String deliverySig() {
         int[] d = deliveryPos();
-        return (d == null ? "none" : d[0] + "," + d[1] + "," + d[2]) + "|" + (namingInfo()[0]) + anvilSource() + "|" + craftingInfo()[0] + craftingInfo()[1] + "|" + orderBlocker() + "|" + rescanDone + "|" + rescanBlocked();
+        return (d == null ? "none" : d[0] + "," + d[1] + "," + d[2]) + "|" + (namingInfo()[0]) + anvilSource() + "|" + craftingInfo()[0] + craftingInfo()[1] + tableSource() + "|" + orderBlocker() + "|" + rescanDone + "|" + rescanBlocked() + "|" + storageSig();
     }
 
     /** The module is on and taking orders. */
@@ -732,6 +889,17 @@ public class StashManager extends Module {
 
     boolean useNamedShulkers() {
         return useNamedShulkers.get();
+    }
+
+    /** auto-expand-delivery. */
+    boolean autoExpandDelivery() {
+        return autoExpandDelivery.get();
+    }
+
+    /** What the heartbeat says about the delivery storage, or null when no delivery container is set. */
+    private StashIndex.DeliveryStorage deliveryStorage() {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        return sorter == null ? null : sorter.deliveryStorage();
     }
 
     /** enable-crafting. */
@@ -961,11 +1129,16 @@ public class StashManager extends Module {
     }
 
     private void send(URI base, String path, byte[] body, String key, Reply reply) {
+        send(base, path, body, key, reply, false);
+    }
+
+    /** @param isolated the request is not part of the module's link to the server: its failures never set the shared backoff or the status */
+    private void send(URI base, String path, byte[] body, String key, Reply reply, boolean isolated) {
         URI uri;
         try {
             uri = URI.create(base + path);
         } catch (IllegalArgumentException e) {
-            setStatus("bad url");
+            if (!isolated) setStatus("bad url");
             return;
         }
 
@@ -985,7 +1158,7 @@ public class StashManager extends Module {
                 .POST(HttpRequest.BodyPublishers.ofByteArray(body))
                 .build();
         } catch (IllegalArgumentException e) {
-            setStatus("bad url");
+            if (!isolated) setStatus("bad url");
             return;
         }
 
@@ -1029,6 +1202,27 @@ public class StashManager extends Module {
                 if (gen != generation) return;
                 inFlight = false;
 
+                if (isolated) {
+                    // No signature check failure, 404 or conflict here may reach the shared backoff or the status
+                    String conflict = stashOwner(finalCode, finalText);
+                    if (finalBad) {
+                        reply.done(-2, "");
+                        return;
+                    }
+                    if (conflict != null) {
+                        deliverySync.forget();
+                        deliverySync.retryLater(System.currentTimeMillis());
+                        return;
+                    }
+                    try {
+                        reply.done(finalCode, finalText);
+                    } catch (RuntimeException e) {
+                        QwerteAddon.LOG.warn("stash-manager: couldn't handle the reply", e);
+                        deliverySync.retryLater(System.currentTimeMillis());
+                    }
+                    return;
+                }
+
                 // A reply that is not signed by the server for this request is thrown away: no orders, rescans or cancels in it
                 if (finalBad) {
                     backoff = backoff == 0 ? BACKOFF_MIN_MS : Math.min(BACKOFF_MAX_MS, backoff * 2);
@@ -1041,6 +1235,7 @@ public class StashManager extends Module {
                 // try again, so a release on the website takes effect
                 String owner = stashOwner(finalCode, finalText);
                 if (owner != null) {
+                    deliverySync.forget();
                     backoff = 0;
                     nextAttemptAt = System.currentTimeMillis() + 60_000;
                     if (!owner.equals(warnedOwner)) {

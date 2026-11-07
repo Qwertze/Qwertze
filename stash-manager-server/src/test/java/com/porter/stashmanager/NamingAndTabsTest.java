@@ -157,6 +157,29 @@ class NamingAndTabsTest {
         assertEquals(json("{\"anvil\":true,\"xpLevels\":3,\"anvilSource\":null}"), entry(store).getAsJsonObject("naming"));
     }
 
+    @Test
+    void craftingTableSource() throws Exception {
+        for (String src : new String[]{"set", "found", "placed", "crafted", "none"}) {
+            assertEquals(new IndexStore.Crafting(true, false, src),
+                status("{\"crafting\":{\"enabled\":true,\"table\":false,\"tableSource\":\"" + src + "\"}}").crafting(), src);
+        }
+        // Absent or null (an older bot): null.
+        assertNull(status("{\"crafting\":{\"enabled\":true,\"table\":true}}").crafting().tableSource());
+        assertNull(status("{\"crafting\":{\"enabled\":true,\"table\":true,\"tableSource\":null}}").crafting().tableSource());
+        for (String bad : new String[]{"\"SET\"", "\"\"", "\"table\"", "1", "true", "[]", "{}", "[\"set\"]"}) {
+            String body = "{\"crafting\":{\"enabled\":true,\"table\":false,\"tableSource\":" + bad + "}}";
+            assertThrows(IllegalArgumentException.class, () -> status(body), body);
+        }
+
+        // Listed when sent; an older bot's heartbeat goes back to {enabled, table}.
+        IndexStore store = new IndexStore(data, CreativeTabs.NONE);
+        store.load();
+        store.heartbeat("s", "a", "Bob", null, status("{\"crafting\":{\"enabled\":true,\"table\":true,\"tableSource\":\"crafted\"}}"));
+        assertEquals(json("{\"enabled\":true,\"table\":true,\"tableSource\":\"crafted\"}"), entry(store).getAsJsonObject("crafting"));
+        store.heartbeat("s", "a", "Bob", null, status("{\"crafting\":{\"enabled\":true,\"table\":false}}"));
+        assertEquals(json("{\"enabled\":true,\"table\":false}"), entry(store).getAsJsonObject("crafting"));
+    }
+
     // ---------- creative tabs ----------
 
     private static CreativeTabs fixture() throws Exception {
@@ -275,5 +298,29 @@ class NamingAndTabsTest {
         CreativeTabs.Table t = CreativeTabs.parse("{\"version\":\"1.21.4\",\"items\":{\"a\":[\"combat\",1],\"b\":\"combat\",\"c\":[1,2],\"d\":[\"other\",3]}}");
         assertEquals(1, t.items().size());
         assertTrue(t.items().containsKey("a"));
+    }
+
+    @Test
+    void deliveryStorageFromTheHeartbeatIsStoredAndListedWithoutPositions() throws Exception {
+        IndexStore store = new IndexStore(java.nio.file.Files.createTempDirectory("ds"), CreativeTabs.NONE);
+        store.load();
+        com.google.gson.JsonObject hb = com.google.gson.JsonParser.parseString(
+            "{\"deliveryStorage\":{\"autoExpand\":true,\"chests\":3,\"full\":3,\"canExpand\":false,\"blocked\":\"stone is in the way above the top chest\"}}").getAsJsonObject();
+        store.heartbeat("s", "a", "P", null, AddonRoutes.botStatus(hb));
+        com.google.gson.JsonObject ds = store.listJson().get(0).getAsJsonObject().getAsJsonObject("deliveryStorage");
+        org.junit.jupiter.api.Assertions.assertEquals(3, ds.get("chests").getAsInt());
+        org.junit.jupiter.api.Assertions.assertEquals(3, ds.get("full").getAsInt());
+        org.junit.jupiter.api.Assertions.assertFalse(ds.get("canExpand").getAsBoolean());
+        org.junit.jupiter.api.Assertions.assertEquals("stone is in the way above the top chest", ds.get("blocked").getAsString());
+        // Absent keeps it; null clears it; nonsense is refused.
+        store.heartbeat("s", "a", "P", null, AddonRoutes.botStatus(new com.google.gson.JsonObject()));
+        org.junit.jupiter.api.Assertions.assertTrue(store.listJson().get(0).getAsJsonObject().get("deliveryStorage").isJsonObject());
+        store.heartbeat("s", "a", "P", null, AddonRoutes.botStatus(com.google.gson.JsonParser.parseString("{\"deliveryStorage\":null}").getAsJsonObject()));
+        org.junit.jupiter.api.Assertions.assertTrue(store.listJson().get(0).getAsJsonObject().get("deliveryStorage").isJsonNull());
+        for (String bad : new String[]{"{\"deliveryStorage\":5}", "{\"deliveryStorage\":{\"autoExpand\":true,\"chests\":1,\"full\":2,\"canExpand\":true}}",
+            "{\"deliveryStorage\":{\"autoExpand\":\"yes\",\"chests\":1,\"full\":0,\"canExpand\":true}}"}) {
+            org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+                () -> AddonRoutes.botStatus(com.google.gson.JsonParser.parseString(bad).getAsJsonObject()), bad);
+        }
     }
 }

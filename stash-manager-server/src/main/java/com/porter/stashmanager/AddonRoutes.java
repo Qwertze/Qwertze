@@ -22,8 +22,14 @@ final class AddonRoutes {
     private final IconService icons;
     private final OrderStore orders;
     private final Owners owners;
+    private final DeliveryContents delivery;
 
     AddonRoutes(IndexStore store, LinkState link, IconService icons, OrderStore orders, Owners owners) {
+        this(store, link, icons, orders, owners, new DeliveryContents());
+    }
+
+    AddonRoutes(IndexStore store, LinkState link, IconService icons, OrderStore orders, Owners owners, DeliveryContents delivery) {
+        this.delivery = delivery;
         this.orders = orders;
         this.owners = owners;
         this.icons = icons;
@@ -100,6 +106,14 @@ final class AddonRoutes {
             Http.error(ex, 400, "player and indexHash must be strings");
             return;
         }
+        // PROTOCOL.md, "Additions: delivery storage contents": absent = an older bot, null = no delivery container.
+        boolean hasDeliveryHash = o.has("deliveryHash");
+        String deliveryHash = string(o, "deliveryHash");
+        if (hasDeliveryHash && !o.get("deliveryHash").isJsonNull()
+            && (deliveryHash == null || !DeliveryContents.HASH.matcher(deliveryHash).matches())) {
+            Http.error(ex, 400, "deliveryHash must be 40 lowercase hex digits (sha1) or null");
+            return;
+        }
         String error = checkLengths(o);
         if (error != null) {
             Http.error(ex, 400, error);
@@ -127,6 +141,9 @@ final class AddonRoutes {
         link.seen(generation(ex), server, stash, string(o, "player"));
         JsonObject out = Http.ok();
         out.addProperty("needIndex", result.needIndex());
+        // Always sent, so a bot knows this server takes delivery reports (it only sends them once it has seen the key).
+        if (hasDeliveryHash && deliveryHash == null) delivery.clear(server, stash); // the container was unset
+        out.addProperty("needDelivery", delivery.needed(server, stash, deliveryHash));
         out.add("orders", orders.heartbeatJson(server, stash));
         if (result.rescan() != null) out.addProperty("rescan", result.rescan());
         Http.json(ex, 200, out);
@@ -211,10 +228,42 @@ final class AddonRoutes {
             if (table == null || !table.isJsonPrimitive() || !table.getAsJsonPrimitive().isBoolean()) {
                 throw new IllegalArgumentException("crafting.table must be true or false");
             }
-            crafting = new IndexStore.Crafting(enabled.getAsBoolean(), table.getAsBoolean());
+            String tableSource = null; // absent or null: an older bot that doesn't report it
+            if (c.has("tableSource") && !c.get("tableSource").isJsonNull()) {
+                JsonElement src = c.get("tableSource");
+                tableSource = src.isJsonPrimitive() && src.getAsJsonPrimitive().isString() ? src.getAsString() : null;
+                if (tableSource == null || !IndexStore.Crafting.TABLE_SOURCES.contains(tableSource)) {
+                    throw new IllegalArgumentException("crafting.tableSource must be \"set\", \"found\", \"placed\", \"crafted\" or \"none\"");
+                }
+            }
+            crafting = new IndexStore.Crafting(enabled.getAsBoolean(), table.getAsBoolean(), tableSource);
+        }
+        boolean hasStorage = o.has("deliveryStorage");
+        IndexStore.DeliveryStorage storage = null;
+        if (hasStorage && !o.get("deliveryStorage").isJsonNull()) {
+            if (!o.get("deliveryStorage").isJsonObject()) {
+                throw new IllegalArgumentException("deliveryStorage must be {autoExpand, chests, full, canExpand, blocked} or null");
+            }
+            JsonObject d = o.getAsJsonObject("deliveryStorage");
+            JsonElement auto = d.get("autoExpand"), can = d.get("canExpand");
+            if (auto == null || !auto.isJsonPrimitive() || !auto.getAsJsonPrimitive().isBoolean()
+                || can == null || !can.isJsonPrimitive() || !can.getAsJsonPrimitive().isBoolean()) {
+                throw new IllegalArgumentException("deliveryStorage.autoExpand and canExpand must be true or false");
+            }
+            Integer chests = wholeInt(d.get("chests")), full = wholeInt(d.get("full"));
+            if (chests == null || full == null || chests < 0 || full < 0 || chests > 100_000 || full > chests) {
+                throw new IllegalArgumentException("deliveryStorage.chests and full must be whole numbers, 0 <= full <= chests");
+            }
+            String blocked = null;
+            if (d.has("blocked") && !d.get("blocked").isJsonNull()) {
+                blocked = string(d, "blocked");
+                if (blocked == null) throw new IllegalArgumentException("deliveryStorage.blocked must be a string or null");
+                blocked = blocked.isEmpty() ? null : Http.truncate(blocked, MAX_STATUS);
+            }
+            storage = new IndexStore.DeliveryStorage(auto.getAsBoolean(), chests, full, can.getAsBoolean(), blocked);
         }
         return new IndexStore.BotStatus(hasDelivery, delivery, hasBlocker, blocker, rescanDone, hasRescanBlocked, rescanBlocked,
-            hasNaming, naming, hasCrafting, crafting);
+            hasNaming, naming, hasCrafting, crafting, hasStorage, storage);
     }
 
     /** A whole number in int range (1.0 is fine, 1.5 isn't), or null. */

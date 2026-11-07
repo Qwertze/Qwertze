@@ -183,6 +183,46 @@ public final class BaritoneHelper {
     }
 
     /**
+     * Paths to anywhere the player's eyes are within {@code reach} of the centre of one of {@code parts}: close enough
+     * to click it, not next to it. A container up high is reached from below like a player would, instead of Baritone
+     * looking for a spot beside it that may not exist.
+     */
+    public static Goal moveInReach(Collection<BlockPos> parts, double reach) {
+        Goal goal = new GoalReach(List.copyOf(parts), reach);
+        baritone().getCustomGoalProcess().setGoalAndPath(goal);
+        return goal;
+    }
+
+    /** Feet positions whose eyes are within reach of a block's centre; see {@link #moveInReach}. */
+    private record GoalReach(List<BlockPos> parts, double reach) implements Goal {
+        // Standing eye height, and a little less reach than the setting so the arrival check never misses by a hair
+        private static final double EYES = 1.62, MARGIN = 0.25;
+
+        @Override
+        public boolean isInGoal(int x, int y, int z) {
+            double r = Math.max(1, reach - MARGIN);
+            for (BlockPos p : parts) {
+                double dx = x + 0.5 - (p.getX() + 0.5), dy = y + EYES - (p.getY() + 0.5), dz = z + 0.5 - (p.getZ() + 0.5);
+                if (dx * dx + dy * dy + dz * dz <= r * r) return true;
+            }
+            return false;
+        }
+
+        @Override
+        public double heuristic(int x, int y, int z) {
+            // Toward the nearest part, with any height from which the eyes can reach it counting as the right height
+            double best = Double.MAX_VALUE;
+            int span = (int) Math.floor(reach);
+            for (BlockPos p : parts) {
+                int top = p.getY() - 1, bottom = p.getY() - 1 - span;
+                int dy = y > top ? y - top : y < bottom ? y - bottom : 0;
+                best = Math.min(best, baritone.api.pathing.goals.GoalBlock.calculate(x - p.getX(), dy, z - p.getZ()));
+            }
+            return best;
+        }
+    }
+
+    /**
      * Paths to anywhere in the column at x, z, whatever the height.
      */
     public static Goal moveXZ(int x, int z) {

@@ -6,6 +6,9 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.porter.qwerte.QwerteAddon;
+import com.porter.qwerte.stash.IndexJson.Agg;
+import com.porter.qwerte.stash.IndexJson.Info;
+import com.porter.qwerte.stash.IndexJson.Shulker;
 import com.porter.qwerte.stash.Stash.Box;
 import meteordevelopment.meteorclient.utils.Utils;
 import net.minecraft.core.component.DataComponentPatch;
@@ -41,9 +44,6 @@ public final class StashIndex {
     /** A finished index: the JSON body and the hash of its items, plus what identifies the stash. */
     public record Built(String server, String stash, String player, String hash, byte[] json) {}
 
-    /** What is worked out once per kind of stack (item plus components, container contents ignored). */
-    private record Info(String key, String id, String name, String englishName, int maxStack, List<String> details, boolean enchanted, String tab, int tabOrder) {}
-
     private record CacheKey(Item item, DataComponentPatch patch) {}
 
     private static final Gson GSON = new Gson();
@@ -62,19 +62,6 @@ public final class StashIndex {
 
     private record TabSlot(String tab, int order) {}
 
-    private static final class Shulker {
-        final Info info;
-        final List<int[]> slots = new ArrayList<>();
-        final List<String> keys = new ArrayList<>();
-        final String key;
-        int count;
-
-        Shulker(Info info, String key) {
-            this.info = info;
-            this.key = key;
-        }
-    }
-
     // Item -> creative tab, built once per world
     private static Map<Item, TabSlot> tabs;
     private static boolean tabsWarned;
@@ -82,15 +69,6 @@ public final class StashIndex {
     private static boolean langWarned, encodeWarned;
 
     private StashIndex() {}
-
-    private static final class Agg {
-        final Info info;
-        int count;
-
-        Agg(Info info) {
-            this.info = info;
-        }
-    }
 
     /** Forgets the cached names and keys. */
     public static void clearCache() {
@@ -108,7 +86,7 @@ public final class StashIndex {
         h = mix(h, stash.name.hashCode());
         if (mc.level != null) h = mix(h, mc.level.dimension().hashCode());
         for (Box box : stash.boxes) {
-            if (box.excluded && !includeExcluded) continue;
+            if (box.delivery || box.foreign || box.excluded && !includeExcluded) continue;
             h = mix(h, (box.known() ? 1 : 0) | (box.stale ? 2 : 0));
             if (!box.known()) continue;
             for (ItemStack stack : box.contents) h = mix(h, stackHash(stack));
@@ -142,7 +120,8 @@ public final class StashIndex {
         Map<String, Shulker> shulkers = new LinkedHashMap<>();
         int known = 0, total = 0, stale = 0;
         for (Box box : stash.boxes) {
-            if (box.excluded && !includeExcluded) continue;
+            // The delivery containers are never indexed, whatever include-excluded says
+            if (box.delivery || box.foreign || box.excluded && !includeExcluded) continue;
             total++;
             if (box.stale) stale++;
             if (!box.known()) continue;
@@ -157,49 +136,8 @@ public final class StashIndex {
             addShulker(shulkers, ops, stack);
         }
 
-        List<Agg> sorted = new ArrayList<>(groups.values());
-        sorted.sort(Comparator.comparing((Agg a) -> a.info.key()));
-
-        JsonArray items = new JsonArray();
-        for (Agg a : sorted) {
-            Info i = a.info;
-            JsonObject o = new JsonObject();
-            o.addProperty("key", i.key());
-            o.addProperty("id", i.id());
-            o.addProperty("name", i.name());
-            o.addProperty("englishName", i.englishName());
-            o.addProperty("count", a.count);
-            o.addProperty("maxStack", i.maxStack());
-            JsonArray details = new JsonArray();
-            for (String d : i.details()) details.add(d);
-            o.add("details", details);
-            o.addProperty("enchanted", i.enchanted());
-            o.addProperty("tab", i.tab());
-            o.addProperty("tabOrder", i.tabOrder());
-            items.add(o);
-        }
-
-        List<Shulker> sortedShulkers = new ArrayList<>(shulkers.values());
-        sortedShulkers.sort(Comparator.comparing((Shulker x) -> x.key));
-        JsonArray shulkerArray = new JsonArray();
-        for (Shulker sh : sortedShulkers) {
-            JsonObject o = new JsonObject();
-            o.addProperty("key", sh.key);
-            o.addProperty("itemKey", sh.info.key());
-            o.addProperty("id", sh.info.id());
-            o.addProperty("name", sh.info.name());
-            o.addProperty("count", sh.count);
-            JsonArray contents = new JsonArray();
-            for (int n = 0; n < sh.keys.size(); n++) {
-                JsonObject c = new JsonObject();
-                c.addProperty("slot", sh.slots.get(n)[0]);
-                c.addProperty("key", sh.keys.get(n));
-                c.addProperty("count", sh.slots.get(n)[1]);
-                contents.add(c);
-            }
-            o.add("contents", contents);
-            shulkerArray.add(o);
-        }
+        JsonArray items = IndexJson.items(groups);
+        JsonArray shulkerArray = IndexJson.shulkers(shulkers);
         String hash = sha1(GSON.toJson(items) + GSON.toJson(shulkerArray));
 
         String dimension = dimension();
@@ -223,6 +161,27 @@ public final class StashIndex {
         root.add("shulkers", shulkerArray);
 
         return new Built(stash.server, stash.name, player, hash, GSON.toJson(root).getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * The {@code items} and {@code shulkers} arrays for these stacks, in the exact shape (and order, and numbers) of
+     * {@link #build}: shulker and bundle contents are counted, filled shulkers are grouped. Used by the in-game Stash
+     * Window to index what the player has opened. Null with no world. Client thread only.
+     */
+    public static JsonObject aggregate(Iterable<ItemStack> stacks) {
+        if (mc.level == null) return null;
+        if (CACHE.size() > MAX_CACHE) CACHE.clear();
+        RegistryOps<Tag> ops = mc.level.registryAccess().createSerializationContext(NbtOps.INSTANCE);
+        Map<String, Agg> groups = new LinkedHashMap<>();
+        Map<String, Shulker> shulkers = new LinkedHashMap<>();
+        for (ItemStack stack : stacks) {
+            add(groups, ops, stack, 0);
+            addShulker(shulkers, ops, stack);
+        }
+        JsonObject out = new JsonObject();
+        out.add("items", IndexJson.items(groups));
+        out.add("shulkers", IndexJson.shulkers(shulkers));
+        return out;
     }
 
     /** At most {@code max} characters, cut at a word boundary and ending in an ellipsis when it was longer. */
@@ -250,7 +209,46 @@ public final class StashIndex {
      * or null to leave it out.
      */
     public static byte[] heartbeat(Built b, int[] delivery, String orderBlocker, long rescanDone, String rescanBlocked, int[] naming, int[] crafting, String anvilSource) {
+        return heartbeat(b, delivery, orderBlocker, rescanDone, rescanBlocked, naming, crafting, anvilSource, null);
+    }
+
+    /**
+     * The delivery storage (0.4.0-dev.5, "deliveryStorage" in the heartbeat): how many chests there are (a double chest counts once),
+     * how many are known to be full, whether another can be put up now, and why not. No positions.
+     * @param blocked why no chest can be put up, or null
+     */
+    public record DeliveryStorage(boolean autoExpand, int chests, int full, boolean canExpand, String blocked) {}
+
+    /** As above, with {@code storage} sent as {@code deliveryStorage}, or left out when null. */
+    public static byte[] heartbeat(Built b, int[] delivery, String orderBlocker, long rescanDone, String rescanBlocked, int[] naming, int[] crafting, String anvilSource,
+                                   DeliveryStorage storage) {
+        return heartbeat(b, delivery, orderBlocker, rescanDone, rescanBlocked, naming, crafting, anvilSource, storage, null);
+    }
+
+    /**
+     * As above, with {@code tableSource} sent as {@code crafting.tableSource} ("set", "found", "placed", "crafted" or "none"; 0.4.0-dev.6),
+     * or left out when null.
+     */
+    public static byte[] heartbeat(Built b, int[] delivery, String orderBlocker, long rescanDone, String rescanBlocked, int[] naming, int[] crafting, String anvilSource,
+                                   DeliveryStorage storage, String tableSource) {
+        return heartbeat(b, delivery, orderBlocker, rescanDone, rescanBlocked, naming, crafting, anvilSource, storage, tableSource, null);
+    }
+
+    /** As above, with {@code deliveryHash} (0.4.0-dev.7, the hash of the delivery contents report) sent as {@code deliveryHash}, or left out when null. */
+    public static byte[] heartbeat(Built b, int[] delivery, String orderBlocker, long rescanDone, String rescanBlocked, int[] naming, int[] crafting, String anvilSource,
+                                   DeliveryStorage storage, String tableSource, String deliveryHash) {
         JsonObject o = new JsonObject();
+        if (deliveryHash != null) o.addProperty("deliveryHash", deliveryHash);
+        if (storage != null) {
+            JsonObject d = new JsonObject();
+            d.addProperty("autoExpand", storage.autoExpand());
+            d.addProperty("chests", Math.max(0, storage.chests()));
+            d.addProperty("full", Math.max(0, Math.min(storage.full(), storage.chests())));
+            d.addProperty("canExpand", storage.canExpand());
+            if (storage.blocked() == null || storage.blocked().isEmpty()) d.add("blocked", com.google.gson.JsonNull.INSTANCE);
+            else d.addProperty("blocked", clamp(storage.blocked(), 160));
+            o.add("deliveryStorage", d);
+        }
         if (naming != null) {
             JsonObject n = new JsonObject();
             n.addProperty("anvil", naming[0] != 0);
@@ -262,6 +260,7 @@ public final class StashIndex {
             JsonObject c = new JsonObject();
             c.addProperty("enabled", crafting[0] != 0);
             c.addProperty("table", crafting[1] != 0);
+            if (tableSource != null) c.addProperty("tableSource", tableSource);
             o.add("crafting", c);
         }
         if (rescanDone >= 0) o.addProperty("rescanDone", rescanDone);
@@ -293,6 +292,75 @@ public final class StashIndex {
         } catch (RuntimeException ex) {
             return false;
         }
+    }
+
+    /** The delivery chests of the stash in fill order, as far as the book and the boxes tell; empty when no delivery container is set. */
+    private record DChest(Box box, boolean full) {}
+
+    private static List<DChest> deliveryChests(Stash stash) {
+        List<DChest> out = new ArrayList<>();
+        DeliveryBook book = new DeliveryBook(stash.deliveryStorage);
+        for (DeliveryBook.Entry e : book.fillOrder()) {
+            Box box = stash.boxAt(new net.minecraft.core.BlockPos(e.at[0], e.at[1], e.at[2]));
+            if (box != null && box.delivery) out.add(new DChest(box, e.full));
+        }
+        if (out.isEmpty()) {
+            // The book is filled in when the sorter first looks at the storage: until then the delivery container alone
+            for (Box box : stash.boxes) if (box.delivery && !box.deliveryExtra) out.add(new DChest(box, false));
+        }
+        return out;
+    }
+
+    /**
+     * A cheap number that changes when a delivery chest is read or its fullness changes (any read moves {@code lastRead}), to notice
+     * that the delivery report is to be built again. Not sent. Never indexes anything.
+     */
+    public static long deliveryStamp(Stash stash) {
+        long h = 0;
+        for (DChest c : deliveryChests(stash)) {
+            Box box = c.box();
+            h = mix(h, box.lastRead);
+            h = mix(h, (box.known() ? box.contents.length + 1 : 0) | (c.full() ? 1000 : 0));
+        }
+        return h;
+    }
+
+    /**
+     * The delivery storage's contents (see {@link DeliveryContents}), or null with no world or no delivery container. Reads the
+     * contents the sorter last saw in each chest ({@code Box.contents}, kept by the read of every open window and saved with the stash);
+     * nothing here opens a container. Delivery containers stay out of the index and out of searches.
+     */
+    public static DeliveryContents.Built deliveryReport(Stash stash, String player) {
+        if (mc.level == null || stash == null) return null;
+        List<DChest> chests = deliveryChests(stash);
+        if (chests.isEmpty()) return null;
+        if (CACHE.size() > MAX_CACHE) CACHE.clear();
+        RegistryOps<Tag> ops = mc.level.registryAccess().createSerializationContext(NbtOps.INSTANCE);
+        List<DeliveryContents.Chest> out = new ArrayList<>();
+        for (DChest c : chests) {
+            Box box = c.box();
+            if (!box.known() || box.lastRead <= 0) {
+                out.add(new DeliveryContents.Chest(box.parts.size() > 1 ? 54 : 27, c.full(), 0, null));
+                continue;
+            }
+            List<DeliveryContents.Item> items = new ArrayList<>();
+            for (int slot = 0; slot < box.contents.length; slot++) {
+                ItemStack stack = box.contents[slot];
+                if (stack == null || stack.isEmpty()) continue;
+                Info info = infoOf(ops, stack);
+                List<DeliveryContents.Inner> inside = null;
+                if (Utils.isShulker(stack.getItem())) {
+                    inside = new ArrayList<>();
+                    for (ItemStack inner : Kits.inside(stack)) {
+                        if (inner == null || inner.isEmpty()) continue;
+                        inside.add(new DeliveryContents.Inner(BuiltInRegistries.ITEM.getKey(inner.getItem()).toString(), inner.getCount()));
+                    }
+                }
+                items.add(new DeliveryContents.Item(slot, info.id(), info.name(), stack.getCount(), info.maxStack(), inside, info.damage(), info.maxDamage()));
+            }
+            out.add(new DeliveryContents.Chest(box.parts.size() > 1 || box.contents.length > 27 ? 54 : 27, c.full(), box.lastRead, items));
+        }
+        return DeliveryContents.build(stash.server, stash.name, player, out, System.currentTimeMillis());
     }
 
     private static String mcVersion() {
@@ -429,7 +497,13 @@ public final class StashIndex {
         StackInfo info = StackInfo.of(stack);
         TabSlot tab = tabOf(stack.getItem());
         return new Info(key(ops, id, stripped), id, stack.getHoverName().getString(), englishName(stack), stack.getMaxStackSize(),
-            details(info), info != null && !info.enchants.isEmpty(), tab.tab(), tab.order());
+            details(info), info != null && !info.enchants.isEmpty(), tab.tab(), tab.order(),
+            durability(stack.getDamageValue(), stack.getMaxDamage())[0], durability(stack.getDamageValue(), stack.getMaxDamage())[1]);
+    }
+
+    /** {damage, maxDamage} to send for an item, or {0, 0} to send neither: only damageable (maxDamage > 0) and damaged (damage > 0). */
+    public static int[] durability(int damage, int maxDamage) {
+        return maxDamage > 0 && damage > 0 ? new int[] {damage, maxDamage} : new int[] {0, 0};
     }
 
     private static String key(RegistryOps<Tag> ops, String id, DataComponentPatch stripped) {

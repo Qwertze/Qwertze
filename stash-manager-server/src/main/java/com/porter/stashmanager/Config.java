@@ -39,6 +39,12 @@ public final class Config {
     public final String iconSource;
     /** allowBearer=: accept the old Authorization: Bearer header on index/heartbeat/order requests (never on bot/*). */
     public final boolean allowBearer;
+    /**
+     * trustedProxies=: addresses of reverse proxies / tunnels (e.g. cloudflared) in front of this server. Only for a
+     * request whose socket address is one of these is the client address taken from the last
+     * X-Forwarded-For entry, for the login rate limit and the audit log. Empty: headers are never trusted.
+     */
+    public final List<String> trustedProxies;
     /** The key before the last regenerate, accepted for 10 minutes on non-dashboard requests. */
     private volatile KeyState previousKey;
     private volatile long previousUntil;
@@ -49,8 +55,9 @@ public final class Config {
     private volatile String dashboardPassword;
 
     private Config(Path file, int port, String bind, String apiKey, boolean allowRemote, List<String> allowedHosts,
-                   boolean generatedKey, Path minecraftJar, String iconSource, boolean allowBearer) {
+                   boolean generatedKey, Path minecraftJar, String iconSource, boolean allowBearer, List<String> trustedProxies) {
         this.allowBearer = allowBearer;
+        this.trustedProxies = List.copyOf(trustedProxies);
         this.file = file;
         this.minecraftJar = minecraftJar;
         this.iconSource = iconSource;
@@ -64,6 +71,11 @@ public final class Config {
 
     public String apiKey() {
         return key.key();
+    }
+
+    /** The data folder (where config.properties lives). */
+    public Path dataDir() {
+        return file.toAbsolutePath().getParent();
     }
 
     public KeyState keyState() {
@@ -137,7 +149,18 @@ public final class Config {
             appendMissing(file, props);
         }
         boolean allowBearer = Boolean.parseBoolean(props.getProperty("allowBearer", "false").trim());
-        Config config = new Config(file, port, bind, apiKey, allowRemote, allowedHosts, generated, minecraftJar, iconSource, allowBearer);
+        List<String> trustedProxies = new ArrayList<>();
+        for (String a : props.getProperty("trustedProxies", "").split(",")) {
+            String t = a.trim().toLowerCase(Locale.ROOT);
+            if (t.isEmpty()) continue;
+            if (!AuthRoutes.isIpLiteral(t)) {
+                System.err.println("config.properties: ignoring trustedProxies entry '" + t + "' (an IP address is needed)");
+                continue;
+            }
+            trustedProxies.add(t);
+        }
+        Config config = new Config(file, port, bind, apiKey, allowRemote, allowedHosts, generated, minecraftJar, iconSource, allowBearer,
+            trustedProxies);
         String password = props.getProperty(PASSWORD_KEY, "").trim();
         if (!password.isEmpty()) {
             if (!Auth.wellFormed(password)) {
@@ -214,6 +237,12 @@ public final class Config {
         # (never on the dashboard). The key then crosses the network in clear text: update every bot and set false.
         allowBearer=false
         """;
+    private static final String PROXY_BLOCK = """
+        # IP addresses (comma separated) of a reverse proxy or tunnel in front of this server, such as the machine
+        # running cloudflared. Requests from exactly these addresses have their real client address read from
+        # the last X-Forwarded-For entry for the login rate limit and the audit log. Leave empty otherwise.
+        trustedProxies=
+        """;
     private static final String SOURCE_BLOCK = """
         # Where item icons come from: auto (the game jar, then the Minecraft Wiki for what it can't draw),
         # game (the game jar only), or wiki (the Minecraft Wiki only).
@@ -226,6 +255,7 @@ public final class Config {
         if (!props.containsKey("minecraftJar")) add.append('\n').append(JAR_BLOCK);
         if (!props.containsKey("iconSource")) add.append('\n').append(SOURCE_BLOCK);
         if (!props.containsKey("allowBearer")) add.append('\n').append(BEARER_BLOCK);
+        if (!props.containsKey("trustedProxies")) add.append('\n').append(PROXY_BLOCK);
         if (add.isEmpty()) return;
         String text = Files.readString(file, StandardCharsets.UTF_8);
         if (!text.isEmpty() && !text.endsWith("\n")) text += "\n";
@@ -254,7 +284,7 @@ public final class Config {
             # Extra host names (comma separated) the browser may use to reach this server,
             # e.g. a DNS name on your LAN. IP addresses, localhost and this machine's name always work.
             allowedHosts=%s
-            """ + "\n" + JAR_BLOCK + "\n" + SOURCE_BLOCK + "\n" + BEARER_BLOCK).formatted(port, clean(bind), clean(apiKey), allowRemote, clean(allowedHosts));
+            """ + "\n" + JAR_BLOCK + "\n" + SOURCE_BLOCK + "\n" + BEARER_BLOCK + "\n" + PROXY_BLOCK).formatted(port, clean(bind), clean(apiKey), allowRemote, clean(allowedHosts));
         AtomicFiles.write(file, text.getBytes(StandardCharsets.UTF_8), true);
     }
 

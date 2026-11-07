@@ -32,15 +32,20 @@ final class SessionStore {
     /** lastSeen is written to disk at most this often per session (it only matters for display and pruning). */
     private static final long SEEN_WRITE_MS = 10L * 60 * 1000;
     private static final int MAX_SESSIONS = 200;
+    /** One account can't hold more, so it can't push everyone else's sessions out of the global cap. */
+    static final int MAX_PER_USER = 20;
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private static final class Session {
+        final String user; // Users.OWNER_ID or a sub-user's id
+        String cred; // Auth.tag of the password hash the session was made with; null for sessions from older servers
         final long created;
         final long expires;
         long lastSeen;
         long writtenSeen;
 
-        Session(long created, long expires, long lastSeen) {
+        Session(String user, long created, long expires, long lastSeen) {
+            this.user = user;
             this.created = created;
             this.expires = expires;
             this.lastSeen = lastSeen;
@@ -70,7 +75,11 @@ final class SessionStore {
                 JsonObject o = e.getAsJsonObject();
                 String hash = o.get("hash").getAsString();
                 if (!hash.matches("[0-9a-f]{64}")) continue;
-                sessions.put(hash, new Session(o.get("created").getAsLong(), o.get("expires").getAsLong(), o.get("lastSeen").getAsLong()));
+                // Sessions from before sub-users have no user: they are the owner's.
+                String user = o.has("user") ? o.get("user").getAsString() : Users.OWNER_ID;
+                Session s = new Session(user, o.get("created").getAsLong(), o.get("expires").getAsLong(), o.get("lastSeen").getAsLong());
+                s.cred = o.has("cred") && o.get("cred").isJsonPrimitive() ? o.get("cred").getAsString() : null;
+                sessions.put(hash, s);
             }
         } catch (RuntimeException e) {
             System.err.println("Skipping " + file.getFileName() + " (everyone has to log in again): " + e);
@@ -79,10 +88,36 @@ final class SessionStore {
         if (prune()) save();
     }
 
-    /** Starts a session and returns its token (for the cookie). */
+    /** Starts an owner session and returns its token (for the cookie). */
     synchronized String create() {
+        return create(Users.OWNER_ID);
+    }
+
+    /** Starts a session for this user and returns its token (for the cookie). */
+    synchronized String create(String user) {
+        return create(user, null);
+    }
+
+    /** Starts a session for this user, made with the password whose {@link Auth#tag} is cred. */
+    synchronized String create(String user, String cred) {
         long now = clock.getAsLong();
         prune();
+        // This user's own least recently used session goes first.
+        int own = 0;
+        String ownOldest = null;
+        long ownSeen = Long.MAX_VALUE;
+        for (Map.Entry<String, Session> e : sessions.entrySet()) {
+            if (!e.getValue().user.equals(user)) continue;
+            own++;
+            if (e.getValue().lastSeen < ownSeen) {
+                ownSeen = e.getValue().lastSeen;
+                ownOldest = e.getKey();
+            }
+        }
+        if (own >= MAX_PER_USER) {
+            sessions.remove(ownOldest);
+            elevatedUntil.remove(ownOldest);
+        }
         if (sessions.size() >= MAX_SESSIONS) {
             // Drop the least recently used session to stay bounded.
             String oldest = null;
@@ -98,7 +133,9 @@ final class SessionStore {
         byte[] bytes = new byte[32];
         RANDOM.nextBytes(bytes);
         String token = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
-        sessions.put(hash(token), new Session(now, now + LIFETIME_MS, now));
+        Session s = new Session(user, now, now + LIFETIME_MS, now);
+        s.cred = cred;
+        sessions.put(hash(token), s);
         save();
         return token;
     }
@@ -118,6 +155,54 @@ final class SessionStore {
         s.lastSeen = now;
         if (now - s.writtenSeen >= SEEN_WRITE_MS) save();
         return true;
+    }
+
+    /** The user id of a live session, or null (the same checks as {@link #valid}). */
+    synchronized String userOf(String token) {
+        if (!valid(token)) return null;
+        Session s = sessions.get(hash(token));
+        return s == null ? null : s.user;
+    }
+
+    /** The credential tag a live session was made with (null when unknown or the session is gone). */
+    synchronized String credOf(String token) {
+        if (token == null) return null;
+        Session s = sessions.get(hash(token));
+        return s == null ? null : s.cred;
+    }
+
+    /** This session now belongs to the new password (after its owner changed it from this session). */
+    synchronized void retag(String token, String cred) {
+        if (token == null) return;
+        Session s = sessions.get(hash(token));
+        if (s != null) {
+            s.cred = cred;
+            save();
+        }
+    }
+
+    /** Ends every session of this user except keepToken's (null ends them all). Returns how many ended. */
+    synchronized int removeUser(String user, String keepToken) {
+        String keep = keepToken == null ? null : hash(keepToken);
+        int removed = 0;
+        for (Iterator<Map.Entry<String, Session>> it = sessions.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, Session> e = it.next();
+            if (e.getValue().user.equals(user) && !e.getKey().equals(keep)) {
+                it.remove();
+                removed++;
+            }
+        }
+        elevatedUntil.keySet().removeIf(h -> !sessions.containsKey(h));
+        if (removed > 0) save();
+        return removed;
+    }
+
+    /** How many live sessions each user has. */
+    synchronized Map<String, Integer> countByUser() {
+        prune();
+        Map<String, Integer> out = new HashMap<>();
+        for (Session s : sessions.values()) out.merge(s.user, 1, Integer::sum);
+        return out;
     }
 
     /** Ends one session. */
@@ -205,6 +290,8 @@ final class SessionStore {
         for (Map.Entry<String, Session> e : sessions.entrySet()) {
             JsonObject o = new JsonObject();
             o.addProperty("hash", e.getKey());
+            o.addProperty("user", e.getValue().user);
+            if (e.getValue().cred != null) o.addProperty("cred", e.getValue().cred);
             o.addProperty("created", e.getValue().created);
             o.addProperty("lastSeen", e.getValue().lastSeen);
             o.addProperty("expires", e.getValue().expires);

@@ -43,6 +43,7 @@ The addon sends this when its index hash changes, or when a heartbeat reply says
 - `key`: the item id, plus `#` and the first 8 hex digits of the SHA-1 of the canonical component-patch NBT string, but only when the stack has a component patch (CONTAINER and BUNDLE_CONTENTS are dropped for shulkers and bundles first). The key stays the same across sessions, and orders will refer to items by it later.
 - `name`: the stack's hover name. It may be a custom name set by a player, so the page must treat it as untrusted text.
 - `englishName`: the base item's en_us name, used to look up its icon.
+- `damage`, `maxDamage` (optional, plugin 1.9.0 / addon 0.4.0-dev.5): sent only for a damageable stack with damage > 0. The website draws the game's durability bar from them (width round(13 × (maxDamage − damage) / maxDamage) of 13, green to red) and shows "Durability: left / max" in the tooltip. Damaged stacks already have their own `key` (the damage is part of the component patch).
 - Shulkers and bundles are counted as their base item, with contents ignored, and their contents are added to the totals as well.
 - If two items share a `key`, the server merges them: the counts are added up and the first entry's other fields are kept. `GET /api/v1/index` returns the merged list.
 - The server holds at most 64 (server, stash) pairs. A new pair past that limit gets `400` (an offline pair that never sent an index is dropped first to make room).
@@ -67,7 +68,7 @@ The whole website is behind one password. The page's static files (`/`, `/app.js
 - **Route guards** (the LAN address and `Host` checks run first, as before):
   - `OPEN`: static files, `GET /api/v1/auth/state`.
   - `CSRF` (the browser-write checks below, no session): `POST /api/v1/auth/setup`, `POST /api/v1/auth/login`.
-  - `SESSION`: every browser GET: `/api/v1/stashes`, `/api/v1/index`, `/api/v1/orders`, `/api/v1/link`, `/icon/...`.
+  - `SESSION`: the browser GETs, for example `/api/v1/stashes`, `/api/v1/index`, `/api/v1/orders`, `/api/v1/link`, `/icon/...`; the others (`/api/v1/delivery`, `/api/v1/bots`, the planner, the viewer, `/api/v1/users`, `/api/v1/audit`) are in their sections below.
   - `BROWSER_WRITE` (the CSRF checks, then a session): every other browser POST.
   - `ADDON_KEY`: unchanged (Bearer).
 - Without a session the reply is `401 {"ok": false, "error": "login required"}`. API responses carry `Cache-Control: no-store`, except `GET /api/v1/index`, which keeps its ETag revalidation with `private, no-cache`; icons are `private`.
@@ -75,15 +76,81 @@ The whole website is behind one password. The page's static files (`/`, `/app.js
 Endpoints (`/api/v1/auth/...`):
 
 - `GET state` → `{ setupNeeded, setupAllowed, codeRequired, loggedIn, elevated, minLength }` (plus `message` when the setup must be done on the server PC). `setupAllowed` is true only for a loopback client without proxy headers while no password is set. `elevated` says whether this session is in sudo mode.
-- `POST setup { password, code }`: first run only, and only from the server PC itself (loopback, and without `X-Forwarded-For`, `Forwarded`, `Via` or `X-Real-IP` headers); anything else gets `403` with "Set the dashboard password on the server PC (open http://localhost:<port>)". `code` is the one-time setup code the server prints at startup while no password is set (`Dashboard setup code: XXXX-XXXX`; case, spaces and dashes don't matter; a wrong code gets `403`). The password needs at least 12 characters and must not be one of about 150 very common passwords (`400`); `409` once a password is set; `500 {"error":"could not save"}` when config.properties can't be written. On success: `200` with the session cookie (in sudo mode).
-- `POST login { password }`: `200` with the cookie, `401 "wrong password"`, `409` while no password is set, or `429 { error, retryAfter }` with `Retry-After` (seconds).
-- `POST logout`: ends this browser's session and clears the cookie. `POST logout-all`: ends every session (`{ ok, ended }`).
+- `POST setup { password, code }`: first run only, and only from the server PC itself (loopback, and without `X-Forwarded-For`, `Forwarded`, `Via`, `X-Real-IP` or `CF-Connecting-IP` headers); anything else gets `403` with "Set the dashboard password on the server PC (open http://localhost:<port>)". `code` is the one-time setup code the server prints at startup while no password is set (`Dashboard setup code: XXXX-XXXX`; case, spaces and dashes don't matter; a wrong code gets `403`). The password needs at least 12 characters and must not be one of about 150 very common passwords (`400`); `409` once a password is set; `500 {"error":"could not save"}` when config.properties can't be written. On success: `200` with the session cookie (in sudo mode).
+- `POST login { username?, password }`: `200 { ok, mustChange }` with the cookie, `401 "wrong username or password"` (the same for an unknown name, which still costs a full hash check), `403 "this account is disabled"` (only after the right password), `409` while no password is set, or `429 { error, retryAfter }` with `Retry-After` (seconds). A blank or missing `username`, or the owner's name, means the owner. See "Additions: website users".
+- `POST logout`: ends this browser's session and clears the cookie. `POST logout-all`: the owner ends every session of every user; a sub-user ends their own (`{ ok, ended }`).
 - `POST password { current, next }`: needs the current password (`401` when wrong, and it counts as a failed login); `next` follows the setup rules. Every other session is logged out; this one stays (`{ ok, ended }`). `500 {"error":"could not save"}` when the file can't be written.
 - `POST lock`: ends sudo mode for this session now (the header's "Lock now"). `GET state` reports `elevatedUntil` (server time, ms; 0 when off).
 - `POST confirm { password }` (sudo mode): puts this session in sudo mode for 15 minutes (`{ ok, elevatedForSeconds }`); a wrong password gets `401` and counts as a failure. Login and setup also start sudo mode. Sudo mode is kept in memory only, so a server restart asks again. Actions that need it answer `403 {"error":"confirm password"}` otherwise: today console commands (and, from phase 4, changes in the `proxy` scope).
 - Auth request bodies are capped at 4 KiB (`413`). The JDK server's `sun.net.httpserver.maxReqTime=30` limits how long a request may take to arrive.
 - **Rate limit** (login, password change, confirm): after 5 failures from one address (IPv6: per /64), that address is locked out for 1 minute, doubling with each further lockout up to 15 minutes; a success resets it. On top of that, 20 failures from anywhere within 10 minutes pause every attempt for 15 minutes, doubling with each further pause up to 1 hour. The server PC itself (loopback) is exempt from both, so its owner can always log in. Both answer `429` with `Retry-After`.
 - On Windows, `config.properties`, `sessions.json` and the data folder get an ACL with only the user the server runs as (POSIX: owner-only permissions); failures are only warned about.
+
+## Additions: website users
+
+The website has one **owner** (the `dashboardPassword=` line, as before) and up to 50 **sub-users** with their own passwords and permissions. Nothing changes for bots (signed requests, API key).
+
+- **Storage:** `stash-manager-data/users.json` (written atomically, owner-only): `{ version: 1, ownerName, users: [{ id: "u-<12 hex>", name, hash, perms, disabled, mustChange, createdAt, lastLoginAt, passwordChangedAt }] }`. Hashes are the same PBKDF2 format as the owner's. A users.json that can't be read stops the server at startup (it never starts without the sub-users silently). Missing file: only the owner.
+- **Migration:** an existing setup needs nothing. Sessions in `sessions.json` gain a `user` field; sessions without one (made by an older server) are the owner's. The owner's name defaults to `owner`.
+- **Names:** 1-32 characters `[A-Za-z0-9_.-]`, unique ignoring case, never the owner's name.
+- **Sessions:** per user. `GET /api/v1/auth/state` adds `user: { id ("owner" or "u-..."), name, owner, mustChange, perms }` when logged in. Every request reads the user afresh, so permission changes apply at once; a disabled or deleted user's sessions end (401). Disabling, a password reset by the owner, "log out" by the owner and deleting end that user's sessions. `password` and `confirm` use the caller's own password; `password` also refuses the current password as the new one and clears `mustChange`.
+- **Must change password:** a user created or reset with `mustChange` (the default) can only use `/api/v1/auth/*` until they change it; everything else answers `403 { ok: false, error: "change your password first", mustChange: true }`.
+- **Permissions** (sub-users; the owner has all):
+  - `view`: stash list, index, item icons, order list.
+  - `order`: place orders; cancel, retry and force-cancel the user's own orders (orders with no `placedBy` are the owner's). `plannerOrder` covers the user's own orders the same way (retry included), but doesn't place orders here.
+  - `ordersAll`: cancel, retry (also needs `order`) and force-cancel any order; Clear finished.
+  - `activity`: the Bots list, Activity, job status and reading plugin settings.
+  - `settings`: change plugin settings (`scope: "plugin"`).
+  - `proxy`: `none`, `read` or `change` for the proxy's and other plugins' settings (plus Admin unlocked, as before).
+  - `console`: `none`, `list` or `full` (plus Admin unlocked). `consoleAllow` lists command prefixes for `list`: a command is allowed when, lowercased and with whitespace collapsed, it equals a prefix or starts with prefix + space; commands with `;`, `&`, `|`, `$`, a backtick or a line break are refused in `list` mode. Reading the console needs `list` or `full`: a `list` user sees only the entries they sent, `full` (and the owner) sees everyone's. In `list` mode the whole command must also be plain ASCII from `A-Z a-z 0-9 space _ : . , @ / = + # ~ -`.
+  - `rescan`: rescan a stash.
+  - `link`: the Link addon panel (linked bots filtered by stash scope) and releasing stash ownership. The API key itself (`apiKey`) and `POST /api/v1/link/regenerate` are the owner's only: the key lets a bot do anything a bot can, past every user's limits. Sub-users get `apiKeyOwnerOnly: true` instead.
+  - `planner`: the Build Planner: upload schematics and see their material list (see "Additions: build planner").
+  - `plannerOrder`: order a build plan's materials. It does not need `order`. Like `order`, it also covers cancelling, retrying and force-cancelling the user's own orders.
+  - `viewer`: the live viewer ("Additions: live viewer").
+  - `streamer`: **force streamer mode**, a restriction (off by default and in every preset; the owner can never be forced). The server never sends this user positions, player names, server addresses, chat or the bots' free text; see the table below. Changes are audited with `user.update` ("forced streamer mode") and apply on the user's next request (an open live viewer stream ends with `bye {revoked}` within 5 s and reconnects redacted). `auth/state` shows it as `user.perms.streamer`; the page then shows streamer mode as on and locked. The page's blur is only a second layer: the redaction happens on the server.
+  - `stashes`: `null` (all) or `[{ server, stash }]`; `bots`: `null` (all) or `[botId]`. Lists are filtered, and anything outside the scope answers `404`, as if it didn't exist.
+  - Implied when saved: `plannerOrder` turns on `planner`; `order`, `ordersAll` or `planner` turn on `view`; `settings`, `proxy` other than `none` or `console` other than `none` turn on `activity`; so does `viewer`.
+  - User management and the audit log are the owner's only.
+  - Every logged-in route declares the permission it needs in the router (registration fails without one); handlers check the finer rules. A missing permission answers `403 { ok: false, error: "you don't have permission to ...", permission: "<key>" }`.
+- **Orders** gain `placedBy: { id, name } | null` (also in the bot's claim; bots ignore it). The name is kept as it was when the order was placed. A retried order belongs to whoever pressed Retry (the audit log records "old as new"). An order can be placed again only once: afterwards it carries `retriedAs: "<new id>"`, Retry answers `409`, and the website hides its Retry button. The Build Planner's "Order part again" counts as placing it again too, and a part whose failed order was retried counts as ordered.
+- **Scope details:** stash scope filters stashes, indexes, orders, rescan, release and the Link panel's linked-bot list. It doesn't hide bots or their Activity (a bot isn't tied to one stash); use bot scope for that. Each user can hold at most 20 sessions; a new login past that ends that user's least recently used one.
+- **Owner only** (`403` otherwise). The POSTs also need Admin unlocked (`403 "confirm password"`); bodies up to 64 KiB.
+  - `GET /api/v1/users` → `{ owner: { name, sessions }, users: [{ id, name, disabled, mustChange, perms, createdAt, lastLoginAt, sessions }], presets: { viewer, orderer, operator }, maxUsers, minLength }`. Hashes are never sent.
+  - `POST /api/v1/users { name, password, perms? | preset?, mustChange? (true) }` → `{ ok, user }`. Without perms or preset: `viewer`.
+  - `POST /api/v1/users/{id} { name?, perms? | preset?, disabled? }` → `{ ok, user, ended }`. `perms` is the whole object (a missing key is off). Both perms and preset, a preset that isn't one of the presets, or nothing to change: `400`.
+  - `POST /api/v1/users/{id}/password { password, mustChange? (true) }`, `.../logout`, `.../delete` → `{ ok, ended }`.
+  - `POST /api/v1/users/owner { name }`: renames the owner.
+  - `GET /api/v1/audit?limit=200` → `{ entries: [{ at, userId, user, action, detail, address }] }`, newest first. The newest 2000 are kept in `audit.json` (owner-only). Actions: `setup`, `login`, `login.failed`, `logout-all`, `password.change`, `user.create`, `user.update`, `user.password`, `user.logout`, `user.delete`, `owner.rename`, `console` (a command that looks sensitive is logged as `(hidden)`), `settings.change`, `apikey.regenerate`, `stash.release`, `order.cancel`, `order.force-cancel`, `order.retry`, `orders.clear`, `planner.upload`, `planner.order`. Order placement is recorded on the order (`placedBy`).
+- **Presets:** `viewer` = view; `orderer` = view, order, planner, plannerOrder; `operator` = view, order, ordersAll, activity, settings, rescan, proxy read, planner, plannerOrder, viewer. Users saved before the planner existed have neither planner permission until the owner turns them on, and users saved before the live viewer don't have `viewer`.
+- **Credential check per session:** each session stores a fingerprint of the password hash it was made with (`cred` in sessions.json). A session whose password has changed since ends on its next request, even one created by a login that was in flight while the password changed. Sessions from older servers (no fingerprint) are accepted for the owner only.
+- **Rate limits:** failures count per address and account (5 lock that pair, as before), and per address across all accounts (10 lock the address; a success doesn't reset this count). The global pause is unchanged. There is no lockout per account across addresses, so nobody can lock the owner out by guessing at their name from elsewhere. Password confirm and change count the same way. The server's own login doesn't depend on any reverse proxy in front of it.
+- **Behind a reverse proxy or tunnel:** set `trustedProxies=` in config.properties to the proxy's IP address(es) (for example the machine running cloudflared). For requests from exactly those addresses, the client address for the rate limit and the audit log comes from the last `X-Forwarded-For` entry (the one the proxy added; Cloudflare and cloudflared put the real client there). Otherwise every tunnelled client shares the proxy's address and its limits. Headers from other addresses are never trusted. "From the server PC" (setup, the loopback exemption) now also needs a Host header of `localhost`, `127.x.x.x` or `[::1]`, no proxy header (`CF-Connecting-IP` included), and a socket address that is not in `trustedProxies`. A reverse proxy must add `X-Forwarded-For`.
+- **Forced streamer mode, what the server leaves out** (`Redact` and `ServerIds`, applied when the user's `perms.streamer` is true; the owner and other users get the full data).
+  - **Opaque ids.** A forced user never gets a server address or a bot id. Every `"server"` value in every JSON answer (stashes, index, orders, bots' stash refs, link, delivery, planner) is replaced by `sid = base64url(HMAC-SHA256(secret, "server:" + address))[:12]`, and every `"botId"` by `"b" + base64url(HMAC-SHA256(secret, "bot:" + id))[:12]` (also the stream's `hello.botId`). The secret is generated once per install (`stash-manager-data/streamer-ids.key`, owner-only). Requests from a forced user must use these ids (query, body and `/bots/{id}/…` paths): they are mapped back, and a raw address or bot id answers `404`, so it can't be used to test guesses. `serverLabel` ("Server 1", …) is numbered over the stashes the user can see.
+  - **Bot free text** is always `"(hidden)"` when present: `orderBlocker`, `rescanBlocked`, `deliveryStorage.blocked`, `orders.active.phase`, order `phase` and `message`, activity titles and event lines. Stash names stay (they are the user's own configuration).
+
+  | Endpoint | For a forced user |
+  |---|---|
+  | `GET /api/v1/auth/state` | The user's own `perms.stashes[].server` → sid and `perms.bots[]` → bid. |
+  | `GET /api/v1/bots` (also) | `plugin` → `{}`, `scopes` → `[]`. Live viewer: `world.minY`/`height` are fixed at -64/384, so they don't tell the dimension (the terrain colours still can). |
+  | `GET /api/v1/stashes` | `server` → sid; `delivery` → null; `player`, `owner`, `conflict.player` → null; bot free text hidden; `serverLabel` for display. |
+  | `GET /api/v1/index` | `server` → sid; `player` and `dimension` removed; item `name` → its English name, `details` → `[]`; shulker `name` → its item's name ("Red Shulker Box"). No ETag/304 for this form. |
+  | `GET /api/v1/orders`, and the order in place/cancel/force-cancel/retry replies | `server` → sid; other users' `placedBy.name` → `"another user"` and their shulker `names` → null; `phase` and `message` → `"(hidden)"`. |
+  | `GET /api/v1/bots` | `botId` → bid; `player` → null, `proxy` → `{}`, `summary` → null; stash refs' `server` → sid. |
+  | `GET /api/v1/bots/{bid}/activity` | only `connection.{state, queuePosition, health, food, ping, uptimeSeconds, spectators}`; `current[]` keeps `kind`, `progress`, `since`, `level`, `source` (a known plugin subsystem, else `"(hidden)"`) and `title: "(hidden)"`; `modules` and `plugins` → `[]`; `events[]` keep `at`, `level`, `source` (known or `"(hidden)"`) and `text: "(hidden)"`. |
+  | `GET/POST /api/v1/bots/{bid}/settings` (both scopes), `GET /api/v1/bots/{bid}/jobs`, `GET/POST /api/v1/bots/{bid}/console` | `403 {permission: "streamer"}`, whatever the user's other permissions. |
+  | `GET /api/v1/link` | `urls` → `[]`; players → null; `server` → sid. (The API key stays owner-only.) |
+  | `GET /api/v1/delivery` | `server` → sid; `player` → null; item `name` → named after the item id. |
+  | Build Planner | `server` → sid in every answer (the plan's stash, ordered parts). |
+  | Live viewer stream (`/bots/{bid}/viewer/stream`) | every x/z rebased by a secret per-stream offset (whole chunks: the bot's chunk when the stream first sees it plus a uniform random shift in ±2^20 chunks per axis): tile and drop chunk coordinates, `self`, entities; `y` kept. `world.dim` → `"hidden"`; entity `n` removed; no `chat` events, `chat: []` in the snapshot. Default deny: only `snapshot`, `tiles`, `ents` and `hud` pass, each rewritten (the `hud`, inventory included, as is: it holds only numbers and item ids, counts and durability, nothing positional and no names). `hello` and the snapshot carry `relative: true`. Each reconnect gets a new offset. If the flag is turned on during a stream, it ends with `bye {revoked}` before its next write. |
+  | `GET /api/v1/bots/{bid}/viewer`, auth, icons, rescan, release, orders clear, planner delete | nothing sensitive (the server and bot ids in them are mapped). Users and audit: owner only. |
+
+  A test (`StreamerTest.everyLoggedInRouteIsClassified`) fails when a logged-in route isn't classified as redacted, no data, forbidden for forced users, or owner only. Every session response with an ETag carries `Vary: Cookie`, and logging out (`logout`, `logout-all`) sends `Clear-Site-Data: "cache"`.
+
+  The page hides the Console and Proxy tabs for a forced user. The Settings tab stays (for the theme and the user's own password) but doesn't show the plugin settings.
+- **Changing the flag:** only an explicit `streamer` key in `perms` changes it. A preset, or a `perms` object without the key (an older page), keeps the stored value, so nobody is un-forced by accident. The audit log records the transitions ("forced streamer mode ON" / "OFF").
+- **Audit redaction:** console commands that the console hides, and login-style commands (`login`, `register`, `pass`, `password`, `auth`, `key`, with or without `/`), are logged as `(hidden)`.
 
 ## Browser endpoints (website login required)
 
@@ -102,11 +169,11 @@ Endpoints (`/api/v1/auth/...`):
 - `GET /api/v1/link` (website login required; `apiKey` only in sudo mode, otherwise `apiKeySet: true` and `apiKeyHint`): `{ "apiKey": "...", "urls": ["http://192.168.1.20:8765", ...], "linked": { "player", "server", "stash", "lastSeen" } | null }`. `urls` are the addresses the server listens on (localhost and its LAN IPv4 addresses). `linked` stays `null` until an addon request authenticated with the *current* key arrives; it then holds that request's details.
 - `POST /api/v1/link/regenerate` (browser-write guard and sudo mode): makes a new key, saves it to `config.properties`, and returns `{ "ok": true, "apiKey": "<new key>" }`. The old key gets `401` from then on, and `linked` goes back to `null`.
 
-Anyone logged in to the website can read the key this way.
+Only the owner can read the key this way (see "Additions: website users").
 
 ## Browser writes (CSRF guard)
 
-Every state-changing request from the website (`POST /api/v1/link/regenerate`, `/api/v1/rescan`, `/api/v1/stashes/release`, `/api/v1/orders`, `/api/v1/orders/clear`, `/api/v1/orders/<id>/cancel` and `/force-cancel`, the `/api/v1/auth/...` POSTs) must meet all of these, otherwise it gets `403`:
+Every state-changing request from the website (`POST /api/v1/link/regenerate`, `/api/v1/rescan`, `/api/v1/stashes/release`, `/api/v1/orders`, `/api/v1/orders/clear`, `/api/v1/orders/<id>/cancel` and `/force-cancel`, the `/api/v1/planner/...` JSON POSTs, the `/api/v1/auth/...` POSTs) must meet all of these, otherwise it gets `403`:
 
 - the method is `POST`;
 - the header `X-Stash-Manager: 1` is present. A cross-site page can only send a custom header after a CORS preflight, and the preflight fails: `OPTIONS` always gets `405` and no `Access-Control-*` headers are ever sent;
@@ -254,9 +321,17 @@ Bots can craft missing empty shulker boxes from the stash's materials at a craft
 - `table` is true when a crafting table position is set and (if its chunk is loaded) it is a crafting table.
 - Both are required. Bots without crafting support leave the field out.
 
-A `crafting` that isn't an object or null, or whose `enabled` or `table` is missing or isn't a boolean, gets `400`. The server keeps it in memory like `naming`: a heartbeat that leaves it out keeps the stored value, and an explicit `null` clears it. `GET /api/v1/stashes` entries return it as `crafting` (`{ enabled, table }`, or `null` if never sent).
+- `tableSource` (optional, newer bots) says where the bot's crafting table comes from: `"set"` (a position the player set), `"found"` (found in the stash area), `"placed"` (placed from the stash), `"crafted"` (crafted from planks or logs) or `"none"` (none yet). Absent or `null` means an older bot that doesn't report it.
 
-The website shows a neutral note on the order form for the stash's bot: with `enabled` and `table` both true, "The bot may craft missing empty shulker boxes from the stash's materials."; with `enabled` true and `table` false, "Crafting is on, but no crafting table is set: the bot can't craft shulker boxes." Nothing is shown when `enabled` is false or `crafting` is `null`.
+A `crafting` that isn't an object or null, or whose `enabled` or `table` is missing or isn't a boolean, or whose `tableSource` is present, not null and not one of those five strings, gets `400`. The server keeps it in memory like `naming`: a heartbeat that leaves it out keeps the stored value, and an explicit `null` clears it. `GET /api/v1/stashes` entries return it as `crafting` (`{ enabled, table }`, plus `tableSource` when the bot sent one; `null` if never sent).
+
+The website shows a neutral note on the order form for the stash's bot:
+
+- `enabled` and `table` both true: "The bot may craft missing empty shulker boxes from the stash's materials." With a `tableSource` of set, found, placed or crafted it adds " (crafting table: <source>)".
+- `enabled` true, `table` false, with a `tableSource` (the bot can find, place or craft one): "No crafting table yet: the bot will look for one in the stash area, place one from the stash, or craft one from planks or logs."
+- `enabled` true, `table` false, without `tableSource` (an older bot): "Crafting is on, but no crafting table is set: the bot can't craft shulker boxes."
+
+Nothing is shown when `enabled` is false or `crafting` is `null`.
 
 ## Additions: creative tabs for bots that don't send them
 
@@ -444,3 +519,155 @@ Reply: `{ok}`. The `bot/next` reply gains `watchingActivity: bool`.
 
 - `GET /api/v1/bots/{id}/activity` returns `{activity, receivedAt, events:[…last 500, newest first…]}`. The server keeps the 500 most recent events per bot in memory. Fetching this marks the Activity tab as watched for 10 s.
 - The Activity tab is shown for bots whose `caps` include `"activity"`.
+
+## Additions: build planner
+
+A logged-in user uploads a schematic and gets its survival material list joined with a stash's index (have / available / missing), and can order what the stash has.
+
+**Permissions.** `planner` for every endpoint below, `plannerOrder` for `.../order` (dry runs included). `plannerOrder` implies `planner`, which implies `view`; `plannerOrder` does not need `order`. Stash scope applies: a `server`/`stash` outside it answers `404`. A plan belongs to the user who uploaded it: anyone else's plan id answers `404` (the owner's included).
+
+**Upload.** `POST /api/v1/planner/upload?server=..&stash=..&name=<file name>`, the raw file as the body.
+- Guard `BROWSER_UPLOAD`: the browser-write checks (POST, `X-Stash-Manager: 1`, same `Origin`, `Sec-Fetch-Site`) but `Content-Type: application/octet-stream` instead of JSON, then a session. Anything else gets `403`.
+- `server` and `stash` are optional (both or neither); with them the reply is joined with that stash.
+- Formats: Litematica `.litematic` (a `BlockStates` array longer than needed is padding and accepted), Sponge `.schem` (versions 1-3), vanilla structure `.nbt` (gzip or raw NBT; block entries past the declared size are ignored).
+- Body at most 8 MiB (`413` with no body and `Connection: close`: the rest of the upload is never read). An empty body, a file that can't be read or is over the parser's limits, or a read that takes over 10 s: `400 { error }` with a short message that never quotes the file. A pre-1.13 MCEdit `.schematic`: `422` with the hint to re-save it as `.litematic` or `.schem`.
+- At most 2 files are read at once, on a dedicated pool (`429` with `Retry-After` when both are busy). Per user: 10 uploads a minute and 60 an hour (`429 { error, retryAfter }` with `Retry-After`); every accepted attempt counts, failed ones included.
+- The block-items table is the one with the lowest data version not below the file's (a 1.21.5-1.21.10 file gets the 1.21.11 table), or the newest when the file is newer than every table or has no data version. A block that table doesn't know is looked up in the other bundled tables before it counts as unknown. `newerThanTable` is true when the file is newer than the newest table.
+- Reply: `200 { ok, plan }` (below, with the default options). Audit action `planner.upload` (file name, format, block count).
+
+**What is kept.** The file bytes are never written to disk or logged and are dropped when the request ends. The server keeps only the computed list, in memory: id `p-<12 hex>`, owner, the file name (everything up to the last `/` or `\` removed, unprintable and invisible characters dropped, at most 64 characters), format, data version, size, dimensions, block count, the item, fluid, chest-content and unknown-block counts, `createdAt` and the last use. A plan ends 30 minutes after its last use or 2 hours after the upload, when it is deleted, when its user has no session left (at once on logout, logout-all, disabling or deleting the user, a password reset or "log out" by the owner; on expiry at the next planner request), and on restart. At most 3 per user (the oldest goes) and 50 in all (the oldest goes).
+
+**Endpoints.**
+- `GET /api/v1/planner` → `{ plans: [{ id, fileName, format, blocks, createdAt, expiresAt }] }`, the caller's plans, oldest first.
+- `GET /api/v1/planner/{id}?server=..&stash=..&multiplier=1&exclude=<id>,<id>&fluids=1&containerItems=1&round=none` → `{ ok, plan }`. `server` and `stash` are required here; switching them needs no new upload.
+- `POST /api/v1/planner/{id}/view` (`BROWSER_WRITE`, `planner`) `{ server, stash, multiplier, exclude, fluids, containerItems, round }` → the same as the GET, with the options as JSON (the page uses this: a long `exclude` list doesn't fit a URL). It changes nothing.
+- `POST /api/v1/planner/{id}/delete` → `{ ok }` (`BROWSER_WRITE`).
+- `POST /api/v1/planner/{id}/order` (`BROWSER_WRITE`, `plannerOrder`) `{ server, stash, multiplier, exclude, fluids, containerItems, round, names, dryRun, part }`.
+
+**Options** (view and order): `multiplier` 1-64 (default 1); `exclude` item ids left out (at most 2000; in the query, comma-separated); `fluids` adds `minecraft:water_bucket` / `minecraft:lava_bucket` for source blocks (default off); `containerItems` adds the items inside chests and other block entities (default off); `round` `none` | `stack` | `shulker` rounds each line up to whole stacks or a whole shulker (27 stacks). A bad option answers `400`.
+
+**plan:** `{ id, fileName, format ("litematic" | "sponge" | "structure"), formatVersion, dataVersion, size, dimensions: {x, y, z}, regions, blocks, tableVersion, tableDataVersion, newerThanTable, createdAt, expiresAt, options, fluids, containerItems, unknown: [{ id, count }], unknownOmitted, stash: { server, stash, indexed, mcVersion } | null, items, totals, ordered }`.
+- `items`, in creative order (tab, then the index's `tabOrder`, then id): `{ id, name, icon, mc, base, need, from: { blocks, fluids, containers }, inIndex, inStash, available, missing, want, maxStack, variants, excluded }`. `need` = `base` × multiplier. `inStash` is the index count of the plain id key only (`OrderCounts.total("item", id)`). `available` = `inStash` minus what open orders reserve (the numbers order placement uses). `missing` = max(0, need − available). `want` = min(need rounded as asked, available), 0 when excluded. `variants` counts the same id under component-patched keys (`id#hash`): shown, never counted as have and never ordered. `maxStack` comes from the index, else the block-items table. `name`, `icon` and `mc` come from any stored index that has the id (no icon: the page shows the placeholder).
+- `totals`: `need`, `available` (sum of min(need, available)), `missing`, `want` over the rows not excluded; with an index also `lines`, `slots`, `shulkers` and `parts` of the split below.
+- `totals.frozen` is true when `want`, `lines`, `slots`, `shulkers` and `parts` come from the split a part was placed with (see Order), so they match the parts being ordered.
+- `ordered`: `{ partsTotal, placed: { "<part>": "<order id>" }, remaining: [parts never placed], again: [placed parts whose order failed or was cancelled], locked, sameOptions, options, server, stash }` once a part has been placed, else `null`. `options`, `server` and `stash` are the ones the split was made with; `sameOptions` says whether this view asked for them. The view may preview other options while the order is `locked`.
+
+**Order.**
+- Lines are the rows with `want` > 0, in creative order; rows with `want` 0 are dropped and listed as `notAvailable`.
+- They are split into parts: each item line takes `ceil(count / maxStack)` slots (an empty-shulker line one shulker per unit), and a part may need at most 54 shulkers (as order placement counts them) and hold at most 200 lines. A line that doesn't fit is split at the part's remaining room (whole stacks) and the rest starts the next part. Every part is checked against the order limits.
+- `dryRun: true` → `{ ok, dryRun, parts: [{ part, lines: [{type, key, count}], lineCount, shulkers, slots, items, order }], partsTotal, remaining, notAvailable: [{ id, need }], missing: [{ id, missing }] }`. Nothing is placed.
+- Otherwise one part is placed (`part`, 1-based, default 1) through the normal order placement (`placedBy` is the user; every check of `POST /api/v1/orders` applies and answers the same way): `200 { ok, order, part, partsTotal, remaining, again, placed }`. The part is recorded as placed as soon as the order exists. `400` for a part number past the end or when nothing is available, `409` for a part whose order is pending, running or delivered (or no longer in the order history). A placed part whose order failed or was cancelled may be ordered again; the new order replaces it (the audit entry says "again, was ...").
+- The split is remembered on the plan (one per plan) with the options and stash it was made with. Until a part is placed, every dry run or order computes it afresh; once one is placed it is kept as it is, so the later parts are the confirmed ones even though the placed part now reserves its items. While any placed part's order is not failed or cancelled the split is **locked**: a dry run or order with other options or another stash answers `409 "options can't change after a part is ordered; dismiss and upload again, or keep the options"`. Once every placed part failed or was cancelled, other options start a new split. The bots end an order when the delivery container is full, so the page offers "Order next part" once the previous part's order has finished.
+- `names: true` → `{ "mode": "all", "name": "Build: <file name>" }`, plus `" <i>/<n>"` with several parts, cut to 50 characters (the file part is shortened, `§` removed) and checked like any order's names.
+- Audit action `planner.order` (file name, part, order id, stash).
+
+## Additions: delivery storage (plugin 1.9.0, addon 0.4.0-dev.5)
+
+The heartbeat may carry `deliveryStorage` (a separate field: `delivery` stays the container position):
+
+```json
+"deliveryStorage": { "autoExpand": true, "chests": 3, "full": 1, "canExpand": true, "blocked": null }
+```
+
+- `chests`: delivery chests (the delivery container plus the chests the bot put up above it; a double chest counts once). `full`: how many of them are full (0 <= full <= chests).
+- `canExpand`: auto expand is on and nothing stops the bot from putting up another chest. `blocked`: why it can't (at most 160 characters from the bot, cut to the status length here), or null. Never positions.
+- Absent: an older bot (the stored value is kept); null clears it. A malformed value gets `400`, like the other status fields.
+- `GET /api/v1/stashes` returns it as `deliveryStorage` (or null). The website shows "N delivery chests, M full, …" with the order maker.
+- With every chest full, the bot pauses the order ("paused: waiting for delivery space: <why>", at most 2 hours) instead of ending it.
+
+## Additions: live viewer
+
+A logged-in user with the `viewer` permission can watch a bot live: a map of the chunks around it (vanilla map colours), its position and heading, nearby players, mobs and dropped items, its HUD (health, food, XP, armour, hotbar, offhand) and its chat. Bot to server: signed frames at up to 5 Hz, sent only while someone watches. Server to browser: Server-Sent Events. Everything is in memory: nothing is written to disk, and no position, name or chat line is logged. Plugin bots only (the Meteor addon has no signed dashboard link).
+
+**Permission.** `perms.viewer` (boolean; the owner has it). It implies `activity` (the bot list). Presets: `operator` has it, `viewer` and `orderer` don't. `Router.Perm.VIEWER` guards both browser routes; a bot outside the user's bot scope is `404`.
+
+**Start and stop (bot/next).** The `bot/next` reply gains `"watchingViewer": <bool>` and, only while watching, `"viewer": {"radius": 8, "hz": 5, "session": "<16 hex>"}`. A change of either wakes the long-poll. Every open browser stream refreshes the watch every 4 s and once more when it closes, so watching lingers 10 s after the last stream (a reconnect keeps the session). A new session is minted when watching starts, or when the server has no viewer state for the bot; a new session means the bot's next frame must be full.
+
+### POST /api/v1/bot/viewer (signed, like every bot/* request)
+
+Body at most 512 KiB (`413` above). At most 15 frames per second per bot (`429 {"ok":false,"error":…,"retryMs":n}`; every attempt counts). Unknown bot (no `bot/hello`): `409`. Anything malformed: `400`.
+
+```json
+{"botId":"ct113","v":1,"session":"9f3c…","seq":1042,"t":1730790000123,"full":false,
+ "world":{"dim":"minecraft:overworld","minY":-64,"height":384},
+ "self":{"x":123.4,"y":64,"z":-88.0,"yaw":91},
+ "tiles":[{"x":7,"z":-6,"c":"<base64 of 256 bytes>","h":"<base64 of 512 bytes>"}],
+ "drop":[[5,-9]],
+ "ents":[{"id":311,"k":"player","n":"Steve","x":130.2,"y":64,"z":-80.5,"yaw":180},
+         {"id":402,"k":"mob","t":"zombie","x":1,"y":2,"z":3,"yaw":12},
+         {"id":509,"k":"item","t":"minecraft:diamond","c":3,"x":1,"y":2,"z":3}],
+ "hud":{"hp":18.5,"food":17,"sat":2.0,"xp":30,"xpP":0.42,"armor":15,"held":2,
+        "hotbar":[{"id":"minecraft:diamond_sword","c":1,"d":120,"md":1561},null,null,null,null,null,null,null,null],
+        "armorSlots":[null,null,null,null],"offhand":{"id":"minecraft:totem_of_undying","c":1},
+        "inv":[{"id":"minecraft:dirt","c":64},null, … 27 entries in all …]},
+ "chat":[{"t":1730790000001,"k":"public","s":"Steve","to":null,"m":"hello"}]}
+```
+
+- `v` is 1; `session` is the 16-hex session from `bot/next`; `seq` (≥ 0) increases within a session; `t` is the bot's clock (epoch ms) when the frame was captured.
+- `full:true` replaces the server's state: it needs `world`, `self`, `tiles` and `ents` (`hud` may be missing for a moment at login: the page shows "-"; `chat` optional, at most 50 lines; the plugin sends at most 20). A full frame needn't cover the whole radius (the plugin sends the nearest 300 tiles); later frames add the rest.
+- Otherwise a missing `world`/`self`/`tiles`/`drop`/`ents`/`hud`/`chat` means unchanged. `ents`, when present, is the complete list (at most 256). A delta whose `seq` isn't above the last one applied is ignored; one more than 100,000 above it is not applied (`resync`).
+- **Tiles:** chunk `x`/`z` (|v| ≤ 2,000,000); `c` = 256 packed map bytes (`colourId*4 + brightness`, 0 = transparent) and `h` = 512 bytes (int16 little-endian top y per column, -32768 = none), columns `i = lz*16 + lx`. Standard base64 with padding; a tile whose `c` isn't 344 characters / 256 bytes, or whose `h` isn't 684 / 512, is `400`. At most 625 `tiles` and 625 `drop` (`[x, z]` pairs). A tile or drop more than (radius + 2) x 16 = 160 blocks from the bot's position on either axis is ignored. The server keeps at most 1,024 tiles per bot: past that the farthest from the bot go and every stream gets a fresh snapshot.
+- **Entities:** `id` (int), `k` one of `player`, `mob`, `item`, `other`; optional `n` (≤ 16 characters, players), `t` (≤ 64: a mob type such as `zombie`, an item id such as `minecraft:diamond`), `c` (item count), `yaw`; `x`/`y`/`z` required. Only these fields are kept; positions are rounded to 0.1, yaw to a whole number.
+- **HUD:** optional numbers `hp`, `food`, `sat`, `xp`, `xpP` (0-1), `armor`, `held` (0-8); `hotbar` exactly 9 entries, `armorSlots` (optional) exactly 4, `offhand` (optional), `inv` (optional: the main inventory, window 0 slots 9-35, top left to bottom right) exactly 27; each an item `{id, c, d?, md?}` (id ≤ 64 characters, `namespace:path`; ids and the dimension are lowercased before they are checked) or null. `d` (damage, whole, ≥ 0) and `md` (max damage, whole, 1-100,000) come together and only for damageable items, with `d` ≤ `md`; one without the other, or `d` > `md`, is `400`. Nothing else of an item is kept (no custom names). Plugins before 1.12.0 send no `inv` and no `d`/`md`: the page then shows no durability bars and says the inventory isn't sent; an older server ignores the new keys (it keeps only the fields listed). The plugin sends the HUD when it changes (inventory included) and at least every 5 s, never more often than its 5 Hz frame tick.
+- **Chat:** at most 20 lines per delta; `t`, `k` one of `public`, `whisper`, `system`, `death`, `s` and `to` (text or null, cut to 16 characters; system and death lines have `s: ""`, `to` is null except on whispers), `m` (text, cut to 256). Control characters become spaces. Long text is cut, never refused.
+- **Reply:** `200 {"ok":true,"watching":<bool>,"resync":<bool>}`. `watching:false`: stop sending. `resync:true`: the frame was not applied (a session that isn't the current one, or a delta with no full frame to build on); the next frame must be full, with the session from `bot/next`.
+
+### Browser routes (website login, `viewer` permission)
+
+- Item icons (`/icon/…`) need `view` or `viewer` (the hotbar and inventory), for item ids as before.
+- `GET /api/v1/bots/{id}/viewer` → `{now, live, lastFrameAt, streams, maxStreams, mc}` plus `yours`, `maxPerUser`, `total`, `maxTotal`, `online`. `live`: a snapshot younger than 3 s; `streams`/`maxStreams` count this bot's streams. The page uses it to explain a failed stream and as a clock for the latency figures.
+- `GET /api/v1/bots/{id}/viewer/stream?vs=<16 hex>` (GET only): `vs` names one viewer page and is kept across its reconnects. Checked before the headers: login and permission (`401`/`403`), the bot and its scope (`404`), the `Origin` / `Sec-Fetch-Site` rules of browser writes (`403`), `vs` (`400`), and the caps (`429`, `Retry-After: 5`): 8 streams on the server, 2 per user, 4 per bot; and, counted from the handler's start to its end (a replaced stream may still be finishing a write), at most 3 viewer connections per user and 10 on the server. A user may open at most 12 streams a minute and 20 new viewer pages (`vs`) an hour (`429`). A new stream of the same `vs` replaces the old one (which gets `bye {capacity}`) and doesn't count against the caps.
+- Response: `200`, `Content-Type: text/event-stream; charset=utf-8`, `Cache-Control: no-cache, no-transform`, `X-Accel-Buffering: no`, chunked, never compressed. It starts with `retry: 1000`; each event is `event: <name>`, `id: <session>:<rev>` (when there is state) and `data: <one line of JSON>`. A `: hb` comment every 10 s, and a `:` ping comment whenever nothing was sent for 3 s (so a closed tab is noticed within seconds). Each batch is flushed at once. Writes go through a few dedicated writer threads: a write that doesn't finish within 8 s (a reader that stopped reading) ends the stream and frees its pool thread at once, and a stream to a very slow reader is cut 15 s after its rotate time. Such stuck writes are counted until they end: a user with 2 of them, or the server with 8, gets `429` for new streams, so the 16 writer threads never all stall.
+
+| event | data |
+|---|---|
+| `hello` | `{botId, mc, st, rotateMs}` |
+| `snapshot` | `{session, seq, t, rt, st, world, self, tiles[], ents[], hud, chat[≤100]}` |
+| `tiles` | `{seq, t, rt, st, tiles[], drop[]}` |
+| `ents` | `{seq, t, rt, st, self, ents[]}` |
+| `hud` | `{seq, t, rt, st, hud}` |
+| `chat` | `{lines[]}` |
+| `status` | `{state}`: `waiting` (no state yet), `live`, `stale` (no frame for 3 s) or `offline` (the bot isn't polling) |
+| `bye` | `{reason}`: `rotate`, `revoked` or `capacity` |
+
+`t` = the bot's capture time, `rt` = the server's receive time, `st` = the server's send time (all epoch ms); `seq`/`t`/`rt` are those of the latest frame that changed that part.
+
+- **Rotation:** each response ends itself with `bye {rotate}` after 45 s (the JDK server kills any response 60 s after its request); the page reconnects at once and gets a fresh snapshot.
+- **Revocation:** before a batch is written (at most every 5 s) the session and permission are checked again (`Router.stillAllowed`); on failure only `bye {revoked}` is sent: a logged-out, disabled or deleted user, a changed password, a lost `viewer` permission or a bot taken out of the user's scope ends the stream with `bye {revoked}`.
+- **Coalescing:** per stream, tiles are queued newest-wins per chunk, entities and HUD latest-only, chat at most 100 lines. A stream holding more than 2 MiB (a slow reader) drops its queue and gets one fresh snapshot instead. A full frame sends every stream a snapshot.
+- **Memory:** about 0.7 MB per bot (625 tiles; at most 1,024); a bot's state is dropped 60 s after its last stream closed. Snapshots are put together under the bot's lock and serialized after it is released.
+- **Audit:** `viewer.open` when a user starts watching a bot (at most once per user and bot per 15 minutes), `viewer.close` once that user has had no stream to that bot for 15 s (only after an audited open). Only the bot id and how long; never positions, names or chat.
+
+**Colours.** `src/main/resources/web/map-palette.json` = `{"v":1,"mc":["1.21.4","1.21.11"],"rgb":[256 ints]}`: index = packed map byte, value = `0xRRGGBB`, or `-1` for transparent (ids 0-3, and ids the game doesn't define). Generated by `dev/map-colors` from the game's own `MapColor`, with both versions checked equal.
+
+## Additions: delivery storage contents
+
+The Orders tab's delivery chest preview shows what is **already** in the delivery storage (left over from earlier orders), so you can see whether a new order fits. These contents are **never** part of the index, search, the stock counts or the build planner's "have", and they hold no positions. The server keeps them **in memory only** (never written to disk or logged); after a restart it asks again.
+
+**Heartbeat.** The body gains an optional `"deliveryHash": "<40 lowercase hex>"` (the hash of the bot's current report, below): absent from older bots, `null` when no delivery container is set (the stored report, if any, is dropped). Anything else gets `400`. The reply **always** carries `"needDelivery": <bool>` from servers that support this (a bot only sends reports once it has seen the key): `true` when the heartbeat has a `deliveryHash` and the server holds no report for that (server, stash) or one with a different hash; `false` otherwise (no `deliveryHash` included).
+
+**`POST /api/v1/delivery`** (signed, like `/api/v1/index`, with the same owner check: `409 {owner}` for another bot's stash). Body at most 256 KiB (`413` above).
+
+```json
+{"version":1,"server":"2b2t.org","stash":"stash","player":"Qwerttze",
+ "hash":"<sha1 hex of the chests array>","readAt":1767225600000,
+ "chests":[
+   {"n":0,"size":54,"full":false,"readAt":1767225500000,
+    "items":[{"slot":0,"id":"minecraft:red_shulker_box","name":"Gems","count":1,"maxStack":1,
+              "shulker":true,"contents":[{"id":"minecraft:diamond","count":1728}]},
+             {"slot":5,"id":"minecraft:cobblestone","name":"Cobblestone","count":64,"maxStack":64}]},
+   {"n":1,"size":54,"full":true,"readAt":0,"items":null}
+ ]}
+```
+
+- `chests`: every delivery chest (at most 16) in **fill order**: `n` = 0 is the lowest chest with room, then the other chests with room (lowest first), then the full ones. `n` is 0-15 and unique; `size` is 27 or 54; `full` is the bot's view; `readAt` is when the bot last saw the chest (epoch ms), or 0 = never, in which case `items` is `null` (not seen). The bot may also send `items: null` for the last chests, and leave out shulker `contents`, to stay under the size limit.
+- `items`: the non-empty slots (at most `size`): `slot` (0 to size-1, unique), `id` (`namespace:path`; lowercased), `name` (untrusted: control characters are dropped and it is cut to 64 characters; it may end with "…"), `count` (1-10,000), `maxStack` (default 64), optional `damage`/`maxDamage`. Shulker boxes: `shulker: true` and `contents` (at most 27 `{id, count}` grouped by id; `[]` = empty; absent = not reported).
+- `hash`: sha1 of the canonical JSON of `chests` without the `readAt` fields; `readAt` (top level): the newest chest `readAt`.
+- The bot sends a report after delivering into a chest, after any read of a delivery chest, and when `needDelivery` asks; at most once every 5 s, and only when the hash changed or it was asked.
+- Reply: `200 {"ok":true}`; `400` for anything malformed (with the reason); `409` owner conflict; `413` too big. Only the known fields are kept.
+
+**Browser.**
+- `GET /api/v1/stashes` entries gain `"deliveryContents": {readAt, receivedAt, hash, chests, usedSlots, freeSlots, unknownChests}` or `null` (no report). `usedSlots`/`freeSlots` count the chests that were seen.
+- `GET /api/v1/delivery?server=&stash=` (login, `view`, stash scope: `404` outside it; `400` without both parameters): the cleaned report plus `receivedAt`, or `null` when there is none.
+
+**Website.** In the Orders tab's planned delivery chest, the items already in chest `n` = 0 are drawn in their slots, hatched and dimmed, with an "Already in the delivery chest" tooltip (name, count, a shulker's contents); the planned shulkers take the free slots after them, and those past the chest's free room are outlined (they go to the next chest). Below the chest: "Delivery chest: N of 54 slots used, M free; this order needs K (as of X ago)", or with several chests "3 delivery chests: U of T slots used, F free (1 not seen yet); the first (filled first) has M of 54 free; …". A chest never read shows "not seen yet". When the order needs more slots than are free (and every chest was seen), a warning says what happens: with `deliveryStorage.autoExpand` on, "the bot will put up more chests (if it can)"; otherwise "the order will pause until a chest is emptied". Names are shown as text only. Older bots (no report): the preview is as before.

@@ -62,7 +62,8 @@ public final class IndexStore {
     /** An index after validation, merging and serialization, built outside any lock. */
     private record Prepared(String server, String stash, String player, String indexHash, long receivedAt,
                             int itemTypes, long itemTotal, byte[] bytes, byte[] gzip, String etag,
-                            Map<String, String> idNames, String mcVersion, OrderCounts orderCounts, long[] containers) {
+                            Map<String, String> idNames, String mcVersion, OrderCounts orderCounts, long[] containers,
+                            Map<String, CreativeTabs.Entry> tabOrder) {
     }
 
     /**
@@ -120,8 +121,23 @@ public final class IndexStore {
         }
     }
 
-    /** Whether the bot can craft: auto-crafting is on, and a crafting table is set (and, if loaded, really is one). */
-    public record Crafting(boolean enabled, boolean table) {
+    /**
+     * Whether the bot can craft: auto-crafting is on, a crafting table is set (and, if loaded, really is one), and where
+     * its table comes from ("set", "found", "placed", "crafted" or "none"; null for an older bot that doesn't report it).
+     */
+    public record Crafting(boolean enabled, boolean table, String tableSource) {
+        public static final java.util.Set<String> TABLE_SOURCES = java.util.Set.of("set", "found", "placed", "crafted", "none");
+
+        public Crafting(boolean enabled, boolean table) {
+            this(enabled, table, null);
+        }
+    }
+
+    /**
+     * The delivery storage (plugin 1.9.0 / addon 0.4.0-dev.5 heartbeat "deliveryStorage"): how many delivery chests
+     * there are, how many are full, whether more can be put up, and why not. Never positions.
+     */
+    public record DeliveryStorage(boolean autoExpand, int chests, int full, boolean canExpand, String blocked) {
     }
 
     /**
@@ -130,8 +146,15 @@ public final class IndexStore {
      */
     public record BotStatus(boolean hasDelivery, Delivery delivery, boolean hasBlocker, String orderBlocker,
                             long rescanDone, boolean hasRescanBlocked, String rescanBlocked, boolean hasNaming, Naming naming,
-                            boolean hasCrafting, Crafting crafting) {
-        public static final BotStatus NONE = new BotStatus(false, null, false, null, -1, false, null, false, null, false, null);
+                            boolean hasCrafting, Crafting crafting, boolean hasStorage, DeliveryStorage storage) {
+        public static final BotStatus NONE = new BotStatus(false, null, false, null, -1, false, null, false, null, false, null, false, null);
+
+        public BotStatus(boolean hasDelivery, Delivery delivery, boolean hasBlocker, String orderBlocker, long rescanDone,
+                         boolean hasRescanBlocked, String rescanBlocked, boolean hasNaming, Naming naming, boolean hasCrafting,
+                         Crafting crafting) {
+            this(hasDelivery, delivery, hasBlocker, orderBlocker, rescanDone, hasRescanBlocked, rescanBlocked, hasNaming, naming,
+                hasCrafting, crafting, false, null);
+        }
     }
 
     /** A stash's stored player and when it was last seen, for adopting owners on load. */
@@ -151,6 +174,13 @@ public final class IndexStore {
     }
 
     /** Whether the server holds anything (index or heartbeat state) for the pair. */
+    /** Every server address the store knows a stash for. */
+    public java.util.Set<String> servers() {
+        java.util.Set<String> out = new java.util.HashSet<>();
+        for (StashKey k : stashes.keySet()) out.add(k.server());
+        return out;
+    }
+
     public boolean has(String server, String stash) {
         return stashes.containsKey(new StashKey(server, stash));
     }
@@ -168,6 +198,7 @@ public final class IndexStore {
         Delivery delivery;
         Naming naming;
         Crafting crafting;
+        DeliveryStorage storage;
         String orderBlocker;
         long rescanRequested; // latest rescan request id, 0 = none
         long rescanDone;      // highest id the bot acknowledged
@@ -457,6 +488,14 @@ public final class IndexStore {
         index.addProperty("receivedAt", receivedAt);
         byte[] disk = Json.GSON.toJson(index).getBytes(StandardCharsets.UTF_8);
         byte[] bytes = tabs.fill(index) > 0 ? Json.GSON.toJson(index).getBytes(StandardCharsets.UTF_8) : disk;
+        Map<String, CreativeTabs.Entry> tabOrder = new HashMap<>();
+        for (JsonElement e : index.getAsJsonArray("items")) {
+            JsonObject item = e.getAsJsonObject();
+            JsonElement tab = item.get("tab");
+            if (tab == null || !tab.isJsonPrimitive() || !tab.getAsJsonPrimitive().isString()) continue;
+            int order = isNumber(item, "tabOrder") ? (int) Math.max(Integer.MIN_VALUE, Math.min(Integer.MAX_VALUE, item.get("tabOrder").getAsDouble())) : 1_000_000;
+            tabOrder.putIfAbsent(item.get("key").getAsString(), new CreativeTabs.Entry(tab.getAsString(), order));
+        }
         String mc = stringOrNull(index, "mcVersion");
         if (mc == null || !IconService.MC_VERSION.matcher(mc).matches()) mc = IconService.DEFAULT_MC;
         return new Built(new Prepared(
@@ -473,7 +512,8 @@ public final class IndexStore {
             Map.copyOf(idNames),
             mc,
             orderCounts,
-            containers(index)), disk);
+            containers(index),
+            Map.copyOf(tabOrder)), disk);
     }
 
     /** {known, total, stale} from the index's containers object (missing numbers are 0), or null. */
@@ -519,6 +559,7 @@ public final class IndexStore {
             if (status.hasBlocker()) s.orderBlocker = status.orderBlocker();
             if (status.hasNaming()) s.naming = status.naming();
             if (status.hasCrafting()) s.crafting = status.crafting();
+            if (status.hasStorage()) s.storage = status.storage();
             if (status.hasRescanBlocked()) s.rescanBlocked = status.rescanBlocked();
             if (status.rescanDone() > s.rescanDone) s.rescanDone = status.rescanDone();
             boolean needIndex = s.index == null || indexHash == null || !indexHash.equals(s.index.indexHash);
@@ -587,9 +628,22 @@ public final class IndexStore {
                     JsonObject c = new JsonObject();
                     c.addProperty("enabled", s.crafting.enabled());
                     c.addProperty("table", s.crafting.table());
+                    // Only from bots that report it (an older bot's entry stays {enabled, table}).
+                    if (s.crafting.tableSource() != null) c.addProperty("tableSource", s.crafting.tableSource());
                     o.add("crafting", c);
                 } else {
                     o.add("crafting", com.google.gson.JsonNull.INSTANCE);
+                }
+                if (s.storage != null) {
+                    JsonObject ds = new JsonObject();
+                    ds.addProperty("autoExpand", s.storage.autoExpand());
+                    ds.addProperty("chests", s.storage.chests());
+                    ds.addProperty("full", s.storage.full());
+                    ds.addProperty("canExpand", s.storage.canExpand());
+                    ds.addProperty("blocked", s.storage.blocked());
+                    o.add("deliveryStorage", ds);
+                } else {
+                    o.add("deliveryStorage", com.google.gson.JsonNull.INSTANCE);
                 }
                 o.addProperty("orderBlocker", s.orderBlocker);
                 o.addProperty("rescanPending", rescanPending(s));
@@ -641,6 +695,31 @@ public final class IndexStore {
             p = s.index;
         }
         return p == null ? null : p.orderCounts;
+    }
+
+    /**
+     * Each item key's creative tab and tabOrder in a stash's current index (with the creative-tab fallback filled in),
+     * for keys that have a tab. Empty when there is no index.
+     */
+    Map<String, CreativeTabs.Entry> tabOrder(String server, String stash) {
+        Stash s = stashes.get(new StashKey(server, stash));
+        if (s == null) return Map.of();
+        Prepared p;
+        synchronized (s) {
+            p = s.index;
+        }
+        return p == null ? Map.of() : p.tabOrder;
+    }
+
+    /** The Minecraft version of a stash's current index, or null when it has none. */
+    String mcVersion(String server, String stash) {
+        Stash s = stashes.get(new StashKey(server, stash));
+        if (s == null) return null;
+        Prepared p;
+        synchronized (s) {
+            p = s.index;
+        }
+        return p == null ? null : p.mcVersion;
     }
 
     /** The mcVersion of any stored index (for icons that are not in an index), or the default. */

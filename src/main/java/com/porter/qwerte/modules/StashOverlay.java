@@ -145,7 +145,7 @@ public class StashOverlay extends Module {
         if (stash == null) return;
 
         for (Box box : stash.boxes) {
-            if (!box.known() || (hideExcluded.get() && box.excluded)) continue;
+            if (!box.known() || box.foreign || (hideExcluded.get() && box.excluded)) continue;
 
             Icon icon = iconFor(box);
             if (icon != null) icons.add(icon);

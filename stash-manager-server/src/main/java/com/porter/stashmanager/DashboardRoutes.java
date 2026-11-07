@@ -31,18 +31,21 @@ final class DashboardRoutes {
     private final IndexStore store;
     private final Owners owners;
     private final SessionStore sessions;
+    private final AuditLog audit;
 
-    DashboardRoutes(BotHub hub, IndexStore store, Owners owners, SessionStore sessions) {
+    DashboardRoutes(BotHub hub, IndexStore store, Owners owners, SessionStore sessions, AuditLog audit) {
         this.sessions = sessions;
+        this.audit = audit;
         this.hub = hub;
         this.store = store;
         this.owners = owners;
     }
 
     void register(Router router) {
-        router.exact(Router.GET, "/api/v1/bots", Router.Guard.SESSION, this::list)
-            .pattern(Router.GET, BOT, Router.Guard.SESSION, this::get)
-            .pattern(Router.POST, BOT, Router.Guard.BROWSER_WRITE, this::post);
+        // Every bot route needs the Bots view; settings, proxy and console levels are checked below.
+        router.exact(Router.GET, "/api/v1/bots", Router.Guard.SESSION, Router.Perm.ACTIVITY, this::list)
+            .pattern(Router.GET, BOT, Router.Guard.SESSION, Router.Perm.ACTIVITY, this::get)
+            .pattern(Router.POST, BOT, Router.Guard.BROWSER_WRITE, Router.Perm.ACTIVITY, this::post);
     }
 
     // ---------- list ----------
@@ -51,9 +54,11 @@ final class DashboardRoutes {
         long now = hub.now();
         JsonArray stashes = store.listJson();
         JsonArray out = new JsonArray();
+        Users.Perms perms = Router.user(ex).perms();
         for (BotHub.Bot b : hub.all()) {
             JsonObject o = new JsonObject();
             synchronized (b) {
+                if (!perms.seesBot(b.botId)) continue;
                 o.addProperty("botId", b.botId);
                 o.addProperty("player", b.player);
                 o.addProperty("online", BotHub.online(b, now));
@@ -81,7 +86,7 @@ final class DashboardRoutes {
                     String stash = s.get("stash").getAsString();
                     String owner = owners.owner(server, stash);
                     String used = s.has("player") && !s.get("player").isJsonNull() ? s.get("player").getAsString() : null;
-                    if (player.equalsIgnoreCase(owner != null ? owner : used == null ? "" : used)) {
+                    if (player.equalsIgnoreCase(owner != null ? owner : used == null ? "" : used) && perms.seesStash(server, stash)) {
                         JsonObject ref = new JsonObject();
                         ref.addProperty("server", server);
                         ref.addProperty("stash", stash);
@@ -90,6 +95,7 @@ final class DashboardRoutes {
                 }
             }
             o.add("stashes", mine);
+            if (Redact.on(ex)) Redact.bot(o);
             out.add(o);
         }
         Http.json(ex, 200, out);
@@ -101,16 +107,32 @@ final class DashboardRoutes {
         return sessions.elevated((String) Http.attr(ex, Router.SESSION_TOKEN));
     }
 
+    /** The bot, or null after answering 404 (also for a bot outside the user's bot scope). */
     private BotHub.Bot bot(HttpExchange ex, Matcher m) throws IOException {
-        BotHub.Bot b = hub.bot(m.group(1));
+        String id = Router.botParam(ex, m.group(1)); // forced streamer mode: an opaque bot id
+        BotHub.Bot b = id != null && Router.user(ex).perms().seesBot(id) ? hub.bot(id) : null;
         if (b == null) Http.error(ex, 404, "no such bot");
         return b;
+    }
+
+    private static Users.Perms perms(HttpExchange ex) {
+        return Router.user(ex).perms();
     }
 
     private void get(HttpExchange ex) throws IOException {
         Matcher m = BOT.matcher(ex.getRequestURI().getRawPath());
         if (!m.matches()) {
             Http.error(ex, 404, "not found");
+            return;
+        }
+        if (m.group(2).equals("console") && !perms(ex).consoleRead()) {
+            Router.forbid(ex, "use the console", "console");
+            return;
+        }
+        // Forced streamer mode: only the (redacted) activity. Settings values, job results and the console can hold
+        // positions and names.
+        if (Redact.on(ex) && !m.group(2).equals("activity")) {
+            streamerForbid(ex);
             return;
         }
         BotHub.Bot b = bot(ex, m);
@@ -120,11 +142,15 @@ final class DashboardRoutes {
             case "activity" -> {
                 // Read-only status: a login is enough (no sudo).
                 hub.watchActivity(b);
-                Http.json(ex, 200, hub.activityJson(b));
+                Http.json(ex, 200, Redact.on(ex) ? Redact.activity(hub.activityJson(b)) : hub.activityJson(b));
             }
             case "settings" -> {
                 String scope = q.getOrDefault("scope", "plugin");
-                // The proxy's and other plugins' configs are shown in sudo mode only (like the console).
+                // The proxy's and other plugins' configs: the proxy permission, and sudo mode (like the console).
+                if (!scope.equals("plugin") && !perms(ex).proxyRead()) {
+                    Router.forbid(ex, "see the proxy settings", "proxy");
+                    return;
+                }
                 if (!scope.equals("plugin") && !elevated(ex)) {
                     Http.error(ex, 403, "confirm password");
                     return;
@@ -140,6 +166,10 @@ final class DashboardRoutes {
                 Http.json(ex, 200, hub.jobs(b, ids));
             }
             default -> {
+                if (!perms(ex).consoleRead()) {
+                    Router.forbid(ex, "use the console", "console");
+                    return;
+                }
                 if (!elevated(ex)) {
                     Http.error(ex, 403, "confirm password");
                     return;
@@ -151,11 +181,18 @@ final class DashboardRoutes {
                 } catch (NumberFormatException e) {
                     after = 0;
                 }
-                JsonObject out = hub.console(b, after);
+                // "list" users see only what they sent; "full" (and the owner) see the whole console.
+                Users.Principal who = Router.user(ex);
+                JsonObject out = hub.console(b, after, "full".equals(who.perms().console()) ? null : who.id());
                 out.addProperty("online", hub.online(b));
                 Http.json(ex, 200, out);
             }
         }
+    }
+
+    /** 403 for what a user in forced streamer mode can't use (settings, proxy settings, console, job results). */
+    static void streamerForbid(HttpExchange ex) throws IOException {
+        Router.forbid(ex, "use that in streamer mode (enforced by the owner)", "streamer");
     }
 
     private void getSettings(HttpExchange ex, BotHub.Bot b, String scope) throws IOException {
@@ -203,6 +240,14 @@ final class DashboardRoutes {
             Http.error(ex, 404, "not found");
             return;
         }
+        if (Redact.on(ex)) {
+            streamerForbid(ex);
+            return;
+        }
+        if (m.group(2).equals("console") && !perms(ex).consoleRead()) {
+            Router.forbid(ex, "use the console", "console");
+            return;
+        }
         BotHub.Bot b = bot(ex, m);
         if (b == null) return;
         JsonElement json = AddonRoutes.readJson(ex);
@@ -240,8 +285,16 @@ final class DashboardRoutes {
             Http.error(ex, 400, "scope must be plugin, proxy or plugin:<id>");
             return;
         }
+        if (scope.equals("plugin") && !perms(ex).settings()) {
+            Router.forbid(ex, "change settings", "settings");
+            return;
+        }
         if (!scope.equals("plugin")) {
             // The proxy's own config and other plugins' configs: a proxy cap and "sudo mode" (password in the last 15 min).
+            if (!perms(ex).proxyChange()) {
+                Router.forbid(ex, "change the proxy settings", "proxy");
+                return;
+            }
             if (!caps(b, "proxy")) {
                 Http.error(ex, 400, "this bot doesn't offer the proxy settings");
                 return;
@@ -298,6 +351,9 @@ final class DashboardRoutes {
             return;
         }
         List<String> ids = hub.queueSets(b, scope, changes);
+        StringBuilder paths = new StringBuilder();
+        for (JsonObject c : changes) paths.append(paths.isEmpty() ? "" : ", ").append(c.get("path").getAsString());
+        audit.add(Router.user(ex), "settings.change", b.botId + " " + scope + ": " + paths, AuthRoutes.address(ex));
         JsonObject out = Http.ok();
         JsonArray jobs = new JsonArray();
         for (int i = 0; i < ids.size(); i++) {
@@ -380,6 +436,10 @@ final class DashboardRoutes {
             Http.error(ex, 400, "this bot doesn't offer a console");
             return;
         }
+        if (!perms(ex).consoleRead()) {
+            Router.forbid(ex, "use the console", "console");
+            return;
+        }
         // Console commands can do anything the proxy can: the password must have been typed in the last 15 minutes.
         if (!sessions.elevated((String) Http.attr(ex, Router.SESSION_TOKEN))) {
             Http.error(ex, 403, "confirm password");
@@ -399,12 +459,17 @@ final class DashboardRoutes {
             Http.error(ex, 400, "the command has control characters");
             return;
         }
+        if (!perms(ex).consoleAllows(command)) {
+            Router.forbid(ex, "run that command", "console");
+            return;
+        }
         if (!hub.online(b)) {
             Http.error(ex, 409, "bot offline");
             return;
         }
         JsonObject out = Http.ok();
-        out.addProperty("id", hub.queueCommand(b, command));
+        out.addProperty("id", hub.queueCommand(b, command, Router.user(ex).id()));
+        audit.add(Router.user(ex), "console", b.botId + ": " + (AuditLog.hideCommand(command) ? "(hidden)" : command), AuthRoutes.address(ex));
         Http.json(ex, 200, out);
     }
 }

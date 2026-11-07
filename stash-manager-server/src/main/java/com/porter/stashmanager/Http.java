@@ -61,6 +61,13 @@ final class Http {
         ATTRS.remove(ex);
     }
 
+    /**
+     * Exchange attribute: a handler handed the exchange to another thread (a viewer stream whose write is stuck),
+     * which closes it; the Router must not (closing would block behind that write).
+     */
+    static final String DETACHED = "stashmanager.detached";
+    /** Exchange attribute: the ServerIds that mask this response (a user in forced streamer mode). */
+    static final String MASK = "stashmanager.mask";
     /** Exchange attribute: the request body, read once by the Router to check a signature (byte[]). */
     static final String BODY = "stashmanager.body";
     /** Exchange attributes for signing the response to a signed request: the key K (byte[]) and the request nonce. */
@@ -91,6 +98,12 @@ final class Http {
         Headers h = ex.getResponseHeaders();
         if (contentType != null) h.set("Content-Type", contentType);
         if (cacheControl != null) h.set("Cache-Control", cacheControl);
+        if (h.containsKey("ETag")) {
+            // A cached response is per login: never reuse one across users of the same browser.
+            String vary = h.getFirst("Vary");
+            if (vary == null) h.set("Vary", "Cookie");
+            else if (!vary.contains("Cookie")) h.set("Vary", vary + ", Cookie");
+        }
         if (Http.attr(ex, SIGN_KEY) instanceof byte[] k && Http.attr(ex, SIGN_NONCE) instanceof String nonce) {
             // A response to a signed request is signed too, over the uncompressed body (empty for 204/304/HEAD).
             byte[] plain = Http.attr(ex, PLAIN_BODY) instanceof byte[] p ? p : body;
@@ -110,6 +123,8 @@ final class Http {
     }
 
     static void json(HttpExchange ex, int status, JsonElement json) throws IOException {
+        // Forced streamer mode: every "server" and "botId" in the response becomes its opaque id.
+        if (Http.attr(ex, MASK) instanceof ServerIds ids) json = ids.mask(json);
         byte[] body = Json.GSON.toJson(json).getBytes(StandardCharsets.UTF_8);
         sendJson(ex, status, body, body.length >= GZIP_MIN ? null : body, "no-store");
     }
