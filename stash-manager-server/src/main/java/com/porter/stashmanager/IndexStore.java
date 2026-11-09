@@ -770,6 +770,20 @@ public final class IndexStore {
         return IconService.DEFAULT_MC;
     }
 
+    /** The distinct Minecraft versions of the stored indexes, or the default when there are none. */
+    public java.util.Set<String> mcVersions() {
+        java.util.Set<String> out = new java.util.LinkedHashSet<>();
+        for (Stash s : stashes.values()) {
+            Prepared p;
+            synchronized (s) {
+                p = s.index;
+            }
+            if (p != null) out.add(p.mcVersion);
+        }
+        if (out.isEmpty()) out.add(IconService.DEFAULT_MC);
+        return out;
+    }
+
     /** Whether some stored index was made with this Minecraft version. */
     public boolean hasMcVersion(String mcVersion) {
         for (Stash s : stashes.values()) {
@@ -801,6 +815,49 @@ public final class IndexStore {
         return out;
     }
 
+    /** Most extra (not indexed) ids that may be allowed for icons, e.g. materials of loaded plans. */
+    static final int MAX_EXTRA_ICON_IDS = 4096;
+    /** Access-ordered (LRU): the least recently used id is dropped when full, so new plans always work. */
+    private final Map<String, IconInfo> extraLatest = new java.util.HashMap<>(); // id -> info of the latest caller
+    /** Keyed by id@mcVersion, so two stashes on different versions never share an entry. */
+    private final Map<String, IconInfo> extraIcons = new java.util.LinkedHashMap<>(256, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, IconInfo> eldest) {
+            if (size() <= MAX_EXTRA_ICON_IDS) return false;
+            String key = eldest.getKey();
+            extraLatest.remove(key.substring(0, key.lastIndexOf('@')), eldest.getValue());
+            return true;
+        }
+    };
+    private volatile java.util.function.Function<String, java.util.Set<String>> packItems = v -> null;
+
+    /** Item definition names of the complete icon set of a Minecraft version, or null when there is none (see IconPacks). */
+    void setPackItems(java.util.function.Function<String, java.util.Set<String>> packItems) {
+        this.packItems = packItems == null ? v -> null : packItems;
+    }
+
+    /**
+     * Allows an item id that no index has (a material of a loaded plan) to get an icon. The id must be a valid
+     * namespaced id; at most {@link #MAX_EXTRA_ICON_IDS} are remembered (least recently used first out, in memory
+     * only). When a complete icon set exists for the version, only item ids it lists are accepted. Returns an info
+     * carrying the caller's Minecraft version, or null when the id is refused.
+     */
+    public IconInfo allowIcon(String id, String mcVersion) {
+        if (id == null || mcVersion == null) return null;
+        int colon = id.indexOf(':');
+        if (colon <= 0 || !IconService.ID_PART.matcher(id.substring(0, colon)).matches()
+            || !IconService.ID_PART.matcher(id.substring(colon + 1)).matches()
+            || !IconService.MC_VERSION.matcher(mcVersion).matches()) return null;
+        java.util.Set<String> items = packItems.apply(mcVersion);
+        if (items != null && !(id.startsWith("minecraft:") && items.contains(id.substring("minecraft:".length())))) return null;
+        IconInfo info = new IconInfo("", mcVersion);
+        synchronized (extraIcons) {
+            extraIcons.put(id + "@" + mcVersion, info);
+            extraLatest.put(id, info);
+        }
+        return info;
+    }
+
     /** The English name and Minecraft version for an item id that appears in some stored index, or null. */
     public IconInfo iconInfo(String id) {
         for (Stash s : stashes.values()) {
@@ -812,7 +869,9 @@ public final class IndexStore {
             String name = p.idNames.get(id);
             if (name != null) return new IconInfo(name, p.mcVersion);
         }
-        return null;
+        synchronized (extraIcons) {
+            return extraLatest.get(id);
+        }
     }
 
     // ---------- file names ----------

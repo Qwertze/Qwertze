@@ -283,6 +283,9 @@ public final class IconService implements AutoCloseable {
         // 1. The game jar for the page's Minecraft version (when some index has that version), else the index's.
         String mc = requestedMc != null && MC_VERSION.matcher(requestedMc).matches() && knownVersion.test(requestedMc)
             ? requestedMc : info.mcVersion();
+        game.requestPack(mc);
+        // The full icon set for this version is being downloaded/rendered: wait for it rather than hit the wiki.
+        if (game.packPending(mc) && !game.cached(mc, ns, path) && !game.available(mc)) return placeholderPending;
         byte[] rendered = game.get(mc, ns, path);
         if (rendered != null) return new Icon(200, rendered, "image/png", CACHE_ICON);
         if (!wikiEnabled) return placeholderMiss;
@@ -347,6 +350,8 @@ public final class IconService implements AutoCloseable {
             Path nsDir = nsDir(ns);
             if (nsDir == null) continue;
             String mc = e.getValue().mcVersion();
+            game.requestPack(mc);
+            if (game.packPending(mc) && !game.available(mc)) continue; // the set being built covers it; later requests fill the rest
             if (game.cached(mc, ns, path)) {
                 alreadyRendered++;
                 continue;

@@ -49,6 +49,7 @@ The first run creates `stash-manager-data/config.properties` with comments:
 | `allowedHosts` | empty | Extra host names (comma separated) the browser may use, for example a LAN DNS name. |
 | `minecraftJar` | empty | Minecraft client jar (or a launcher/`.minecraft` folder) for rendering icons. Empty: found automatically. See Item icons. |
 | `iconSource` | `auto` | `auto` (game files, then the wiki), `game` or `wiki`. |
+| `iconDownload` | `true` | When no Minecraft client jar is found on the machine, download the official one once from Mojang (piston-meta.mojang.com, piston-data.mojang.com; sha1 verified), render every item icon into `icons/game-<version>/` in the background, then delete the jar. `false` = never download. |
 | `trustedProxies` | empty | IP addresses of a reverse proxy / tunnel in front of the server. Only requests from these have their client address read from the last `X-Forwarded-For` entry (rate limit and audit log), and they never count as the server PC. |
 
 Restart the server after editing.

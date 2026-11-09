@@ -115,12 +115,23 @@ public final class StashManagerServer {
         // Up to 8 bot long-polls and up to 8 live viewer streams (ViewerHub.MAX_STREAMS) hold a thread each.
         ExecutorService pool = Executors.newFixedThreadPool(32, daemonThreads());
         server.setExecutor(pool);
+        if (gameOn) {
+            // Only now that the port is ours: the constructor sweeps leftovers, which must not hit a live instance's build.
+            IconPacks packs = new IconPacks(dataDir, config.minecraftJar, config.iconDownload ? new ClientJarFetcher() : null, GameIcons.SIZE,
+                30_000, 120_000);
+            game.attachPacks(packs);
+            store.setPackItems(packs::knownItems);
+            System.out.println("  Icon download: " + (config.iconDownload
+                ? "on (if no client jar is found, the official one is fetched once from piston-meta.mojang.com / piston-data.mojang.com)"
+                : "off (iconDownload=false)"));
+        }
         server.createContext("/", router);
         server.start();
 
         // Only once the port is ours: clean up the old icon cache, then queue every missing icon.
         int migrated = icons.migrateCache();
         if (migrated > 0) System.out.println("Icon cache: removed " + migrated + " stale file(s); they will be fetched again.");
+        for (String v : store.mcVersions()) game.requestPack(v); // background: check the disk set, download+render once if missing
         icons.prefetch(store.allIconIds());
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {

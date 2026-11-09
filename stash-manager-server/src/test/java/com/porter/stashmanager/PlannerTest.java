@@ -246,6 +246,10 @@ class PlannerTest {
         assertEquals(7, glass.get("variants").getAsLong());
         JsonObject diamond = row(plan, "minecraft:diamond_block");
         assertFalse(diamond.get("inIndex").getAsBoolean());
+        // A material that no index has still gets a real icon (and the stash's Minecraft version for the URL).
+        assertTrue(diamond.get("icon").getAsBoolean());
+        assertEquals("1.21.4", diamond.get("mc").getAsString());
+        assertTrue(row(plan, "minecraft:stone").get("icon").getAsBoolean());
         assertEquals(2, diamond.get("missing").getAsLong());
         // creative order: building_blocks (planks 1, stone 5), colored_blocks (glass), then the rest
         JsonArray items = plan.getAsJsonArray("items");

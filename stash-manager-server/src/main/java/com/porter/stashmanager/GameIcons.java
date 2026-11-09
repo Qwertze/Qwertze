@@ -40,6 +40,25 @@ final class GameIcons implements AutoCloseable {
         return enabled;
     }
 
+    private volatile IconPacks packs;
+
+    /** The background builder of complete per-version icon sets (null in tests and when the game source is off). */
+    void attachPacks(IconPacks packs) {
+        this.packs = packs;
+    }
+
+    /** Makes sure the full icon set of this version is checked/built (once per process, in the background). */
+    void requestPack(String mcVersion) {
+        IconPacks p = packs;
+        if (enabled && p != null) p.request(mcVersion);
+    }
+
+    /** True while the version's icon set is being checked, downloaded or rendered. */
+    boolean packPending(String mcVersion) {
+        IconPacks p = packs;
+        return enabled && p != null && p.pending(mcVersion);
+    }
+
     /** Whether a client jar for this version was found and opened (opens it on first call). */
     boolean available(String mcVersion) {
         return renderer(mcVersion).isPresent();
@@ -129,6 +148,8 @@ final class GameIcons implements AutoCloseable {
 
     @Override
     public void close() {
+        IconPacks p = packs;
+        if (p != null) p.close();
         for (Optional<IconRenderer> r : renderers.values()) {
             r.ifPresent(renderer -> {
                 try {

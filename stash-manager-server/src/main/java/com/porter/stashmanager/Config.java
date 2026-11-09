@@ -37,6 +37,8 @@ public final class Config {
     public final Path minecraftJar;
     /** iconSource=: auto (game jar, then the wiki), game, or wiki. */
     public final String iconSource;
+    /** iconDownload=: download the official client jar once to render the full icon set when none is found locally. */
+    public boolean iconDownload = true;
     /** allowBearer=: accept the old Authorization: Bearer header on index/heartbeat/order requests (never on bot/*). */
     public final boolean allowBearer;
     /**
@@ -161,6 +163,7 @@ public final class Config {
         }
         Config config = new Config(file, port, bind, apiKey, allowRemote, allowedHosts, generated, minecraftJar, iconSource, allowBearer,
             trustedProxies);
+        config.iconDownload = parseIconDownload(props.getProperty("iconDownload"));
         String password = props.getProperty(PASSWORD_KEY, "").trim();
         if (!password.isEmpty()) {
             if (!Auth.wellFormed(password)) {
@@ -170,6 +173,16 @@ public final class Config {
             config.dashboardPassword = password;
         }
         return config;
+    }
+
+    /** Absent = true (the default); "true"/"false" exactly; anything else warns and means false (no download). */
+    static boolean parseIconDownload(String raw) {
+        if (raw == null) return true;
+        String v = raw.trim().toLowerCase(Locale.ROOT);
+        if (v.equals("true")) return true;
+        if (v.equals("false")) return false;
+        System.err.println("config.properties: iconDownload must be true or false, got '" + clean(v) + "'. Treating it as false (no download).");
+        return false;
     }
 
     /** Makes a new key, saves it, and only then makes it the live key, so the old key stops working at once. */
@@ -248,12 +261,19 @@ public final class Config {
         # game (the game jar only), or wiki (the Minecraft Wiki only).
         iconSource=auto
         """;
+    private static final String DOWNLOAD_BLOCK = """
+        # true: when no Minecraft client jar is found on this machine, download the official one ONCE from Mojang
+        # (piston-meta.mojang.com / piston-data.mojang.com, sha1 verified), render every item icon into
+        # <data>/icons/game-<version>/, then delete the jar. false: never download (local jars only).
+        iconDownload=true
+        """;
 
     /** Adds settings introduced after the file was created, with their comments, leaving every existing line alone. */
     private static void appendMissing(Path file, Properties props) throws IOException {
         StringBuilder add = new StringBuilder();
         if (!props.containsKey("minecraftJar")) add.append('\n').append(JAR_BLOCK);
         if (!props.containsKey("iconSource")) add.append('\n').append(SOURCE_BLOCK);
+        if (!props.containsKey("iconDownload")) add.append('\n').append(DOWNLOAD_BLOCK);
         if (!props.containsKey("allowBearer")) add.append('\n').append(BEARER_BLOCK);
         if (!props.containsKey("trustedProxies")) add.append('\n').append(PROXY_BLOCK);
         if (add.isEmpty()) return;
@@ -284,7 +304,7 @@ public final class Config {
             # Extra host names (comma separated) the browser may use to reach this server,
             # e.g. a DNS name on your LAN. IP addresses, localhost and this machine's name always work.
             allowedHosts=%s
-            """ + "\n" + JAR_BLOCK + "\n" + SOURCE_BLOCK + "\n" + BEARER_BLOCK + "\n" + PROXY_BLOCK).formatted(port, clean(bind), clean(apiKey), allowRemote, clean(allowedHosts));
+            """ + "\n" + JAR_BLOCK + "\n" + SOURCE_BLOCK + "\n" + DOWNLOAD_BLOCK + "\n" + BEARER_BLOCK + "\n" + PROXY_BLOCK).formatted(port, clean(bind), clean(apiKey), allowRemote, clean(allowedHosts));
         AtomicFiles.write(file, text.getBytes(StandardCharsets.UTF_8), true);
     }
 

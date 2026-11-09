@@ -753,11 +753,14 @@ final class PlannerRoutes {
             o.add("stash", so);
         }
         JsonArray items = new JsonArray();
+        String stashMc = server == null ? null : index.mcVersion(server, stash);
         long need = 0, have = 0, missing = 0, want = 0;
         for (Row r : rows) {
             JsonObject ro = new JsonObject();
             ro.addProperty("id", r.id);
             IndexStore.IconInfo info = index.iconInfo(r.id);
+            // A material no index has (never stocked) still gets its real icon: allow the (validated, bounded) id.
+            if (info == null) info = index.allowIcon(r.id, stashMc != null ? stashMc : index.anyMcVersion());
             ro.addProperty("name", info == null || info.englishName().isEmpty() ? null : info.englishName());
             ro.addProperty("icon", info != null);
             ro.addProperty("mc", info == null ? null : info.mcVersion());
