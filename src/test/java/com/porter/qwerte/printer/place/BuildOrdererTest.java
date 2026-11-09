@@ -516,6 +516,7 @@ class BuildOrdererTest {
         o.setActiveLayer(3);
         assertEquals(List.of(floating, floating2), o.stranded(3, 5, 100, 0, 3, 0, NONE, w)); // nearest first, solid cells only
         assertEquals(List.of(floating), o.stranded(3, 1, 100, 0, 3, 0, NONE, w));
+        assertEquals(List.of(floating2), o.stranded(3, 1, 100, 0, 3, 0, NONE, w, c -> c.equals(floating)), "a skipped cell does not take a place");
         assertTrue(o.stranded(0, 5, 100, 0, 0, 0, NONE, w).isEmpty(), "the ground cell is ready");
         BuildOrderer air = orderer(Mode.LAYER_THEN_DISTANCE, true, true, floating);
         assertTrue(air.stranded(3, 5, 100, 0, 0, 0, NONE, w).isEmpty(), "air-placing needs no scaffold");

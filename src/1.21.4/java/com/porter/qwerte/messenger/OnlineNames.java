@@ -18,4 +18,13 @@ public final class OnlineNames {
         }
         return false;
     }
+
+    /** The names of the players on the tab list (empty when not connected). */
+    public static java.util.List<String> all() {
+        ClientPacketListener connection = mc.getConnection();
+        java.util.List<String> names = new java.util.ArrayList<>();
+        if (connection == null) return names;
+        for (PlayerInfo info : connection.getOnlinePlayers()) names.add(info.getProfile().getName());
+        return names;
+    }
 }

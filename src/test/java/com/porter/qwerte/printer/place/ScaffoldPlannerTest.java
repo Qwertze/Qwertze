@@ -27,6 +27,13 @@ class ScaffoldPlannerTest {
         final Set<List<Integer>> wanted = new HashSet<>();
         final Map<List<Integer>, Cell> open = new HashMap<>();
         int groundTop = 0; // y below this is solid
+        int minY = -1_000_000, maxY = 1_000_000; // the build height: minY <= y < maxY
+        long calls;
+
+        @Override
+        public boolean inHeight(int y) {
+            return y >= minY && y < maxY;
+        }
 
         static List<Integer> k(int x, int y, int z) {
             return List.of(x, y, z);
@@ -34,11 +41,13 @@ class ScaffoldPlannerTest {
 
         @Override
         public boolean air(int x, int y, int z) {
+            calls++;
             return !solid(x, y, z);
         }
 
         @Override
         public boolean solid(int x, int y, int z) {
+            calls++;
             return y < groundTop || solid.contains(k(x, y, z));
         }
 
@@ -62,7 +71,7 @@ class ScaffoldPlannerTest {
     private static final long FOREVER = Long.MAX_VALUE;
 
     private static Result plan(Fake w, int x, int y, int z, int max) {
-        return ScaffoldPlanner.plan(w, AREA, x, y, z, max, 0, 0, 0, FOREVER);
+        return ScaffoldPlanner.plan(w, AREA, x, y, z, 6, max, 0, 0, 0, FOREVER);
     }
 
     @Test
@@ -137,7 +146,7 @@ class ScaffoldPlannerTest {
         Fake high = new Fake();
         high.want(0, 5, 0, Role.SOLID, null);
         high.groundTop = -3; // 8 blocks to the ground
-        assertNull(plan(high, 0, 5, 0, 99).chain(), "the chain is never longer than " + ScaffoldPlanner.MAX_CHAIN);
+        assertNull(plan(high, 0, 5, 0, 99).chain(), "the chain is never longer than the limit");
     }
 
     @Test
@@ -145,11 +154,11 @@ class ScaffoldPlannerTest {
         Fake w = new Fake();
         w.want(0, 5, 0, Role.SOLID, null);
         List<Box> far = List.of(new Box(100, 100, 100, 100, 100, 100));
-        assertNull(ScaffoldPlanner.plan(w, far, 0, 5, 0, 6, 0, 0, 0, FOREVER).chain());
+        assertNull(ScaffoldPlanner.plan(w, far, 0, 5, 0, 6, 6, 0, 0, 0, FOREVER).chain());
         // a box that covers only the top of the column: the ground block is outside the margin
         List<Box> top = List.of(new Box(0, 12, 0, 0, 12, 0));
         w.groundTop = 0;
-        assertNull(ScaffoldPlanner.plan(w, top, 0, 5, 0, 6, 0, 0, 0, FOREVER).chain());
+        assertNull(ScaffoldPlanner.plan(w, top, 0, 5, 0, 6, 6, 0, 0, 0, FOREVER).chain());
     }
 
     @Test
@@ -157,10 +166,10 @@ class ScaffoldPlannerTest {
         Fake w = new Fake();
         w.want(0, 0, 0, Role.SOLID, null);
         // one-block chains on the four sides, each touching the ground; the player stands off to one side
-        Result r = ScaffoldPlanner.plan(w, AREA, 0, 0, 0, 6, 5, 0, 0, FOREVER);
+        Result r = ScaffoldPlanner.plan(w, AREA, 0, 0, 0, 6, 6, 5, 0, 0, FOREVER);
         assertEquals(1, r.chain().size());
         assertEquals(1, r.chain().blocks().get(0)[0]);
-        Result r2 = ScaffoldPlanner.plan(w, AREA, 0, 0, 0, 6, -5, 0, 0, FOREVER);
+        Result r2 = ScaffoldPlanner.plan(w, AREA, 0, 0, 0, 6, 6, -5, 0, 0, FOREVER);
         assertEquals(-1, r2.chain().blocks().get(0)[0]);
     }
 
@@ -168,7 +177,7 @@ class ScaffoldPlannerTest {
     void anExpiredBudgetStopsTheSearchAndSaysSo() {
         Fake w = new Fake();
         w.want(0, 5, 0, Role.SOLID, null);
-        Result r = ScaffoldPlanner.plan(w, AREA, 0, 5, 0, 6, 0, 0, 0, System.nanoTime() - 1);
+        Result r = ScaffoldPlanner.plan(w, AREA, 0, 5, 0, 6, 6, 0, 0, 0, System.nanoTime() - 1);
         assertTrue(r.budgetHit());
         assertNull(r.chain());
     }
@@ -181,6 +190,117 @@ class ScaffoldPlannerTest {
         long t = System.nanoTime();
         for (int i = 0; i < 50; i++) assertNull(plan(w, 0, 5, 0, 6).chain());
         assertTrue((System.nanoTime() - t) / 50 < 20_000_000L, "one failed search under 20 ms");
+    }
+
+    private static Result unlimited(Fake w, int x, int y, int z, double px, double py, double pz) {
+        return ScaffoldPlanner.plan(w, AREA, x, y, z, 0, 4096, px, py, pz, FOREVER);
+    }
+
+    @Test
+    void unlimitedFindsALongColumnToTheGroundWithinTheBudget() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        w.groundTop = -25; // blocks from y=-25 to y=4: 30 of them
+        Result r = ScaffoldPlanner.plan(w, AREA, 0, 5, 0, 0, 4096, 0, 0, 0, System.nanoTime() + 10_000_000L);
+        assertFalse(r.budgetHit());
+        assertNotNull(r.chain());
+        assertEquals(30, r.chain().size());
+        assertEquals(-25, r.chain().blocks().get(0)[1]);
+        assertEquals(4, r.chain().blocks().get(29)[1]);
+    }
+
+    @Test
+    void unlimitedHasNoMargin() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        w.groundTop = -40;
+        List<Box> far = List.of(new Box(100, 100, 100, 100, 100, 100));
+        Result r = ScaffoldPlanner.plan(w, far, 0, 5, 0, 0, 4096, 0, 0, 0, System.nanoTime() + ScaffoldPlanner.MAX_BUDGET_NANOS);
+        assertNotNull(r.chain());
+        assertEquals(45, r.chain().size());
+    }
+
+    @Test
+    void aLimitCapsTheChainLength() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        List<Box> wide = List.of(new Box(0, -100, 0, 0, 100, 0));
+        assertNull(ScaffoldPlanner.plan(w, wide, 0, 5, 0, 4, 99, 0, 0, 0, FOREVER).chain(), "needs 5 blocks");
+        assertEquals(5, ScaffoldPlanner.plan(w, wide, 0, 5, 0, 5, 99, 0, 0, 0, FOREVER).chain().size());
+        assertNull(ScaffoldPlanner.plan(w, wide, 0, 5, 0, 0, 4, 0, 0, 0, FOREVER).chain(), "the room caps it too");
+    }
+
+    @Test
+    void aLimitCapsTheDistanceOutsideTheBounds() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        w.groundTop = 1; // blocks y=1..4, the bounds are at y=5
+        assertNotNull(ScaffoldPlanner.plan(w, AREA, 0, 5, 0, 4, 99, 0, 0, 0, FOREVER).chain());
+        w.groundTop = 0; // the lowest block is 5 below the bounds
+        assertNull(ScaffoldPlanner.plan(w, AREA, 0, 5, 0, 4, 99, 0, 0, 0, FOREVER).chain());
+        assertNotNull(ScaffoldPlanner.plan(w, AREA, 0, 5, 0, 5, 99, 0, 0, 0, FOREVER).chain());
+    }
+
+    @Test
+    void unlimitedNeverUsesAWantedCell() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        w.groundTop = -20;
+        for (int y = -20; y <= 4; y++) w.wanted.add(Fake.k(0, y, 0)); // the whole column below is wanted
+        Result r = unlimited(w, 0, 5, 0, 0, 0, 0);
+        assertNotNull(r.chain(), "a detour exists");
+        for (int[] b : r.chain().blocks()) assertFalse(w.wanted(b[0], b[1], b[2]));
+        // a straight column that hits a wanted cell is abandoned
+        Fake v = new Fake();
+        v.want(0, 5, 0, Role.SOLID, null);
+        v.groundTop = -20;
+        v.wanted.add(Fake.k(0, -3, 0));
+        Result r2 = unlimited(v, 0, 5, 0, 0, 0, 0);
+        assertNotNull(r2.chain());
+        for (int[] b : r2.chain().blocks()) assertFalse(v.wanted(b[0], b[1], b[2]));
+    }
+
+    @Test
+    void theShortestStraightColumnWinsAndTiesGoToThePlayer() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        w.solid.add(Fake.k(3, 5, 0));
+        w.solid.add(Fake.k(-3, 5, 0));
+        Result r = unlimited(w, 0, 5, 0, 10, 5, 0);
+        assertEquals(2, r.chain().size());
+        assertEquals(2, r.chain().blocks().get(0)[0]);
+        assertEquals(1, r.chain().blocks().get(1)[0]);
+        Result r2 = unlimited(w, 0, 5, 0, -10, 5, 0);
+        assertEquals(-2, r2.chain().blocks().get(0)[0]);
+    }
+
+    @Test
+    void aShorterBentChainBeatsAStraightOne() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        w.solid.add(Fake.k(1, 4, 1)); // (1,5,0) then (1,4,0) touches it; straight down is 5 blocks
+        Result r = unlimited(w, 0, 5, 0, 0, 0, 0);
+        assertEquals(2, r.chain().size());
+    }
+
+    @Test
+    void whenTheSearchRunsOutOfTimeAStraightChainIsStillUsed() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        w.groundTop = -25;
+        Result r = ScaffoldPlanner.plan(w, AREA, 0, 5, 0, 0, 4096, 0, 0, 0, FOREVER);
+        assertEquals(30, r.chain().size());
+    }
+
+    @Test
+    void unlimitedWithNothingToFindStaysBounded() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        w.groundTop = -1000; // out of the probe's reach
+        long t = System.nanoTime();
+        Result r = ScaffoldPlanner.plan(w, AREA, 0, 5, 0, 0, 4096, 0, 0, 0, FOREVER);
+        assertNull(r.chain());
+        assertTrue((System.nanoTime() - t) < 2_000_000_000L, "the node cap ends the search");
     }
 
     // Removal
@@ -274,5 +394,56 @@ class ScaffoldPlannerTest {
         assertEquals(2_000_000L, ScaffoldPlanner.budgetNanos(3));
         assertEquals(2_000_000L, ScaffoldPlanner.budgetNanos(50));
         assertEquals(400_000L, ScaffoldPlanner.budgetNanos(-1));
+    }
+
+    @Test
+    void nothingOutsideTheBuildHeight() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        w.groundTop = -25;
+        w.minY = -10; // the ground is below the world
+        assertNull(unlimited(w, 0, 5, 0, 0, 0, 0).chain());
+        w.minY = -64;
+        w.maxY = 6; // y < 6 only: the chain below the cell stays inside
+        assertEquals(30, unlimited(w, 0, 5, 0, 0, 0, 0).chain().size());
+        // a roof that is the only way: solid above, build height ends under it
+        Fake v = new Fake();
+        v.want(0, 5, 0, Role.SOLID, null);
+        v.groundTop = -1000;
+        v.solid.add(Fake.k(0, 7, 0));
+        v.maxY = 6;
+        assertNull(unlimited(v, 0, 5, 0, 0, 0, 0).chain());
+        v.maxY = 8;
+        assertEquals(1, unlimited(v, 0, 5, 0, 0, 0, 0).chain().size());
+    }
+
+    @Test
+    void theSearchInOpenAirEndsBoundedAndSaysItStopped() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        w.groundTop = -100000; // nothing to find within reach
+        w.calls = 0;
+        Result r = unlimited(w, 0, 5, 0, 0, 0, 0);
+        assertNull(r.chain());
+        assertFalse(r.budgetHit(), "stopped by the node cap, not by time");
+        assertTrue(r.stopped(), "null with the cap is not 'no chain exists'");
+        assertTrue(w.calls < 3_000_000, "world lookups bounded, was " + w.calls);
+    }
+
+    @Test
+    void aChainBeyondTheRoomIsFoundSoItCanBeToldFromNone() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        Result r = ScaffoldPlanner.plan(w, AREA, 0, 5, 0, 0, Integer.MAX_VALUE, 0, 0, 0, FOREVER);
+        assertEquals(5, r.chain().size());
+        assertNull(ScaffoldPlanner.plan(w, AREA, 0, 5, 0, 0, 4, 0, 0, 0, FOREVER).chain(), "the room as the cap finds none");
+    }
+
+    @Test
+    void aFoundChainIsNotStopped() {
+        Fake w = new Fake();
+        w.want(0, 5, 0, Role.SOLID, null);
+        assertFalse(unlimited(w, 0, 5, 0, 0, 0, 0).stopped());
+        assertTrue(ScaffoldPlanner.plan(w, AREA, 0, 5, 0, 6, 6, 0, 0, 0, System.nanoTime() - 1).stopped());
     }
 }

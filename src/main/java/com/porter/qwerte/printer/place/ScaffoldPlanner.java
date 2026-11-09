@@ -5,6 +5,7 @@ import com.porter.qwerte.printer.place.BuildOrderer.Role;
 import com.porter.qwerte.printer.place.PlaceRecipe.Dir;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -16,7 +17,7 @@ import java.util.Set;
  * the cell. Pure; the world is passed in.
  *
  * <p>A chain block goes in a position that is air, that the schematic does not want a block in, and that is within
- * {@link #MARGIN} blocks of the schematic's bounds. The chain is the shortest one (at most {@link #MAX_CHAIN} blocks); it is
+ * the limit's margin of the schematic's bounds (no margin without a limit). The chain is the shortest one (at most the limit); it is
  * searched from the cell outward and ends at the first position that has an existing solid block next to it, so the blocks
  * can be placed one after another starting there. Only a SOLID cell is helped: a block that hangs on something (a torch, a
  * lantern) or falls would lose or need its support when the scaffold goes.
@@ -27,8 +28,8 @@ import java.util.Set;
 public final class ScaffoldPlanner {
     private ScaffoldPlanner() {}
 
-    public static final int MAX_CHAIN = 6;
-    public static final int MARGIN = 6;
+    /** Hard caps when there is no limit: the longest straight probe (about the world height) and the BFS node count. */
+    public static final int MAX_PROBE = 384, MAX_NODES = 40_000;
     /** The search time for one cell, which grows when the search keeps running out of it (up to {@link #MAX_BUDGET_NANOS}). */
     public static final long BASE_BUDGET_NANOS = 400_000L, MAX_BUDGET_NANOS = 2_000_000L;
 
@@ -43,6 +44,9 @@ public final class ScaffoldPlanner {
 
         /** A block a click can target (in the world, or placed and not yet seen). Scaffold blocks count. */
         boolean solid(int x, int y, int z);
+
+        /** The height is inside the world's build height: nothing can be placed outside it. */
+        boolean inHeight(int y);
 
         /** The schematic wants a block (not air) in this cell, built or not. */
         boolean wanted(int x, int y, int z);
@@ -65,11 +69,23 @@ public final class ScaffoldPlanner {
         }
     }
 
-    /** {@code chain} is null when there is none; {@code budgetHit}: the search ran out of time and was not finished. */
-    public record Result(Chain chain, boolean budgetHit) {}
+    /**
+     * {@code chain} is null when there is none. {@code budgetHit}: the deadline passed before any chain was found. {@code stopped}:
+     * the search ended early (deadline or node cap) and may have missed a shorter chain; with a null chain that is not "none
+     * exists", and a chain returned that way is a valid one that is just not known to be the shortest.
+     */
+    public record Result(Chain chain, boolean budgetHit, boolean stopped) {
+        public Result(Chain chain, boolean budgetHit) {
+            this(chain, budgetHit, budgetHit);
+        }
+    }
 
-    private static boolean inReach(List<Box> areas, int x, int y, int z) {
-        for (Box b : areas) if (b.near(x, y, z, MARGIN)) return true;
+    /** The longest arm of the L probe (kept small: it runs in open air, where nothing ends it early). */
+    public static final int MAX_ARM = 48;
+
+    private static boolean inReach(List<Box> areas, int margin, int x, int y, int z) {
+        if (margin < 0) return true;
+        for (Box b : areas) if (b.near(x, y, z, margin)) return true;
         return false;
     }
 
@@ -77,8 +93,8 @@ public final class ScaffoldPlanner {
         return ((long) (x & 0x3FFFFFF) << 38) | ((long) (z & 0x3FFFFFF) << 12) | (y & 0xFFF);
     }
 
-    private static boolean allowed(World w, List<Box> areas, int x, int y, int z) {
-        return w.air(x, y, z) && !w.wanted(x, y, z) && inReach(areas, x, y, z);
+    private static boolean allowed(World w, List<Box> areas, int margin, int x, int y, int z) {
+        return w.inHeight(y) && w.air(x, y, z) && !w.wanted(x, y, z) && inReach(areas, margin, x, y, z);
     }
 
     private static boolean touchesSolid(World w, int x, int y, int z) {
@@ -86,28 +102,102 @@ public final class ScaffoldPlanner {
         return false;
     }
 
+    /** A set of longs without boxing (open addressing). */
+    private static final class LongSet {
+        private static final long EMPTY = Long.MIN_VALUE;
+        private long[] table = new long[1024];
+        private int size;
+
+        LongSet() {
+            Arrays.fill(table, EMPTY);
+        }
+
+        /** True when the value was not in the set. */
+        boolean add(long v) {
+            if (v == EMPTY) v++;
+            if (size * 2 >= table.length) grow();
+            int mask = table.length - 1;
+            int i = (int) ((v * 0x9E3779B97F4A7C15L) >>> 40) & mask;
+            while (table[i] != EMPTY) {
+                if (table[i] == v) return false;
+                i = (i + 1) & mask;
+            }
+            table[i] = v;
+            size++;
+            return true;
+        }
+
+        private void grow() {
+            long[] old = table;
+            table = new long[old.length * 2];
+            Arrays.fill(table, EMPTY);
+            size = 0;
+            for (long v : old) if (v != EMPTY) add(v);
+        }
+    }
+
     /**
      * The shortest scaffold chain that gives the cell at (tx, ty, tz) a solid neighbour, or none. Among chains of the same
      * length the one whose first block is nearest to the point (px, py, pz) wins, then the lowest position.
      *
+     * <p>First the straight columns from the cell's six faces are probed (cheap, any length), then an L (one cell next to the
+     * cell and a straight column from it); then a BFS looks for a strictly shorter chain within a node cap. A straight chain
+     * wins a tie with a bent one. When the BFS runs out of time or nodes, the straight or L chain is used ({@code stopped}).
+     *
+     * @param limit longest chain and margin outside the {@code areas}; 0: neither is limited
+     * @param maxChain the most blocks the chain may have (the room left)
      * @param deadlineNanos {@code System.nanoTime()} value after which the search gives up (budgetHit)
      */
-    public static Result plan(World w, List<Box> areas, int tx, int ty, int tz, int maxChain, double px, double py, double pz, long deadlineNanos) {
-        int limit = Math.max(1, Math.min(MAX_CHAIN, maxChain));
+    public static Result plan(World w, List<Box> areas, int tx, int ty, int tz, int limit, int maxChain, double px, double py, double pz, long deadlineNanos) {
+        int margin = limit > 0 ? limit : -1;
+        int cap = Math.min(maxChain, limit > 0 ? limit : MAX_PROBE);
+        if (cap < 1) return new Result(null, false, false);
+
+        // Straight columns, one per direction
+        List<int[]> straight = null;
+        double straightD = 0;
+        for (Dir d : Dir.values()) {
+            for (int k = 1; k <= cap; k++) {
+                if (System.nanoTime() > deadlineNanos) return new Result(null, true);
+                int x = tx + d.dx * k, y = ty + d.dy * k, z = tz + d.dz * k;
+                if (!allowed(w, areas, margin, x, y, z)) break;
+                if (!touchesSolid(w, x, y, z)) continue;
+                double dx = x + 0.5 - px, dy = y + 0.5 - py, dz = z + 0.5 - pz;
+                double dd = dx * dx + dy * dy + dz * dz;
+                if (straight == null || k < straight.size() || k == straight.size() && (dd < straightD || dd == straightD && before(new int[] { x, y, z }, straight.get(0)))) {
+                    List<int[]> col = new ArrayList<>();
+                    for (int j = k; j >= 1; j--) col.add(new int[] { tx + d.dx * j, ty + d.dy * j, tz + d.dz * j });
+                    straight = col;
+                    straightD = dd;
+                }
+                break;
+            }
+        }
+        Chain fallback = straight == null ? null : new Chain(straight);
+        if (fallback == null) {
+            // No straight one: a column from a cell next to the target (an L), also cheap
+            Result bent = bentProbe(w, areas, margin, tx, ty, tz, cap, px, py, pz, deadlineNanos);
+            if (bent.budgetHit()) return bent;
+            fallback = bent.chain();
+        }
+        int maxDepth = fallback == null ? cap : fallback.size() - 1;
+        if (maxDepth < 1) return new Result(fallback, false, false);
+
+        // A shorter bent chain, if there is one
         List<int[]> nodes = new ArrayList<>(); // x, y, z, parent index (toward the cell, -1 at the first ring), depth
-        Set<Long> seen = new HashSet<>();
+        LongSet seen = new LongSet();
         seen.add(key(tx, ty, tz));
         for (Dir d : Dir.values()) {
             int x = tx + d.dx, y = ty + d.dy, z = tz + d.dz;
-            if (seen.add(key(x, y, z)) && allowed(w, areas, x, y, z)) nodes.add(new int[] { x, y, z, -1, 1 });
+            if (seen.add(key(x, y, z)) && allowed(w, areas, margin, x, y, z)) nodes.add(new int[] { x, y, z, -1, 1 });
         }
         int from = 0;
-        for (int depth = 1; depth <= limit && from < nodes.size(); depth++) {
+        for (int depth = 1; depth <= maxDepth && from < nodes.size(); depth++) {
             int to = nodes.size();
             int bestIdx = -1;
             double bestD = Double.MAX_VALUE;
             for (int i = from; i < to; i++) {
-                if (System.nanoTime() > deadlineNanos) return new Result(null, true);
+                if (System.nanoTime() > deadlineNanos) return fallback != null ? new Result(fallback, false, true) : new Result(null, true);
                 int[] n = nodes.get(i);
                 if (!touchesSolid(w, n[0], n[1], n[2])) continue;
                 double dx = n[0] + 0.5 - px, dy = n[1] + 0.5 - py, dz = n[2] + 0.5 - pz;
@@ -117,19 +207,54 @@ public final class ScaffoldPlanner {
                     bestD = dd;
                 }
             }
-            if (bestIdx >= 0) return new Result(chainOf(nodes, bestIdx), false);
-            if (depth == limit) break;
+            if (bestIdx >= 0) return new Result(chainOf(nodes, bestIdx), false, false);
+            if (depth == maxDepth) break;
             for (int i = from; i < to; i++) {
-                if (System.nanoTime() > deadlineNanos) return new Result(null, true);
+                if (System.nanoTime() > deadlineNanos) return fallback != null ? new Result(fallback, false, true) : new Result(null, true);
                 int[] n = nodes.get(i);
                 for (Dir d : Dir.values()) {
                     int x = n[0] + d.dx, y = n[1] + d.dy, z = n[2] + d.dz;
-                    if (seen.add(key(x, y, z)) && allowed(w, areas, x, y, z)) nodes.add(new int[] { x, y, z, i, depth + 1 });
+                    if (seen.add(key(x, y, z)) && allowed(w, areas, margin, x, y, z)) nodes.add(new int[] { x, y, z, i, depth + 1 });
                 }
+                if (nodes.size() > MAX_NODES) return new Result(fallback, false, true);
             }
             from = to;
         }
-        return new Result(null, false);
+        return new Result(fallback, false, false);
+    }
+
+    /**
+     * No straight chain: one cell next to the target, then a straight column from it (an L). Cheap (arms of at most
+     * {@link #MAX_ARM}), finds a detour around a wall of wanted cells; the shortest, then nearest first block, then lowest.
+     */
+    private static Result bentProbe(World w, List<Box> areas, int margin, int tx, int ty, int tz, int cap, double px, double py, double pz, long deadlineNanos) {
+        List<int[]> best = null;
+        double bestD = 0;
+        int arm = Math.min(cap - 1, MAX_ARM);
+        for (Dir f : Dir.values()) {
+            int fx = tx + f.dx, fy = ty + f.dy, fz = tz + f.dz;
+            if (!allowed(w, areas, margin, fx, fy, fz)) continue;
+            for (Dir d : Dir.values()) {
+                if (d.dx == -f.dx && d.dy == -f.dy && d.dz == -f.dz || d == f) continue;
+                for (int k = 1; k <= arm; k++) {
+                    if (System.nanoTime() > deadlineNanos) return new Result(null, true);
+                    int x = fx + d.dx * k, y = fy + d.dy * k, z = fz + d.dz * k;
+                    if (!allowed(w, areas, margin, x, y, z)) break;
+                    if (!touchesSolid(w, x, y, z)) continue;
+                    double dx = x + 0.5 - px, dy = y + 0.5 - py, dz = z + 0.5 - pz;
+                    double dd = dx * dx + dy * dy + dz * dz;
+                    if (best == null || k + 1 < best.size() || k + 1 == best.size() && (dd < bestD || dd == bestD && before(new int[] { x, y, z }, best.get(0)))) {
+                        List<int[]> col = new ArrayList<>();
+                        for (int j = k; j >= 1; j--) col.add(new int[] { fx + d.dx * j, fy + d.dy * j, fz + d.dz * j });
+                        col.add(new int[] { fx, fy, fz });
+                        best = col;
+                        bestD = dd;
+                    }
+                    break;
+                }
+            }
+        }
+        return new Result(best == null ? null : new Chain(best), false, false);
     }
 
     private static boolean before(int[] a, int[] b) {

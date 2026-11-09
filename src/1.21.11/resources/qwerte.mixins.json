@@ -6,6 +6,7 @@
   "mixins": [
     "AbstractContainerScreenMixin",
     "AbstractContainerScreenSlotMixin",
+    "ChatScreenAccessor",
     "ClientPacketListenerMixin",
     "GuiMixin",
     "ItemContainerContentsMixin"

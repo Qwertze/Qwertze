@@ -1106,12 +1106,12 @@ public final class PlannerTab {
         table.rightAlign(2, 3, 4, 5);
         table.maxWidth = tableW;
         for (PlanModel.Row r : PlanModel.page(rows, page)) {
-            WHorizontalList first = new WHorizontalList();
+            WHorizontalList first = theme.horizontalList();
             WCheckbox include = first.add(theme.checkbox(!options.exclude().contains(r.id()))).widget();
             include.tooltip = "Untick to leave this item out of the order";
             String id = r.id();
             include.action = () -> changed(options.withExcluded(id, !include.checked));
-            WHorizontalList name = new WHorizontalList();
+            WHorizontalList name = theme.horizontalList();
             name.add(new WItemIcon(host::graphics, ItemStacks.displayId(r.id())));
             WVerticalList names2 = name.add(theme.verticalList()).widget();
             names2.spacing = 0;
@@ -1159,7 +1159,7 @@ public final class PlannerTab {
             int n = 0;
             for (PlanModel.Count c : plan.containerItems()) {
                 if (n++ >= LIST_SHOWN) break;
-                WHorizontalList name = new WHorizontalList();
+                WHorizontalList name = theme.horizontalList();
                 name.add(new WItemIcon(host::graphics, ItemStacks.displayId(c.id())));
                 name.add(theme.label(PlanModel.pretty(c.id())));
                 t.addRow(name, theme.label(Text.grouped(c.count())));

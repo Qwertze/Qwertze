@@ -37,6 +37,14 @@ public final class Outbox<T> {
         return queue.pollFirst();
     }
 
+    /** Whether any waiting item matches. */
+    public boolean anyMatch(java.util.function.Predicate<T> test) {
+        for (T t : queue) {
+            if (test.test(t)) return true;
+        }
+        return false;
+    }
+
     public int size() {
         return queue.size();
     }

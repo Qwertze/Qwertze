@@ -18,6 +18,7 @@ public final class ServerStores {
 
     private final Map<String, ConversationStore> byServer = new LinkedHashMap<>();
     private int cap;
+    private int globalCap = ConversationStore.DEFAULT_GLOBAL_CAP;
     private String current = LOCAL;
 
     public ServerStores(int cap) {
@@ -73,6 +74,7 @@ public final class ServerStores {
         if (s == null) {
             if (byServer.size() >= MAX_SERVERS) evict();
             s = new ConversationStore(cap);
+            s.globalCap(globalCap);
             byServer.put(key, s);
         }
         return s;
@@ -91,11 +93,33 @@ public final class ServerStores {
         return cap;
     }
 
+    /** How many public chat lines are kept per server. */
+    public void globalCap(int cap) {
+        this.globalCap = ConversationStore.clampGlobalCap(cap);
+        for (ConversationStore s : byServer.values()) s.globalCap(this.globalCap);
+    }
+
+    public int globalCap() {
+        return globalCap;
+    }
+
     public boolean dirty() {
         for (ConversationStore s : byServer.values()) {
             if (s.dirty()) return true;
         }
         return false;
+    }
+
+    /** The public chat of some server changed (saved on a long interval, or when leaving). */
+    public boolean globalDirty() {
+        for (ConversationStore s : byServer.values()) {
+            if (s.globalDirty()) return true;
+        }
+        return false;
+    }
+
+    public boolean anyDirty() {
+        return dirty() || globalDirty();
     }
 
     public void clean() {
@@ -120,6 +144,8 @@ public final class ServerStores {
             if (e.getKey().equals(current)) continue;
             long t = 0;
             for (Conversation c : e.getValue().all()) t = Math.max(t, c.lastActivity());
+            List<Message> pub = e.getValue().global();
+            if (!pub.isEmpty()) t = Math.max(t, pub.get(pub.size() - 1).time());
             if (t < oldestTime) {
                 oldestTime = t;
                 oldest = e.getKey();

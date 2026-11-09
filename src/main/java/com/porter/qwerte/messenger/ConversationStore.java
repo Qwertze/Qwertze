@@ -17,10 +17,17 @@ public final class ConversationStore {
     public static final int MAX_CONVERSATIONS = 100;
     public static final int MIN_CAP = 10;
     public static final int MAX_CAP = 500;
+    public static final int MIN_GLOBAL_CAP = 50;
+    public static final int MAX_GLOBAL_CAP = 2000;
+    public static final int DEFAULT_GLOBAL_CAP = 500;
 
     private final Map<String, Conversation> byKey = new HashMap<>();
+    /** The public chat of this server, oldest first: lines from the chat feed (IN) and notes from the Messenger. */
+    private final List<Message> global = new ArrayList<>();
+    private int globalCap = DEFAULT_GLOBAL_CAP;
     private int cap;
     private boolean dirty;
+    private boolean globalDirty;
     private int version;
 
     public ConversationStore(int cap) {
@@ -35,6 +42,61 @@ public final class ConversationStore {
         return cap;
     }
 
+    public static int clampGlobalCap(int cap) {
+        return Math.max(MIN_GLOBAL_CAP, Math.min(MAX_GLOBAL_CAP, cap));
+    }
+
+    public int globalCap() {
+        return globalCap;
+    }
+
+    /** Changes how many public chat lines are kept; a longer log is cut at once (the oldest go). */
+    public void globalCap(int cap) {
+        this.globalCap = clampGlobalCap(cap);
+        trimGlobal();
+    }
+
+    /** The public chat log, oldest first. Do not change from outside; use the store. */
+    public List<Message> global() {
+        return global;
+    }
+
+    /** A line that arrived in the chat feed (kept as plain text). */
+    public Message addGlobal(String text, long now) {
+        Message m = new Message(Direction.IN, text, now, Message.State.SENT);
+        global.add(m);
+        trimGlobal();
+        globalDirty = true;
+        return m;
+    }
+
+    /** A line from the Messenger itself in the public log (not saved). */
+    public Message addGlobalNote(String text, long now) {
+        Message m = new Message(Direction.NOTE, text, now, Message.State.SENT);
+        global.add(m);
+        trimGlobal();
+        return m;
+    }
+
+    /** Loading from a file: adds a line without marking anything to save. */
+    Message addGlobalLoaded(String text, long time) {
+        Message m = new Message(Direction.IN, text, time, Message.State.SENT);
+        global.add(m);
+        trimGlobal();
+        return m;
+    }
+
+    /** Forgets the public chat log. */
+    public void clearGlobal() {
+        if (global.stream().anyMatch(m -> m.direction() != Direction.NOTE)) globalDirty = true;
+        global.clear();
+    }
+
+    private void trimGlobal() {
+        int over = global.size() - globalCap;
+        if (over > 0) global.subList(0, over).clear();
+    }
+
     /** Changes the per-player cap; longer histories are cut at once. */
     public void cap(int cap) {
         this.cap = clampCap(cap);
@@ -47,13 +109,19 @@ public final class ConversationStore {
         return version;
     }
 
-    /** True once something that should be saved changed; {@link #clean()} resets it. */
+    /** Whispers (or a message state) changed and should be saved soon. The public chat alone does not set this. */
     public boolean dirty() {
         return dirty;
     }
 
+    /** The public chat changed; it is saved on a long interval, or when leaving. */
+    public boolean globalDirty() {
+        return globalDirty;
+    }
+
     public void clean() {
         dirty = false;
+        globalDirty = false;
     }
 
     /** Something about an existing message changed (its state). */
@@ -136,6 +204,18 @@ public final class ConversationStore {
                 trim(c);
             }
         }
+        Set<String> seenGlobal = new HashSet<>();
+        for (Message m : global) seenGlobal.add(signature(m));
+        boolean addedGlobal = false;
+        for (Message m : other.global) {
+            if (m.direction() != Direction.IN || !seenGlobal.add(signature(m))) continue;
+            global.add(new Message(Direction.IN, m.text(), m.time(), Message.State.SENT));
+            addedGlobal = true;
+        }
+        if (addedGlobal) {
+            global.sort(Comparator.comparingLong(Message::time));
+            trimGlobal();
+        }
         version++;
     }
 
@@ -177,8 +257,9 @@ public final class ConversationStore {
     }
 
     public void clear() {
-        if (!byKey.isEmpty()) dirty = true;
+        if (!byKey.isEmpty() || !global.isEmpty()) { dirty = true; globalDirty = true; }
         byKey.clear();
+        global.clear();
         version++;
     }
 

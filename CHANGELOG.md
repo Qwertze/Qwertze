@@ -7,7 +7,45 @@ Versions before 0.2.8 are listed on the [GitHub releases page](https://github.co
 
 ## [Unreleased]
 
-Mirrors Stash Sorter plugin 1.14.0 (version 0.4.0-dev.16; the plugin is unchanged in this release).
+Mirrors Stash Sorter plugin 1.14.0 (version 0.4.0-dev.17; the plugin is unchanged in this release).
+
+### Added (0.4.0-dev.17)
+- **Messenger, New picker**: the New button opens a search field and a list: Meteor friends, then players online (tab list), then past conversations, without doubles and without yourself.
+  - Typing filters the list; names that start with the text come first in each group. An exact match goes to the top. A valid typed name (3 to 16 letters, digits or `_`) that is not in the list is offered as "Message <name>".
+  - Click or Enter opens or creates the conversation and sends nothing. Esc closes the picker.
+  - Names the whisper command can't address (such as Bedrock `.Name`) are not listed.
+- **Messenger, Global**: a pinned entry at the top of the left pane, selected by default.
+  - It shows public chat as the chat shows it after other modules (cancelled lines are left out). Whispers stay in their own conversation.
+  - Typing there sends public chat through the game's normal chat send, so a Meteor command (the Meteor prefix, `.` by default) runs as a command, and chat modules such as BetterChat may change the text. `/` sends a command; a space right after the `/` is refused.
+  - Global sends use the same queue and rate limit as whispers (one per `send-interval-ms`, at most 3 waiting, never retried, dropped on a server change). A command's arguments are never shown in the log.
+  - `global-scrollback` (500 by default, 50 to 2000): the most public chat lines kept per server.
+  - Clear (with confirmation) empties Global.
+- **Messenger, history for Global**: with `save-history` on, Global is saved too, per server. Saving runs in the background: whispers every 20 seconds, Global every 5 minutes, and everything when you leave a world or turn the module off. The file is written owner-only where the system supports it. Older history files still load.
+- **Messenger, `take-chat-key`** (off by default): the chat key opens the Messenger on Global instead of the normal chat; `/` still opens the normal chat. Only a chat opened with empty text is taken: on 1.21.11 a saved vanilla chat draft still opens the normal chat, and another mod's empty chat screen is taken too.
+- **Messenger, `overlay-global`** (off by default): shows the public chat in the always-on overlay while the window isn't focused. Off, the overlay shows the first conversation in the left pane (friends first, then most recent) instead of Global.
+- **Messenger, left pane**: Global, then the conversations (friends first, then most recent), each with its unread badge. Delete asks for confirmation.
+- Not tested in game yet.
+
+### Fixed (0.4.0-dev.17)
+- Messenger: a deleted conversation's draft no longer comes back.
+- Messenger: a click or Enter in the New picker opens the row that is shown.
+- Messenger: the window re-wraps its text once a resize has settled, instead of on every frame.
+- Not tested in game yet.
+
+### Fixed (0.4.0-dev.16.2)
+- Stash window, Build Planner: loading a schematic no longer breaks the window with "the window's layout failed". The rows of the materials table and the chest contents card were built without a theme. A safety net now gives any widget left without a theme its parent's theme before layout, and logs one warning instead of failing.
+- Not tested in game yet.
+
+### Added (0.4.0-dev.16.1)
+- Printer, `scaffold-length` (Order group, 0 by default, 0 to 256): the longest scaffold chain, and how far outside the schematic it may go. 0 means no limit on either. Scaffold still never goes in a cell the schematic wants a block in.
+  - Before, both limits were fixed at 6 blocks.
+  - `scaffold-max` now goes up to 4096 (64 by default). It and the spare blocks carried are the real cap on a chain's length.
+  - The search tries the straight columns from the cell's faces first, then an L-shaped chain, then a short search for a shorter chain within the time budget. A long column down to the ground is found. Long winding detours may still not be found.
+  - The "No scaffold can reach..." warning names the limit only when one is set, and only appears after a real search.
+  - New warnings: a chain needs more blocks than `scaffold-max` or the spare blocks allow; no room for more scaffold; the search took too long (that cell is given up on for a minute). Each warns once per layer.
+  - Scaffold is never planned outside the world's build height.
+  - A long chain is no longer dropped halfway: unplaced scaffold blocks expire 15 s after the chain last made progress (placing, or walking to it), with a hard cap of 15 s plus 2 s per scaffold block.
+  - Not tested in game yet.
 
 ### Added (0.4.0-dev.16)
 - **Messenger** (new module in the Qwerte category): a small chat window that shows your whispers, keeps a history per player and sends from the window, with emoji.

@@ -232,6 +232,7 @@ public class WFrame extends WContainer {
         double fullW = width - 2 * bw;
         double innerW = fullW - ringInset;
 
+        ThemeRepair.repair(this);
         header.innerWidth = fullW;
         header.cornerRadius = Math.max(0, p.radius * u - bw);
         header.calculateSize();

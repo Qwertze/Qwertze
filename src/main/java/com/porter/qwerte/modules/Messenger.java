@@ -1,7 +1,9 @@
 package com.porter.qwerte.modules;
 
 import com.porter.qwerte.QwerteAddon;
+import com.porter.qwerte.mixin.ChatScreenAccessor;
 import com.porter.qwerte.messenger.ChatClicks;
+import com.porter.qwerte.messenger.ChatKeyRoute;
 import com.porter.qwerte.messenger.ChatLines;
 import com.porter.qwerte.messenger.ConversationStore;
 import com.porter.qwerte.messenger.DmFormat;
@@ -20,6 +22,7 @@ import com.porter.qwerte.messenger.UserPatterns;
 import meteordevelopment.meteorclient.MeteorClient;
 import meteordevelopment.meteorclient.events.game.GameJoinedEvent;
 import meteordevelopment.meteorclient.events.game.GameLeftEvent;
+import meteordevelopment.meteorclient.events.game.OpenScreenEvent;
 import meteordevelopment.meteorclient.events.game.ReceiveMessageEvent;
 import meteordevelopment.meteorclient.events.render.Render2DEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
@@ -39,7 +42,9 @@ import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.utils.Utils;
 import meteordevelopment.meteorclient.utils.misc.Keybind;
+import meteordevelopment.meteorclient.systems.config.Config;
 import meteordevelopment.orbit.EventHandler;
+import meteordevelopment.orbit.EventPriority;
 import net.minecraft.client.gui.screens.ChatScreen;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.resources.sounds.SimpleSoundInstance;
@@ -53,6 +58,11 @@ import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static meteordevelopment.meteorclient.MeteorClient.mc;
 
@@ -60,15 +70,18 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
  * Reads the whispers you get (and send) from chat into a small messenger window: a conversation list, a history per
  * player, an input line and an emoji picker. The window is drawn over the game like a HUD element and takes the
  * keyboard and mouse only when you focus it (the keybind, or a click on it while the chat is open); Esc or the keybind
- * lets go. Nothing is ever sent unless you press Enter or Send in the window, and then only what you typed, as a
- * whisper command, one message per interval.
+ * lets go. Nothing is ever sent unless you press Enter or Send in the window, and then only what you typed: as a
+ * whisper command to the open player, or in Global as public chat (a text starting with / as a command), one message
+ * per interval.
  *
  * <p>History is kept in memory. With save-history on it is also written to one JSON file in the addon's folder
  * ({@code meteor-client/qwerte/messenger-history.json}); it is never sent anywhere.
  */
 public class Messenger extends Module {
     private static final String GEOMETRY_KEY = "qwerteMessengerWindow";
+    /** Changed whispers are written after this long; the public chat alone only after the longer one (or on leaving). */
     private static final long SAVE_EVERY_MS = 20_000;
+    private static final long SAVE_GLOBAL_EVERY_MS = 5 * 60_000;
 
     private final SettingGroup sgPatterns = settings.createGroup("Patterns");
     private final SettingGroup sgSending = settings.createGroup("Sending");
@@ -168,6 +181,16 @@ public class Messenger extends Module {
         .build()
     );
 
+    private final Setting<Integer> globalScrollback = sgHistory.add(new IntSetting.Builder()
+        .name("global-scrollback")
+        .description("The most public chat lines kept in the Global view per server; the oldest are dropped. Saved with save-history too.")
+        .defaultValue(ConversationStore.DEFAULT_GLOBAL_CAP)
+        .range(ConversationStore.MIN_GLOBAL_CAP, ConversationStore.MAX_GLOBAL_CAP)
+        .sliderRange(ConversationStore.MIN_GLOBAL_CAP, 1000)
+        .onChanged(v -> this.core.stores().globalCap(v))
+        .build()
+    );
+
     // ---------- window ----------
 
     private final Setting<Keybind> focusKey = sgWindow.add(new KeybindSetting.Builder()
@@ -175,6 +198,20 @@ public class Messenger extends Module {
         .description("Takes the keyboard and mouse for the Messenger window, and lets go again (a key that is not a letter or digit; Esc always lets go).")
         .defaultValue(Keybind.none())
         .action(this::keybindAction)
+        .build()
+    );
+
+    private final Setting<Boolean> takeChatKey = sgWindow.add(new BoolSetting.Builder()
+        .name("take-chat-key")
+        .description("Take priority over the chat key: it opens the Messenger on Global instead of the normal chat. The command key (/) still opens the normal chat with a slash. Only a chat opened with empty text is taken, so on 1.21.11 a saved vanilla chat draft still opens vanilla chat, and another mod that opens an empty chat screen is taken too. Off: the normal chat is untouched.")
+        .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<Boolean> overlayGlobalChat = sgWindow.add(new BoolSetting.Builder()
+        .name("overlay-global")
+        .description("Shows the public chat (Global) in the always-on overlay. Off: the overlay shows your whispers, and Global only appears while the window is focused.")
+        .defaultValue(false)
         .build()
     );
 
@@ -236,6 +273,33 @@ public class Messenger extends Module {
         }
 
         @Override
+        public List<String> friendNames() {
+            List<String> names = new ArrayList<>();
+            for (var f : Friends.get()) names.add(f.name);
+            return names;
+        }
+
+        @Override
+        public List<String> onlineNames() {
+            return OnlineNames.all();
+        }
+
+        @Override
+        public String selfName() {
+            return mc.getUser() != null ? mc.getUser().getName() : null;
+        }
+
+        @Override
+        public boolean overlayGlobal() {
+            return overlayGlobalChat.get();
+        }
+
+        @Override
+        public String meteorPrefix() {
+            return Config.get().prefix.get();
+        }
+
+        @Override
         public String hint() {
             Keybind key = focusKey.get();
             return key.isSet() ? "Press " + key + " to type" : "Set the focus-key, or click here with the chat open";
@@ -248,21 +312,32 @@ public class Messenger extends Module {
     /** Where the window was left, in GUI pixels; null until it was moved or resized. Saved with the module's data. */
     private Geometry geometry;
     private long lastSave;
-    private final Object saveLock = new Object();
+    /** Set by the whisper reader for the line being handled, read by the Global reader that runs after it. */
+    private boolean lastWasWhisper;
+    /** Writes the history one at a time, off the client thread; made on first use. */
+    private volatile ExecutorService writer;
+    /** Set by the writer thread, shown to the user on the next tick. */
+    private final AtomicReference<String> pendingWarning = new AtomicReference<>();
+    private final AtomicBoolean saveFailed = new AtomicBoolean();
     /** The history file could not be read, so it is not written this session (it would be lost). */
     private boolean saveBlocked;
     private String warnedTemplate;
 
     public Messenger() {
-        super(QwerteAddon.CATEGORY, "messenger", "Reads your whispers into a small chat window with a history per player. Type back from the window (a key or a click on it), with emoji.");
-        // Safe to run more than once and from another thread: it saves under a lock and only if something changed
+        super(QwerteAddon.CATEGORY, "messenger", "Reads your whispers into a small chat window with a history per player, plus a Global view of the public chat. Type back from the window (a key or a click on it), with emoji. The New list leaves out names the whisper command can't address (like Bedrock .Name).");
+        // On exit, wait a moment for a write that is already running. This thread never reads the live conversations (they
+        // belong to the client thread); what changed after the last save is saved on leaving a world or turning the module off.
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
-                if (isActive()) saveNow(true);
+                ExecutorService w = writer;
+                if (w != null) {
+                    w.shutdown();
+                    w.awaitTermination(3, TimeUnit.SECONDS);
+                }
             } catch (Throwable ignored) {
                 // shutting down anyway
             }
-        }, "qwerte-messenger-save"));
+        }, "qwerte-messenger-flush"));
     }
 
     /** The key of the server the player is on: its address, or "local" for singleplayer and LAN. */
@@ -283,6 +358,7 @@ public class Messenger extends Module {
         core.template(template.get());
         core.intervalMs(interval.get());
         core.stores().cap(maxHistory.get());
+        core.stores().globalCap(globalScrollback.get());
         core.switchServer(serverKey());
         ui.reset();
         saveBlocked = false;
@@ -327,17 +403,32 @@ public class Messenger extends Module {
 
     @EventHandler
     private void onMessage(ReceiveMessageEvent event) {
+        long now = System.currentTimeMillis();
         DmParser.Parsed p = ChatLines.parse(event.getMessage(), parser, fmtVanilla.get(), OnlineNames::has);
+        lastWasWhisper = p != null; // read by onChatLine, which runs after this for the same message
         if (p == null) return;
         String self = mc.getUser() != null ? mc.getUser().getName() : null;
         boolean reading = ui.isReading(p.name());
-        MessengerCore.Received r = core.receive(p, self, System.currentTimeMillis(), reading);
+        MessengerCore.Received r = core.receive(p, self, now, reading);
         if (r == null) return;
-        ui.onActivity(r);
         if (r.fromOther() && !reading && sound.get() && mc.player != null) {
             // quiet: a short high blip at a quarter of the volume
             mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.EXPERIENCE_ORB_PICKUP, 1.6f, 0.25f));
         }
+    }
+
+    /**
+     * The public chat for Global: every line that reaches the chat feed except whispers (those go only to their
+     * conversation, so deleting it removes them everywhere). It runs last, so it sees the line as the chat shows it:
+     * after other handlers changed it, and not at all if one cancelled it. The whisper reading above stays at the normal
+     * priority, because the patterns are written for the server's own wording.
+     */
+    @EventHandler(priority = EventPriority.LOWEST)
+    private void onChatLine(ReceiveMessageEvent event) {
+        boolean whisper = lastWasWhisper;
+        lastWasWhisper = false;
+        if (whisper || event.isCancelled() || event.getMessage() == null) return;
+        core.receiveGlobal(event.getMessage().getString(), System.currentTimeMillis());
     }
 
     // ---------- sending and saving ----------
@@ -345,13 +436,31 @@ public class Messenger extends Module {
     @EventHandler
     private void onTick(TickEvent.Post event) {
         long now = System.currentTimeMillis();
-        core.tick(now, command -> {
-            ClientPacketListener connection = mc.getConnection();
-            if (connection == null || mc.player == null) return false;
-            connection.sendCommand(command);
-            return true;
+        core.tick(now, new MessengerCore.Sender() {
+            @Override
+            public boolean command(String command) {
+                ClientPacketListener connection = mc.getConnection();
+                if (connection == null || mc.player == null) return false;
+                connection.sendCommand(command); // a whisper, or a command the user typed in Global (no slash)
+                return true;
+            }
+
+            @Override
+            public boolean chat(String text) {
+                ClientPacketListener connection = mc.getConnection();
+                if (connection == null || mc.player == null) return false;
+                connection.sendChat(text); // public chat the user typed in Global
+                return true;
+            }
         });
-        if (saveHistory.get() && core.stores().dirty() && now - lastSave > SAVE_EVERY_MS) saveNow();
+        if (saveHistory.get()) {
+            boolean whispers = core.stores().dirty() && now - lastSave > SAVE_EVERY_MS;
+            boolean pub = core.stores().globalDirty() && now - lastSave > SAVE_GLOBAL_EVERY_MS;
+            if (whispers || pub) saveNow();
+        }
+        String warn = pendingWarning.getAndSet(null);
+        if (warn != null) warning(warn);
+        if (saveFailed.getAndSet(false)) core.stores().touch(); // try again at the next save
     }
 
     // ---------- drawing and focus ----------
@@ -394,6 +503,23 @@ public class Messenger extends Module {
         return true;
     }
 
+    /**
+     * With take-chat-key on, the game's chat key opens the Messenger on Global. The game opens its chat by
+     * {@code Minecraft.setScreen(new ChatScreen(initialText))}, with an empty text from the chat key and "/" from the
+     * command key; this event comes before that and is cancelled only for an exact {@link ChatScreen} with an empty text.
+     * Any other chat screen (a link, a command suggestion, another mod, a restored draft) is left alone.
+     */
+    @EventHandler
+    private void onOpenScreen(OpenScreenEvent event) {
+        if (!takeChatKey.get() || event.screen == null || event.screen.getClass() != ChatScreen.class) return;
+        boolean available = isActive() && mc.player != null && mc.level != null && mc.screen == null;
+        String initial = ((ChatScreenAccessor) event.screen).qwerte$getInitial();
+        if (ChatKeyRoute.route(true, initial, available) != ChatKeyRoute.Route.MESSENGER) return;
+        event.cancel();
+        ui.selectGlobal();
+        open();
+    }
+
     /** Focuses the window (as soon as no other screen is up). */
     public void open() {
         Utils.screenToOpen = new MessengerScreen(ui);
@@ -427,51 +553,68 @@ public class Messenger extends Module {
     }
 
     private void loadHistory() {
-        synchronized (saveLock) {
-            // An old (version 1) file has no servers: its conversations go to the server the player is on now
-            HistoryJson.Loaded loaded = HistoryJson.load(historyFile(), core.stores(), core.stores().currentKey());
-            switch (loaded.status()) {
-                case CORRUPT -> warning("The saved history was unreadable and was moved aside (messenger-history.json.corrupt).");
-                case TOO_BIG, UNREADABLE -> {
-                    // Left as it is, and not overwritten: saving is off until the module is turned on again
-                    saveBlocked = true;
-                    warning("The saved history could not be read (too big or unreadable); it is left alone and nothing is saved this session.");
-                }
-                default -> {
-                }
+        // An old (version 1) file has no servers: its conversations go to the server the player is on now
+        HistoryJson.Loaded loaded = HistoryJson.load(historyFile(), core.stores(), core.stores().currentKey());
+        switch (loaded.status()) {
+            case CORRUPT -> warning("The saved history was unreadable and was moved aside (messenger-history.json.corrupt).");
+            case TOO_BIG, UNREADABLE -> {
+                // Left as it is, and not overwritten: saving is off until the module is turned on again
+                saveBlocked = true;
+                warning("The saved history could not be read (too big or unreadable); it is left alone and nothing is saved this session.");
+            }
+            default -> {
             }
         }
     }
 
-    /** Writes the history if it changed. Safe to call from any thread and as often as you like. */
-    private void saveNow() {
-        saveNow(false);
+    /** The one background thread that writes the file, so two writes never overlap and the client thread never waits for the disk. */
+    private ExecutorService writer() {
+        ExecutorService w = writer;
+        if (w == null) {
+            w = Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "qwerte-messenger-save");
+                t.setDaemon(true);
+                return t;
+            });
+            writer = w;
+        }
+        return w;
     }
 
     /**
-     * @param quiet from the shutdown hook, which runs on another thread while the client thread may still change the
-     *              history without this lock: it never posts a message, and a failed or interrupted save is skipped
-     *              (the history was saved on the last world leave or deactivation anyway)
+     * Writes the history if it changed (client thread). A copy of the conversations is taken here, so the thread that
+     * writes never looks at the live lists; it only turns the copy into JSON and writes it. A failed write marks the
+     * history as changed again, so the next save tries once more.
      */
-    private void saveNow(boolean quiet) {
-        synchronized (saveLock) {
-            lastSave = System.currentTimeMillis();
-            if (!saveHistory.get() || saveBlocked || !core.stores().dirty()) return;
-            if (HistoryJson.save(historyFile(), core.stores())) core.stores().clean();
-            else if (!quiet && mc.player != null) warning("Could not save the history.");
-        }
+    private void saveNow() {
+        lastSave = System.currentTimeMillis();
+        if (!saveHistory.get() || saveBlocked || !core.stores().anyDirty()) return;
+        HistoryJson.Snapshot snapshot = HistoryJson.snapshot(core.stores());
+        core.stores().clean();
+        Path file = historyFile();
+        AtomicReference<String> warn = pendingWarning;
+        AtomicBoolean failed = saveFailed;
+        writer().execute(() -> {
+            if (!HistoryJson.write(file, snapshot)) {
+                warn.set("Could not save the history.");
+                failed.set(true);
+            }
+        });
     }
 
     /** Forgets every conversation (every server), in memory and on disk. */
     public void clearHistory() {
-        synchronized (saveLock) {
-            core.cancelQueued();
-            core.stores().clear();
-            core.stores().clean();
-            ui.reset();
-            saveBlocked = false;
-            if (!HistoryJson.delete(historyFile())) warning("Could not delete the history file.");
-        }
+        core.cancelQueued();
+        core.stores().clear();
+        core.stores().clean();
+        ui.reset();
+        saveBlocked = false;
+        Path file = historyFile();
+        AtomicReference<String> warn = pendingWarning;
+        // On the writer thread, after any save already waiting, so an old save can not bring the file back
+        writer().execute(() -> {
+            if (!HistoryJson.delete(file)) warn.set("Could not delete the history file.");
+        });
     }
 
     // ---------- saved data and settings screen ----------

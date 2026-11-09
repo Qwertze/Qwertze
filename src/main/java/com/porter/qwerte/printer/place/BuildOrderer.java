@@ -371,6 +371,11 @@ public final class BuildOrderer {
      * than {@code cap} cells.
      */
     public List<Cell> stranded(int y, int max, int cap, double px, double py, double pz, Box box, World world) {
+        return stranded(y, max, cap, px, py, pz, box, world, c -> false);
+    }
+
+    /** As above, but the cells {@code skip} says yes to are left out (they do not take one of the {@code max} places). */
+    public List<Cell> stranded(int y, int max, int cap, double px, double py, double pz, Box box, World world, Predicate<Cell> skip) {
         List<Cell> out = new ArrayList<>();
         if (airplace || max <= 0) return out;
         int work = 0;
@@ -380,7 +385,7 @@ public final class BuildOrderer {
             if (slice == null) continue;
             for (Cell c : slice) {
                 if (++work > cap) return out;
-                if (c.role != Role.SOLID || !world.loaded(c.x, c.y, c.z) || !world.free(c.x, c.y, c.z) || ready(c, null, world)) continue;
+                if (c.role != Role.SOLID || !world.loaded(c.x, c.y, c.z) || !world.free(c.x, c.y, c.z) || ready(c, null, world) || skip.test(c)) continue;
                 insert(out, c, max, near);
             }
         }

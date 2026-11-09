@@ -15,7 +15,26 @@ public final class MessengerCore {
 
     public static final String STRIPPED_NOTE = "This server seems to remove emoji from messages: the other player may not see them.";
 
-    private record Pending(String command, Message message) {
+    /** How a waiting item is sent: a whisper command, a public chat message, or a command typed in Global. */
+    enum Kind {
+        WHISPER, CHAT, COMMAND
+    }
+
+    /**
+     * @param payload what is handed to the game (a command without its slash, or the chat text)
+     * @param message the message whose state follows the send (for Global it is not in any list)
+     * @param label   what the public log may say about it if it was not sent
+     */
+    private record Pending(Kind kind, String payload, Message message, String label, boolean meteor) {
+    }
+
+    /** The game side of sending. Each returns false when it could not send (not connected). */
+    public interface Sender {
+        /** Sends a command; {@code command} has no leading slash. */
+        boolean command(String command);
+
+        /** Sends a public chat message. */
+        boolean chat(String text);
     }
 
     /** What a received line did: the conversation, the new message (null for a copy of one we sent), whether it is new from them. */
@@ -126,27 +145,88 @@ public final class MessengerCore {
         if (!r.ok()) return r.error();
         if (outbox.size() >= Outbox.MAX_QUEUE) return "Too many messages waiting, give it a moment.";
         Message m = store().addOutgoing(name, r.text(), now, Message.State.SENDING);
-        outbox.offer(new Pending(r.command(), m));
+        outbox.offer(new Pending(Kind.WHISPER, r.command(), m, null, false));
         return null;
+    }
+
+    /** A line that arrived in the chat feed, for the Global log. Lines that are empty after cleaning are ignored. */
+    public void receiveGlobal(String line, long now) {
+        String text = ChatText.message(line);
+        if (!text.isEmpty()) store().addGlobal(text, now);
+    }
+
+    /**
+     * Checks and queues what the user typed in Global. Nothing is sent here; {@link #tick} sends it, in the same queue
+     * and at the same rate as whispers. The text is handed to the game's normal chat send, as vanilla chat does (see
+     * {@link GlobalSend}); Meteor's own send hook then applies to chat text.
+     *
+     * @return null when queued, else why not (shown to the user)
+     */
+    public String sendGlobal(String raw, long now) {
+        return sendGlobal(raw, now, null);
+    }
+
+    /**
+     * @param meteorPrefix Meteor's command prefix ("." by default), or null/empty: a chat text starting with it is run
+     *                     by Meteor as a command and never reaches the server, so the log says "Ran Meteor command"
+     */
+    public String sendGlobal(String raw, long now, String meteorPrefix) {
+        GlobalSend.Result r = GlobalSend.prepare(raw);
+        if (!r.ok()) return r.error();
+        if (outbox.size() >= Outbox.MAX_QUEUE) return "Too many messages waiting, give it a moment.";
+        boolean command = r.kind() == GlobalSend.Kind.COMMAND;
+        boolean meteor = !command && meteorPrefix != null && !meteorPrefix.isEmpty() && r.payload().startsWith(meteorPrefix);
+        String label = meteor ? "Meteor command" : r.label(); // its arguments are never shown
+        // Not in any list: the server's own copy of a chat message is what shows in the log
+        Message m = new Message(Direction.OUT, label, now, Message.State.SENDING);
+        outbox.offer(new Pending(command ? Kind.COMMAND : Kind.CHAT, r.payload(), m, label, meteor));
+        return null;
+    }
+
+    /** Whether something typed in Global is waiting to be sent. */
+    public boolean globalQueued() {
+        return outbox.anyMatch(p -> p.kind() != Kind.WHISPER);
     }
 
     /**
      * Sends the next waiting message if the interval has passed. {@code sender} gets the command (no slash) and returns
-     * false when it could not send (not connected).
+     * false when it could not send (not connected). Only whispers are sent through this form.
      */
     public void tick(long now, Predicate<String> sender) {
+        tick(now, new Sender() {
+            @Override
+            public boolean command(String command) {
+                return sender.test(command);
+            }
+
+            @Override
+            public boolean chat(String text) {
+                return false;
+            }
+        });
+    }
+
+    /** Sends the next waiting message if the interval has passed: at most one per interval, whatever it is. */
+    public void tick(long now, Sender sender) {
         Pending p = outbox.next(now, intervalMs);
         if (p == null) return;
-        boolean ok = sender.test(p.command());
+        boolean ok = p.kind() == Kind.CHAT ? sender.chat(p.payload()) : sender.command(p.payload());
         p.message().state(ok ? Message.State.SENT : Message.State.FAILED);
         if (ok) p.message().sentAt(now);
-        stores.touch();
+        if (p.meteor()) store().addGlobalNote(ok ? "Ran Meteor command" : "Not sent: " + p.label(), now);
+        else if (p.kind() == Kind.COMMAND) store().addGlobalNote(ok ? "Sent " + p.label() : "Not sent: " + p.label(), now);
+        else if (p.kind() == Kind.CHAT && !ok) store().addGlobalNote("Not sent: " + p.label(), now);
+        if (p.kind() == Kind.WHISPER) stores.touch(); // only whispers are worth a save
     }
 
     /** Drops what is waiting (leaving the server, module off); those messages show as not sent. */
     public void cancelQueued() {
         List<Pending> dropped = outbox.clear();
-        for (Pending p : dropped) p.message().state(Message.State.FAILED);
+        long now = System.currentTimeMillis();
+        for (Pending p : dropped) {
+            p.message().state(Message.State.FAILED);
+            if (p.kind() != Kind.WHISPER) store().addGlobalNote("Not sent: " + p.label(), now);
+        }
         if (!dropped.isEmpty()) stores.touch();
     }
 }

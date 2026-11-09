@@ -461,8 +461,18 @@ public class Printer extends Module {
         .name("scaffold-max")
         .description("Most scaffold blocks standing at once.")
         .defaultValue(64)
-        .range(1, 512)
-        .sliderRange(1, 128)
+        .range(1, 4096)
+        .sliderRange(1, 256)
+        .visible(() -> layerOrder.get() != LayerOrder.Off && scaffold.get())
+        .build()
+    );
+
+    private final Setting<Integer> scaffoldLength = sgOrder.add(new IntSetting.Builder()
+        .name("scaffold-length")
+        .description("Longest scaffold chain, and how far outside the schematic it may go. 0: no limit.")
+        .defaultValue(0)
+        .range(0, 256)
+        .sliderRange(0, 64)
         .visible(() -> layerOrder.get() != LayerOrder.Off && scaffold.get())
         .build()
     );
@@ -961,9 +971,19 @@ public class Printer extends Module {
     private int removalSince, removalFails, removalRetryAt;
     private static final int REMOVAL_WALK_MAX = 20 * 20;
     private List<ScaffoldPlanner.Box> scaffoldAreas = List.of();
-    private boolean scaffoldNoSpareWarned, scaffoldPlannedNow;
+    private boolean scaffoldNoSpareWarned, scaffoldPlannedNow, scaffoldRoomWarned, scaffoldSlowWarned, scaffoldShortWarned;
     private int scaffoldTry = -1000, scaffoldCheck = -1000, scaffoldPlacedTotal, scaffoldRemovedTotal;
+    /** The last tick a planned chain made progress (a block placed or standing, or a walk going): the planned-block TTL counts from it. */
+    private int scaffoldProgress = -1000;
+    /** The last tick the walk code was heading for an unplaced scaffold block of a chain. */
+    private int scaffoldWalkTick = -1000;
+    /** The layer the once-per-layer scaffold warnings were last raised for. */
+    private Integer scaffoldWarnLayer;
+    /** The scaffold-length and scaffold-max the cached failures were found with. */
+    private int scaffoldSeenLength = -1, scaffoldSeenMax = -1;
     private static final int SCAFFOLD_EVERY = 10, SCAFFOLD_CHECK = 5, SCAFFOLD_PLANNED_TTL = 300, SCAFFOLD_FAIL_TTL = 200, SCAFFOLD_BREAK_TRIES = 200;
+    /** A cell whose search keeps running out of time is left alone for this long, after this many tries in a row. */
+    private static final int SCAFFOLD_SLOW_TTL = 1200, SCAFFOLD_SLOW_HITS = 4;
     /** The most one planning pass may take in all, however many cells ran out of their own time. */
     private static final long SCAFFOLD_TOTAL_NANOS = 4_000_000L;
     private BlockPos refillSource;
@@ -1237,8 +1257,10 @@ public class Printer extends Module {
         scaffoldBudgetHits.clear();
         removalWalk = walkNoPlace = false;
         removalFails = removalRetryAt = 0;
-        scaffoldNoSpareWarned = scaffoldPlannedNow = false;
-        scaffoldTry = scaffoldCheck = -1000;
+        scaffoldNoSpareWarned = scaffoldPlannedNow = scaffoldRoomWarned = scaffoldSlowWarned = scaffoldShortWarned = false;
+        scaffoldTry = scaffoldCheck = scaffoldProgress = scaffoldWalkTick = -1000;
+        scaffoldWarnLayer = null;
+        scaffoldSeenLength = scaffoldSeenMax = -1;
         scaffoldPlacedTotal = scaffoldRemovedTotal = 0;
         scaffoldFailures = 0;
         targets.clear();
@@ -2144,6 +2166,7 @@ public class Printer extends Module {
             Scaf scaf = scaffolds.get(k);
             if (scaf != null && !scaf.placed) {
                 scaf.placed = true;
+                scaffoldProgress = tick;
                 scaffoldPlacedTotal++;
             }
             orderer.placed(c);
@@ -3027,6 +3050,11 @@ public class Printer extends Module {
         }
 
         @Override
+        public boolean inHeight(int y) {
+            return y >= (mc.level.getMinSectionY() << 4) && y < ((mc.level.getMaxSectionY() + 1) << 4);
+        }
+
+        @Override
         public boolean wanted(int x, int y, int z) {
             if (built == null) return false;
             BlockState w = built.stateAt(pos.set(x, y, z));
@@ -3108,8 +3136,12 @@ public class Printer extends Module {
         }
         if (tick - scaffoldCheck < SCAFFOLD_CHECK) return;
         scaffoldCheck = tick;
+        // Walking to the chain's own unplaced blocks counts as progress; a walk for anything else does not
+        if (walkGoal != null && tick - scaffoldWalkTick <= 20) scaffoldProgress = tick;
+        int hardCap = SCAFFOLD_PLANNED_TTL + 40 * scaffolds.size();
         for (Scaf sc : new ArrayList<>(scaffolds.values())) {
-            if (!sc.placed && tick - sc.since > SCAFFOLD_PLANNED_TTL) {
+            // The TTL counts from the chain's last progress, so the tail of a long chain is not dropped while it is being built
+            if (!sc.placed && (tick - Math.max(sc.since, scaffoldProgress) > SCAFFOLD_PLANNED_TTL || tick - sc.since > hardCap)) {
                 dropScaffold(sc);
             } else if (sc.built && mc.level.isLoaded(sc.pos) && !mc.level.getBlockState(sc.pos).is(sc.state.getBlock())) {
                 // The world showed it once and it is gone now (broken by someone, or replaced): it is no support any more
@@ -3160,6 +3192,7 @@ public class Printer extends Module {
         switch (loop.verdict(k, ok)) {
             case OK -> {
                 sc.built = true;
+                scaffoldProgress = tick;
                 awaiting.remove(k);
                 orderer.unplaced(c.x(), c.y(), c.z()); // the world shows it now
                 orderer.wake(c.x(), c.y(), c.z());
@@ -3224,7 +3257,16 @@ public class Printer extends Module {
         if (!scaffoldEnabled() || scaffoldInProgress() || tick - scaffoldTry < SCAFFOLD_EVERY) return false;
         scaffoldTry = tick;
         int layerY = layers.active();
-        List<BuildOrderer.Cell> stranded = orderer.stranded(layerY, 6, 4000, eye.x, eye.y, eye.z, box, worldView);
+        if (scaffoldWarnLayer == null || scaffoldWarnLayer != layerY) {
+            // The once-a-run warnings are once a layer
+            scaffoldWarnLayer = layerY;
+            scaffoldRoomWarned = scaffoldSlowWarned = scaffoldShortWarned = false;
+        }
+        // Cells that are cooling down are left out, so they do not take the places of the others
+        List<BuildOrderer.Cell> stranded = orderer.stranded(layerY, 6, 4000, eye.x, eye.y, eye.z, box, worldView, cc -> {
+            Integer u = scaffoldFail.get(key(cc));
+            return u != null && tick < u;
+        });
         if (stranded.isEmpty()) return false;
         Item item = spareItem(have);
         if (item == null) {
@@ -3239,9 +3281,30 @@ public class Printer extends Module {
         // Only planned blocks count toward scaffold-max; the stand blocks Baritone climbed with are not the Printer's to limit
         int planned = 0;
         for (Scaf s : scaffolds.values()) if (!s.stand) planned++;
+        if (scaffoldSeenLength != scaffoldLength.get() || scaffoldSeenMax != scaffoldMax.get()) {
+            // A setting changed: what was refused or too slow under the old one may work now
+            if (scaffoldSeenLength >= 0) {
+                scaffoldFail.clear();
+                scaffoldBudgetHits.clear();
+                scaffoldWarned.clear();
+                scaffoldRoomWarned = scaffoldSlowWarned = scaffoldShortWarned = false;
+            }
+            scaffoldSeenLength = scaffoldLength.get();
+            scaffoldSeenMax = scaffoldMax.get();
+        }
         int room = Math.min(scaffoldMax.get() - planned, have.getOrDefault(item, 0));
+        if (room < 1) {
+            // Not a refusal of the cells: nothing is remembered, the next try can find room
+            if (!scaffoldRoomWarned && scaffoldRemovable.isEmpty()) {
+                scaffoldRoomWarned = true;
+                warning("No room for more scaffold: scaffold-max (%d) is reached or the spare blocks have run out.", scaffoldMax.get());
+            }
+            return false;
+        }
+        int limit = scaffoldLength.get();
         long started = System.nanoTime();
         boolean timedOut = false;
+        int searched = 0;
         for (BuildOrderer.Cell c : stranded) {
             Integer until = scaffoldFail.get(key(c));
             if (until != null && tick < until) continue;
@@ -3252,18 +3315,41 @@ public class Printer extends Module {
             }
             int hits = scaffoldBudgetHits.getOrDefault(key(c), 0);
             long deadline = System.nanoTime() + ScaffoldPlanner.budgetNanos(hits);
-            ScaffoldPlanner.Result r = ScaffoldPlanner.plan(scaffoldWorld, areas, c.x(), c.y(), c.z(), ScaffoldPlanner.MAX_CHAIN, eye.x, eye.y, eye.z, deadline);
-            if (r.budgetHit()) {
-                // Out of time: remembered for this cell only, the others are still looked at
+            // Planned without the room as the cap, so a chain that is too long for it can be told from none
+            ScaffoldPlanner.Result r = ScaffoldPlanner.plan(scaffoldWorld, areas, c.x(), c.y(), c.z(), limit, Integer.MAX_VALUE, eye.x, eye.y, eye.z, deadline);
+            if (r.chain() == null && (r.budgetHit() || r.stopped())) {
+                // Out of time or nodes with nothing found: remembered for this cell only, the others are still looked at
                 if (scaffoldBudgetHits.size() > 4096) scaffoldBudgetHits.clear();
-                scaffoldBudgetHits.merge(key(c), 1, Integer::sum);
+                int n = scaffoldBudgetHits.merge(key(c), 1, Integer::sum);
+                if (n >= SCAFFOLD_SLOW_HITS) {
+                    scaffoldBudgetHits.remove(key(c));
+                    if (scaffoldFail.size() > 4096) scaffoldFail.clear();
+                    scaffoldFail.put(key(c), tick + SCAFFOLD_SLOW_TTL);
+                    if (!scaffoldSlowWarned) {
+                        scaffoldSlowWarned = true;
+                        warning("The scaffold search for the cell at %d %d %d took too long and was given up for now; it is tried again later.", c.x(), c.y(), c.z());
+                    }
+                }
                 timedOut = true;
                 continue;
             }
             scaffoldBudgetHits.remove(key(c));
-            if (r.chain() == null || r.chain().size() > room) {
+            searched++;
+            if (r.chain() == null) {
                 if (scaffoldFail.size() > 4096) scaffoldFail.clear();
                 scaffoldFail.put(key(c), tick + SCAFFOLD_FAIL_TTL);
+                continue;
+            }
+            if (r.chain().size() > room) {
+                // A chain exists but there are not enough blocks or scaffold-max for it
+                if (scaffoldFail.size() > 4096) scaffoldFail.clear();
+                scaffoldFail.put(key(c), tick + SCAFFOLD_FAIL_TTL);
+                timedOut = true; // not "no chain exists": the warning below stays out of it
+                if (!scaffoldShortWarned) {
+                    scaffoldShortWarned = true;
+                    warning("The scaffold for the cell at %d %d %d needs %d blocks but only %d are available (scaffold-max and the spare blocks you carry).",
+                        c.x(), c.y(), c.z(), r.chain().size(), room);
+                }
                 continue;
             }
             Info info = scaffoldInfoOf(item);
@@ -3279,10 +3365,13 @@ public class Printer extends Module {
             QwerteAddon.LOG.info("printer: scaffold of {} block(s) for the cell at {} {} {}", r.chain().size(), c.x(), c.y(), c.z());
             return true;
         }
-        if (!timedOut && scaffoldWarned.add(layerY) && scaffoldWarned.size() <= 5) {
+        if (!timedOut && searched > 0 && scaffoldWarned.add(layerY) && scaffoldWarned.size() <= 5) {
             BuildOrderer.Cell c = stranded.get(0);
-            warning("No scaffold can reach the cell at %d %d %d (layer Y=%d): no chain of up to %d spare blocks from a block that exists gets to it. The layer is carried over and tried again later.",
-                c.x(), c.y(), c.z(), layerY, ScaffoldPlanner.MAX_CHAIN);
+            int lim = scaffoldLength.get();
+            if (lim > 0) warning("No scaffold can reach the cell at %d %d %d (layer Y=%d): no chain of up to %d spare blocks from a block that exists gets to it. The layer is carried over and tried again later.",
+                c.x(), c.y(), c.z(), layerY, lim);
+            else warning("No scaffold can reach the cell at %d %d %d (layer Y=%d): no chain of spare blocks from a block that exists gets to it. The layer is carried over and tried again later.",
+                c.x(), c.y(), c.z(), layerY);
         }
         return false;
     }
@@ -3796,6 +3885,12 @@ public class Printer extends Module {
 
     private void standTo(List<BlockPos> parts) {
         if (!SmartPlaceSession.BARITONE) return;
+        for (BlockPos p : parts) {
+            if (scaffoldUnplacedAt(p.getX(), p.getY(), p.getZ())) {
+                scaffoldWalkTick = tick;
+                break;
+            }
+        }
         if (!confineBaritone()) return;
         if (BaritoneHelper.placingAllowed()) standTrackUntil = tick + 10;
         boolean going = BaritoneHelper.goalIs((baritone.api.pathing.goals.Goal) walkGoal);

@@ -6,15 +6,20 @@ import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.network.chat.Component;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 
 import static meteordevelopment.meteorclient.MeteorClient.mc;
 
 /**
- * The Messenger window: a conversation list on the left, the history and an input line on the right, an emoji picker.
- * The same code draws it twice: as a HUD overlay while the game is played ({@code focused} false: nothing can be clicked
- * or typed into) and inside {@link MessengerScreen} ({@code focused} true: it takes the mouse and keyboard). All sizes
- * are GUI pixels. Client thread only.
+ * The Messenger window: a list on the left (Global first, then the conversations), the history and an input line on the
+ * right, an emoji picker and a contact picker. The same code draws it twice: as a HUD overlay while the game is played
+ * ({@code focused} false: nothing can be clicked or typed into) and inside {@link MessengerScreen} ({@code focused}
+ * true: it takes the mouse and keyboard). All sizes are GUI pixels. Client thread only.
+ *
+ * <p>{@code selected == null} means Global, the public chat.
  */
 public final class MessengerUi {
     /** What the window needs from the module. */
@@ -36,6 +41,21 @@ public final class MessengerUi {
 
         /** Shown in the HUD-style window where the input line would be, like "Press RSHIFT to type". */
         String hint();
+
+        /** The names of the Meteor friends. */
+        List<String> friendNames();
+
+        /** The names on the tab list now. */
+        List<String> onlineNames();
+
+        /** The player's own name, or null. */
+        String selfName();
+
+        /** Draw the public chat in the always-on overlay (otherwise it shows whispers there and Global only when focused). */
+        boolean overlayGlobal();
+
+        /** Meteor's command prefix (a chat text starting with it runs a Meteor command), or null. */
+        String meteorPrefix();
     }
 
     private record Rect(int x1, int y1, int x2, int y2) {
@@ -59,6 +79,10 @@ public final class MessengerUi {
         NONE, MOVE, RESIZE
     }
 
+    private enum Confirm {
+        NONE, DELETE, CLEAR
+    }
+
     private static final int TITLE_H = 13;
     private static final int ROW_H = 12;
     private static final int LINE_H = 11;
@@ -66,10 +90,14 @@ public final class MessengerUi {
     private static final int GRIP = 9;
     private static final int PAD = 3;
     private static final int GAP = 3;
+    private static final int GLOBAL_GAP = 1;
     private static final int CELL = 12;
     private static final int PICK_ROWS = 4;
     private static final int EMOJI_DRAW = 9;
     private static final int EMOJI_ADVANCE = 10;
+    private static final String GLOBAL_DRAFT = "#global";
+    private static final long WRAP_SETTLE_MS = 100;
+
 
     private static final int C_PANEL = 0x0E1218;
     private static final int C_TITLE = 0x1B2430;
@@ -91,18 +119,32 @@ public final class MessengerUi {
     private final EmojiSet emoji = EmojiSet.bundled();
     private final EmojiTextures textures = new EmojiTextures();
     private EditBox input;
+    private EditBox search;
 
     private boolean focused;
+    /** The key of the open conversation; null is Global. */
     private String selected;
     private int listScroll;
     private int histScroll;
     private int pickScroll;
     private boolean pickerOpen;
-    private boolean newChat;
-    private String draft = "";
+    private final Map<String, String> drafts = new HashMap<>();
     private String status;
     private long statusUntil;
-    private long deleteArmedUntil;
+
+    // The contact picker (New)
+    private boolean contactOpen;
+    private int contactScroll;
+    private int contactSel;
+    private String contactsQuery;
+    private long contactsAt;
+    private List<ContactPicker.Entry> contacts = List.of();
+    /** The entries as last drawn: a click or Enter picks from what the user saw, not from a list refreshed since. */
+    private List<ContactPicker.Entry> drawn = List.of();
+
+    // Delete / clear, asked first
+    private Confirm confirm = Confirm.NONE;
+    private String confirmName;
 
     private Geometry geo;
     private Drag drag = Drag.NONE;
@@ -121,15 +163,25 @@ public final class MessengerUi {
     private Rect inputRect = winRect;
     private Rect sendRect = winRect;
     private Rect gripRect = winRect;
+    private Rect searchRect = winRect;
+    private Rect contactRect = winRect;
+    private Rect dlgRect = winRect;
+    private Rect dlgYes = winRect;
+    private Rect dlgNo = winRect;
     private int pickCols = 1;
     private List<Conversation> shownList = List.of();
 
-    // Wrapped history of the open conversation, remade only when it changes
+    // Wrapped history of the open list, remade only when it changes (a block is kept while its message is)
     private List<Block> blocks = List.of();
-    private Conversation blocksConv;
+    private List<Message> blocksSrc;
     private int blocksSize;
     private Message blocksLast;
     private int blocksWidth;
+    private Map<Message, Block> blockCache = new IdentityHashMap<>();
+    private List<Message> scrollSrc;
+    private int scrollTotal;
+    private int pendingWidth = -1;
+    private long pendingSince;
 
     // The sorted conversation list, kept until the store changes or the friends list does
     private ConversationStore orderedStore;
@@ -161,7 +213,10 @@ public final class MessengerUi {
     public void unfocus() {
         focused = false;
         drag = Drag.NONE;
+        contactOpen = false;
+        confirm = Confirm.NONE;
         if (input != null) input.setFocused(false);
+        if (search != null) search.setFocused(false);
         if (geo != null) host.geometryChanged(geo);
     }
 
@@ -175,11 +230,36 @@ public final class MessengerUi {
         textures.close();
     }
 
+    /** Shows a conversation. A new message from them then counts as read while the window is focused. */
     public void select(String name) {
-        selected = Conversation.key(name);
-        histScroll = 0;
-        blocksConv = null;
+        setSelected(Conversation.key(name));
         if (focused) host.core().store().markRead(name); // unfocused, a new message keeps its unread badge
+    }
+
+    /** Shows the public chat. */
+    public void selectGlobal() {
+        setSelected(null);
+    }
+
+    private void setSelected(String key) {
+        if (input != null) drafts.put(draftKey(selected), input.getValue());
+        selected = key;
+        histScroll = 0;
+        blocksSrc = null;
+        scrollSrc = null;
+        if (input != null) {
+            input.setValue(drafts.getOrDefault(draftKey(selected), ""));
+            updateHint();
+        }
+    }
+
+    private static String draftKey(String selected) {
+        return selected == null ? GLOBAL_DRAFT : selected;
+    }
+
+    private void updateHint() {
+        String hint = selected == null ? "Say it in public chat (/ for a command)" : "Message";
+        input.setHint(Component.literal(hint).withStyle(net.minecraft.ChatFormatting.DARK_GRAY));
     }
 
     /** The saved place may have changed (settings reloaded): read it again. */
@@ -187,20 +267,23 @@ public final class MessengerUi {
         geo = null;
     }
 
-    /** A message arrived or was sent: show the conversation if none is open. */
-    public void onActivity(MessengerCore.Received r) {
-        if (r == null) return;
-        if (selectedConversation() == null) select(r.conversation().name());
-    }
-
-    /** Forgets everything the window shows about a conversation (after the history was cleared). */
+    /** Forgets everything the window shows about a conversation (after the history was cleared, or on another server). */
     public void reset() {
         selected = null;
         blocks = List.of();
-        blocksConv = null;
+        blocksSrc = null;
+        scrollSrc = null;
+        blockCache.clear();
         orderedStore = null;
         histScroll = 0;
         listScroll = 0;
+        drafts.clear();
+        contactOpen = false;
+        confirm = Confirm.NONE;
+        if (input != null) {
+            input.setValue("");
+            updateHint();
+        }
     }
 
     /** The focused window shows this player's conversation (so a new message from them counts as read). */
@@ -220,7 +303,15 @@ public final class MessengerUi {
         if (input != null) return;
         input = new EditBox(mc.font, 0, 0, 100, 14, Component.literal("Message"));
         input.setMaxLength(256);
-        input.setHint(Component.literal("Message").withStyle(net.minecraft.ChatFormatting.DARK_GRAY));
+        input.setValue(drafts.getOrDefault(draftKey(selected), ""));
+        updateHint();
+    }
+
+    private void ensureSearch() {
+        if (search != null) return;
+        search = new EditBox(mc.font, 0, 0, 100, 14, Component.literal("Search"));
+        search.setMaxLength(32);
+        search.setHint(Component.literal("Search, or type a player name").withStyle(net.minecraft.ChatFormatting.DARK_GRAY));
     }
 
     private void setStatus(String s) {
@@ -267,10 +358,20 @@ public final class MessengerUi {
         }
         List<Conversation> list = ordered;
         shownList = list;
-        if (selected != null && store.get(selected) == null) selected = null;
-        if (selected == null && !list.isEmpty()) selected = list.get(0).key();
+        if (selected != null && store.get(selected) == null) { // it was deleted (or this is another server)
+            String dead = selected;
+            setSelected(null);
+            drafts.remove(dead);
+        }
         Conversation sel = selectedConversation();
         if (focus && sel != null) store.markRead(sel.name());
+        // The always-on overlay keeps to whispers unless overlay-global is on: a busy public chat is not shown over the game
+        Conversation shown = sel;
+        boolean globalShown = sel == null;
+        if (!focus && sel == null && !host.overlayGlobal()) {
+            shown = list.isEmpty() ? null : list.get(0);
+            globalShown = false;
+        }
 
         layout(w, focus, font);
 
@@ -278,22 +379,26 @@ public final class MessengerUi {
         g.fill(winRect.x1, winRect.y1, winRect.x2, winRect.y2, alpha(C_PANEL));
         g.fill(titleRect.x1, titleRect.y1, titleRect.x2, titleRect.y2, alpha(C_TITLE));
         int total = store.totalUnread();
-        String title = "Messenger" + (sel != null ? " - " + sel.name() : "") + (total > 0 ? " (" + total + ")" : "");
-        int titleMax = (focus ? btnDelete.x1 : titleRect.x2) - titleRect.x1 - 8;
+        String title = "Messenger" + (shown != null ? " - " + shown.name() : globalShown ? " - Global" : "")
+            + (globalShown && core.globalQueued() ? " (sending...)" : "") + (total > 0 ? " (" + total + ")" : "");
+        int titleMax = (focus ? btnNew.x1 : titleRect.x2) - titleRect.x1 - 8;
         g.drawString(font, font.plainSubstrByWidth(title, Math.max(10, titleMax)), titleRect.x1 + 4, titleRect.y1 + 3, C_TEXT, true);
         if (focus) {
-            button(g, font, btnNew, newChat ? "Cancel" : "New", mx, my, newChat);
+            button(g, font, btnNew, contactOpen ? "Cancel" : "New", mx, my, contactOpen);
             button(g, font, btnEmoji, "Emoji", mx, my, pickerOpen);
-            button(g, font, btnDelete, System.currentTimeMillis() < deleteArmedUntil ? "Sure?" : "Delete", mx, my, false);
+            button(g, font, btnDelete, sel == null ? "Clear" : "Delete", mx, my, confirm != Confirm.NONE);
         }
 
         g.fill(listRect.x1, listRect.y1, listRect.x2, listRect.y2, alpha(C_LIST));
-        drawList(g, font, list, focus, mx, my);
-        drawHistory(g, font, sel);
+        drawList(g, font, list, focus, mx, my, shown == null ? null : shown.key(), globalShown);
+        if (focus && contactOpen) drawContacts(g, font, mx, my);
+        else drawHistory(g, font, shown, globalShown, store);
+        drawStatus(g, font);
 
         if (focus) {
             if (pickerOpen) drawPicker(g, mx, my);
             drawInput(g, font, mx, my);
+            if (confirm != Confirm.NONE) drawConfirm(g, font, mx, my);
             // grip
             for (int i = 0; i < 3; i++) {
                 int o = 2 + i * 3;
@@ -332,11 +437,19 @@ public final class MessengerUi {
         pickRect = new Rect(listRect.x2 + 1, winRect.y2 - INPUT_H - pickH, winRect.x2, winRect.y2 - INPUT_H);
         histRect = new Rect(listRect.x2 + 1, titleRect.y2, winRect.x2, pickRect.y1);
         gripRect = new Rect(winRect.x2 - GRIP, winRect.y2 - GRIP, winRect.x2, winRect.y2);
+        searchRect = new Rect(histRect.x1 + PAD, histRect.y1 + PAD, histRect.x2 - PAD, histRect.y1 + PAD + 14);
+        contactRect = new Rect(histRect.x1, searchRect.y2 + PAD, histRect.x2, histRect.y2);
         if (focus) {
             ensureInput();
             input.setX(inputRect.x1);
             input.setY(inputRect.y1);
             input.setWidth(Math.max(20, inputRect.w() - sendW - 3));
+            if (contactOpen) {
+                ensureSearch();
+                search.setX(searchRect.x1);
+                search.setY(searchRect.y1);
+                search.setWidth(Math.max(20, searchRect.w()));
+            }
         }
     }
 
@@ -346,21 +459,23 @@ public final class MessengerUi {
         g.drawString(font, label, r.x1 + (r.w() - font.width(label)) / 2, r.y1 + (r.h() - 8) / 2, C_TEXT, false);
     }
 
-    private void drawList(GuiGraphics g, Font font, List<Conversation> list, boolean focus, int mx, int my) {
+    private void drawList(GuiGraphics g, Font font, List<Conversation> list, boolean focus, int mx, int my, String shownKey, boolean globalShown) {
         g.enableScissor(listRect.x1, listRect.y1, listRect.x2, listRect.y2);
-        if (list.isEmpty()) {
-            g.drawString(font, "No messages yet", listRect.x1 + 5, listRect.y1 + 5, C_DIM, false);
-        }
+        int rowsTotal = 1 + list.size(); // Global is the first row
         int rows = Math.max(1, listRect.h() / ROW_H);
-        listScroll = Math.max(0, Math.min(listScroll, Math.max(0, list.size() - rows)));
-        for (int i = listScroll; i < list.size(); i++) {
+        listScroll = Math.max(0, Math.min(listScroll, Math.max(0, rowsTotal - rows)));
+        for (int i = listScroll; i < rowsTotal; i++) {
             int y = listRect.y1 + (i - listScroll) * ROW_H;
             if (y >= listRect.y2) break;
-            Conversation c = list.get(i);
+            Conversation c = i == 0 ? null : list.get(i - 1);
             Rect row = new Rect(listRect.x1, y, listRect.x2, y + ROW_H);
-            boolean isSel = c.key().equals(selected);
+            boolean isSel = c == null ? globalShown : c.key().equals(shownKey);
             if (isSel) g.fill(row.x1, row.y1, row.x2, row.y2, alpha(C_SELECT));
             else if (focus && row.contains(mx, my)) g.fill(row.x1, row.y1, row.x2, row.y2, alpha(C_HOVER));
+            if (c == null) {
+                g.drawString(font, "Global", row.x1 + 4, row.y1 + 2, 0xFF000000 | C_ACCENT, false);
+                continue;
+            }
             boolean friend = host.isFriend(c.name());
             int badgeW = 0;
             if (c.unread() > 0) {
@@ -373,29 +488,41 @@ public final class MessengerUi {
             String name = font.plainSubstrByWidth(c.name(), Math.max(8, row.w() - badgeW - 8));
             g.drawString(font, name, row.x1 + 4, row.y1 + 2, friend ? C_FRIEND : C_TEXT, false);
         }
+        if (list.isEmpty()) {
+            int y = listRect.y1 + (1 - listScroll) * ROW_H + 3;
+            if (y < listRect.y2) g.drawString(font, "No whispers yet", listRect.x1 + 5, y, C_DIM, false);
+        }
         g.disableScissor();
     }
 
-    private void drawHistory(GuiGraphics g, Font font, Conversation sel) {
+    private void drawHistory(GuiGraphics g, Font font, Conversation sel, boolean global, ConversationStore store) {
         g.enableScissor(histRect.x1, histRect.y1, histRect.x2, histRect.y2);
-        if (sel == null) {
-            String msg = focused ? "Pick a conversation, or press New." : "No conversation.";
-            g.drawString(font, msg, histRect.x1 + 6, histRect.y1 + 6, C_DIM, false);
+        if (sel == null && !global) { // the overlay, with no whisper yet
+            g.drawString(font, "No whispers yet.", histRect.x1 + 6, histRect.y1 + 6, C_DIM, false);
             g.disableScissor();
             return;
         }
+        List<Message> msgs = global ? store.global() : sel.messages();
+        int gap = global ? GLOBAL_GAP : GAP;
         int innerW = histRect.w() - 2 * PAD - 8;
-        List<Block> bl = blocks(sel, innerW, font);
+        List<Block> bl = blocks(msgs, global, innerW, font);
+        if (msgs.isEmpty() && global) {
+            g.drawString(font, "Public chat shows up here.", histRect.x1 + 6, histRect.y1 + 6, C_DIM, false);
+        }
         int total = 0;
-        for (Block b : bl) total += b.height + GAP;
+        for (Block b : bl) total += b.height + gap;
         int areaH = histRect.h() - 2 * PAD;
+        // Scrolled up, new lines must not move what is being read
+        if (histScroll > 0 && scrollSrc == msgs && total > scrollTotal) histScroll += total - scrollTotal;
+        scrollSrc = msgs;
+        scrollTotal = total;
         int maxScroll = Math.max(0, total - areaH);
         histScroll = Math.max(0, Math.min(histScroll, maxScroll));
         int y = histRect.y2 - PAD - total + histScroll;
         if (total < areaH) y = histRect.y2 - PAD - total; // short history sits at the bottom, like a chat
         for (Block b : bl) {
-            if (y + b.height >= histRect.y1 && y <= histRect.y2) drawBlock(g, font, b, y);
-            y += b.height + GAP;
+            if (y + b.height >= histRect.y1 && y <= histRect.y2) drawBlock(g, font, b, y, global);
+            y += b.height + gap;
         }
         if (maxScroll > 0) {
             // scrollbar
@@ -404,33 +531,40 @@ public final class MessengerUi {
             int barY = histRect.y1 + 1 + (trackH - barH) * (maxScroll - histScroll) / maxScroll;
             g.fill(histRect.x2 - 3, barY, histRect.x2 - 1, barY + barH, 0x80FFFFFF);
         }
-        if (status != null) {
-            if (System.currentTimeMillis() > statusUntil) {
-                status = null;
-            } else {
-                String s = font.plainSubstrByWidth(status, histRect.w() - 8);
-                g.fill(histRect.x1, histRect.y2 - 11, histRect.x2, histRect.y2, 0xC0200C0C);
-                g.drawString(font, s, histRect.x1 + 4, histRect.y2 - 10, C_ERROR, false);
-            }
-        }
         g.disableScissor();
     }
 
-    private void drawBlock(GuiGraphics g, Font font, Block b, int top) {
+    private void drawStatus(GuiGraphics g, Font font) {
+        if (status == null) return;
+        if (System.currentTimeMillis() > statusUntil) {
+            status = null;
+            return;
+        }
+        g.enableScissor(histRect.x1, histRect.y1, histRect.x2, histRect.y2);
+        String s = font.plainSubstrByWidth(status, histRect.w() - 8);
+        g.fill(histRect.x1, histRect.y2 - 11, histRect.x2, histRect.y2, 0xC0200C0C);
+        g.drawString(font, s, histRect.x1 + 4, histRect.y2 - 10, C_ERROR, false);
+        g.disableScissor();
+    }
+
+    private void drawBlock(GuiGraphics g, Font font, Block b, int top, boolean global) {
         Message m = b.message;
         Direction d = m.direction();
         int color = d == Direction.IN ? C_IN : d == Direction.OUT ? C_OUT : C_DIM;
+        if (global && d == Direction.IN) color = C_TEXT; // public chat is plain text, no bubbles
         if (m.state() == Message.State.SENDING) color = 0xFF9FB3A5;
         if (m.state() == Message.State.FAILED) color = 0xFFB07070;
         int left = histRect.x1 + PAD;
         int right = histRect.x2 - PAD - 6;
-        if (d == Direction.IN) g.fill(left, top, left + 1, top + b.height, C_BAR_IN);
-        else if (d == Direction.OUT) g.fill(right - 1, top, right, top + b.height, C_BAR_OUT);
+        if (!global) {
+            if (d == Direction.IN) g.fill(left, top, left + 1, top + b.height, C_BAR_IN);
+            else if (d == Direction.OUT) g.fill(right - 1, top, right, top + b.height, C_BAR_OUT);
+        }
         int y = top;
         boolean first = true;
         for (TextLayout.Line line : b.lines) {
             int x = switch (d) {
-                case IN -> left + 4;
+                case IN -> left + (global ? 1 : 4);
                 case OUT -> right - 4 - line.width();
                 case NOTE -> (left + right - line.width()) / 2;
             };
@@ -451,11 +585,23 @@ public final class MessengerUi {
         }
     }
 
-    /** The wrapped messages of a conversation; remade when the conversation, its length, last message or the width changes. */
-    private List<Block> blocks(Conversation c, int width, Font font) {
-        List<Message> msgs = c.messages();
+    /**
+     * The wrapped messages of a list; remade when the list, its length, last message or the width changes. A message
+     * that was wrapped before keeps its block, so a busy public chat does not wrap everything again for each new line.
+     */
+    private List<Block> blocks(List<Message> msgs, boolean global, int width, Font font) {
         Message last = msgs.isEmpty() ? null : msgs.get(msgs.size() - 1);
-        if (c == blocksConv && msgs.size() == blocksSize && last == blocksLast && width == blocksWidth) return blocks;
+        if (msgs == blocksSrc && msgs.size() == blocksSize && last == blocksLast && width == blocksWidth) return blocks;
+        // While the window is being resized the old wrapping is drawn; it is redone once the width has been still a moment
+        long nowMs = System.currentTimeMillis();
+        if (msgs == blocksSrc && width != blocksWidth && !blocks.isEmpty()) {
+            if (width != pendingWidth) {
+                pendingWidth = width;
+                pendingSince = nowMs;
+            }
+            if (nowMs - pendingSince < WRAP_SETTLE_MS) return blocks;
+        }
+        pendingWidth = -1;
         TextLayout.Measure measure = new TextLayout.Measure() {
             @Override
             public int width(String text) {
@@ -467,19 +613,149 @@ public final class MessengerUi {
                 return EMOJI_ADVANCE;
             }
         };
+        if (width != blocksWidth || msgs != blocksSrc) blockCache = new IdentityHashMap<>();
+        Map<Message, Block> used = new IdentityHashMap<>();
         List<Block> out = new ArrayList<>(msgs.size());
-        int bubble = Math.max(40, width * 85 / 100);
+        int bubble = global ? width : Math.max(40, width * 85 / 100);
         for (Message m : msgs) {
-            int wrap = m.direction() == Direction.NOTE ? width : bubble;
-            List<TextLayout.Line> lines = TextLayout.wrap(m.text(), wrap, emoji, measure);
-            out.add(new Block(m, lines, lines.size() * LINE_H));
+            Block b = blockCache.get(m);
+            if (b == null) {
+                int wrap = m.direction() == Direction.NOTE ? width : bubble;
+                List<TextLayout.Line> lines = TextLayout.wrap(m.text(), wrap, emoji, measure);
+                b = new Block(m, lines, lines.size() * LINE_H);
+            }
+            used.put(m, b);
+            out.add(b);
         }
+        blockCache = used;
         blocks = out;
-        blocksConv = c;
+        blocksSrc = msgs;
         blocksSize = msgs.size();
         blocksLast = last;
         blocksWidth = width;
         return out;
+    }
+
+    // ----- contact picker (New) -----
+
+    private List<ContactPicker.Entry> contacts() {
+        String query = search == null ? "" : search.getValue();
+        long now = System.currentTimeMillis();
+        if (!query.equals(contactsQuery) || now - contactsAt > 1000) {
+            if (!query.equals(contactsQuery)) {
+                contactSel = 0;
+                contactScroll = 0;
+            }
+            List<String> convs = new ArrayList<>();
+            for (Conversation c : ordered) convs.add(c.name());
+            contacts = ContactPicker.build(query, host.friendNames(), host.onlineNames(), convs, host.selfName());
+            contactsQuery = query;
+            contactsAt = now;
+        }
+        return contacts;
+    }
+
+    private void drawContacts(GuiGraphics g, Font font, int mx, int my) {
+        ensureSearch();
+        g.fill(histRect.x1, histRect.y1, histRect.x2, histRect.y2, alpha(C_PANEL));
+        search.render(g, mx, my, 0f);
+        List<ContactPicker.Entry> list = contacts();
+        drawn = list;
+        contactSel = Math.max(0, Math.min(contactSel, Math.max(0, list.size() - 1)));
+        int rows = Math.max(1, contactRect.h() / ROW_H);
+        contactScroll = Math.max(0, Math.min(contactScroll, Math.max(0, list.size() - rows)));
+        g.enableScissor(contactRect.x1, contactRect.y1, contactRect.x2, contactRect.y2);
+        if (list.isEmpty()) {
+            String q = search.getValue().strip();
+            g.drawString(font, q.isEmpty() ? "Nobody to list yet. Type a player name." : "No match, and not a player name.", contactRect.x1 + 6, contactRect.y1 + 4, C_DIM, false);
+        }
+        for (int i = contactScroll; i < list.size(); i++) {
+            int y = contactRect.y1 + (i - contactScroll) * ROW_H;
+            if (y >= contactRect.y2) break;
+            ContactPicker.Entry e = list.get(i);
+            Rect row = new Rect(contactRect.x1 + 1, y, contactRect.x2 - 1, y + ROW_H);
+            if (i == contactSel) g.fill(row.x1, row.y1, row.x2, row.y2, alpha(C_SELECT));
+            else if (row.contains(mx, my)) g.fill(row.x1, row.y1, row.x2, row.y2, alpha(C_HOVER));
+            String tag = switch (e.source()) {
+                case FRIEND -> "friend";
+                case ONLINE -> "online";
+                case CONVERSATION -> "chat";
+                case TYPED -> "";
+            };
+            int tagW = tag.isEmpty() ? 0 : font.width(tag) + 8;
+            String label = e.source() == ContactPicker.Source.TYPED ? "Message " + e.name() : e.name();
+            int color = e.source() == ContactPicker.Source.TYPED ? 0xFF000000 | C_ACCENT : e.source() == ContactPicker.Source.FRIEND ? C_FRIEND : C_TEXT;
+            g.drawString(font, font.plainSubstrByWidth(label, Math.max(8, row.w() - tagW - 8)), row.x1 + 4, row.y1 + 2, color, false);
+            if (tagW > 0) g.drawString(font, tag, row.x2 - tagW + 2, row.y1 + 2, C_DIM, false);
+        }
+        g.disableScissor();
+    }
+
+    /** Opens (or makes) the conversation with the entry and shows it. This sends nothing. */
+    private void pickContact(int index) {
+        List<ContactPicker.Entry> list = drawn;
+        if (index < 0 || index >= list.size()) return;
+        String name = list.get(index).name();
+        if (!ContactPicker.validName(name)) return;
+        Conversation c = host.core().store().open(name, System.currentTimeMillis());
+        closeContacts();
+        select(c.name());
+    }
+
+    private void openContacts() {
+        ensureSearch();
+        search.setValue("");
+        contactsQuery = null;
+        drawn = List.of();
+        contactSel = 0;
+
+        contactScroll = 0;
+        contactOpen = true;
+        search.setFocused(true);
+        if (input != null) input.setFocused(false);
+    }
+
+    private void closeContacts() {
+        contactOpen = false;
+        if (search != null) search.setFocused(false);
+        if (input != null) input.setFocused(true);
+    }
+
+    // ----- delete / clear -----
+
+    private void drawConfirm(GuiGraphics g, Font font, int mx, int my) {
+        String question = confirm == Confirm.CLEAR ? "Clear the Global log?" : "Delete the conversation with " + confirmName + "?";
+        String yes = confirm == Confirm.CLEAR ? "Clear" : "Delete";
+        String no = "Cancel";
+        int w = Math.min(histRect.w() - 8, Math.max(font.width(question) + 16, 120));
+        int h = 44;
+        int x1 = histRect.x1 + (histRect.w() - w) / 2;
+        int y1 = histRect.y1 + Math.max(2, (histRect.h() - h) / 2);
+        dlgRect = new Rect(x1, y1, x1 + w, y1 + h);
+        int bw = Math.max(font.width(yes), font.width(no)) + 12;
+        dlgYes = new Rect(x1 + w / 2 - bw - 3, y1 + h - 17, x1 + w / 2 - 3, y1 + h - 4);
+        dlgNo = new Rect(x1 + w / 2 + 3, y1 + h - 17, x1 + w / 2 + 3 + bw, y1 + h - 4);
+        g.fill(dlgRect.x1 - 1, dlgRect.y1 - 1, dlgRect.x2 + 1, dlgRect.y2 + 1, 0xFF4FA3FF);
+        g.fill(dlgRect.x1, dlgRect.y1, dlgRect.x2, dlgRect.y2, 0xF0101820);
+        g.drawString(font, font.plainSubstrByWidth(question, w - 8), x1 + 5, y1 + 6, C_TEXT, false);
+        button(g, font, dlgYes, yes, mx, my, false);
+        button(g, font, dlgNo, no, mx, my, false);
+    }
+
+    private void doConfirm() {
+        ConversationStore store = host.core().store();
+        if (confirm == Confirm.CLEAR) {
+            store.clearGlobal();
+            blocksSrc = null;
+            setStatus("Cleared the Global log.");
+        } else if (confirm == Confirm.DELETE && confirmName != null) {
+            store.remove(confirmName);
+            if (selected != null && selected.equals(Conversation.key(confirmName))) setSelected(null);
+            drafts.remove(Conversation.key(confirmName)); // after setSelected, which files the old draft
+            setStatus("Deleted the conversation with " + confirmName + ".");
+        }
+        confirm = Confirm.NONE;
+        confirmName = null;
     }
 
     private void drawPicker(GuiGraphics g, int mx, int my) {
@@ -517,6 +793,16 @@ public final class MessengerUi {
             return true;
         }
         if (button != 0) return true;
+        if (confirm != Confirm.NONE) {
+            // Asked first: the one button answers yes, any other click says no
+            if (dlgYes.contains(x, y)) {
+                doConfirm();
+            } else {
+                confirm = Confirm.NONE;
+                confirmName = null;
+            }
+            return true;
+        }
         if (gripRect.contains(x, y)) {
             drag = Drag.RESIZE;
             dragDx = winRect.x2 - (int) x;
@@ -524,7 +810,8 @@ public final class MessengerUi {
             return true;
         }
         if (btnNew.contains(x, y)) {
-            toggleNewChat();
+            if (contactOpen) closeContacts();
+            else openContacts();
             return true;
         }
         if (btnEmoji.contains(x, y)) {
@@ -533,17 +820,12 @@ public final class MessengerUi {
         }
         if (btnDelete.contains(x, y)) {
             Conversation c = selectedConversation();
-            long now = System.currentTimeMillis();
             if (c == null) {
-                // nothing to delete
-            } else if (now > deleteArmedUntil) {
-                deleteArmedUntil = now + 3000; // asks first: click again within 3 seconds
+                if (host.core().store().global().isEmpty()) setStatus("Nothing to clear.");
+                else confirm = Confirm.CLEAR;
             } else {
-                deleteArmedUntil = 0;
-                host.core().store().remove(c.name());
-                selected = null;
-                blocksConv = null;
-                setStatus("Deleted the conversation with " + c.name() + ".");
+                confirm = Confirm.DELETE;
+                confirmName = c.name();
             }
             return true;
         }
@@ -555,7 +837,23 @@ public final class MessengerUi {
         }
         if (listRect.contains(x, y)) {
             int idx = listScroll + ((int) y - listRect.y1) / ROW_H;
-            if (idx >= 0 && idx < shownList.size()) select(shownList.get(idx).name());
+            if (idx == 0) {
+                if (contactOpen) closeContacts();
+                selectGlobal();
+            } else if (idx <= shownList.size()) {
+                if (contactOpen) closeContacts();
+                select(shownList.get(idx - 1).name());
+            }
+            return true;
+        }
+        if (contactOpen && histRect.contains(x, y)) {
+            if (searchRect.contains(x, y)) {
+                ensureSearch();
+                search.setFocused(true);
+                EditInput.click(search, x, y, button);
+            } else if (contactRect.contains(x, y)) {
+                pickContact(contactScroll + ((int) y - contactRect.y1) / ROW_H);
+            }
             return true;
         }
         if (pickerOpen && pickRect.contains(x, y)) {
@@ -564,6 +862,7 @@ public final class MessengerUi {
             int idx = (pickScroll + r) * pickCols + c;
             List<String> files = emoji.files();
             if (c >= 0 && c < pickCols && r >= 0 && idx >= 0 && idx < files.size()) {
+                if (contactOpen) closeContacts();
                 ensureInput();
                 input.insertText(EmojiSet.textOf(files.get(idx)));
                 input.setFocused(true);
@@ -571,10 +870,12 @@ public final class MessengerUi {
             return true;
         }
         if (sendRect.contains(x, y)) {
+            if (contactOpen) closeContacts();
             submit();
             return true;
         }
         if (inputRect.contains(x, y)) {
+            if (contactOpen) closeContacts();
             ensureInput();
             input.setFocused(true);
             EditInput.click(input, x, y, button);
@@ -609,6 +910,8 @@ public final class MessengerUi {
             listScroll = Math.max(0, listScroll - step);
         } else if (pickerOpen && pickRect.contains(x, y)) {
             pickScroll = Math.max(0, pickScroll - step);
+        } else if (contactOpen && histRect.contains(x, y)) {
+            contactScroll = Math.max(0, contactScroll - step);
         } else {
             histScroll = Math.max(0, histScroll + step * LINE_H * 3);
         }
@@ -616,82 +919,95 @@ public final class MessengerUi {
     }
 
     public boolean keyPressed(int key, int scancode, int modifiers) {
+        if (confirm != Confirm.NONE) {
+            if (key == 256) { // escape says no; nothing else reaches the input while asking
+                confirm = Confirm.NONE;
+                confirmName = null;
+            }
+            return true;
+        }
         switch (key) {
-            case 256 -> { // escape: the picker, then a new-chat box, then the window
-                if (pickerOpen) pickerOpen = false;
-                else if (newChat) toggleNewChat();
+            case 256 -> { // escape: the contact picker, the emoji picker, then the window
+                if (contactOpen) closeContacts();
+                else if (pickerOpen) pickerOpen = false;
                 else close();
                 return true;
             }
             case 257, 335 -> { // enter
-                submit();
+                if (contactOpen) pickContact(contactSel);
+                else submit();
+                return true;
+            }
+            case 264 -> { // down
+                if (!contactOpen) return typeKey(key, scancode, modifiers);
+                contactSel = Math.min(Math.max(0, drawn.size() - 1), contactSel + 1);
+                followContactSel();
+                return true;
+            }
+            case 265 -> { // up
+                if (!contactOpen) return typeKey(key, scancode, modifiers);
+                contactSel = Math.max(0, contactSel - 1);
+                followContactSel();
                 return true;
             }
             case 266 -> { // page up
-                histScroll += Math.max(LINE_H, histRect.h() * 8 / 10);
+                if (!contactOpen) histScroll += Math.max(LINE_H, histRect.h() * 8 / 10);
                 return true;
             }
             case 267 -> { // page down
-                histScroll = Math.max(0, histScroll - Math.max(LINE_H, histRect.h() * 8 / 10));
+                if (!contactOpen) histScroll = Math.max(0, histScroll - Math.max(LINE_H, histRect.h() * 8 / 10));
                 return true;
             }
             default -> {
-                ensureInput();
-                input.setFocused(true);
-                EditInput.key(input, key, scancode, modifiers);
-                return true; // nothing reaches the game's own keys while the window is open
+                return typeKey(key, scancode, modifiers);
             }
         }
     }
 
-    public boolean charTyped(int codepoint, int modifiers) {
-        if (codepoint == '§' || codepoint < 32 || codepoint == 127) return true;
+    private boolean typeKey(int key, int scancode, int modifiers) {
+        EditBox box = activeBox();
+        box.setFocused(true);
+        EditInput.key(box, key, scancode, modifiers);
+        return true; // nothing reaches the game's own keys while the window is open
+    }
+
+    private EditBox activeBox() {
+        if (contactOpen) {
+            ensureSearch();
+            return search;
+        }
         ensureInput();
-        input.setFocused(true);
-        EditInput.typed(input, codepoint, modifiers);
+        return input;
+    }
+
+    private void followContactSel() {
+        int rows = Math.max(1, contactRect.h() / ROW_H);
+        if (contactSel < contactScroll) contactScroll = contactSel;
+        else if (contactSel >= contactScroll + rows) contactScroll = contactSel - rows + 1;
+    }
+
+    public boolean charTyped(int codepoint, int modifiers) {
+        if (confirm != Confirm.NONE) return true;
+        if (codepoint == '§' || codepoint < 32 || codepoint == 127) return true;
+        EditBox box = activeBox();
+        box.setFocused(true);
+        EditInput.typed(box, codepoint, modifiers);
         return true;
     }
 
     // ---------- actions ----------
 
-    private void toggleNewChat() {
-        ensureInput();
-        if (!newChat) {
-            draft = input.getValue();
-            input.setValue("");
-            input.setHint(Component.literal("Player name, then Enter").withStyle(net.minecraft.ChatFormatting.DARK_GRAY));
-            newChat = true;
-        } else {
-            input.setValue(draft);
-            input.setHint(Component.literal("Message").withStyle(net.minecraft.ChatFormatting.DARK_GRAY));
-            newChat = false;
-        }
-        input.setFocused(true);
-    }
-
+    /**
+     * Enter or Send in the input line: what was typed goes to the open conversation as a whisper, or in Global to the
+     * public chat (a text starting with / is a command there). It is only queued; the module sends it, one per interval.
+     */
     private void submit() {
         ensureInput();
         String text = input.getValue();
-        long now = System.currentTimeMillis();
-        ConversationStore store = host.core().store();
-        if (newChat) {
-            String name = text.strip();
-            if (!ChatText.isValidName(name)) {
-                setStatus("Not a player name (3 to 16 letters, digits or _).");
-                return;
-            }
-            Conversation c = store.open(name, now);
-            select(c.name());
-            toggleNewChat();
-            return;
-        }
-        Conversation c = selectedConversation();
-        if (c == null) {
-            setStatus("Pick a conversation, or press New.");
-            return;
-        }
         if (text.isBlank()) return;
-        String error = host.core().send(c.name(), text, now);
+        long now = System.currentTimeMillis();
+        Conversation c = selectedConversation();
+        String error = c == null ? host.core().sendGlobal(text, now, host.meteorPrefix()) : host.core().send(c.name(), text, now);
         if (error != null) {
             setStatus(error);
         } else {

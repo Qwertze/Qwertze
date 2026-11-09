@@ -18,7 +18,7 @@ Qwerte adds ten modules to [Meteor Client](https://meteorclient.com):
   on your network: a small website that shows the stash and takes orders for the bot to fill.
 - **Reset Pearl** climbs out of a saved stasis chamber after you're pulled through it, throws a fresh pearl into the water
   and closes the cover again.
-- **Messenger** shows your whispers in a small chat window, with a history per player, emoji, and sending from the window.
+- **Messenger** is a small chat window over the game: a Global view of public chat you can type into, a conversation per player for whispers with history and emoji, and a picker to start a new one.
 - **Stash Window** is a window to search your stash in game, and with a Stash Manager server, the server's pages too.
 - **Container Tweaks** shows what is inside a shulker box when you hover it, and draws its most common item on it. With
   Smart Shulker or Smart Echest turned on, right-clicking a shulker box or ender chest places it, opens it and picks it up again.
@@ -388,15 +388,29 @@ New in 0.4.0-dev and still being tested.
   `experimental-climb-throw` are off by default.
 
 ### Messenger
-New in 0.4.0-dev.16. Not tested in game yet.
+New in 0.4.0-dev.16, extended in 0.4.0-dev.17. Not tested in game yet.
 
-Messenger reads your whispers into a small chat window with a history per player, and sends from the window. Turn it on
-with the **Messenger** module (category Qwerte).
+Messenger reads your whispers into a small chat window with a history per player and a Global view of the public chat,
+and sends from the window. Turn it on with the **Messenger** module (category Qwerte).
 
 - **The window.** Drawn over the game while you play (`show-overlay`, on; `window-opacity`, 75 by default, from 20 to 100).
   It takes the keyboard and mouse only when you focus it: with `focus-key` (none by default), or by clicking it while the
   chat is open. Esc always lets go. The window has its own input line; a draft in the chat is not carried into it.
   `notification-sound` (on) plays a quiet sound when a whisper arrives that you are not reading.
+- **Left pane.** Global first (selected when the window opens), then your conversations: friends first, then the most
+  recent, each with an unread badge. Delete asks first. On Global the button is Clear, which empties the Global log after
+  a confirmation.
+- **New.** Opens a search field and a list: Meteor friends, then players online (tab list), then past conversations, with
+  no doubles and never yourself. Typing filters the list, names that start with the text first. A valid name you type
+  (3 to 16 letters, digits or `_`) that is not in the list is offered as "Message <name>". Click it or press Enter to open
+  or start that conversation; nothing is sent. Esc closes the list. Names the whisper command can't address (such as
+  Bedrock's `.Name`) are not listed.
+- **Global.** The public chat as the chat shows it after other modules (cancelled lines are left out). Whispers stay in
+  their own conversation. Typing there sends public chat through the game's normal chat send: a text starting with the
+  Meteor prefix (`.` by default) runs as a Meteor command, and chat modules such as BetterChat may change the text. A text
+  starting with `/` is sent as a command; a space right after the `/` is refused. Global messages share the whisper queue
+  and rate limit (`send-interval-ms`, at most 3 waiting, never retried, dropped when you change server), and a command's
+  arguments are never shown. `global-scrollback` (500 by default, 50 to 2000) is the most lines kept per server.
 - **Whispers.** Found by the game's own translation key (vanilla), and by the text patterns `pattern-vanilla` ("X whispers
   to you: ..."), `pattern-2b2t` ("X whispers: ..." and "to X: ..."), `pattern-essentials` ("[X -> me] ...") and
   `pattern-from-to` ("From X: ..." and "To X: ..."), all on by default. A pattern must match the whole chat line. A decorated
@@ -413,12 +427,23 @@ with the **Messenger** module (category Qwerte).
   (1500 by default, from 500 to 10000); three may wait, and more are refused.
 - **Emoji.** Drawn as pictures in messages and in the emoji picker (see [Third-party](#third-party)).
 - **History.** Kept in memory for each server (its address, or `local` for singleplayer and LAN). `max-history` is the most
-  messages kept per player (200 by default, from 10 to 500). `save-history` (off by default) writes the history to
-  `meteor-client/qwerte/messenger-history.json` (version 2: the conversations of each server), at most every 20 seconds,
-  when you leave a world and when the module is turned off. A version 1 file's conversations go to the server you are on
-  when it is loaded. A corrupt file is moved aside (`messenger-history.json.corrupt`); one that is too big or can't be
-  read is left alone and not saved until the module is turned on again. "Clear history" forgets every conversation and
-  deletes the file. Nothing is sent anywhere.
+  messages kept per player (200 by default, from 10 to 500). "Clear history" forgets every conversation and the Global
+  log on every server, and deletes the file.
+- **Saving.** `save-history` (off by default) keeps the history in `meteor-client/qwerte/messenger-history.json` (version 2:
+  the conversations and the Global log of each server). Saves run in the background: whispers at most every 20 seconds,
+  Global every 5 minutes, and everything when you leave a world or turn the module off. The file is written owner-only
+  where the system supports it. The Messenger's own notes, unsent messages and drafts are not saved. A version 1 file's
+  conversations go to the server you are on when it is loaded, and older files without Global still load. A corrupt file
+  is moved aside (`messenger-history.json.corrupt`); one that is too big or can't be read is left alone and not saved
+  until the module is turned on again. Nothing is sent anywhere.
+- **Keys.** `take-chat-key` (off by default) makes the game's chat key (T by default) open the Messenger on Global instead;
+  `/` still opens the normal chat. Only a chat that opens empty is taken: on 1.21.11 a chat that opens with a saved draft
+  still opens the normal chat. `overlay-global` (off by default) puts Global in the overlay while the window isn't focused;
+  off, the overlay shows your conversations instead.
+- **Settings (defaults).** Patterns: `pattern-vanilla`, `pattern-2b2t`, `pattern-essentials` and `pattern-from-to` on,
+  `extra-patterns` empty. Sending: `command-template` `/msg {name} {text}`, `send-interval-ms` 1500. History: `save-history`
+  off, `max-history` 200, `global-scrollback` 500. Window: `show-overlay` on, `window-opacity` 75, `focus-key` none,
+  `take-chat-key` off, `overlay-global` off, `notification-sound` on.
 
 ### Stash Manager
 New in 0.4.0-dev and still being tested.
@@ -676,16 +701,22 @@ New in 0.4.0-dev.16. Not tested in game yet.
 - Litematica's render layers still work and come first: they decide which blocks exist for the Printer, and `layer-order`
   then works inside them (blocks outside the render layer are not counted in any level).
 - `scaffold` (on; shown when `layer-order` is on): when the nearest blocks of the active level have nothing to be placed
-  against (`airplace` off), the Printer builds a short chain of spare blocks from a block that exists up to a face of the
+  against (`airplace` off), the Printer builds a chain of spare blocks from a block that exists up to a face of the
   block, places the block, and breaks the chain when nothing needs it any more. It walks to the chain's base with Baritone
   when it is out of reach, also outside your normal range. A spare block is any block you carry that the schematic does not
   use, a plain full cube that does not fall, open or hold items, and that the hotbar helper does not protect (no weapons,
   food or shulker boxes). It never breaks printed blocks to get access. With no spare block it warns once ("no spare blocks
   for scaffolding: carry some blocks the schematic doesn't use") and carries the block over.
-- `scaffold-max` (64, 1 to 512): most scaffold blocks standing at once.
+- `scaffold-max` (64, 1 to 4096): most scaffold blocks standing at once. With the spare blocks you carry, it is the real cap
+  on a chain's length.
+- `scaffold-length` (Order group, 0, 0 to 256): the longest scaffold chain, and how far outside the schematic it may go.
+  0 means no limit on either. New in 0.4.0-dev.16.1; before it, both were fixed at 6 blocks.
 - Scaffold limits: only plain solid blocks are helped (a torch, a lantern or a falling block loses its support when the
-  scaffold goes, so those wait for their real support); a chain is at most 6 blocks, the shortest one, never inside a cell
-  the schematic wants a block in, and within 6 blocks of the schematic's area; it is not used with `airplace` on; the
+  scaffold goes, so those wait for their real support); a chain is the shortest one, at most `scaffold-length` blocks, never
+  inside a cell the schematic wants a block in, and within `scaffold-length` blocks of the schematic's area (no limit at 0).
+  The search tries the straight columns from the block's faces first, then an L-shaped chain, then a short search for a
+  shorter chain within its time budget. A long column down to the ground is found; long winding detours may not be. The
+  "No scaffold can reach..." warning names the limit only when one is set. It is not used with `airplace` on; the
   Printer does not build stairs to stand on, so a spot out of reach that Baritone can't walk to is not made reachable. If
   you stop the Printer in the middle, the scaffold blocks that stand are listed in the report and left in the world.
 
