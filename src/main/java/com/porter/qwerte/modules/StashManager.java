@@ -344,6 +344,14 @@ public class StashManager extends Module {
     private long deliveryStamp;
     private String deliveryFor = "", deliveryHash;
     private com.porter.qwerte.stash.DeliveryContents.Built deliveryPending;
+    // Kit sorting (0.4.0-dev.14, KIT-CONTRACT.md): the report as last built (every few seconds), what the server last said about it, and what was sent
+    private com.porter.qwerte.stash.KitReport.Built kitReport;
+    private long kitCheckedAt, kitAttemptAt;
+    private boolean kitReportKnown, kitAsked;
+    // What the report was last built from: it is built again only when this changes (no rescoring of every shulker every few seconds)
+    private long kitBuiltSig, kitBuiltAt;
+    private boolean kitBuiltValid;
+    private String kitSentHash, kitRejectedHash, kitInvalidSaid;
     // The rescan id handled and not yet acknowledged to the server, or -1
     private long rescanDone = -1;
     // A website rescan is being carried out: the bot reads until nothing is stale or unread
@@ -535,6 +543,7 @@ public class StashManager extends Module {
         ordersNote = "";
         sentDelivery = "";
         resetDelivery();
+        resetKits();
         rescanDone = -1;
         rescanning = false;
         warnedOwner = null;
@@ -602,6 +611,7 @@ public class StashManager extends Module {
         StashIndex.Built built = current;
         String id = built.server() + "|" + built.stash() + "|" + built.hash();
         updateDelivery(now, built.player());
+        refreshKits(now, built);
 
         if (needIndex || !id.equals(lastPushed)) {
             lastHeartbeat = now;
@@ -615,19 +625,157 @@ public class StashManager extends Module {
             lastHeartbeat = now;
             String sig = deliverySig();
             long done = rescanDone;
-            send(base, "/api/v1/heartbeat", StashIndex.heartbeat(built, deliveryPos(), orderBlocker(), done, rescanBlocked(), namingInfo(), craftingInfo(), anvilSource(), deliveryStorage(), tableSource(), deliveryHash), key, (code, body) -> {
+            send(base, "/api/v1/heartbeat", StashIndex.heartbeat(built, deliveryPos(), orderBlocker(), done, rescanBlocked(), namingInfo(), craftingInfo(), anvilSource(), deliveryStorage(), tableSource(), deliveryHash, kitsBody(built)), key, (code, body) -> {
                 if (code != 200) return false;
                 sentDelivery = sig;
                 if (done >= 0 && rescanDone == done) rescanDone = -1;
                 readRescan(body);
                 needIndex = StashIndex.needsIndex(body);
                 deliverySync.onHeartbeatReply(body);
+                kitsReplied(built, body);
                 readOrders(body);
                 return true;
             });
         } else if (deliveryPending != null && deliverySync.canSend(now)) {
             sendDelivery(base, key, now);
+        } else if (kitReportDue(built, now)) {
+            // Last in line: the index, the heartbeat, the orders and the delivery report all go first
+            sendKits(base, key, kitReport, now);
         }
+    }
+
+    // Kit sorting (0.4.0-dev.14, KIT-CONTRACT.md)
+
+    private void resetKits() {
+        kitReport = null;
+        kitCheckedAt = kitAttemptAt = 0;
+        kitReportKnown = kitAsked = false;
+        kitBuiltValid = false;
+        kitSentHash = kitRejectedHash = kitInvalidSaid = null;
+    }
+
+    private boolean kitSorting() {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        return sorter != null && sorter.kitSorting();
+    }
+
+    /** The kit fields of the heartbeat, or null with kit sorting off (nothing about kits is said then). */
+    private StashIndex.KitsHashes kitsBody(StashIndex.Built built) {
+        if (!kitSorting()) return null;
+        com.porter.qwerte.stash.KitSettings cached = com.porter.qwerte.stash.KitStore.shared().get(built.server(), built.stash());
+        com.porter.qwerte.stash.KitReport.Built report = kitReport;
+        return new StashIndex.KitsHashes(cached == null ? null : cached.hash(), report == null ? null : report.hash());
+    }
+
+    /** What a heartbeat reply says about kits: new settings are checked and cached (the sorter notices and plans again); the report is asked for or not. */
+    private void kitsReplied(StashIndex.Built built, String body) {
+        if (!kitSorting()) return;
+        StashIndex.KitsReply reply = StashIndex.kitsReply(body);
+        // Only a server that answers with a needKitsReport key (true or false) knows the report route
+        kitReportKnown = reply.reportKnown();
+        kitAsked = reply.reportKnown() && reply.needReport();
+        if (reply.invalid() != null) {
+            if (!reply.invalid().equals(kitInvalidSaid)) QwerteAddon.LOG.warn("stash-manager: ignoring kit settings from the server: {}.", reply.invalid());
+            kitInvalidSaid = reply.invalid();
+        } else if (reply.settings() != null) {
+            kitInvalidSaid = null;
+            if (com.porter.qwerte.stash.KitStore.shared().put(built.server(), built.stash(), reply.settings())) {
+                QwerteAddon.LOG.info("stash-manager: kit settings updated (revision {}, {} rules{}).", reply.settings().rev(), reply.settings().rules().size(),
+                    reply.settings().kitsChest() == null ? "" : ", a kits chest");
+            }
+        }
+    }
+
+    /** Keeps the kit report current: rebuilt every few seconds from the stash as it is and what the bot carries. Cheap (containers and shulker names only). */
+    private void refreshKits(long now, StashIndex.Built built) {
+        if (!kitSorting()) {
+            kitReport = null;
+            kitBuiltValid = false;
+            return;
+        }
+        if (now - kitCheckedAt < 5000) return;
+        kitCheckedAt = now;
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        Stash stash = sorter == null ? null : sorter.currentStash();
+        // The server needs a player name in the report
+        if (stash == null || mc.player == null || mc.level == null || built.player().isEmpty()) {
+            kitReport = null;
+            kitBuiltValid = false;
+            return;
+        }
+        try {
+            List<net.minecraft.world.item.ItemStack> inv = new java.util.ArrayList<>(36);
+            for (int slot = 0; slot < 36; slot++) inv.add(mc.player.getInventory().getItem(slot));
+            long sig = kitSignature(stash, built, inv);
+            // Built again when something it shows changed, and at least once a minute
+            if (kitBuiltValid && kitReport != null && sig == kitBuiltSig && now - kitBuiltAt < 60_000) return;
+            kitBuiltSig = sig;
+            kitBuiltAt = now;
+            kitBuiltValid = true;
+            com.porter.qwerte.stash.KitSettings cached = com.porter.qwerte.stash.KitStore.shared().get(built.server(), built.stash());
+            kitReport = StashIndex.kitReport(stash, includeExcluded.get(), built.player(), inv,
+                cached == null ? com.porter.qwerte.stash.KitSettings.Scoring.DEFAULT : cached.scoring(), sorter == null ? null : sorter::buildingKit);
+        } catch (RuntimeException e) {
+            QwerteAddon.LOG.debug("stash-manager: couldn't build the kit report: {}", e.toString());
+            kitReport = null;
+        }
+    }
+
+    private static long mixKit(long h, long v) {
+        return (h ^ v) * 0x100000001b3L + 0x9e3779b97f4a7c15L;
+    }
+
+    /**
+     * A cheap number that changes when the kit report would: the stash contents (the manager's own fingerprint), the containers' labels,
+     * flags and read times, the kit settings (their version), the shulkers carried and whether excluded containers are listed. Not sent.
+     */
+    private long kitSignature(Stash stash, StashIndex.Built built, List<net.minecraft.world.item.ItemStack> inventory) {
+        long h = mixKit(fingerprint, includeExcluded.get() ? 1 : 0);
+        h = mixKit(h, com.porter.qwerte.stash.KitStore.shared().version());
+        h = mixKit(h, built.server().hashCode());
+        h = mixKit(h, built.stash().hashCode());
+        h = mixKit(h, built.player().hashCode());
+        for (Stash.Box box : stash.boxes) {
+            h = mixKit(h, box.lastRead);
+            h = mixKit(h, box.labels.hashCode());
+            h = mixKit(h, (box.known() ? 1 : 0) | (box.excluded ? 2 : 0) | (box.dropOff ? 4 : 0) | (box.delivery ? 8 : 0) | (box.unreachable ? 16 : 0) | (box.foreign ? 32 : 0));
+            h = mixKit(h, box.parts.size() * 100L + (box.known() ? box.contents.length : 0));
+        }
+        for (net.minecraft.world.item.ItemStack stack : inventory) {
+            if (stack.isEmpty() || !meteordevelopment.meteorclient.utils.Utils.isShulker(stack.getItem())) continue;
+            h = mixKit(h, stack.getItem().hashCode());
+            h = mixKit(h, stack.getComponentsPatch().hashCode());
+        }
+        return h;
+    }
+
+    /**
+     * Whether to send the report now: only after a heartbeat reply carried needKitsReport (an older server never sees the route), at
+     * most every 10 s, and only when its hash changed or the server asked. A report the server refused is not sent again until it changes.
+     */
+    private boolean kitReportDue(StashIndex.Built built, long now) {
+        com.porter.qwerte.stash.KitReport.Built r = kitReport;
+        if (r == null || !kitReportKnown || !kitSorting()) return false;
+        if (!r.server().equals(built.server()) || !r.stash().equals(built.stash())) return false;
+        if (now - kitAttemptAt < 10_000) return false;
+        if (r.hash().equals(kitRejectedHash)) return false;
+        return kitAsked || !r.hash().equals(kitSentHash);
+    }
+
+    /** POST /api/v1/kits/report, signed like the index. Isolated: the answer never feeds the manager's backoff or status. */
+    private void sendKits(URI base, String key, com.porter.qwerte.stash.KitReport.Built report, long now) {
+        kitAttemptAt = now;
+        send(base, "/api/v1/kits/report", report.json(), key, (code, body) -> {
+            if (code == 200) {
+                kitSentHash = report.hash();
+                kitRejectedHash = null;
+                kitAsked = false;
+            } else if (code == 400 || code == 413) {
+                QwerteAddon.LOG.debug("stash-manager: the server refused the kit report ({}).", code);
+                kitRejectedHash = report.hash();
+            }
+            return true;
+        }, true);
     }
 
     private void resetDelivery() {
@@ -1213,6 +1361,8 @@ public class StashManager extends Module {
                     if (conflict != null) {
                         deliverySync.forget();
                         deliverySync.retryLater(System.currentTimeMillis());
+                        // The kit report waits at least 5 minutes after an owner conflict
+                        kitAttemptAt = System.currentTimeMillis() + 290_000;
                         return;
                     }
                     try {

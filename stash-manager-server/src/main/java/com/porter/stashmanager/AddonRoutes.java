@@ -23,12 +23,21 @@ final class AddonRoutes {
     private final OrderStore orders;
     private final Owners owners;
     private final DeliveryContents delivery;
+    private final KitStore kits;       // null: this server has no kit support (the reply leaves the kit fields out)
+    private final KitReports kitReports;
 
     AddonRoutes(IndexStore store, LinkState link, IconService icons, OrderStore orders, Owners owners) {
         this(store, link, icons, orders, owners, new DeliveryContents());
     }
 
     AddonRoutes(IndexStore store, LinkState link, IconService icons, OrderStore orders, Owners owners, DeliveryContents delivery) {
+        this(store, link, icons, orders, owners, delivery, null, null);
+    }
+
+    AddonRoutes(IndexStore store, LinkState link, IconService icons, OrderStore orders, Owners owners, DeliveryContents delivery,
+                KitStore kits, KitReports kitReports) {
+        this.kits = kits;
+        this.kitReports = kitReports;
         this.delivery = delivery;
         this.orders = orders;
         this.owners = owners;
@@ -44,7 +53,12 @@ final class AddonRoutes {
 
     /** Strict UTF-8 JSON body, or null when it doesn't parse. */
     static JsonElement readJson(HttpExchange ex) throws IOException {
-        byte[] body = Http.readBody(ex, Http.MAX_BODY);
+        return readJson(ex, Http.MAX_BODY);
+    }
+
+    /** The same with a body limit (Http.TooLarge, answered 413, above it). */
+    static JsonElement readJson(HttpExchange ex, long max) throws IOException {
+        byte[] body = Http.readBody(ex, max);
         try {
             String text = StandardCharsets.UTF_8.newDecoder()
                 .onMalformedInput(CodingErrorAction.REPORT)
@@ -114,6 +128,16 @@ final class AddonRoutes {
             Http.error(ex, 400, "deliveryHash must be 40 lowercase hex digits (sha1) or null");
             return;
         }
+        // KIT-CONTRACT.md: kitsHash and kitsReportHash are a hash, null (the bot has none) or absent (an older bot).
+        boolean hasKitsHash = o.has("kitsHash");
+        String kitsHash = string(o, "kitsHash");
+        String kitsReportHash = string(o, "kitsReportHash");
+        if ((hasKitsHash && !o.get("kitsHash").isJsonNull() && (kitsHash == null || !KitReports.HASH.matcher(kitsHash).matches()))
+            || (o.has("kitsReportHash") && !o.get("kitsReportHash").isJsonNull()
+            && (kitsReportHash == null || !KitReports.HASH.matcher(kitsReportHash).matches()))) {
+            Http.error(ex, 400, "kitsHash and kitsReportHash must be 40 lowercase hex digits or null");
+            return;
+        }
         String error = checkLengths(o);
         if (error != null) {
             Http.error(ex, 400, error);
@@ -146,7 +170,25 @@ final class AddonRoutes {
         out.addProperty("needDelivery", delivery.needed(server, stash, deliveryHash));
         out.add("orders", orders.heartbeatJson(server, stash));
         if (result.rescan() != null) out.addProperty("rescan", result.rescan());
+        if (kits != null && kitReports != null) kitFields(out, server, stash, hasKitsHash, kitsHash, kitsReportHash);
         Http.json(ex, 200, out);
+    }
+
+    /**
+     * The kit part of the reply (KIT-CONTRACT.md, "Heartbeat"): kitsHash always, kits when the bot sent a different
+     * kitsHash, needKitsReport always. When the settings file can't be read all three are left out.
+     */
+    private void kitFields(JsonObject out, String server, String stash, boolean hasKitsHash, String kitsHash, String kitsReportHash) {
+        kitReports.beat(server, stash, hasKitsHash, kitsHash);
+        KitStore.Settings s;
+        try {
+            s = kits.get(server, stash);
+        } catch (KitStore.DisabledException e) {
+            return;
+        }
+        out.addProperty("kitsHash", s.hash());
+        if (hasKitsHash && !s.hash().equals(kitsHash)) out.add("kits", s.toJson());
+        out.addProperty("needKitsReport", kitReports.needed(server, stash, kitsReportHash));
     }
 
     /**
@@ -262,8 +304,15 @@ final class AddonRoutes {
             }
             storage = new IndexStore.DeliveryStorage(auto.getAsBoolean(), chests, full, can.getAsBoolean(), blocked);
         }
+        boolean hasRepair = o.has("repair");
+        boolean repair = false;
+        if (hasRepair && !o.get("repair").isJsonNull()) {
+            JsonElement r = o.get("repair");
+            if (!r.isJsonPrimitive() || !r.getAsJsonPrimitive().isBoolean()) throw new IllegalArgumentException("repair must be true or false");
+            repair = r.getAsBoolean();
+        }
         return new IndexStore.BotStatus(hasDelivery, delivery, hasBlocker, blocker, rescanDone, hasRescanBlocked, rescanBlocked,
-            hasNaming, naming, hasCrafting, crafting, hasStorage, storage);
+            hasNaming, naming, hasCrafting, crafting, hasStorage, storage, hasRepair, repair);
     }
 
     /** A whole number in int range (1.0 is fine, 1.5 isn't), or null. */

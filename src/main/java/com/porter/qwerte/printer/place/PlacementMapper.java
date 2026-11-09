@@ -182,6 +182,17 @@ public final class PlacementMapper {
                     clickEach(d -> d == support, CENTER, LookWindow.any(), 0, 0, false, "facing = clicked face");
                     airplace(f, CENTER, LookWindow.lookCone(support), 0, 0, false, "look at the support");
                 }
+                case WALL_HANGING -> {
+                    // facing = the opposite of the look; the clicked block is beside the sign, never on its facing axis
+                    LookWindow w = quadrant(f.opposite());
+                    clickEach(d -> d.axis() != f.axis(), CENTER, w, 0, 0, false, "wall hanging sign: facing = look.opposite");
+                    airplace(Dir.UP, CENTER, w, 0, 0, false, "wall hanging sign: facing = look.opposite");
+                }
+                case COCOA -> {
+                    // facing = towards the log it hangs on = the opposite of the clicked face
+                    clickEach(d -> d == f, CENTER, LookWindow.any(), 0, 0, false, "cocoa: facing = towards the clicked log");
+                    airplace(f.opposite(), CENTER, LookWindow.any(), 0, 0, false, "cocoa: facing = towards the clicked log");
+                }
                 case ROTATION16 -> {
                     double off = skullLike(s.blockId()) ? 0 : 180;
                     LookWindow w = LookWindow.rotation16(num("rotation", 0), off);
@@ -341,7 +352,7 @@ public final class PlacementMapper {
     private static boolean needsFacing(StateKind k) {
         return switch (k) {
             case HFACING, HFACING_LOOK, HFACING_CW, FACING6_LOOK, FACING6_LOOK_SAME, FACING6_FACE, HOPPER, TRAPDOOR, DOOR, BED, FENCE_GATE,
-                ATTACH_FACE, WALL_OR_STANDING, REPEATER, COMPARATOR, CHEST, BELL -> true;
+                ATTACH_FACE, WALL_OR_STANDING, WALL_HANGING, COCOA, REPEATER, COMPARATOR, CHEST, BELL -> true;
             default -> false;
         };
     }

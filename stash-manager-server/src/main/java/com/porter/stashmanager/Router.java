@@ -57,6 +57,8 @@ final class Router implements HttpHandler {
         /** order, ordersAll or plannerOrder (cancel and retry: own orders, or any with ordersAll). */
         ORDER_OWN_OR_ALL("order", "change orders"),
         ORDERS_ALL("ordersAll", "change other users' orders"),
+        /** Stash settings (the kit chests and rules). */
+        SETTINGS("settings", "change stash settings"),
         ACTIVITY("activity", "view bots"),
         RESCAN("rescan", "rescan stashes"),
         LINK("link", "link bots"),
@@ -86,6 +88,7 @@ final class Router implements HttpHandler {
                 case ORDER -> x.order();
                 case ORDER_OWN_OR_ALL -> x.order() || x.ordersAll() || x.plannerOrder();
                 case ORDERS_ALL -> x.ordersAll();
+                case SETTINGS -> x.settings();
                 case ACTIVITY -> x.activity();
                 case RESCAN -> x.rescan();
                 case LINK -> x.link();

@@ -1,5 +1,6 @@
 package com.porter.qwerte.compat;
 
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.tags.ItemTags;
 import net.minecraft.world.item.ItemStack;
 
@@ -21,5 +22,13 @@ public final class Players {
 
     public static boolean isSpear(ItemStack stack) {
         return stack.is(ItemTags.SPEARS);
+    }
+
+    /**
+     * The off hand holds something that makes an axe (or other tool) in the main hand pass while not sneaking: anything
+     * that blocks attacks (a shield).
+     */
+    public static boolean blocksWithoutSneak(ItemStack stack) {
+        return stack.has(DataComponents.BLOCKS_ATTACKS);
     }
 }

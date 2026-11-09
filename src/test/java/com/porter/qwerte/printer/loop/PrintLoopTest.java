@@ -24,7 +24,8 @@ class PrintLoopTest {
 
     private static final class B {
         boolean worldChanged, cancelled, loaded = true, scanDone = true, breaking, placeable, walkTarget, lacking, resupplyActive, sessionActive,
-            inventoryFull, baritoneBusy, supplyPossible = true, canWalk = true, waiting;
+            inventoryFull, baritoneBusy, supplyPossible = true, canWalk = true, waiting, disableWhenOut;
+        String layerHold;
         String loadError, wrongInfo, lackingInfo, resupplyFailed, orderWait, orderProblem;
         int pending = 10, wrongPending;
         Wrong wrongMode = Wrong.SKIP_AND_LIST;
@@ -44,7 +45,7 @@ class PrintLoopTest {
 
         Obs build() {
             return new Obs(worldChanged, cancelled, loaded, loadError, scanDone, pending, wrongPending, wrongInfo, breaking, wrongMode, placeable,
-                walkTarget, lacking, lackingInfo, supplyPossible, resupplyActive, resupplyFailed, sessionActive, inventoryFull, baritoneBusy, canWalk, waiting, orderWait, orderProblem);
+                walkTarget, lacking, lackingInfo, supplyPossible, resupplyActive, resupplyFailed, sessionActive, inventoryFull, baritoneBusy, canWalk, waiting, orderWait, orderProblem, disableWhenOut, layerHold);
         }
     }
 
@@ -337,12 +338,100 @@ class PrintLoopTest {
     }
 
     @Test
-    void endsWhenNothingCanBeBuiltForAWhile() {
+    void whenNothingCanBeBuiltForAWhileItPausesOnceInsteadOfEnding() {
         PrintLoop loop = building();
-        Step last = null;
-        for (int i = 0; i < PrintLoop.STUCK_TICKS + 1 && (last == null || !last.ends()); i++) last = loop.tick(obs(b -> b));
-        assertEquals(Act.FINISH, last.act());
-        assertTrue(last.msg().contains("10 cell"));
+        Step said = null;
+        int messages = 0;
+        for (int i = 0; i < PrintLoop.STUCK_TICKS * 4; i++) {
+            Step s = loop.tick(obs(b -> b));
+            assertFalse(s.ends());
+            if (s.msg() != null) {
+                messages++;
+                said = s;
+            }
+        }
+        assertEquals(1, messages);
+        assertTrue(said.msg().startsWith(PrintLoop.STUCK_PREFIX));
+        assertTrue(said.msg().contains("10 cell"));
+        assertEquals(Phase.PAUSED, loop.phase());
+    }
+
+    @Test
+    void aStuckPauseResumesByItselfWhenSomethingBecomesPlaceableOrWalkable() {
+        PrintLoop loop = building();
+        for (int i = 0; i < PrintLoop.STUCK_TICKS + 1; i++) loop.tick(obs(b -> b));
+        assertEquals(Phase.PAUSED, loop.phase());
+        Step s = loop.tick(obs(B::place));
+        assertEquals(Act.PLACE, s.act());
+        assertEquals(Phase.BUILDING, loop.phase());
+        assertEquals("Printing resumed.", s.msg());
+
+        for (int i = 0; i < PrintLoop.STUCK_TICKS + 1; i++) loop.tick(obs(b -> b));
+        assertEquals(Phase.PAUSED, loop.phase());
+        assertEquals(Act.WALK, loop.tick(obs(B::walk)).act());
+        assertEquals(Phase.BUILDING, loop.phase());
+    }
+
+    @Test
+    void leavingAPauseForAWaitingBlipSaysNothingAndTheStuckMessageSaysItStaysOn() {
+        PrintLoop loop = building();
+        Step stuck = null;
+        for (int i = 0; i < PrintLoop.STUCK_TICKS + 1; i++) {
+            Step s = loop.tick(obs(b -> b));
+            if (s.msg() != null) stuck = s;
+        }
+        assertTrue(stuck.msg().contains("stays on"));
+        assertTrue(stuck.msg().contains("Turn it off yourself"));
+        Step blip = loop.tick(obs(b -> { b.waiting = true; return b; }));
+        assertEquals(Act.NONE, blip.act());
+        assertNull(blip.msg());
+        assertEquals(Phase.BUILDING, loop.phase());
+
+        PrintLoop layer = building();
+        layer.tick(obs(b -> { b.layerHold = "Layer done"; return b.pending(0); }));
+        assertEquals(Phase.PAUSED, layer.phase());
+        Step quiet = layer.tick(obs(b -> { b.waiting = true; return b.pending(0); }));
+        assertNull(quiet.msg());
+        assertEquals(Phase.BUILDING, layer.phase());
+    }
+
+    @Test
+    void onlyEverythingBuiltEndsTheRun() {
+        PrintLoop loop = building();
+        for (int i = 0; i < PrintLoop.STUCK_TICKS + 1; i++) loop.tick(obs(b -> b));
+        Step done = loop.tick(obs(b -> b.pending(0)));
+        assertEquals(Act.FINISH, done.act());
+    }
+
+    @Test
+    void jobsThatCannotProgressDoNotHoldTheEnd() {
+        // pending 0 and the module reports nothing in progress (an axe-less strip job is not "waiting"): the run finishes
+        PrintLoop loop = building();
+        assertEquals(Act.FINISH, loop.tick(obs(b -> b.pending(0))).act());
+        // while a job can progress the module reports waiting and the run stays
+        PrintLoop held = building();
+        for (int i = 0; i < 5; i++) assertEquals(Act.NONE, held.tick(obs(b -> { b.waiting = true; return b.pending(0); })).act());
+        assertFalse(held.ended());
+    }
+
+    @Test
+    void whenTheLayerIsDoneItPausesAndResumesWhenTheLayersChange() {
+        PrintLoop loop = building();
+        String hold = "Layer done: move Litematica's render layer to continue (40 block(s) outside it).";
+        Step s = loop.tick(obs(b -> { b.layerHold = hold; return b.pending(0); }));
+        assertFalse(s.ends());
+        assertEquals(hold, s.msg());
+        assertEquals(Phase.PAUSED, loop.phase());
+        for (int i = 0; i < PrintLoop.STUCK_TICKS * 2; i++) assertFalse(loop.tick(obs(b -> { b.layerHold = hold; return b.pending(0); })).ends());
+        // the layer moved: blocks inside the new range are placeable again
+        assertEquals(Act.PLACE, loop.tick(obs(b -> b.place())).act());
+        assertEquals(Phase.BUILDING, loop.phase());
+    }
+
+    @Test
+    void theLayerPauseIsNotUsedWhileBlocksRemainInTheRange() {
+        PrintLoop loop = building();
+        assertEquals(Act.PLACE, loop.tick(obs(b -> { b.layerHold = "x"; return b.place(); })).act());
     }
 
     @Test
@@ -412,8 +501,9 @@ class PrintLoopTest {
         assertFalse(loop.ended());
         // the search ends without finding anything: the stuck count starts only now
         Step last = null;
-        for (int i = 0; i < PrintLoop.STUCK_TICKS + 1 && (last == null || !last.ends()); i++) last = loop.tick(obs(b -> b));
-        assertEquals(Act.FINISH, last.act());
+        for (int i = 0; i < PrintLoop.STUCK_TICKS + 1; i++) last = loop.tick(obs(b -> b));
+        assertEquals(Phase.PAUSED, loop.phase());
+        assertFalse(loop.ended());
     }
 
     @Test
@@ -458,5 +548,57 @@ class PrintLoopTest {
         t.clear();
         assertEquals(0, t.size());
         assertFalse(t.contains(300000, 319, -30000000));
+    }
+
+    @Test
+    void outOfMaterialsPausesAndNeverEndsWhileTheSettingIsOff() {
+        PrintLoop loop = building();
+        Step s = loop.tick(obs(b -> b.lack().noSupply()));
+        assertEquals(Phase.PAUSED, loop.phase());
+        assertFalse(s.ends());
+        for (int i = 0; i < PrintLoop.STUCK_TICKS * 2; i++) assertFalse(loop.tick(obs(b -> b.lack().noSupply())).ends());
+        // and goes on by itself when the item turns up
+        assertEquals(Act.PLACE, loop.tick(obs(B::place)).act());
+        assertEquals(Phase.BUILDING, loop.phase());
+    }
+
+    @Test
+    void outOfMaterialsEndsTheRunWhenTheSettingIsOnAndNothingCanSupplyIt() {
+        PrintLoop loop = building();
+        Step s = loop.tick(obs(b -> { b.disableWhenOut = true; return b.lack().noSupply(); }));
+        assertEquals(Act.ABORT, s.act());
+        assertTrue(s.msg().contains("disable-when-out-of-materials"));
+        assertTrue(loop.ended());
+    }
+
+    @Test
+    void withTheSettingOnOtherBlocksAreStillPlacedFirstAndASourceIsStillTried() {
+        PrintLoop loop = building();
+        // a block with its item is ready: the starved ones are skipped, nothing ends
+        assertEquals(Act.PLACE, loop.tick(obs(b -> { b.disableWhenOut = true; return b.place().lack().noSupply(); })).act());
+        // a source is set up: fetch from it
+        assertEquals(Act.RESUPPLY, loop.tick(obs(b -> { b.disableWhenOut = true; return b.lack(); })).act());
+    }
+
+    @Test
+    void withTheSettingOnAStashOrderIsStillWaitedFor() {
+        PrintLoop loop = building();
+        Step s = loop.tick(obs(b -> { b.disableWhenOut = true; return b.lack().noSupply().order("the order from stash Main"); }));
+        assertEquals(Phase.PAUSED, loop.phase());
+        assertFalse(s.ends());
+        assertTrue(s.msg().contains("the order from stash Main"));
+    }
+
+    @Test
+    void aFailedFetchEndsTheRunOnlyWhenTheSettingIsOnAndNoOrderIsOpen() {
+        PrintLoop on = building();
+        assertEquals(Act.RESUPPLY, on.tick(obs(b -> { b.disableWhenOut = true; return b.lack(); })).act());
+        assertEquals(Act.ABORT, on.tick(obs(b -> { b.disableWhenOut = true; b.lacking = true; b.resupplyFailed = "no source holds stone."; return b; })).act());
+
+        PrintLoop ordered = building();
+        ordered.tick(obs(b -> { b.disableWhenOut = true; return b.lack(); }));
+        Step s = ordered.tick(obs(b -> { b.disableWhenOut = true; b.lacking = true; b.resupplyFailed = "no source holds stone."; b.orderWait = "the order from stash Main"; return b; }));
+        assertFalse(s.ends());
+        assertEquals(Phase.PAUSED, ordered.phase());
     }
 }

@@ -72,7 +72,19 @@ public final class IndexStore {
      * shulkers[].itemKey); filledById: the same by item id, for groups without itemKey (older indexes).
      */
     public record OrderCounts(Map<String, Long> items, Map<String, String> itemIds, Map<String, Integer> maxStacks,
-                              Map<String, Long> shulkers, Map<String, Long> filledByItemKey, Map<String, Long> filledById) {
+                              Map<String, Long> shulkers, Map<String, Long> filledByItemKey, Map<String, Long> filledById,
+                              Map<String, Repair.Info> repairs) {
+        public OrderCounts(Map<String, Long> items, Map<String, String> itemIds, Map<String, Integer> maxStacks,
+                           Map<String, Long> shulkers, Map<String, Long> filledByItemKey, Map<String, Long> filledById) {
+            this(items, itemIds, maxStacks, shulkers, filledByItemKey, filledById, Map.of());
+        }
+
+        /** Repair info of an item key (not in the index: no Mending). */
+        Repair.Info repair(String key) {
+            Repair.Info i = repairs.get(key);
+            return i != null ? i : new Repair.Info(Repair.NO_MENDING, 0);
+        }
+
         /**
          * Units the index holds for a line, before reservations; -1 when the key isn't in the index.
          * An item line for a shulker box means EMPTY shulkers: its count minus the filled ones of that id.
@@ -146,8 +158,16 @@ public final class IndexStore {
      */
     public record BotStatus(boolean hasDelivery, Delivery delivery, boolean hasBlocker, String orderBlocker,
                             long rescanDone, boolean hasRescanBlocked, String rescanBlocked, boolean hasNaming, Naming naming,
-                            boolean hasCrafting, Crafting crafting, boolean hasStorage, DeliveryStorage storage) {
+                            boolean hasCrafting, Crafting crafting, boolean hasStorage, DeliveryStorage storage,
+                            boolean hasRepair, boolean repair) {
         public static final BotStatus NONE = new BotStatus(false, null, false, null, -1, false, null, false, null, false, null, false, null);
+
+        public BotStatus(boolean hasDelivery, Delivery delivery, boolean hasBlocker, String orderBlocker, long rescanDone,
+                         boolean hasRescanBlocked, String rescanBlocked, boolean hasNaming, Naming naming, boolean hasCrafting,
+                         Crafting crafting, boolean hasStorage, DeliveryStorage storage) {
+            this(hasDelivery, delivery, hasBlocker, orderBlocker, rescanDone, hasRescanBlocked, rescanBlocked, hasNaming, naming,
+                hasCrafting, crafting, hasStorage, storage, false, false);
+        }
 
         public BotStatus(boolean hasDelivery, Delivery delivery, boolean hasBlocker, String orderBlocker, long rescanDone,
                          boolean hasRescanBlocked, String rescanBlocked, boolean hasNaming, Naming naming, boolean hasCrafting,
@@ -199,6 +219,7 @@ public final class IndexStore {
         Naming naming;
         Crafting crafting;
         DeliveryStorage storage;
+        boolean repair; // the bot can repair items with XP bottles (heartbeat "repair"); in memory only
         String orderBlocker;
         long rescanRequested; // latest rescan request id, 0 = none
         long rescanDone;      // highest id the bot acknowledged
@@ -357,6 +378,10 @@ public final class IndexStore {
             if (item.has("enchanted") && !(item.get("enchanted").isJsonPrimitive() && item.get("enchanted").getAsJsonPrimitive().isBoolean())) {
                 return "items[" + i + "].enchanted must be a boolean";
             }
+            if (item.has("mending") && !item.get("mending").isJsonNull()
+                && !(item.get("mending").isJsonPrimitive() && item.get("mending").getAsJsonPrimitive().isBoolean())) {
+                return "items[" + i + "].mending must be a boolean";
+            }
             if (item.has("tab") && !item.get("tab").isJsonNull()
                 && (!isString(item, "tab") || item.get("tab").getAsString().length() > 40)) return "items[" + i + "].tab must be a short string";
             if (item.has("tabOrder") && !item.get("tabOrder").isJsonNull() && !isNumber(item, "tabOrder")) return "items[" + i + "].tabOrder must be a number";
@@ -482,12 +507,21 @@ public final class IndexStore {
                 else filledById.merge(g.get("id").getAsString(), n, Long::sum);
             }
         }
+        Map<String, Repair.Info> repairs = new HashMap<>();
+        for (Map.Entry<String, JsonObject> e : byKey.entrySet()) repairs.put(e.getKey(), Repair.of(e.getValue()));
         OrderCounts orderCounts = new OrderCounts(Map.copyOf(itemCounts), Map.copyOf(itemIds), Map.copyOf(maxStacks), Map.copyOf(shulkerCounts),
-            Map.copyOf(filledByItemKey), Map.copyOf(filledById));
+            Map.copyOf(filledByItemKey), Map.copyOf(filledById), Map.copyOf(repairs));
 
         index.addProperty("receivedAt", receivedAt);
         byte[] disk = Json.GSON.toJson(index).getBytes(StandardCharsets.UTF_8);
-        byte[] bytes = tabs.fill(index) > 0 ? Json.GSON.toJson(index).getBytes(StandardCharsets.UTF_8) : disk;
+        tabs.fill(index);
+        // Served only (the file keeps what the bot sent): the computed repair fields.
+        for (Map.Entry<String, JsonObject> e : byKey.entrySet()) {
+            Repair.Info r = repairs.get(e.getKey());
+            e.getValue().addProperty("repairable", r.repairable());
+            e.getValue().addProperty("repairBottles", r.bottles());
+        }
+        byte[] bytes = Json.GSON.toJson(index).getBytes(StandardCharsets.UTF_8);
         Map<String, CreativeTabs.Entry> tabOrder = new HashMap<>();
         for (JsonElement e : index.getAsJsonArray("items")) {
             JsonObject item = e.getAsJsonObject();
@@ -560,6 +594,7 @@ public final class IndexStore {
             if (status.hasNaming()) s.naming = status.naming();
             if (status.hasCrafting()) s.crafting = status.crafting();
             if (status.hasStorage()) s.storage = status.storage();
+            if (status.hasRepair()) s.repair = status.repair();
             if (status.hasRescanBlocked()) s.rescanBlocked = status.rescanBlocked();
             if (status.rescanDone() > s.rescanDone) s.rescanDone = status.rescanDone();
             boolean needIndex = s.index == null || indexHash == null || !indexHash.equals(s.index.indexHash);
@@ -645,6 +680,7 @@ public final class IndexStore {
                 } else {
                     o.add("deliveryStorage", com.google.gson.JsonNull.INSTANCE);
                 }
+                o.addProperty("repair", s.repair);
                 o.addProperty("orderBlocker", s.orderBlocker);
                 o.addProperty("rescanPending", rescanPending(s));
                 o.addProperty("rescanBlocked", s.rescanBlocked);

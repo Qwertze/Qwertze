@@ -72,6 +72,7 @@
     panelLabel: $("panel-label"),
     viewItems: $("view-items"),
     viewOrders: $("view-orders"),
+    viewKits: $("view-kits"),
     crumbs: $("crumbs"),
     pickerBody: $("picker-body"),
     cartLines: $("cart-lines"),
@@ -82,6 +83,9 @@
     namesRows: $("names-rows"),
     namesWarn: $("names-warn"),
     craftInfo: $("craft-info"),
+    repairAll: $("repair-all"),
+    repairInfo: $("repair-info"),
+    repairWarn: $("repair-warn"),
     deliveryFit: $("delivery-fit"),
     deliveryWarn: $("delivery-warn"),
     cartPlace: $("cart-place"),
@@ -2171,8 +2175,31 @@
       tabOrder: num(it.tabOrder, 1000000),
       // Bots that report durability send these only for a damaged, damageable stack.
       damage: Math.max(0, Math.floor(num(it.damage, 0))),
-      maxDamage: Math.max(0, Math.floor(num(it.maxDamage, 0)))
+      maxDamage: Math.max(0, Math.floor(num(it.maxDamage, 0))),
+      // Repair with XP bottles (PROTOCOL.md): the server computes repairable / repairBottles; mending is the bot's flag.
+      mending: it.mending === true || (Array.isArray(it.details) && it.details.some(function (d) {
+        return typeof d === "string" && /^mending(?: (?:[ivxlcdm]+|[0-9]+))?$/i.test(d.trim());
+      })),
+      repairable: it.repairable === true,
+      repairBottles: Math.max(0, Math.floor(num(it.repairBottles, 0)))
     };
+  }
+
+  var BOTTLE_KEY = "minecraft:experience_bottle";
+
+  /** One bottle is about 14 durability (about 7 XP, 2 durability per XP point under Mending). */
+  function bottlesFor(damage) {
+    return damage > 0 ? Math.ceil(damage / 14) : 0;
+  }
+
+  /** Why a stash item can't be repaired ("no Mending", "not damaged", "not a single item"), or "" when it can. */
+  function repairReason(item) {
+    if (!item) return "no Mending";
+    if (/^minecraft:.*shulker_box$/.test(item.id)) return "not a single item";
+    if (!item.mending) return "no Mending";
+    if (!(item.damage > 0)) return "not damaged";
+    if (item.maxStack !== 1) return "not a single item";
+    return "";
   }
 
   /** Remaining durability from 0 to 1 for a damaged item, or -1 when it isn't damaged (or the bot doesn't say). */
@@ -2946,6 +2973,7 @@
   var TAB_ALL = { id: "all", name: "Search", icon: "minecraft:compass" };
   var TAB_SHULKERS = { id: "shulkers", name: "Shulkers", icon: "minecraft:shulker_box" };
   var TAB_ORDERS = { id: "orders", name: "Orders", icon: "minecraft:writable_book" };
+  var TAB_KITS = { id: "kits", name: "Kits", icon: "minecraft:purple_shulker_box" };
   var TAB_INDEX = {};
   CREATIVE_TABS.forEach(function (t, i) { TAB_INDEX[t.id] = i; });
 
@@ -2963,6 +2991,7 @@
     if (id === "all") return TAB_ALL;
     if (id === "shulkers") return TAB_SHULKERS;
     if (id === "orders") return TAB_ORDERS;
+    if (id === "kits") return TAB_KITS;
     return CREATIVE_TABS[TAB_INDEX[id]] || TAB_ALL;
   }
 
@@ -2975,6 +3004,8 @@
       if (present[t.id]) out.push(t);
     });
     if (state.shulkers.length) out.push(TAB_SHULKERS);
+    // Kits shows positions and names players typed: not for a user the owner forced into streamer mode (the server says 403).
+    if (can("view") && !forcedStreamer()) out.push(TAB_KITS);
     out.push(TAB_ORDERS);
     return out;
   }
@@ -2982,7 +3013,7 @@
   /** The entries a tab shows (before search). */
   function tabEntries(id) {
     if (id === "shulkers") return state.shulkers;
-    if (id === "all" || id === "orders") return state.items;
+    if (id === "all" || id === "orders" || id === "kits") return state.items;
     return state.items.filter(function (e) { return e.item.tab === id; });
   }
 
@@ -3012,7 +3043,15 @@
   function renderTabs() {
     var tabs = visibleTabs();
     var ids = tabs.map(function (t) { return t.id; });
-    if (ids.indexOf(state.tab) < 0) state.tab = "all";
+    if (ids.indexOf(state.tab) < 0) {
+      state.tab = "all";
+      if (el.viewKits && !el.viewKits.hidden) {
+        // The Kits tab went away under the user (their permissions changed): back to the items.
+        el.viewKits.hidden = true;
+        el.viewItems.hidden = false;
+        kitsSync();
+      }
+    }
     var signature = ids.join(",") + "|" + state.mc;
     if (signature !== tabsShown) {
       tabsShown = signature;
@@ -3021,14 +3060,14 @@
       tabs.forEach(function (t) {
         var b = document.createElement("button");
         b.type = "button";
-        b.className = "tab" + (t.id === "orders" ? " tab-orders" : "");
+        b.className = "tab" + (t.id === "orders" || t.id === "kits" ? " tab-orders" : "");
         b.setAttribute("role", "tab");
         b.dataset.tab = t.id;
         b.title = t.name;
         b.setAttribute("aria-label", t.name);
         b.appendChild(iconImg(t.icon, 32));
         b.addEventListener("click", function () { selectTab(t.id); });
-        (t.id === "orders" ? right : left).appendChild(b);
+        (t.id === "orders" || t.id === "kits" ? right : left).appendChild(b);
       });
       el.tabs.replaceChildren(left);
       el.tabsRight.replaceChildren(right);
@@ -3052,9 +3091,14 @@
     state.tab = id;
     hideTooltip();
     var orders = id === "orders";
-    el.viewItems.hidden = orders;
+    var kitsTab = id === "kits";
+    el.viewItems.hidden = orders || kitsTab;
     el.viewOrders.hidden = !orders;
-    if (!orders) {
+    el.viewKits.hidden = !kitsTab;
+    kitsSync();
+    if (kitsTab) {
+      kitsRender();
+    } else if (!orders) {
       el.sort.value = isCreativeTab(id) ? state.sortTab : state.sortAll;
       el.gridWrap.scrollTop = 0;
       renderNow();
@@ -3478,7 +3522,7 @@
     expanded: new Set(),
     retryErrors: new Map() // order id -> why the last retry was refused
   };
-  var cart = { lines: [], badLine: -1 };
+  var cart = { lines: [], badLine: -1, repairAll: false };
   var picker = { level: "types", type: null, entry: null, search: "", slots: [], qtyHost: null };
 
   function clampInt(v, lo, hi) {
@@ -3537,14 +3581,22 @@
   function loadCart() {
     cart.lines = [];
     cart.badLine = -1;
+    cart.repairAll = false;
     var k = cartStorageKey();
     if (!k) return;
+    try {
+      cart.repairAll = window.localStorage.getItem(k + ".repairAll") === "1";
+    } catch (e) {
+      cart.repairAll = false;
+    }
     try {
       var raw = JSON.parse(window.localStorage.getItem(k) || "[]");
       if (Array.isArray(raw)) {
         raw.forEach(function (l) {
           if (l && (l.type === "item" || l.type === "shulker") && typeof l.key === "string" && num(l.count, 0) >= 1) {
-            cart.lines.push({ type: l.type, key: l.key, count: Math.floor(l.count) });
+            var cl = { type: l.type, key: l.key, count: Math.floor(l.count) };
+            if (l.type === "item" && l.repair === true) cl.repair = true;
+            cart.lines.push(cl);
           }
         });
       }
@@ -3558,6 +3610,8 @@
     if (!k) return;
     try {
       window.localStorage.setItem(k, JSON.stringify(cart.lines));
+      if (cart.repairAll) window.localStorage.setItem(k + ".repairAll", "1");
+      else window.localStorage.removeItem(k + ".repairAll");
     } catch (e) {
       // Storage full or disabled: the cart just isn't remembered.
     }
@@ -3643,7 +3697,7 @@
    * message is shown). Returns whether it was added.
    */
   function addToCart(type, key, n) {
-    var next = cart.lines.map(function (l) { return { type: l.type, key: l.key, count: l.count }; });
+    var next = cart.lines.map(function (l) { return l.repair ? { type: l.type, key: l.key, count: l.count, repair: true } : { type: l.type, key: l.key, count: l.count }; });
     var found = null;
     next.forEach(function (l) { if (l.type === type && l.key === key) found = l; });
     if (found) found.count += n;
@@ -3728,6 +3782,7 @@
     renderBotStatus();
     renderOrderList();
     scheduleOrdersPoll(0);
+    kitsReset();
   }
 
   /** Re-renders the parts of the Orders tab that depend on the index (after every index refresh). */
@@ -4408,6 +4463,8 @@
         updatePickerCounts();
       });
       row.appendChild(input);
+      var rp = repairLineControl(l, item);
+      if (rp) row.appendChild(rp);
       var rm = document.createElement("button");
       rm.type = "button";
       rm.className = "mc-button small danger";
@@ -4449,9 +4506,105 @@
     el.cartTotals.classList.toggle("warn", !units);
     el.cartPlace.disabled = !cart.lines.length || !state.items.length || !units;
     el.cartClear.disabled = !cart.lines.length;
+    renderRepair();
     var s = currentStash();
     el.cartOffline.hidden = !(s && !s.online);
   }
+
+  // ---------- orders: repair with XP bottles ----------
+  // Mending items can be repaired by the bot with Bottles o' Enchanting from the stash before delivery. The estimate
+  // is a guess (about 14 durability per bottle); bottles are not reserved, and the bot repairs as far as they go.
+
+  /** Bottles to fully repair one stash item (0 when it can't be repaired). */
+  function itemBottles(item) {
+    if (!item || repairReason(item)) return 0;
+    return item.repairBottles > 0 ? item.repairBottles : bottlesFor(item.damage);
+  }
+
+  /** Whether the cart wants this line repaired: an item line with the cart-wide switch or its own toggle. */
+  function lineWantsRepair(l) {
+    if (l.type !== "item") return false;
+    if (l.repair === true) return true;
+    var it = itemByKey(l.key);
+    return cart.repairAll && !!it && it.damage > 0;
+  }
+
+  /** The cart's estimate: bottles needed, bottles in the stash after open orders, and the wanted lines. */
+  function cartRepairEstimate() {
+    var needed = 0;
+    var wanted = 0;
+    var fixable = 0;
+    cart.lines.forEach(function (l) {
+      if (!lineWantsRepair(l)) return;
+      wanted++;
+      var b = l.count * itemBottles(itemByKey(l.key));
+      if (b > 0) fixable++;
+      needed += b;
+    });
+    var a = orders.available;
+    var have = a && typeof a.bottles === "number" ? a.bottles : availableTotal("item", BOTTLE_KEY);
+    return { needed: needed, available: have, wanted: wanted, fixable: fixable };
+  }
+
+  /** The per-line control: a Repair checkbox on a repairable item line, a note on a damaged one that can't be, else null. */
+  function repairLineControl(l, item) {
+    if (l.type !== "item" || !item || isEmptyShulkerLine(l)) return null;
+    var reason = repairReason(item);
+    if (reason) {
+      if (!(item.damage > 0)) return null; // nothing to repair, nothing to say
+      var no = document.createElement("span");
+      no.className = "note repair-no";
+      no.textContent = "can't repair (" + reason + ")";
+      return no;
+    }
+    var label = document.createElement("label");
+    label.className = "unset user-check repair-toggle";
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = cart.repairAll || l.repair === true;
+    box.disabled = cart.repairAll;
+    box.setAttribute("aria-label", "Repair this item");
+    box.addEventListener("change", function () {
+      if (box.checked) l.repair = true;
+      else delete l.repair;
+      saveCart();
+      renderRepair();
+    });
+    label.appendChild(box);
+    label.appendChild(document.createTextNode(" Repair"));
+    if (cart.repairAll) label.title = "Repair all items is on";
+    return label;
+  }
+
+  function renderRepair() {
+    var est = cartRepairEstimate();
+    if (el.repairAll.checked !== cart.repairAll) el.repairAll.checked = cart.repairAll;
+    var info = "";
+    var warn = "";
+    if (est.wanted > 0) {
+      info = est.needed > 0
+        ? "About " + plural(grouped(est.needed), "bottle") + " needed, " + grouped(est.available) + " in the stash."
+        : "None of the chosen items can be repaired (they need Mending and some damage).";
+      if (est.needed > est.available) {
+        warn = "Not enough Bottles o' Enchanting in the stash: the bot repairs as far as the bottles go and delivers the rest as they are.";
+      }
+    }
+    var s = currentStash();
+    if (est.wanted > 0 && est.fixable > 0 && s && s.repair !== true) {
+      warn = (warn ? warn + " " : "") + "This bot can't repair items; they'll arrive as they are.";
+    }
+    if (el.repairInfo.textContent !== info) el.repairInfo.textContent = info;
+    el.repairInfo.hidden = !info;
+    if (el.repairWarn.textContent !== warn) el.repairWarn.textContent = warn;
+    el.repairWarn.hidden = !warn;
+  }
+
+  el.repairAll.addEventListener("change", function () {
+    cart.repairAll = el.repairAll.checked;
+    saveCart();
+    if (!el.cartLines.contains(document.activeElement)) renderCart();
+    else renderRepair();
+  });
 
   el.cartClear.addEventListener("click", function () {
     if (!cart.lines.length || !window.confirm("Remove everything from the cart?")) return;
@@ -4473,9 +4626,11 @@
     var sent = cart.lines.slice();
     api("/api/v1/orders", {
       method: "POST",
-      body: { server: s.server, stash: s.stash, names: namesBody(), lines: sent }
+      body: { server: s.server, stash: s.stash, names: namesBody(), repairAll: cart.repairAll, lines: sent }
     }).then(function () {
       cart.lines = [];
+      cart.repairAll = false;
+      el.repairAll.checked = false;
       cart.badLine = -1;
       plan.selected = null;
       saveCart();
@@ -4925,6 +5080,53 @@
       });
   }
 
+  /** An item key's display name for the repair report. */
+  function repairItemName(key) {
+    var item = itemByKey(key);
+    return item ? displayName("item", item) : str(key);
+  }
+
+  /** The order's repair estimate (made when it was placed) and, once the bot reports, what the repair did. */
+  function appendRepairInfo(card, o) {
+    var est = o.repairEstimate && typeof o.repairEstimate === "object" ? o.repairEstimate : null;
+    if (est) {
+      var text = "Repair" + (o.repairAll === true ? " (all items)" : "") + ": about " +
+        plural(grouped(num(est.needed, 0)), "bottle") + " needed, " + grouped(num(est.available, 0)) + " in the stash when placed";
+      card.appendChild(line("order-repair" + (est.short === true ? " order-repair-short" : ""), text +
+        (est.short === true ? ". Short on bottles: the bot repairs as far as they go." : ".")));
+    }
+    var rr = FINISHED_STATUS[o.status] && o.result && typeof o.result === "object" && o.result.repair && typeof o.result.repair === "object"
+      ? o.result.repair : null;
+    if (!rr) return;
+    var partial = Array.isArray(rr.partial) ? rr.partial : [];
+    var skipped = Array.isArray(rr.skipped) ? rr.skipped : [];
+    card.appendChild(line("order-repair", "Repaired " + plural(grouped(num(rr.repaired, 0)), "item") + ", " +
+      plural(grouped(num(rr.bottlesUsed, 0)), "bottle") + " used."));
+    if (!partial.length && !skipped.length) return;
+    var d = document.createElement("details");
+    d.className = "order-repair-details";
+    var openKey = "repair:" + o.id;
+    d.open = orders.expanded.has(openKey);
+    d.addEventListener("toggle", function () {
+      if (d.open) orders.expanded.add(openKey);
+      else orders.expanded.delete(openKey);
+    });
+    var sum = document.createElement("summary");
+    sum.textContent = plural(grouped(partial.length + skipped.length), "item") + " not fully repaired";
+    d.appendChild(sum);
+    partial.forEach(function (p) {
+      if (!p || typeof p !== "object") return;
+      var left = num(p.damage, 0);
+      var max = num(p.maxDamage, 0);
+      d.appendChild(line("order-line", repairItemName(p.key) + ": " + grouped(left) + (max > 0 ? " / " + grouped(max) : "") + " damage left"));
+    });
+    skipped.forEach(function (p) {
+      if (!p || typeof p !== "object") return;
+      d.appendChild(line("order-line", repairItemName(p.key) + ": not repaired (" + str(p.reason) + ")"));
+    });
+    card.appendChild(d);
+  }
+
   function linesSummary(o) {
     return o.lines.map(function (l) {
       var item = lineItem(l.type, l.key);
@@ -5101,6 +5303,7 @@
           card.appendChild(nd);
         }
       }
+      appendRepairInfo(card, o);
       if (orders.retryErrors.has(o.id)) card.appendChild(line("note warn", "Retry refused: " + orders.retryErrors.get(o.id)));
 
       var lines = linesSummary(o);
@@ -5126,6 +5329,448 @@
 
   document.addEventListener("visibilitychange", function () {
     if (!document.hidden && state.tab === "orders") scheduleOrdersPoll(0);
+  });
+
+  // ---------- kits ----------
+  // The Kits tab (KIT-CONTRACT.md v1.1): where every kit shulker is (the bots score them), a kits chest for all of them,
+  // a chest per kit name, and the scoring settings. The server computes the rows and statuses; this only draws them. Polled every 5 s while the tab is open.
+
+  var KIT_POLL_MS = 5000;
+  var KIT_MAX_ROWS = 500;
+  var kits = { timer: 0, loading: false, token: 0, data: null, error: "", writing: false, sig: "" };
+  var KIT_STATUS = {
+    pending: ["Waiting for the sorter", ""],
+    home: ["In place", "ok"],
+    full: ["Target full", "warn"],
+    missing: ["Target missing", "off"],
+    none: ["Normal sorting", ""],
+    absent: ["None in the stash", ""]
+  };
+
+  function kitsVisible() {
+    return state.tab === "kits" && dash.page === "stash" && !document.hidden && !auth.blocked && !!currentStash() && !forcedStreamer();
+  }
+
+  /** Starts or stops the polling to match what is on screen. */
+  function kitsSync() {
+    window.clearTimeout(kits.timer);
+    kits.timer = 0;
+    if (kitsVisible()) kitsPoll();
+  }
+
+  function kitsReset() {
+    kits.scoringSnap = null;
+    kits.token++;
+    kits.data = null;
+    kits.error = "";
+    kits.sig = "";
+    kitsRender();
+    kitsSync();
+  }
+
+  function kitsPoll() {
+    if (kits.loading || kits.writing) return;
+    var s = currentStash();
+    if (!s) return;
+    kits.loading = true;
+    var token = kits.token;
+    api("/api/v1/kits?server=" + encodeURIComponent(s.server) + "&stash=" + encodeURIComponent(s.stash)).then(function (d) {
+      if (token !== kits.token) return;
+      kits.data = d && typeof d === "object" ? d : null;
+      kits.error = "";
+    }, function (e) {
+      if (token !== kits.token) return;
+      kits.data = null;
+      if (e && e.status === 503) kits.error = "The server can't read its kit settings (kits.json is damaged), so kit sorting is off. Fix or remove the file and restart the server.";
+      else if (e && e.status === 404) kits.error = "That stash isn't available.";
+      else if (e && e.status === 403) kits.error = "Kits are hidden in streamer mode.";
+      else kits.error = "Can't reach the server. Trying again.";
+    }).then(function () {
+      kits.loading = false;
+      if (token !== kits.token) {
+        // The stash changed or a write was made while this poll ran: its answer was dropped, so ask again now.
+        kitsSync();
+        return;
+      }
+      kitsRender();
+      window.clearTimeout(kits.timer);
+      kits.timer = kitsVisible() ? window.setTimeout(kitsPoll, KIT_POLL_MS) : 0;
+    });
+  }
+
+  function kitsCan() {
+    return can("settings") && !forcedStreamer();
+  }
+
+  /** "x, y, z" for an id like "120,64,-33". */
+  function kitCoords(id) {
+    return str(id).split(",").join(", ");
+  }
+
+  function kitContainer(id) {
+    var list = kits.data && Array.isArray(kits.data.containers) ? kits.data.containers : [];
+    for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i];
+    return null;
+  }
+
+  /** The label and position of a container, as one hidden (streamer-blurred) text. */
+  function kitPlace(id) {
+    var c = kitContainer(id);
+    var label = c && str(c.label) ? str(c.label) + " (" + kitCoords(id) + ")" : kitCoords(id);
+    return hiddenSpan(label);
+  }
+
+  /** The text of a picker option; in streamer mode without label and position (a native option can't be blurred). */
+  function kitOptionText(c, index) {
+    var free = num(c.free, 0) + " free";
+    if (streamerOn()) return "Chest " + (index + 1) + " · " + free;
+    var where = kitCoords(c.id);
+    return (str(c.label) ? str(c.label) + " (" + where + ")" : where) + " · " + free;
+  }
+
+  var KIT_WORD = /(^|[^\p{L}\p{M}])kits?($|[^\p{L}\p{M}])/iu;
+
+  function kitNote(parent, text, kind) {
+    var d = document.createElement("div");
+    d.className = "kits-note" + (kind ? " " + kind : "");
+    d.textContent = text;
+    parent.appendChild(d);
+    return d;
+  }
+
+  /** The reasons things may not work yet, from the server's view of the bot. */
+  function kitsBanner(box, d) {
+    var bot = d.bot && typeof d.bot === "object" ? d.bot : {};
+    var notes = [];
+    if (bot.supports !== true) {
+      notes.push(["warn", "This stash's bot doesn't know about kits yet (update the plugin or addon). Your settings are saved and apply once it does."]);
+    } else {
+      if (bot.online !== true) notes.push(["warn", "The bot is offline. It picks the settings up when it is back."]);
+      else if (bot.synced !== true) notes.push(["", "The bot hasn't picked up the latest settings yet. This takes a few seconds."]);
+    }
+    if (!d.report) notes.push(["warn", "The bot hasn't reported its containers yet, so no chest can be picked. This needs a bot that supports kits and a stash it has read."]);
+    if (d.kitsChestStatus === "missing" && d.report) notes.push(["off", "The kits chest isn't among the bot's containers any more, or can't take kits. Pick another one."]);
+    if (d.kitsChestStatus === "full") notes.push(["warn", "The kits chest is full. Kits that go there wait until it has room."]);
+    if (!kitsCan()) notes.push(["", "You can look, but changing kit settings needs the “settings” permission."]);
+    box.replaceChildren();
+    notes.forEach(function (n) { kitNote(box, n[1], n[0]); });
+    box.hidden = !notes.length;
+  }
+
+  function kitOption(value, text) {
+    var o = document.createElement("option");
+    o.value = value;
+    o.textContent = text;
+    return o;
+  }
+
+  /** The containers a kit may go to, as <option>s, plus the current value when it is no longer one of them. */
+  function kitOptions(select, current, first) {
+    select.replaceChildren();
+    if (first) select.appendChild(kitOption("", first));
+    var list = Array.isArray(kits.data.containers) ? kits.data.containers : [];
+    var seen = false;
+    list.forEach(function (c, i) {
+      if (c.pickable !== true && c.id !== current) return;
+      select.appendChild(kitOption(c.id, kitOptionText(c, i) + (c.pickable !== true ? " · can't take kits" : "")));
+      if (c.id === current) seen = true;
+    });
+    if (current && !seen) select.appendChild(kitOption(current, (streamerOn() ? "Chest" : kitCoords(current)) + " · not reported"));
+    select.value = current || "";
+  }
+
+  function kitsRender() {
+    var root = $("view-kits");
+    if (!root) return;
+    var d = kits.data;
+    var sig = JSON.stringify([d, kits.error, kits.writing, kitsCan(), streamerOn(), !!currentStash()]);
+    if (sig === kits.sig) return;
+    var a = document.activeElement;
+    if (a && root.contains(a) && a.tagName === "SELECT" && !kits.writing) return; // not under an open dropdown; the next poll draws it
+    kits.sig = sig;
+    var banner = $("kits-banner");
+    var chestSel = $("kits-chest");
+    var clear = $("kits-chest-clear");
+    var info = $("kits-chest-info");
+    var rows = $("kits-rows");
+    var empty = $("kits-empty");
+    var count = $("kits-count");
+    if (!currentStash()) {
+      banner.replaceChildren();
+      kitNote(banner, "No stash selected.");
+      banner.hidden = false;
+    } else if (!d) {
+      banner.replaceChildren();
+      kitNote(banner, kits.error || "Loading…", kits.error ? "off" : "");
+      banner.hidden = false;
+    }
+    if (!d) {
+      chestSel.replaceChildren();
+      chestSel.disabled = true;
+      clear.disabled = true;
+      info.textContent = "";
+      kitsScoringSync(null);
+      rows.replaceChildren();
+      empty.hidden = true;
+      count.textContent = "";
+      return;
+    }
+    kitsBanner(banner, d);
+    kitsScoringSync(d);
+    var can_ = kitsCan() && !kits.writing;
+    var chest = typeof d.kitsChest === "string" ? d.kitsChest : "";
+    kitOptions(chestSel, chest, chest ? "" : "Pick a chest…");
+    chestSel.disabled = !can_ || !d.report;
+    clear.disabled = !can_ || !chest;
+    info.replaceChildren();
+    if (chest) {
+      var c = kitContainer(chest);
+      info.appendChild(document.createTextNode("Kits without their own chest go to "));
+      info.appendChild(kitPlace(chest));
+      info.appendChild(document.createTextNode(c ? " · " + num(c.free, 0) + " free." : " (not reported)."));
+      if (c && str(c.label) && !KIT_WORD.test(str(c.label))) {
+        info.appendChild(document.createTextNode(" Its sign doesn't say kit: while it is the kits chest, only kit shulkers go in it."));
+      }
+    } else {
+      info.textContent = "Kits are sorted like any other shulker until you pick a chest.";
+    }
+
+    var list = Array.isArray(d.rows) ? d.rows : [];
+    var frag = document.createDocumentFragment();
+    list.slice(0, KIT_MAX_ROWS).forEach(function (r) {
+      var tr = document.createElement("tr");
+      var name = document.createElement("td");
+      name.className = "kit-name";
+      var unnamed = typeof r.key !== "string";
+      var title = document.createElement("span");
+      title.textContent = unnamed ? "(unnamed)" : str(r.name) || str(r.key);
+      if (streamerOn()) hide(title);
+      else if (!unnamed) title.title = str(r.key);
+      name.appendChild(title);
+      var points = kitScoreText(r, d);
+      if (points) {
+        var line = document.createElement("div");
+        line.className = "kit-score";
+        line.textContent = points;
+        name.appendChild(line);
+      }
+      tr.appendChild(name);
+      var cnt = document.createElement("td");
+      cnt.className = "kit-count";
+      cnt.textContent = String(num(r.count, 0));
+      tr.appendChild(cnt);
+      var where = document.createElement("td");
+      where.className = "kit-where";
+      var locs = Array.isArray(r.locations) ? r.locations : [];
+      locs.forEach(function (l, i) {
+        if (i) where.appendChild(document.createTextNode(", "));
+        where.appendChild(kitPlace(str(l.container)));
+        where.appendChild(document.createTextNode(" ×" + num(l.count, 0)));
+      });
+      if (num(r.carried, 0) > 0) {
+        if (locs.length) where.appendChild(document.createTextNode(", "));
+        where.appendChild(document.createTextNode("carried ×" + num(r.carried, 0)));
+      }
+      if (!where.firstChild) where.textContent = "–";
+      tr.appendChild(where);
+      var target = document.createElement("td");
+      target.className = "kit-target";
+      if (typeof r.target === "string") {
+        target.appendChild(kitPlace(r.target));
+        target.appendChild(document.createTextNode(r.targetSource === "rule" ? " (its chest)" : " (kits chest)"));
+      } else {
+        target.textContent = "–";
+      }
+      tr.appendChild(target);
+      var st = document.createElement("td");
+      var info2 = d.report ? KIT_STATUS[r.status] || [str(r.status), ""] : ["Waiting for the bot's report", ""];
+      var pill = document.createElement("span");
+      pill.className = "status-chip kit-pill" + (info2[1] ? " " + info2[1] : "");
+      pill.textContent = info2[0];
+      st.appendChild(pill);
+      tr.appendChild(st);
+      var assign = document.createElement("td");
+      if (unnamed) {
+        // An unnamed kit has no name to make a rule for: it always goes to the kits chest.
+        assign.textContent = "(kits chest)";
+        tr.appendChild(assign);
+        frag.appendChild(tr);
+        return;
+      }
+      var sel = document.createElement("select");
+      sel.className = "mc-select kit-assign";
+      sel.setAttribute("aria-label", "Chest for " + (str(r.name) || str(r.key)));
+      kitOptions(sel, typeof r.rule === "string" ? r.rule : "", "Kits chest (default)");
+      sel.disabled = !can_ || !d.report;
+      sel.addEventListener("change", function () {
+        sel.blur();
+        kitAssign(str(r.key), str(r.name) || str(r.key), sel.value, typeof r.rule === "string" ? r.rule : "");
+      });
+      assign.appendChild(sel);
+      tr.appendChild(assign);
+      frag.appendChild(tr);
+    });
+    rows.replaceChildren(frag);
+    empty.hidden = list.length > 0;
+    empty.textContent = d.report
+      ? "No kits found. A shulker box that scores enough points (see Kit scoring) counts as a kit."
+      : "Waiting for the bot's report.";
+    count.textContent = list.length > KIT_MAX_ROWS ? "Showing the first " + KIT_MAX_ROWS + " of " + list.length + " kits." : "";
+  }
+
+  var KIT_SCORING_FIELDS = ["threshold", "name", "mix", "full", "op", "opMin"];
+  var KIT_SCORING_POINTS = ["name", "mix", "full", "op"]; // what the highest possible score adds up
+  var KIT_SCORING_DEFAULT = { threshold: 4, name: 2, mix: 3, full: 1, op: 4, opMin: 3 };
+
+  /** "10/10: name 2, mix 3, full 1, OP 4", plus "(lowest 8)" when the row's lowest total differs. */
+  function kitScoreText(r, d) {
+    var sc = r.score && typeof r.score === "object" ? r.score : null;
+    if (!sc) return "";
+    var max = d.scoring && typeof d.scoring === "object" ? num(d.scoring.max, 0) : 0;
+    var parts = [];
+    [["name", "name"], ["mix", "mix"], ["full", "full"], ["op", "OP"]].forEach(function (p) {
+      if (num(sc[p[0]], 0) > 0) parts.push(p[1] + " " + num(sc[p[0]], 0));
+    });
+    var text = num(sc.total, 0) + "/" + max + ": " + (parts.length ? parts.join(", ") : "no points");
+    if (typeof r.minTotal === "number" && r.minTotal !== num(sc.total, 0)) text += " (lowest " + r.minTotal + ")";
+    return text;
+  }
+
+  function kitScoringInput(field) {
+    return $("kits-sc-" + field);
+  }
+
+  /** The editor's numbers if they are all valid whole numbers in range, else null. */
+  function kitScoringRead() {
+    var out = {};
+    for (var i = 0; i < KIT_SCORING_FIELDS.length; i++) {
+      var f = KIT_SCORING_FIELDS[i];
+      var raw = kitScoringInput(f).value.trim();
+      if (!/^[0-9]{1,4}$/.test(raw)) return null;
+      var v = parseInt(raw, 10);
+      if (f === "threshold" ? v < 1 || v > 40 : f === "opMin" ? v < 1 || v > 1728 : v > 10) return null;
+      out[f] = v;
+    }
+    return out;
+  }
+
+  function kitScoringUpdate() {
+    var v = kitScoringRead();
+    var sum = 0;
+    KIT_SCORING_POINTS.forEach(function (f) { sum += parseInt(kitScoringInput(f).value, 10) || 0; });
+    var note = $("kits-sc-max");
+    note.textContent = "Highest possible score: " + sum + (v ? "" : " (check the numbers: threshold 1 to 40, points 0 to 10, OP items needed 1 to 1728)");
+    var sc = kits.data && kits.data.scoring;
+    var same = !!v && !!sc && KIT_SCORING_FIELDS.every(function (f) { return v[f] === sc[f]; });
+    $("kits-sc-save").disabled = !v || same || !kitsCan() || kits.writing || !kits.data;
+    var atDefault = !!sc && KIT_SCORING_FIELDS.every(function (f) { return sc[f] === KIT_SCORING_DEFAULT[f]; });
+    $("kits-sc-reset").disabled = atDefault || !kitsCan() || kits.writing || !kits.data;
+  }
+
+  /** Shows the server's scoring in the editor, unless the user is in the middle of editing it. */
+  function kitsScoringSync(d) {
+    KIT_SCORING_FIELDS.forEach(function (f) { kitScoringInput(f).disabled = !d || !kitsCan() || kits.writing; });
+    if (d && d.scoring) {
+      // Unsaved edits = the fields differ from the last numbers the server gave. Those are never overwritten.
+      var server = KIT_SCORING_FIELDS.map(function (f) { return String(num(d.scoring[f], 0)); });
+      var shown = KIT_SCORING_FIELDS.map(function (f) { return kitScoringInput(f).value.trim(); });
+      var same = function (a, b) { return a.join(",") === b.join(","); };
+      if (same(shown, server)) {
+        kits.scoringSnap = server;
+      } else if (!kits.scoringSnap || same(shown, kits.scoringSnap)) {
+        KIT_SCORING_FIELDS.forEach(function (f, i) { kitScoringInput(f).value = server[i]; });
+        kits.scoringSnap = server;
+      }
+    }
+    kitScoringUpdate();
+  }
+
+  KIT_SCORING_FIELDS.forEach(function (f) {
+    kitScoringInput(f).addEventListener("input", function () {
+      kitScoringUpdate();
+    });
+  });
+
+  $("kits-sc-save").addEventListener("click", function () {
+    var v = kitScoringRead();
+    if (!v) return;
+    kitsWrite("/api/v1/kits/scoring", v);
+  });
+
+  $("kits-sc-reset").addEventListener("click", function () {
+    if (!window.confirm("Put the kit scoring back to the defaults (threshold 4; name 2, mix 3, full 1, OP 4 for 3 or more OP items)?")) return;
+    kitsWrite("/api/v1/kits/scoring", {
+      threshold: KIT_SCORING_DEFAULT.threshold, name: KIT_SCORING_DEFAULT.name, mix: KIT_SCORING_DEFAULT.mix,
+      full: KIT_SCORING_DEFAULT.full, op: KIT_SCORING_DEFAULT.op, opMin: KIT_SCORING_DEFAULT.opMin
+    });
+  });
+
+  /** A write to the server; the answer is the same body as GET, so it is drawn straight away. */
+  function kitsWrite(path, body) {
+    var s = currentStash();
+    if (!s || kits.writing) return;
+    kits.writing = true;
+    var token = ++kits.token; // a poll that is still running can't overwrite what this write answers
+    body.server = s.server;
+    body.stash = s.stash;
+    kitsRender();
+    api(path, { method: "POST", body: body }).then(function (d) {
+      if (token !== kits.token) return;
+      kits.data = d && typeof d === "object" ? d : kits.data;
+      toast("Saved. The bot picks it up in a few seconds.");
+    }, function (e) {
+      var msg = e && e.body && typeof e.body.error === "string" ? e.body.error : "Couldn't save that.";
+      if (e && e.status === 429) msg = "Too many changes. Wait " + num(e.body && e.body.retryAfter, 1) + " s.";
+      else if (e && e.network) msg = "Can't reach the server.";
+      toast(msg);
+    }).then(function () {
+      kits.writing = false;
+      kits.token++; // a poll that started while the write ran may have seen the old state
+      kits.sig = "";
+      kitsRender();
+      kitsSync();
+    });
+  }
+
+  function kitAssign(key, name, container, was) {
+    if (container === was) return;
+    if (!container) {
+      if (!window.confirm((streamerOn() ? "Send this kit to the kits chest again?" : "Send “" + name + "” to the kits chest again?") + "\n\nIts own chest rule is removed.")) {
+        kits.sig = "";
+        kitsRender();
+        return;
+      }
+      kitsWrite("/api/v1/kits/rule/delete", { key: key });
+    } else {
+      kitsWrite("/api/v1/kits/rule", { key: key, container: container });
+    }
+  }
+
+  $("kits-chest").addEventListener("change", function () {
+    var v = this.value;
+    this.blur();
+    var c = kitContainer(v);
+    if (v && c && str(c.label) && !KIT_WORD.test(str(c.label)) &&
+        !window.confirm((streamerOn() ? "This chest is signed for other items. " : "This chest is signed “" + str(c.label) + "”. ") + "As the kits chest it only takes kit shulkers; nothing else is sorted into it.\n\nUse it anyway?")) {
+      kits.sig = "";
+      kitsRender();
+      return;
+    }
+    if (v) {
+      kitsWrite("/api/v1/kits/chest", { container: v });
+    } else {
+      kits.sig = "";
+      kitsRender();
+    }
+  });
+
+  $("kits-chest-clear").addEventListener("click", function () {
+    if (!window.confirm("Stop using a kits chest?\n\nKits without their own chest go back to normal sorting.")) return;
+    kitsWrite("/api/v1/kits/chest", { container: null });
+  });
+
+  document.addEventListener("visibilitychange", function () {
+    kitsSync();
   });
 
   // ---------- dashboard: pages, bot picker ----------
@@ -5216,6 +5861,7 @@
     else plannerClose();
     if (page === "viewer") viewerOpen();
     else viewerClose();
+    kitsSync();
   }
 
   el.dashNav.addEventListener("click", function (e) {
@@ -7595,6 +8241,7 @@
     $("more-users").hidden = !me.owner;
     updateRescan();
     renderOrderList();
+    renderTabs();
     if (!view) showEmpty();
     if (!pageAllowed(dash.page)) showPage("stash");
     else if (pagesChanged && auth.started) showPage(dash.page);

@@ -26,6 +26,7 @@ final class Redact {
     /** Activity sources shown as they are (the plugin's own subsystems); any other source reads "(hidden)". */
     static final java.util.Set<String> SOURCES = java.util.Set.of("Stash sorter", "Stash order", "Pathfinder", "Pearl loader",
         "Queue", "Stash manager", "Dashboard", "Auto eat", "Auto totem", "Delivery");
+    private static final java.util.regex.Pattern SAFE_KEY = java.util.regex.Pattern.compile("[a-z0-9_.:/-]+(#[0-9a-f]+)?");
     private static final SecureRandom RANDOM = new SecureRandom();
     /** The viewer offset's range per axis, in chunks (uniform in -2^20..2^20). */
     static final int OFFSET_CHUNKS = 1 << 20;
@@ -68,6 +69,7 @@ final class Redact {
     }
 
     private static JsonObject obj(JsonObject o, String key) {
+        if (o == null) return null;
         JsonElement e = o.get(key);
         return e != null && e.isJsonObject() ? e.getAsJsonObject() : null;
     }
@@ -141,6 +143,26 @@ final class Redact {
         if (!mine && o.has("names")) o.add("names", JsonNull.INSTANCE);
         scrubField(o, "phase");
         scrubField(o, "message");
+        // result.repair is numbers and item keys; only a skipped item's reason is bot text, so an unknown one is hidden.
+        JsonObject repair = obj(obj(o, "result"), "repair");
+        JsonElement skipped = repair == null ? null : repair.get("skipped");
+        if (skipped != null && skipped.isJsonArray()) {
+            for (JsonElement s : skipped.getAsJsonArray()) {
+                if (!s.isJsonObject()) continue;
+                String reason = text(s.getAsJsonObject(), "reason");
+                if (reason == null || !Repair.SKIP_REASONS.contains(reason)) s.getAsJsonObject().addProperty("reason", HIDDEN);
+            }
+        }
+        // Keys are item keys; anything else (free text) is hidden.
+        for (String list : new String[]{"partial", "skipped"}) {
+            JsonElement arr = repair == null ? null : repair.get(list);
+            if (arr == null || !arr.isJsonArray()) continue;
+            for (JsonElement s : arr.getAsJsonArray()) {
+                if (!s.isJsonObject()) continue;
+                String key = text(s.getAsJsonObject(), "key");
+                if (key == null || !SAFE_KEY.matcher(key).matches()) s.getAsJsonObject().addProperty("key", HIDDEN);
+            }
+        }
     }
 
     /** GET /api/v1/orders: every order. */

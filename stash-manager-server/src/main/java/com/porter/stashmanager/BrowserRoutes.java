@@ -19,6 +19,8 @@ final class BrowserRoutes {
     private final SessionStore sessions;
     private final AuditLog audit;
     private final DeliveryContents delivery;
+    private final KitStore kits;
+    private final KitReports kitReports;
 
     BrowserRoutes(IndexStore store, Config config, LinkState link, List<String> urls, OrderStore orders, Owners owners,
                   SessionStore sessions, AuditLog audit) {
@@ -27,6 +29,13 @@ final class BrowserRoutes {
 
     BrowserRoutes(IndexStore store, Config config, LinkState link, List<String> urls, OrderStore orders, Owners owners,
                   SessionStore sessions, AuditLog audit, DeliveryContents delivery) {
+        this(store, config, link, urls, orders, owners, sessions, audit, delivery, null, null);
+    }
+
+    BrowserRoutes(IndexStore store, Config config, LinkState link, List<String> urls, OrderStore orders, Owners owners,
+                  SessionStore sessions, AuditLog audit, DeliveryContents delivery, KitStore kits, KitReports kitReports) {
+        this.kits = kits;
+        this.kitReports = kitReports;
         this.delivery = delivery;
         this.sessions = sessions;
         this.audit = audit;
@@ -94,6 +103,7 @@ final class BrowserRoutes {
             // What is already in the delivery storage (the full report: GET /api/v1/delivery). Never in the index.
             DeliveryContents.Snapshot dc = delivery.get(server, stash);
             o.add("deliveryContents", dc == null ? com.google.gson.JsonNull.INSTANCE : dc.summary());
+            o.add("kits", kitSummary(server, stash));
             if (forced) Redact.stash(o);
         }
         // "Server 1": what a page in streamer mode shows instead of the address (numbered over the visible stashes).
@@ -103,6 +113,25 @@ final class BrowserRoutes {
             o.addProperty("serverLabel", labels.get(o.get("server").getAsString()));
         }
         return list;
+    }
+
+    /** {supports, synced, flagged} (numbers and booleans only, KIT-CONTRACT.md), or null when this server has no kit settings. */
+    private com.google.gson.JsonElement kitSummary(String server, String stash) {
+        if (kits == null || kitReports == null) return com.google.gson.JsonNull.INSTANCE;
+        KitStore.Settings s;
+        try {
+            s = kits.get(server, stash);
+        } catch (KitStore.DisabledException e) {
+            return com.google.gson.JsonNull.INSTANCE;
+        }
+        KitReports.Beat beat = kitReports.beat(server, stash);
+        JsonObject view = kitReports.view(server, stash, s, kitReports.get(server, stash), beat);
+        JsonObject o = new JsonObject();
+        boolean supports = beat != null && beat.supports();
+        o.addProperty("supports", supports);
+        o.addProperty("synced", supports && s.hash().equals(beat.hash()));
+        o.addProperty("flagged", KitReports.flagged(view));
+        return o;
     }
 
     /** POST /api/v1/stashes/release {server, stash}: clears the owner so another bot can take the stash. */

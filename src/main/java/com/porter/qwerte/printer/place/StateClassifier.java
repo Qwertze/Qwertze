@@ -28,6 +28,7 @@ import net.minecraft.world.level.block.CeilingHangingSignBlock;
 import net.minecraft.world.level.block.ChainBlock;
 import net.minecraft.world.level.block.ChestBlock;
 import net.minecraft.world.level.block.ChiseledBookShelfBlock;
+import net.minecraft.world.level.block.BaseCoralWallFanBlock;
 import net.minecraft.world.level.block.CocoaBlock;
 import net.minecraft.world.level.block.CommandBlock;
 import net.minecraft.world.level.block.ComparatorBlock;
@@ -67,6 +68,7 @@ import net.minecraft.world.level.block.NoteBlock;
 import net.minecraft.world.level.block.ObserverBlock;
 import net.minecraft.world.level.block.PointedDripstoneBlock;
 import net.minecraft.world.level.block.RedStoneWireBlock;
+import net.minecraft.world.level.block.RedstoneWallTorchBlock;
 import net.minecraft.world.level.block.RepeaterBlock;
 import net.minecraft.world.level.block.RespawnAnchorBlock;
 import net.minecraft.world.level.block.RootsBlock;
@@ -86,6 +88,7 @@ import net.minecraft.world.level.block.SugarCaneBlock;
 import net.minecraft.world.level.block.SweetBerryBushBlock;
 import net.minecraft.world.level.block.TallGrassBlock;
 import net.minecraft.world.level.block.TrapDoorBlock;
+import net.minecraft.world.level.block.TripWireHookBlock;
 import net.minecraft.world.level.block.TurtleEggBlock;
 import net.minecraft.world.level.block.VineBlock;
 import net.minecraft.world.level.block.WallBannerBlock;
@@ -141,7 +144,6 @@ public final class StateClassifier {
         if (b instanceof NetherPortalBlock || b instanceof EndPortalBlock || b instanceof EndGatewayBlock) return "portals cannot be placed";
         if (b instanceof VineBlock || b instanceof MultifaceBlock) return "multiface blocks (vine, glow lichen, sculk vein) are not supported";
         if (b instanceof PointedDripstoneBlock) return "pointed dripstone thickness is not supported";
-        if (b instanceof CocoaBlock) return "cocoa pods are not supported";
         if (b instanceof AbstractCauldronBlock) return "cauldrons are not supported";
         if (b instanceof ComposterBlock) return "composters are not supported";
         if (b instanceof RespawnAnchorBlock) return "respawn anchor charges are not supported";
@@ -149,7 +151,7 @@ public final class StateClassifier {
         if (b instanceof FarmBlock || b instanceof DirtPathBlock) return "farmland and dirt paths are made by tools, not placed";
         if (b instanceof CommandBlock || b instanceof StructureBlock || b instanceof JigsawBlock) return "creative-only blocks are not supported";
         if (b instanceof PistonHeadBlock || b instanceof MovingPistonBlock) return "piston heads and moving pistons belong to an extended piston";
-        if (b instanceof CeilingHangingSignBlock || b instanceof WallHangingSignBlock) return "hanging signs are not supported in v1";
+        if (b instanceof CeilingHangingSignBlock) return "hanging signs that hang from a ceiling are not supported";
         if (b instanceof WaterlilyBlock) return "lily pads need a click on water";
         return null;
     }
@@ -181,9 +183,14 @@ public final class StateClassifier {
         // facing from the clicked face
         if (b instanceof EndRodBlock || b instanceof LightningRodBlock || b instanceof AmethystClusterBlock || b instanceof ShulkerBoxBlock) return StateKind.FACING6_FACE;
         if (b instanceof FaceAttachedHorizontalDirectionalBlock) return StateKind.ATTACH_FACE;
-        if (b instanceof LadderBlock || b instanceof WallTorchBlock || b instanceof WallSignBlock || b instanceof WallBannerBlock || b instanceof WallSkullBlock) {
+        // The redstone wall torch is not a WallTorchBlock (it extends RedstoneTorchBlock), which is why it used to fall through
+        // to the floor torches and be skipped for its "facing". Wall torches of every kind (torch, soul, copper) are WallTorchBlock.
+        if (b instanceof LadderBlock || b instanceof WallTorchBlock || b instanceof RedstoneWallTorchBlock || b instanceof WallSignBlock
+            || b instanceof WallBannerBlock || b instanceof WallSkullBlock || b instanceof TripWireHookBlock || b instanceof BaseCoralWallFanBlock) {
             return StateKind.WALL_OR_STANDING;
         }
+        if (b instanceof WallHangingSignBlock) return StateKind.WALL_HANGING;
+        if (b instanceof CocoaBlock) return StateKind.COCOA;
         if (b instanceof StandingSignBlock || b instanceof BannerBlock || b instanceof SkullBlock) return StateKind.ROTATION16;
         if (b instanceof LanternBlock) return StateKind.HANGING;
         if (b instanceof RotatedPillarBlock || b instanceof ChainBlock) return StateKind.AXIS;

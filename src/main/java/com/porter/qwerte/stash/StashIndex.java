@@ -237,7 +237,26 @@ public final class StashIndex {
     /** As above, with {@code deliveryHash} (0.4.0-dev.7, the hash of the delivery contents report) sent as {@code deliveryHash}, or left out when null. */
     public static byte[] heartbeat(Built b, int[] delivery, String orderBlocker, long rescanDone, String rescanBlocked, int[] naming, int[] crafting, String anvilSource,
                                    DeliveryStorage storage, String tableSource, String deliveryHash) {
+        return heartbeat(b, delivery, orderBlocker, rescanDone, rescanBlocked, naming, crafting, anvilSource, storage, tableSource, deliveryHash, null);
+    }
+
+    /**
+     * What the heartbeat says about kit sorting (0.4.0-dev.14, KIT-CONTRACT.md "Heartbeat"). Both keys are written, as an explicit null
+     * when the addon has nothing: {@code settingsHash} is the hash of the cached settings for this stash, {@code reportHash} the hash of
+     * the current report.
+     */
+    public record KitsHashes(String settingsHash, String reportHash) {}
+
+    /** As above, with {@code kits} sent as {@code kitsHash} and {@code kitsReportHash}; null leaves both out (kit sorting is off). */
+    public static byte[] heartbeat(Built b, int[] delivery, String orderBlocker, long rescanDone, String rescanBlocked, int[] naming, int[] crafting, String anvilSource,
+                                   DeliveryStorage storage, String tableSource, String deliveryHash, KitsHashes kits) {
         JsonObject o = new JsonObject();
+        if (kits != null) {
+            if (kits.settingsHash() == null) o.add("kitsHash", com.google.gson.JsonNull.INSTANCE);
+            else o.addProperty("kitsHash", clamp(kits.settingsHash(), 64));
+            if (kits.reportHash() == null) o.add("kitsReportHash", com.google.gson.JsonNull.INSTANCE);
+            else o.addProperty("kitsReportHash", clamp(kits.reportHash(), 64));
+        }
         if (deliveryHash != null) o.addProperty("deliveryHash", deliveryHash);
         if (storage != null) {
             JsonObject d = new JsonObject();
@@ -363,6 +382,141 @@ public final class StashIndex {
             out.add(new DeliveryContents.Chest(box.parts.size() > 1 || box.contents.length > 27 ? 54 : 27, c.full(), box.lastRead, items));
         }
         return DeliveryContents.build(stash.server, stash.name, player, out, System.currentTimeMillis());
+    }
+
+    /**
+     * The container id of a box for kit sorting: its smallest part (KIT-CONTRACT.md "Container ids"), the same on both bots.
+     */
+    public static String kitId(Box box) {
+        List<KitSettings.Pos> parts = new ArrayList<>(box.parts.size());
+        for (net.minecraft.core.BlockPos p : box.parts) parts.add(new KitSettings.Pos(p.getX(), p.getY(), p.getZ()));
+        if (parts.isEmpty()) parts.add(new KitSettings.Pos(box.pos.getX(), box.pos.getY(), box.pos.getZ()));
+        return KitRouting.canonicalId(parts);
+    }
+
+    /** Read, sortable, not excluded, not a drop-off and not a delivery container: a container a kit may be sorted into. */
+    public static boolean kitPickable(Box box) {
+        return box != null && box.sortable() && !box.dropOff && !box.delivery;
+    }
+
+    /** The item ids and stack counts of a shulker box's 27 slots (an empty id for an empty slot). */
+    private static List<KitScore.Slot> shulkerSlots(ItemStack shulker) {
+        ItemStack[] inside = Kits.inside(shulker);
+        List<KitScore.Slot> slots = new ArrayList<>(KitScore.SLOTS);
+        for (ItemStack s : inside) slots.add(s == null || s.isEmpty() ? new KitScore.Slot("", 0) : new KitScore.Slot(BuiltInRegistries.ITEM.getKey(s.getItem()).toString(), s.getCount()));
+        return slots;
+    }
+
+    private record ScoreKey(Item item, DataComponentPatch patch, KitSettings.Scoring scoring) {}
+
+    private static final Map<ScoreKey, KitScore.Result> SCORES = new HashMap<>();
+
+    /**
+     * The kit score of a stack (KIT-CONTRACT.md "Kit score"): null for anything but a shulker box. Worked out once per item and
+     * components (name, contents) and scoring, then remembered, so a planning pass or a report never scores the same box twice.
+     * Whether KitBuilder already routes the shulker is not looked at here. Client thread only.
+     */
+    public static KitScore.Result kitScore(ItemStack stack, KitSettings.Scoring scoring) {
+        if (stack == null || stack.isEmpty() || !Utils.isShulker(stack.getItem())) return null;
+        if (SCORES.size() > MAX_CACHE) SCORES.clear();
+        return SCORES.computeIfAbsent(new ScoreKey(stack.getItem(), stack.getComponentsPatch(), scoring), k -> {
+            var name = stack.get(DataComponents.CUSTOM_NAME);
+            return KitScore.score(shulkerSlots(stack), name == null ? null : name.getString(), scoring, KitItems.table());
+        });
+    }
+
+    /** The plain custom name of a stack, or null when it has none. */
+    public static String customName(ItemStack stack) {
+        var name = stack == null || stack.isEmpty() ? null : stack.get(DataComponents.CUSTOM_NAME);
+        return name == null ? null : name.getString();
+    }
+
+    /** True when KitBuilder routes this shulker already (a finished or part built kit): it keeps KitBuilder's routing, whatever it scores. */
+    public static boolean builderKit(ItemStack stack) {
+        Kits.Match m = Kits.match(stack);
+        return m != null && m.claims();
+    }
+
+    private static KitReport.Shulker reportShulker(ItemStack stack, KitSettings.Scoring scoring) {
+        KitScore.Result r = kitScore(stack, scoring);
+        if (r == null || !r.kit() || builderKit(stack)) return null;
+        return new KitReport.Shulker(customName(stack), r);
+    }
+
+    /**
+     * The kit report of the stash (see {@link KitReport}): the containers the index covers (delivery and foreign ones and, unless
+     * {@code includeExcluded}, excluded ones are left out), the shulkers that score as kits in them and in {@code inventory}.
+     * Reads what the sorter last saw; nothing here opens a container. Client thread. Null with no stash.
+     */
+    public static KitReport.Built kitReport(Stash stash, boolean includeExcluded, String player, Iterable<ItemStack> inventory, KitSettings.Scoring scoring,
+                                            java.util.function.Predicate<ItemStack> notCarried) {
+        if (stash == null) return null;
+        List<KitReport.BoxInfo> boxes = new ArrayList<>(stash.boxes.size());
+        for (Box box : stash.boxes) {
+            if (box.delivery || box.foreign || box.excluded && !includeExcluded) continue;
+            ItemStack[] contents = box.contents;
+            int size = contents != null ? (contents.length >= 54 ? 54 : 27) : (box.parts.size() > 1 ? 54 : 27);
+            int free = 0;
+            List<KitReport.Shulker> shulkers = List.of();
+            if (contents != null) {
+                for (ItemStack stack : contents) {
+                    if (stack == null || stack.isEmpty()) {
+                        free++;
+                        continue;
+                    }
+                    KitReport.Shulker sh = reportShulker(stack, scoring);
+                    if (sh == null) continue;
+                    if (shulkers.isEmpty()) shulkers = new ArrayList<>();
+                    shulkers.add(sh);
+                }
+            }
+            boxes.add(new KitReport.BoxInfo(kitId(box), box.labels.isEmpty() ? null : box.labels.getFirst(), size, free, kitPickable(box), Math.max(0, box.lastRead), shulkers));
+        }
+        List<KitReport.Shulker> carried = new ArrayList<>();
+        for (ItemStack stack : inventory) {
+            // A kit the sorter is building or holds for KitBuilder is not a carried kit
+            if (notCarried != null && notCarried.test(stack)) continue;
+            KitReport.Shulker sh = reportShulker(stack, scoring);
+            if (sh != null) carried.add(sh);
+        }
+        return KitReport.build(stash.server, stash.name, player, boxes, carried);
+    }
+
+    /**
+     * What a heartbeat reply says about kits. {@code reportKnown}: the reply has a {@code needKitsReport} key (true or false), so the
+     * server knows the report route. {@code needReport}: it wants the report. {@code settings}: a valid {@code kits} object, else null.
+     * {@code invalid}: why a {@code kits} object was refused (null when there was none or it was fine).
+     */
+    public record KitsReply(boolean reportKnown, boolean needReport, KitSettings settings, String invalid) {}
+
+    private static final KitsReply NO_KITS = new KitsReply(false, false, null, null);
+
+    /** Reads the kit fields of a heartbeat reply. Missing or broken fields mean nothing was said; a bad {@code kits} object is refused whole. */
+    public static KitsReply kitsReply(String body) {
+        try {
+            JsonElement e = JsonParser.parseString(body);
+            if (!e.isJsonObject()) return NO_KITS;
+            JsonObject o = e.getAsJsonObject();
+            boolean known = false, need = false;
+            JsonElement n = o.get("needKitsReport");
+            if (n != null && n.isJsonPrimitive() && n.getAsJsonPrimitive().isBoolean()) {
+                known = true;
+                need = n.getAsBoolean();
+            }
+            KitSettings settings = null;
+            String invalid = null;
+            JsonElement k = o.get("kits");
+            if (k != null && !k.isJsonNull()) {
+                try {
+                    settings = KitSettings.parse(k);
+                } catch (KitSettings.Invalid ex) {
+                    invalid = ex.getMessage();
+                }
+            }
+            return new KitsReply(known, need, settings, invalid);
+        } catch (RuntimeException ex) {
+            return NO_KITS;
+        }
     }
 
     private static String mcVersion() {

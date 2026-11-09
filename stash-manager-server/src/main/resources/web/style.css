@@ -609,6 +609,31 @@ html[data-theme="classic"] .auth-screen {
   align-content: start;
 }
 .view-orders[hidden] { display: none; }
+
+/* ---------- kits tab ---------- */
+
+.view-kits { overflow-y: auto; align-content: start; }
+.view-kits[hidden] { display: none; }
+.kits-chest-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.kits-chest-row .mc-select { flex: 1 1 260px; min-width: 0; }
+.kits-banner { display: flex; flex-direction: column; gap: 4px; }
+.kits-banner[hidden] { display: none; }
+.kits-note { color: var(--text); font-size: 13px; padding: 2px 6px; border-radius: var(--radius); background: var(--chip-bg); }
+.kits-note.warn { background: var(--warn-bg); color: var(--warn-fg); }
+.kits-note.off { background: var(--danger-bg); color: var(--danger-fg); }
+.kits-scroll { overflow-x: auto; }
+.kits-sc-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.kits-sc-field { display: flex; flex-direction: column; gap: 2px; font-size: 13px; color: var(--text); }
+.kits-sc-field .mc-input { width: 5.5em; flex: 0 0 auto; }
+.kit-score { color: var(--muted); font-size: 12px; font-weight: 400; }
+.kits-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.kits-table th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px 8px; white-space: nowrap; }
+.kits-table td { padding: 4px 8px; border-top: 1px solid var(--border); vertical-align: middle; overflow-wrap: anywhere; }
+.kit-count { text-align: right; width: 4em; }
+.kit-name { font-weight: 700; }
+.kit-assign { width: 100%; min-width: 12em; }
+.kit-pill { white-space: nowrap; }
+.status-chip.warn { background: var(--warn-bg); color: var(--warn-fg); }
 .order-list, .bot-strip { grid-column: 1 / -1; }
 
 /* Inner tile (a section inside a panel). */
@@ -706,6 +731,11 @@ html[data-theme="classic"] .auth-screen {
   font-size: 12px;
 }
 .order-names { color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
+.order-repair, .order-repair-details { color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
+.order-repair-short { background: var(--warn-bg); color: var(--warn-fg); border-radius: var(--radius); padding: 1px 6px; }
+.order-repair-details summary { cursor: pointer; }
+.repair-toggle { min-height: 0; white-space: nowrap; }
+.repair-no { white-space: nowrap; }
 .order-names summary { cursor: pointer; }
 
 .order-card {
@@ -1848,7 +1878,7 @@ html.streamer .sv-hidden { display: inline; color: var(--muted); font-style: ita
   .toast { bottom: calc(var(--bnav-h) + env(safe-area-inset-bottom) + 12px); }
 
   /* Pages scroll with the document (no inner scroll areas). */
-  .inventory, .dash-page, .grid-wrap, .view-orders, .proxy-page, .proxy-side, .proxy-body { overflow: visible; }
+  .inventory, .dash-page, .grid-wrap, .view-orders, .view-kits, .proxy-page, .proxy-side, .proxy-body { overflow: visible; }
   .inventory, .dash-page, .grid-wrap { flex: none; min-height: 0; }
   .proxy-cols { flex: none; }
   .console-log { flex: none; height: 55vh; min-height: 240px; }

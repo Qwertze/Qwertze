@@ -33,11 +33,12 @@ class PropertyRulesTest {
     }
 
     @Test
-    void waterloggedTrueIsSkippedWithAReasonAndFalseIsDerived() {
+    void waterloggedTrueIsPlacedDryAndFilledLaterAndFalseIsDerived() {
         StateSpec wet = spec("minecraft:oak_stairs", StateKind.STAIRS, "facing", "north", "half", "top", "waterlogged", "true");
-        assertTrue(wet.skipped());
-        assertEquals(StateKind.SKIP, wet.kind());
-        assertTrue(wet.skipReason().contains("waterlogged"));
+        assertFalse(wet.skipped());
+        assertTrue(wet.placeable());
+        assertEquals(Map.of("facing", "north", "half", "top"), wet.matched());
+        assertEquals(Map.of("waterlogged", "true"), wet.clicked());
         assertEquals(Action.DERIVED, action(StateKind.STAIRS, "minecraft:oak_stairs", "waterlogged", "false"));
     }
 

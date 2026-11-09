@@ -186,8 +186,12 @@ public final class StashManagerServer {
         authRoutes.onSessionsEnded(plans::pruneNow);
         authRoutes.register(router);
         DeliveryContents delivery = new DeliveryContents(); // in memory only
-        new AddonRoutes(store, link, icons, orders, owners, delivery).register(router);
-        new BrowserRoutes(store, config, link, urls, orders, owners, sessions, audit, delivery).register(router);
+        KitStore kits = new KitStore(config.dataDir());
+        kits.load();
+        KitReports kitReports = new KitReports(); // in memory only
+        new AddonRoutes(store, link, icons, orders, owners, delivery, kits, kitReports).register(router);
+        new BrowserRoutes(store, config, link, urls, orders, owners, sessions, audit, delivery, kits, kitReports).register(router);
+        new KitRoutes(kits, kitReports, owners, audit, store).register(router);
         new DeliveryRoutes(delivery, owners).register(router);
         new OrderRoutes(orders, owners, audit).register(router);
         new BotRoutes(hub).register(router);

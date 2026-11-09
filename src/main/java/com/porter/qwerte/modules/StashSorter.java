@@ -6,6 +6,11 @@ import com.porter.qwerte.stash.Categories;
 import com.porter.qwerte.stash.ItemPreviewScreen;
 import com.porter.qwerte.stash.Kit;
 import com.porter.qwerte.stash.KitPreviewScreen;
+import com.porter.qwerte.stash.KitNames;
+import com.porter.qwerte.stash.KitRouting;
+import com.porter.qwerte.stash.KitScore;
+import com.porter.qwerte.stash.KitSettings;
+import com.porter.qwerte.stash.KitStore;
 import com.porter.qwerte.stash.Kits;
 import com.porter.qwerte.stash.StackInfo;
 import com.porter.qwerte.stash.StackInfo.BulkKey;
@@ -298,6 +303,13 @@ public class StashSorter extends Module {
         .description("Signs mode: when nowhere an item belongs has room, and no container is signed misc, other or overflow, puts it in a container with no sign at all (one already holding items first). Never in a container signed for something else.")
         .defaultValue(true)
         .visible(() -> mode.get() == Mode.Signs)
+        .build()
+    );
+
+    private final Setting<Boolean> kitSorting = sgGeneral.add(new BoolSetting.Builder()
+        .name("kit-sorting")
+        .description("Send shulker boxes that score as kits to the chest picked for them on the Stash Manager website or in the Stash Window's Kits tab: a chest per kit name (named kits only), or one kits chest for all of them (unnamed kits always go there). A box scores points for a name with the word kit, a mix of useful items, all 27 slots filled and OP items; it is a kit when the total reaches the threshold you set there (a part-filled box of one item never is). The chests picked hold nothing but kits. Off: kits are sorted like any shulker, and nothing about kits is reported. The settings come from the Stash Manager server (the last ones it sent are kept while it is offline); without any, nothing changes.")
+        .defaultValue(true)
         .build()
     );
 
@@ -685,6 +697,16 @@ public class StashSorter extends Module {
         @Override
         public boolean keepWholeExists() {
             return !keepWholeBoxes().isEmpty();
+        }
+
+        @Override
+        public boolean kitReserved(Box box) {
+            return StashSorter.this.kitReserved(box);
+        }
+
+        @Override
+        public boolean kitRouted(ItemStack stack) {
+            return StashSorter.this.kitRouted(stack);
         }
 
         @Override
@@ -1577,6 +1599,8 @@ public class StashSorter extends Module {
     });
     private int collectedSlot = -1;
     private int seenKits;
+    private int seenKitSettings;
+    private boolean seenKitSorting;
 
     // Bot mode
     private boolean idle;
@@ -2702,6 +2726,18 @@ public class StashSorter extends Module {
             version++;
         }
 
+        // Turning kit-sorting on or off plans everything again
+        if (kitSorting.get() != seenKitSorting) {
+            seenKitSorting = kitSorting.get();
+            version++;
+        }
+
+        // New kit settings from the Stash Manager server: one full pass, which moves kits stored elsewhere once their chest has room
+        if (KitStore.shared().version() != seenKitSettings) {
+            seenKitSettings = KitStore.shared().version();
+            version++;
+        }
+
         if (version != seenVersion) {
             seenVersion = version;
             clearStalled();
@@ -2734,6 +2770,7 @@ public class StashSorter extends Module {
             misplacedCache = null;
             signedCache = null;
             roomBase = null;
+            kitRoutedCache = null;
         }
     }
 
@@ -3329,8 +3366,16 @@ public class StashSorter extends Module {
     }
 
     private boolean returnable(Box box, ItemStack stack) {
+        return returnable(box, stack, false);
+    }
+
+    /**
+     * @param home the container the stack was taken from: a kit shulker may go back into a kit-reserved chest it came from, but no
+     *             reserved chest is ever a fallback for anything
+     */
+    private boolean returnable(Box box, ItemStack stack, boolean home) {
         return box != null && stash.boxes.contains(box) && box.known() && !box.stale && !box.excluded && !box.delivery && !box.dropOff && !box.unreachable
-            && !isKitBox(box) && box.labels.stream().noneMatch(Categories::isKeepWhole)
+            && !Kits.isKitBox(box) && (!kitReserved(box) || (home && kitRoutedTo(box, stack))) && box.labels.stream().noneMatch(Categories::isKeepWhole)
             && !blocked(box, Job.Return) && !signPending(box) && roomFor(box, stack);
     }
 
@@ -3347,7 +3392,7 @@ public class StashSorter extends Module {
         // empty shulkers belong, else the nearest container that takes it
         boolean emptied = Utils.isShulker(stack.getItem()) && !stack.has(DataComponents.CUSTOM_NAME) && emptyShulker(stack);
         if (emptied && home != null && !destinationsFor(stack).contains(home)) home = null;
-        if (!returnable(home, stack)) {
+        if (!returnable(home, stack, true)) {
             if (emptied) {
                 home = nearest(destinationsFor(stack).stream().filter(b -> returnable(b, stack)).toList());
                 if (home == null) home = nearest(stash.boxes.stream().filter(b -> returnable(b, stack)).toList());
@@ -3372,6 +3417,8 @@ public class StashSorter extends Module {
         for (int slot : returnPool()) {
             ItemStack stack = mc.player.getInventory().getItem(slot);
             if (!canFit(stack)) continue;
+            // A kit-reserved chest takes back only a kit routed to it, whatever else is in the pool
+            if (kitReserved(target) && !kitRoutedTo(target, stack)) continue;
             InvUtils.shiftClick().slotId(inventoryToMenu(slot, target.contents.length));
             return true;
         }
@@ -5847,8 +5894,125 @@ public class StashSorter extends Module {
         return job == Job.KitTake || job == Job.KitUnpack || job == Job.KitFill;
     }
 
+    /** A container only kits go in: signed for a KitBuilder kit, or picked as the kits chest or a kit's chest (kit sorting). */
     private boolean isKitBox(Box box) {
-        return Kits.isKitBox(box);
+        return Kits.isKitBox(box) || kitReserved(box);
+    }
+
+    // Kit sorting (0.4.0-dev.14, KIT-CONTRACT.md "What the bot does"). The settings come from the cache the Stash Manager reply fills
+    // (KitStore, also while offline). The view is the settings against this stash: which box an id is and which boxes are kit-reserved.
+    private KitRouting.View<Box> kitViewCache;
+    private Stash kitViewStash;
+    private int kitViewStore = -1, kitViewVersion = -1, kitViewBoxes = -1;
+    private boolean kitViewOn;
+    // The kit-settings store version the warnings below belong to: they start over only when it changes
+    private int kitWarnedVersion = -1;
+    // A kit whose chest is missing or cannot take kits is said once per key and container until the settings change
+    private final Set<String> kitWarned = new HashSet<>();
+
+    /** Whether kit sorting is on (the kit-sorting setting): stash-manager sends and reports kits only then. */
+    public boolean kitSorting() {
+        return kitSorting.get();
+    }
+
+    /** The kit settings against the stash, or null when kit sorting is off or nothing is set. */
+    private KitRouting.View<Box> kitView() {
+        Stash st = stash;
+        if (!kitSorting.get() || st == null) {
+            kitViewCache = null;
+            kitViewStash = null;
+            kitViewOn = false;
+            return null;
+        }
+        int store = KitStore.shared().version(), boxes = st.boxes.size();
+        if (kitViewOn && st == kitViewStash && store == kitViewStore && version == kitViewVersion && boxes == kitViewBoxes) return kitViewCache;
+        KitSettings settings = KitStore.shared().get(st.server, st.name);
+        kitViewCache = settings == null || settings.isEmpty() ? null : new KitRouting.View<>(new KitRouting.Resolver<Box>() {
+            @Override
+            public Box boxAt(KitSettings.Pos pos) {
+                return st.boxAt(new BlockPos(pos.x(), pos.y(), pos.z()));
+            }
+
+            @Override
+            public boolean pickable(Box box) {
+                return StashIndex.kitPickable(box);
+            }
+        }, settings);
+        kitViewStash = st;
+        kitViewStore = store;
+        kitViewVersion = version;
+        kitViewBoxes = boxes;
+        kitViewOn = true;
+        return kitViewCache;
+    }
+
+    /** The kits chest or the chest of a kit rule: nothing but kit shulkers goes in, and it is out of overflow, sign scoring, the tiers, compacting, repacking and labelling. */
+    private boolean kitReserved(Box box) {
+        KitRouting.View<Box> v = kitView();
+        return v != null && v.reserved(box);
+    }
+
+    /**
+     * Whether kit routing may apply to what is in hand: never while a repair holds the carried stacks (an order's own stacks are
+     * already out of destinationsFor through orderRunner.claims). Planning passes run with neither going.
+     */
+    private boolean kitRoutingOn() {
+        return kitRoutingFlag;
+    }
+
+    // Whether kit routing applies, looked at once per planning pass (plan()); and what kitRouted answered in that pass
+    private boolean kitRoutingFlag = true;
+    private Map<DestKey, Boolean> kitRoutedCache;
+
+    /** The shulker is one KitBuilder is building or holds: it is not a carried kit for the kit report. */
+    public boolean buildingKit(ItemStack stack) {
+        return stack != null && !stack.isEmpty() && kitBuilder.heldKit(stack) != null;
+    }
+
+    /**
+     * What kit settings say about a stack: NOT_KIT for anything that is not a shulker box scoring as a kit. A shulker KitBuilder
+     * already routes (a finished or part built kit) keeps KitBuilder's routing, so it is looked at first. The score is worked out once
+     * per item, components and scoring (StashIndex.kitScore keeps it); the key is the normalised custom name, null for an unnamed kit.
+     */
+    private KitRouting.Route<Box> kitRoute(KitRouting.View<Box> v, ItemStack stack) {
+        if (stack.isEmpty() || !Utils.isShulker(stack.getItem())) return v.route(null, false);
+        if (StashIndex.builderKit(stack) || kitBuilder.heldKit(stack) != null) return v.route(null, false);
+        KitScore.Result score = StashIndex.kitScore(stack, v.settings().scoring());
+        if (score == null || !score.kit()) return v.route(null, false);
+        return v.route(KitNames.keyOf(StashIndex.customName(stack)), true);
+    }
+
+    /** The stack is a kit that kit settings send to this very container (the only thing a reserved chest takes back). */
+    private boolean kitRoutedTo(Box box, ItemStack stack) {
+        KitRouting.View<Box> v = kitView();
+        if (v == null || !kitRoutingOn()) return false;
+        KitRouting.Route<Box> r = kitRoute(v, stack);
+        return r.decision().routed() && r.box() == box;
+    }
+
+    /** A kit shulker that has a say in where it goes (a chest, or none to take it). */
+    private boolean kitRouted(ItemStack stack) {
+        // Only shulker boxes can be kits: nothing else costs a lookup
+        if (stack.isEmpty() || !Utils.isShulker(stack.getItem())) return false;
+        KitRouting.View<Box> v = kitView();
+        if (v == null || !kitRoutingOn()) return false;
+        Map<DestKey, Boolean> cache = kitRoutedCache;
+        if (cache == null) return kitRoute(v, stack).decision().routed();
+        return cache.computeIfAbsent(DestKey.of(stack), k -> kitRoute(v, stack).decision().routed());
+    }
+
+    private void kitMissing(KitRouting.Decision d) {
+        // The warnings start over only when the kit-settings store changes, not on every planning pass
+        int store = KitStore.shared().version();
+        if (store != kitWarnedVersion) {
+            kitWarned.clear();
+            kitWarnedVersion = store;
+        }
+        // An unnamed kit has no key: a sentinel, so it never meets a kit really named "null"
+        if (kitWarned.add((d.key() == null ? "\u0000" : d.key()) + "|" + d.container())) {
+            warning("The chest picked for %s (%s) is missing or can't take kits (not read yet, excluded, a drop-off or unreachable). Such a kit stays where it is, and one from a drop-off goes to overflow.",
+                d.key() == null ? "an unnamed kit" : "the kit \"" + d.key() + "\"", d.container());
+        }
     }
 
     // Repacking shulkers
@@ -5984,7 +6148,18 @@ public class StashSorter extends Module {
      * fits inside a kit is an ordinary bulk shulker.
      */
     private boolean isKitShulker(ItemStack shulker) {
-        return Kits.claims(shulker) || kitBuilder.heldKit(shulker) != null || orderRunner.claims(shulker);
+        return Kits.claims(shulker) || kitBuilder.heldKit(shulker) != null || orderRunner.claims(shulker) || keptWholeKit(shulker);
+    }
+
+    /**
+     * A shulker that scores as a kit while kit sorting is on and that has a target (a rule or the kits chest applies, pickable or missing;
+     * for an unnamed kit a kits chest is set): kept whole, never unpacked, repacked or compacted. With no settings or no target the
+     * shulker is repacked exactly as before. The score uses the cached scoring of the stash (the defaults without a cache).
+     */
+    private boolean keptWholeKit(ItemStack shulker) {
+        if (shulker == null || shulker.isEmpty() || !Utils.isShulker(shulker.getItem())) return false;
+        KitRouting.View<Box> v = kitView();
+        return v != null && kitRoute(v, shulker).decision().routed();
     }
 
     /**
@@ -8314,17 +8489,25 @@ public class StashSorter extends Module {
      */
     private void plan() {
         tierBoxes.clear();
+        // The kit view is looked at again once per pass, whatever the cheap checks say; so is whether kit routing applies
+        kitViewOn = false;
+        kitRoutingFlag = !repairer.active();
+        kitRoutedCache = new HashMap<>();
         if (mode.get() != Mode.Tiers) return;
 
-        List<Box> ordered = stash.boxes.stream().filter(b -> b.sortable() && !b.dropOff).sorted(Comparator.comparingInt(b -> b.order)).toList();
+        // Kit-reserved containers hold kits only, and kits that have a chest of their own are not part of the tiers
+        List<Box> ordered = stash.boxes.stream().filter(b -> b.sortable() && !b.dropOff && !kitReserved(b)).sorted(Comparator.comparingInt(b -> b.order)).toList();
 
         // How many stacks of each tier there are, including drop-offs and what we're carrying
         int[] counts = new int[5];
         for (Box box : stash.boxes) {
             if (!box.sortable()) continue;
-            for (ItemStack stack : box.contents) if (!stack.isEmpty()) counts[tier(stack)]++;
+            for (ItemStack stack : box.contents) if (!stack.isEmpty() && !kitRouted(stack)) counts[tier(stack)]++;
         }
-        for (int slot : carriedSlots()) counts[tier(mc.player.getInventory().getItem(slot))]++;
+        for (int slot : carriedSlots()) {
+            ItemStack carriedStack = mc.player.getInventory().getItem(slot);
+            if (!kitRouted(carriedStack)) counts[tier(carriedStack)]++;
+        }
 
         // Fill the containers in order, a tier at a time. A container can end up shared by two tiers.
         int index = 0, used = 0;
@@ -8363,6 +8546,17 @@ public class StashSorter extends Module {
     }
 
     private List<Box> computeDestinations(ItemStack stack) {
+        // A kit shulker (a custom name with the word kit) goes where the website says, before Tiers, signs and contents are looked at.
+        // An order's own stacks never get here (destinationsFor leaves them out through orderRunner.claims)
+        KitRouting.View<Box> kitRules = kitView();
+        if (kitRules != null && kitRoutingOn()) {
+            KitRouting.Route<Box> route = kitRoute(kitRules, stack);
+            if (route.decision().routed()) {
+                if (route.kind() == KitRouting.Kind.MISSING) kitMissing(route.decision());
+                return kitRules.destinations(route);
+            }
+        }
+
         if (mode.get() == Mode.Tiers) return tierBoxes.getOrDefault(tier(stack), List.of());
 
         // An empty bundle goes to a chest signed for bundles, else one signed for shulkers or containers
@@ -8577,7 +8771,7 @@ public class StashSorter extends Module {
      * Chests signed for kits, which take mixed shulkers whole.
      */
     private List<Box> keepWholeBoxes() {
-        return stash.boxes.stream().filter(b -> b.sortable() && !b.dropOff && b.labels.stream().anyMatch(Categories::isKeepWhole)).toList();
+        return stash.boxes.stream().filter(b -> b.sortable() && !b.dropOff && !kitReserved(b) && b.labels.stream().anyMatch(Categories::isKeepWhole)).toList();
     }
 
     /**

@@ -495,7 +495,13 @@ class StreamerTest {
             "[POST] ^/api/v1/planner/(p-[0-9a-f]{12})/delete$ BROWSER_WRITE PLANNER",
             "[GET, HEAD] /icon/ SESSION ICONS");
         java.util.Set<String> forbidden = java.util.Set.of(
-            "[POST] ^/api/v1/bots/([A-Za-z0-9_-]{1,64})/(settings|jobs|console|activity)$ BROWSER_WRITE ACTIVITY");
+            "[POST] ^/api/v1/bots/([A-Za-z0-9_-]{1,64})/(settings|jobs|console|activity)$ BROWSER_WRITE ACTIVITY",
+            // Kits: positions and names a player typed (KIT-CONTRACT.md, "Forced streamer mode"); see KitRoutesTest.
+            "[GET, HEAD] /api/v1/kits SESSION VIEW",
+            "[POST] /api/v1/kits/chest BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/kits/rule BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/kits/rule/delete BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/kits/scoring BROWSER_WRITE SETTINGS");
         java.util.Set<String> ownerOnly = java.util.Set.of(
             "[POST] /api/v1/link/regenerate BROWSER_WRITE OWNER",
             "[GET, HEAD] /api/v1/users SESSION OWNER",

@@ -37,8 +37,12 @@ public enum StateKind {
     FENCE_GATE,
     /** button, lever, grindstone: face FLOOR/CEILING (facing = H) or WALL (facing = clicked face). */
     ATTACH_FACE,
-    /** a wall-mounted block (wall torch, wall sign, wall banner, wall skull, ladder): facing = clicked face. */
+    /** a wall-mounted block (wall torch of every kind, wall sign, wall banner, wall skull, ladder, tripwire hook, wall coral fan): facing = clicked face. */
     WALL_OR_STANDING,
+    /** a wall hanging sign: facing = the opposite of the look, and it hangs between blocks beside it (a click on a neighbour not on its facing axis). */
+    WALL_HANGING,
+    /** cocoa pods: facing = the direction of the jungle log they hang on (the opposite of the clicked face). */
+    COCOA,
     /** standing sign, banner, skull or head: rotation from the yaw. */
     ROTATION16,
     /** lantern: hanging from the face clicked (bottom face of the block above = hanging). */

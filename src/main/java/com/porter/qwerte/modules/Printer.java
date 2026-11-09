@@ -8,7 +8,9 @@ import com.porter.qwerte.printer.materials.MaterialPlanner;
 import com.porter.qwerte.printer.materials.EchestReturn;
 import com.porter.qwerte.printer.materials.TakeRules;
 import com.porter.qwerte.printer.source.StateResolver;
+import com.porter.qwerte.printer.place.AreaWatch;
 import com.porter.qwerte.printer.place.BuildOrderer;
+import com.porter.qwerte.printer.place.JobHold;
 import com.porter.qwerte.printer.place.LookWindow;
 import com.porter.qwerte.printer.place.PacketBudget;
 import com.porter.qwerte.printer.place.PlaceRecipe;
@@ -18,12 +20,17 @@ import com.porter.qwerte.printer.place.PlacementMapper;
 import com.porter.qwerte.printer.place.StateClassifier;
 import com.porter.qwerte.printer.place.StateKind;
 import com.porter.qwerte.printer.place.StateSpec;
+import com.porter.qwerte.printer.place.StripRules;
+import com.porter.qwerte.printer.place.StripTable;
 import com.porter.qwerte.printer.place.TickBatcher;
+import com.porter.qwerte.printer.place.WaterlogRules;
 import com.porter.qwerte.printer.stash.StashOrders;
 import com.porter.qwerte.printer.schematic.LitematicReader;
 import com.porter.qwerte.printer.schematic.SchematicFile;
 import com.porter.qwerte.printer.schematic.Transform;
 import com.porter.qwerte.printer.source.BuildSource;
+import com.porter.qwerte.printer.source.LayerFilter;
+import com.porter.qwerte.printer.source.LitematicaBridge;
 import com.porter.qwerte.printer.source.SourcePicker;
 import com.porter.qwerte.stash.Stash;
 import com.porter.qwerte.tweaks.Orphans;
@@ -56,7 +63,11 @@ import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.network.chat.Component;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.tags.ItemTags;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.Slot;
@@ -67,6 +78,7 @@ import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.FallingBlock;
+import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.entity.BarrelBlockEntity;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
@@ -75,6 +87,8 @@ import net.minecraft.world.level.block.entity.EnderChestBlockEntity;
 import net.minecraft.world.level.block.entity.HopperBlockEntity;
 import net.minecraft.world.level.block.entity.ShulkerBoxBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
+import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
@@ -85,6 +99,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -230,6 +245,13 @@ public class Printer extends Module {
         .build()
     );
 
+    private final Setting<Boolean> chatMessages = sgSource.add(new BoolSetting.Builder()
+        .name("chat-messages")
+        .description("Lets the Printer write to the chat: progress, warnings, errors and the stash order lines. Off: it sends no chat line at all (everything is still written to the game log).")
+        .defaultValue(false)
+        .build()
+    );
+
     // Speed
 
     private final Setting<Integer> blocksPerTick = sgSpeed.add(new IntSetting.Builder()
@@ -298,10 +320,26 @@ public class Printer extends Module {
         .build()
     );
 
-    private final Setting<Boolean> visibleFacesOnly = sgPlace.add(new BoolSetting.Builder()
-        .name("visible-faces-only")
+    // Named visible-faces-only until 0.4.0-dev.15; the new name drops the old saved value (Meteor ignores a saved setting it no longer knows)
+    private final Setting<Boolean> requireLineOfSight = sgPlace.add(new BoolSetting.Builder()
+        .name("require-line-of-sight")
         .description("Only click a face when there is a clear line from your eyes to the spot that is clicked.")
         .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<Boolean> waterlog = sgPlace.add(new BoolSetting.Builder()
+        .name("waterlog")
+        .description("A block that the schematic wants waterlogged is placed, then a water bucket from your hotbar or inventory is used on it. The bucket is emptied by that. Without a bucket (or with this off) the block is placed dry and you get one warning.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Boolean> refillWaterBucket = sgPlace.add(new BoolSetting.Builder()
+        .name("refill-water-bucket")
+        .description("When an empty bucket is carried and a water source block is within reach, picks the water up again, so the next waterlogged block has a bucket. It does not walk to water.")
+        .defaultValue(false)
+        .visible(waterlog::get)
         .build()
     );
 
@@ -357,6 +395,13 @@ public class Printer extends Module {
     );
 
     // Materials
+
+    private final Setting<Boolean> disableWhenOut = sgMaterials.add(new BoolSetting.Builder()
+        .name("disable-when-out-of-materials")
+        .description("Off: running out of an item never turns the Printer off. It skips the blocks it has no item for, keeps placing the rest, and goes back to them when the item turns up (restock, stash delivery, ender chest). On: when an item is missing and no source or stash order can supply it, the Printer turns itself off.")
+        .defaultValue(false)
+        .build()
+    );
 
     private final Setting<Boolean> useShulkers = sgMaterials.add(new BoolSetting.Builder()
         .name("use-shulkers")
@@ -544,11 +589,21 @@ public class Printer extends Module {
         return id;
     };
 
-    private record Info(StateSpec spec, MaterialPlanner.Cost cost, Item item) {}
+    /** {@code rawItem}: for a block that is the strip result of another (stripped logs), the item of that other block; else null. */
+    private record Info(StateSpec spec, MaterialPlanner.Cost cost, Item item, Item rawItem) {}
 
-    private record Prep(BuildOrderer.Cell cell, Info info, PlaceRecipe recipe, BlockHitResult hit, int slot) {}
+    /** {@code use}/{@code useCount}: what is placed with the click. The cell's own item, or the unstripped one when {@code raw}. */
+    private record Prep(BuildOrderer.Cell cell, Info info, PlaceRecipe recipe, BlockHitResult hit, int slot, Item use, int useCount, boolean raw) {}
 
-    private record Awaiting(BuildOrderer.Cell cell, Info info, PlaceRecipe recipe, int tickPlaced) {}
+    private record Awaiting(BuildOrderer.Cell cell, Info info, PlaceRecipe recipe, int tickPlaced, boolean raw) {}
+
+    /** What the world shows at a cell next to what the schematic wants. */
+    private enum Seen { BUILT, NEEDS_STRIP, NO }
+
+    /** {@code wantId}: the stripped block the schematic wants here; the axe is only used on its unstripped partner. */
+    private record StripJob(BlockPos pos, int tries, int lastTick, int since, String wantId) {}
+
+    private record WaterJob(BlockPos pos, int since, int giveUp, int tries, int lastTick) {}
 
     private record Deferred(BuildOrderer.Cell cell, int dueTick, int tries, String why) {}
 
@@ -634,6 +689,29 @@ public class Printer extends Module {
     private boolean usedConfine, usedProtect, walkWarned;
     private int lastWalk;
 
+    // Stripping (logs placed unstripped, waiting for an axe click), waterlogging, the layer range, the schematic area
+    private static final int STRIP_TRIES = 4, STRIP_WAIT = 5, WATER_TRIES = 4, WATER_WAIT = 5, WATER_GIVE_UP = 20 * 60, WATER_GIVE_UP_PRESENT = 20 * 300, STRIP_GIVE_UP = 20 * 120, LAYER_EVERY = 5;
+    private static final long LAYER_BUDGET_NANOS = 1_000_000L;
+    private static final int OFFHAND = 40;
+    private final Map<Long, StripJob> stripPending = new LinkedHashMap<>();
+    private final Map<Long, WaterJob> waterJobs = new LinkedHashMap<>();
+    private boolean warnedNoAxe, warnedDry, stripSneak;
+    private int stripBlockedUntil, waterBlockedUntil, waterLeft, stripDone, waterDone, dryCount;
+    private final List<String> dryLines = new ArrayList<>();
+    private BlockPos refillSource;
+    private int refillScanTick = -1000;
+    private LayerFilter layer = LayerFilter.ALL;
+    private boolean layerDirty, layerRead;
+    private int layerParkAt, layerDormantAt;
+    // Dormant cells whose block is not there yet (a layer viewed through is "done" when none is left)
+    private int holdScanAt = -1, holdScanTodo, holdTodo, holdTick;
+    private boolean holdDone;
+    private int[] dormant = new int[0];
+    private int dormantN;
+    private final AreaWatch areaWatch = new AreaWatch();
+    private List<int[]> areaBoxes = List.of();
+    private boolean awayFromArea;
+
     // Materials
     private final StashOrders stashOrders = new StashOrders(new StashOrders.Config() {
         @Override public int threshold() { return orderWhenBelow.get(); }
@@ -650,8 +728,14 @@ public class Printer extends Module {
     private final Resupply resupply = new Resupply();
     private final SmartPlaceSession session = new SmartPlaceSession(new SessionHost());
     private final AutoHotbar.Need need = new AutoHotbar.Need("build blocks", s -> currentItem != null && s.is(currentItem) && s.getCount() >= currentCost && !loadedShulker(s), () -> 0, false, () -> currentItem != null);
+    // The tools follow the same hotbar rules as the blocks: weapons, food and shulker boxes are never moved out of the way
+    private final AutoHotbar.Need axeNeed = new AutoHotbar.Need("axe", this::usableAxe, () -> 0, false, () -> !stripPending.isEmpty());
+    private final AutoHotbar.Need waterNeed = new AutoHotbar.Need("water bucket", s -> s.is(Items.WATER_BUCKET), () -> 0, false, () -> !waterJobs.isEmpty())
+        .sharing(s -> s.is(Items.BUCKET));
+    private final AutoHotbar.Need emptyBucketNeed = new AutoHotbar.Need("bucket", s -> s.is(Items.BUCKET), () -> 0, false, () -> waterlog.get() && refillWaterBucket.get() && waterWorkAhead())
+        .sharing(s -> s.is(Items.WATER_BUCKET));
     private final AutoHotbar hotbar = new AutoHotbar(() -> true, s -> keepForeign.get() && !s.isEmpty() && !isBuildItem(s),
-        m -> warning("%s", m), m -> info("%s", m), List.of(need));
+        m -> warning("%s", m), m -> info("%s", m), List.of(need, axeNeed, waterNeed, emptyBucketNeed));
 
     // Orphans
     private Object orphanLevel;
@@ -680,6 +764,55 @@ public class Printer extends Module {
 
     public Printer() {
         super(QwerteAddon.CATEGORY, "printer", "Builds a Litematica schematic (or a .litematic file) block by block with the right facing and state, walking with Baritone and fetching materials from your inventory, shulker boxes, chosen containers and your ender chest, or ordering them from the stash bots.");
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Chat: every line the Printer says goes through chatLine(). With chat-messages off nothing reaches the chat (not even
+    // Meteor's "toggled" line) and the text is written to the game log instead.
+
+    private static final String[] LEVEL_NAMES = { "info", "warning", "error" };
+
+    private boolean chatLine(int level, String format, Object[] args) {
+        if (chatMessages != null && chatMessages.get()) return true;
+        String text;
+        try {
+            text = args == null || args.length == 0 ? format : String.format(format, args);
+        } catch (RuntimeException e) {
+            text = format;
+        }
+        QwerteAddon.LOG.info("printer (chat off, {}): {}", LEVEL_NAMES[level], text);
+        return false;
+    }
+
+    @Override
+    public void info(String message, Object... args) {
+        if (chatLine(0, message, args)) super.info(message, args);
+    }
+
+    @Override
+    public void info(Component message) {
+        if (chatLine(0, message.getString(), null)) super.info(message);
+    }
+
+    @Override
+    public void warning(String message, Object... args) {
+        if (chatLine(1, message, args)) super.warning(message, args);
+    }
+
+    @Override
+    public void error(String message, Object... args) {
+        if (chatLine(2, message, args)) super.error(message, args);
+    }
+
+    @Override
+    public void sendToggledMsg() {
+        if (chatMessages != null && chatMessages.get()) super.sendToggledMsg();
+    }
+
+    /** A warning that is always logged, and goes to the chat only when chat-messages is on. */
+    private void logWarn(String text) {
+        QwerteAddon.LOG.warn("printer: {}", text);
+        if (chatMessages.get()) super.warning("%s", text);
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -736,6 +869,8 @@ public class Printer extends Module {
             stashOrders.newBuild();
         }
         reported = false;
+        layer = LayerFilter.ALL;
+        layerRead = false;
         QwerteAddon.LOG.info("printer: started ({}, blocks-per-tick {}, packet-budget {})", source.get(), blocksPerTick.get(), packetBudget.get());
     }
 
@@ -803,6 +938,25 @@ public class Printer extends Module {
         prevLook = null;
         placeDelay = 0;
         walkSince = -1;
+        stripPending.clear();
+        waterJobs.clear();
+        warnedNoAxe = warnedDry = stripSneak = false;
+        stripBlockedUntil = waterBlockedUntil = 0;
+        waterLeft = stripDone = waterDone = dryCount = 0;
+        refillSource = null;
+        refillScanTick = -1000;
+        dryLines.clear();
+        layer = LayerFilter.ALL;
+        layerDirty = layerRead = false;
+        layerParkAt = layerDormantAt = 0;
+        holdScanAt = -1;
+        holdScanTodo = holdTodo = holdTick = 0;
+        holdDone = false;
+        dormant = new int[0];
+        dormantN = 0;
+        areaWatch.reset();
+        areaBoxes = List.of();
+        awayFromArea = false;
         builtCount = presentCount = scanned = brokenCount = 0;
         skippedLines.clear();
         failedLines.clear();
@@ -822,9 +976,11 @@ public class Printer extends Module {
         tick++;
         if (orderer != null) orderer.advance();
 
+        if (built != null && (!layerRead || tick % LAYER_EVERY == 0)) readLayer();
         PrintLoop.Obs obs = observe();
         PrintLoop.Step step = loop.tick(obs);
         if (step.msg() != null) tell(step.level(), step.msg());
+        if (step.msg() != null && step.msg().startsWith(PrintLoop.STUCK_PREFIX)) reportStuck();
 
         // Checks that run whatever the loop does
         recoverOpened();
@@ -834,13 +990,19 @@ public class Printer extends Module {
 
         if (loop == null) return;
         if (orderFromStash.get() && scanDone) stashOrders.tick(System.currentTimeMillis(), ordersView);
+        // Stripping and waterlogging are clicks on blocks that were just placed: done before the player can walk out of reach
+        stripSneak = false;
+        boolean acted = false;
+        if (scanDone && step.act() != PrintLoop.Act.FINISH && step.act() != PrintLoop.Act.ABORT && step.act() != PrintLoop.Act.RESUPPLY) {
+            acted = stripTick() || waterTick();
+        }
         switch (step.act()) {
             case LOAD -> startLoad();
             case SCAN -> scanSlice();
             case PLAN -> planned();
             case PLACE -> {
                 releaseWalk();
-                placeTick();
+                if (!acted) placeTick();
             }
             case WALK -> walkTick();
             case STOP_WALK -> releaseWalk();
@@ -853,8 +1015,12 @@ public class Printer extends Module {
             }
             default -> {}
         }
-        if (step.act() != PrintLoop.Act.PLACE && sneak.holding()) sneak.release();
-        if (loop != null && loop.phase() != PrintLoop.Phase.IDLE && scanDone) sweepStep();
+        if (step.act() != PrintLoop.Act.PLACE && sneak.holding() && !stripSneak) sneak.release();
+        if (loop != null && loop.phase() != PrintLoop.Phase.IDLE && scanDone) {
+            sweepStep();
+            layerPass();
+            holdScan();
+        }
     }
 
     private PrintLoop.Obs observe() {
@@ -880,6 +1046,7 @@ public class Printer extends Module {
         String orderWait = lackingId != null && orderFromStash.get() ? stashOrders.waitingFor(lackingId) : null;
         String orderProblem = lackingId != null && orderFromStash.get() && orderWait == null ? stashOrders.problemFor(lackingId) : null;
 
+        awayFromArea = checkArea();
         boolean userMoving = walk.get() && pauseOnInput.get() && movementKeyDown();
         // Our own goal was only just let go of: Baritone may need a tick or two to say so
         boolean barBusy = userMoving || SmartPlaceSession.BARITONE && walk.get() && tick - releasedAt >= 2
@@ -890,7 +1057,8 @@ public class Printer extends Module {
         return new PrintLoop.Obs(worldChanged, cancelled, loaded, loadError, scanDone, targets.size(), wrongQueue.size(),
             firstWrong == null ? null : describeWrong(firstWrong), breaking != null, wrongBlocks.get().mode, placeable, walkTarget, lacking,
             lackingInfo, !lacking || supplyPossible(lackingId), resupply.running(), resupply.takeFailure(), session.active(), full, barBusy, canWalk,
-            otherSession || !useJobs.isEmpty() || plan != null && plan.waiting, orderWait, orderProblem);
+            otherSession || !useJobs.isEmpty() || plan != null && plan.waiting || jobsCanProgress() || layerDirty || holdScanning(),
+            orderWait, orderProblem, disableWhenOut.get(), layerHold());
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -933,29 +1101,37 @@ public class Printer extends Module {
             return;
         }
         if (scanDone) return;
+        if (!layerRead) readLayer();
         scanDone = built.scan(cursor, SCAN_BUDGET_NANOS, this::onCell);
     }
 
     private void onCell(int x, int y, int z, BlockState want) {
         Info in = infoOf(want);
-        MaterialPlanner.Cost c = tally.add(in.cost());
-        if (c.skipped()) {
-            noteSkipped(c.skip(), x, y, z);
-            return;
-        }
-        if (in.spec().part()) {
-            partBits.add(x, y, z);
-            return;
-        }
         if (in.item() != null) buildItems.add(in.item());
+        if (in.rawItem() != null) buildItems.add(in.rawItem());
+        if (in.cost().skipped() || in.spec().part()) {
+            MaterialPlanner.Cost c = tally.add(in.cost());
+            if (c.skipped()) noteSkipped(c.skip(), x, y, z);
+            else partBits.add(x, y, z);
+            return;
+        }
+        // Outside Litematica's render layers: not placed, not counted, not ordered. Kept to come back when the layers change.
+        if (!layer.contains(x, y, z)) {
+            dormantAdd(x, y, z);
+            return;
+        }
+        MaterialPlanner.Cost c = tally.add(in.cost());
         scratch.set(x, y, z);
         BuildOrderer.Cell cell = BuildOrderer.Cell.of(x, y, z, in.spec(), null);
         if (mc.level.isLoaded(scratch)) {
             // Looked at first: a block that is already right never enters the queue, a wrong one goes straight to its own queue
             BlockState st = mc.level.getBlockState(scratch);
-            if (PrinterActions.built(in.spec(), st)) {
+            Seen seen = seen(in, st);
+            if (seen != Seen.NO) {
                 tally.remove(c);
                 presentCount++;
+                if (seen == Seen.NEEDS_STRIP) addStrip(x, y, z, in);
+                else queueWater(in, st, scratch.immutable(), true);
                 return;
             }
             if (!PrinterActions.free(st)) {
@@ -963,6 +1139,7 @@ public class Printer extends Module {
                     tally.remove(c);
                     return;
                 }
+                if (wet(in)) waterLeft++;
                 scanned++;
                 wrongKeys.add(key(cell));
                 wrongQueue.add(cell);
@@ -975,8 +1152,13 @@ public class Printer extends Module {
             return;
         }
         targets.add(x, y, z);
+        if (wet(in)) waterLeft++;
         sweep.add(cell);
         scanned++;
+    }
+
+    private static boolean wet(Info in) {
+        return in != null && "true".equals(in.spec().props().get("waterlogged"));
     }
 
     private void planned() {
@@ -984,6 +1166,7 @@ public class Printer extends Module {
             skippedReasons.values().stream().mapToInt(Integer::intValue).sum());
         for (String note : built.notes()) warning("%s", LitematicReader.clean(note, 240));
         for (Map.Entry<String, Integer> e : built.problems().entrySet()) warning("%s", "Not built: " + LitematicReader.clean(e.getKey(), 80) + " x" + e.getValue());
+        if (layer.active()) info("Litematica's render layers are on (%s): %d block(s) outside them are left out until the layers change.", layer.mode(), dormantN);
         materialsSummary();
         sendList("Skipped", skippedList());
     }
@@ -1029,10 +1212,20 @@ public class Printer extends Module {
         if (in == null) {
             StateSpec spec = StateClassifier.classify(want);
             MaterialPlanner.Cost cost = MaterialPlanner.cost(spec, ITEMS);
-            in = new Info(spec, cost, cost.item() == null ? null : itemsById.get(cost.item()));
+            in = new Info(spec, cost, cost.item() == null ? null : itemsById.get(cost.item()), rawItemOf(spec));
             infos.put(want, in);
         }
         return in;
+    }
+
+    /** For a stripped log and the like: the item of the block an axe turns into it (a block with an axis only). */
+    private static Item rawItemOf(StateSpec spec) {
+        if (spec.skipped() || spec.kind() != StateKind.AXIS) return null;
+        Block b = blocksById.get(spec.blockId());
+        Block raw = b == null ? null : StripTable.raw(b);
+        if (raw == null) return null;
+        Item item = raw.asItem();
+        return item == Items.AIR ? null : item;
     }
 
     private static long key(int x, int y, int z) {
@@ -1049,7 +1242,10 @@ public class Printer extends Module {
 
     /** Compares a cell with the world: built (done), wrong block in the way (queued), or still to do. */
     private void evaluate(BuildOrderer.Cell cell, Info in, BlockState st) {
-        if (PrinterActions.built(in.spec(), st)) {
+        Seen seen = seen(in, st);
+        if (seen != Seen.NO) {
+            if (seen == Seen.NEEDS_STRIP) addStrip(cell.x(), cell.y(), cell.z(), in);
+            else queueWater(in, st, posOf(cell), true);
             finish(cell, in, Fin.PRESENT, null);
             return;
         }
@@ -1072,6 +1268,7 @@ public class Printer extends Module {
         if (loop != null) loop.forget(k);
         if (breaking != null && key(breaking) == k) breaking = null;
         if (in != null) tally.remove(in.cost());
+        if (wet(in) && waterLeft > 0) waterLeft--;
         String where = cell.x() + " " + cell.y() + " " + cell.z();
         String what = in == null ? "?" : in.spec().describe();
         switch (how) {
@@ -1105,6 +1302,11 @@ public class Printer extends Module {
             }
             BuildOrderer.Cell c = sweep.get(sweepAt);
             if (!targets.contains(c.x(), c.y(), c.z())) {
+                // While the layer pass walks the list by index nothing may be moved under it
+                if (layerDirty) {
+                    sweepAt++;
+                    continue;
+                }
                 sweep.set(sweepAt, sweep.get(sweep.size() - 1));
                 sweep.remove(sweep.size() - 1);
                 continue;
@@ -1116,6 +1318,8 @@ public class Printer extends Module {
             scratch.set(c.x(), c.y(), c.z());
             if (!mc.level.isLoaded(scratch)) {
                 if (cycleHint == null || nearer(c, cycleHint)) cycleHint = c;
+                // Known at once, not only when the sweep wraps: it is where to walk when nothing else is in reach
+                if (unloadedHint == null || nearer(c, unloadedHint)) unloadedHint = c;
                 continue;
             }
             BlockState want = built.stateAt(scratch);
@@ -1154,17 +1358,22 @@ public class Printer extends Module {
         Map<Item, Integer> have = inventoryCounts();
         Item[] lack = { null };
         // A ready cell whose materials are not carried must not take one of the places: the ones behind it may be placeable
+        // (A cell outside Litematica's render layers is never offered; that is not a missing item.)
         Predicate<BuildOrderer.Cell> usable = c -> {
+            if (!layer.contains(c.x(), c.y(), c.z())) return false;
             BlockState w = built.stateAt(scratch2.set(c.x(), c.y(), c.z()));
             if (w == null || w.isAir()) return true;
             Info in = infoOf(w);
             if (in.item() == null) return true;
             if (have.getOrDefault(in.item(), 0) < in.cost().count()) {
+                // The unstripped block does too (an axe strips it after the placement)
+                if (in.rawItem() != null && have.getOrDefault(in.rawItem(), 0) >= 1) return true;
                 if (lack[0] == null) lack[0] = in.item();
                 return false;
             }
             return true;
         };
+        Boolean[] axe = { null };
         orderer.setWorkCap(0);
         List<BuildOrderer.Cell> near = orderer.top(n, eye.x, eye.y, eye.z, reach, box, worldView, prevLook, usable);
         double yaw = mc.player.getYRot(), pitch = mc.player.getXRot();
@@ -1201,10 +1410,22 @@ public class Printer extends Module {
             if (eye.distanceTo(hitVec) > reach + 0.25) continue;
             int[] cb = r.clickedBlock(c.x(), c.y(), c.z());
             BlockPos clicked = new BlockPos(cb[0], cb[1], cb[2]);
-            if (visibleFacesOnly.get() && !visible(eye, hitVec, clicked, r.airplace())) continue;
+            if (requireLineOfSight.get() && !visible(eye, hitVec, clicked, r.airplace())) continue;
             if (rotationMode.get() == RotationMode.None && !r.look().contains(yaw, pitch)) continue;
             BlockHitResult hit = new BlockHitResult(hitVec, DIRECTIONS[r.face().ordinal()], clicked, false);
-            p.preps.add(new Prep(c, in, r, hit, hotbarSlot(in.item(), in.cost().count())));
+            // The item itself when it is carried (preferred); else the unstripped block, which gets an axe click after it is placed
+            Item use = in.item();
+            int useCount = in.cost().count();
+            boolean raw = false;
+            if (in.rawItem() != null) {
+                StripRules.Choice choice = StripRules.choose(have.getOrDefault(in.item(), 0) >= useCount, have.getOrDefault(in.rawItem(), 0) >= 1, axe[0] == null ? (axe[0] = hasAxeAnywhere()) : axe[0]);
+                if (choice == StripRules.Choice.RAW_THEN_STRIP || choice == StripRules.Choice.RAW_NO_AXE) {
+                    use = in.rawItem();
+                    useCount = 1;
+                    raw = true;
+                }
+            }
+            p.preps.add(new Prep(c, in, r, hit, hotbarSlot(use, useCount), use, useCount, raw));
         }
         p.placeable = !p.preps.isEmpty();
         if (p.placeable) return p;
@@ -1235,6 +1456,28 @@ public class Printer extends Module {
             p.lacking = p.lackingItem != null;
             // A search that was cut short has not said there is nothing: the run must not count that as being stuck
             p.waiting = farTruncated && !p.lacking;
+        }
+        if (!p.walkTarget && !p.lacking && (!stripPending.isEmpty() || !waterJobs.isEmpty())) {
+            // Logs waiting for the axe and blocks waiting for water that are out of reach: go to them (only the ones that can progress)
+            int toStrip = 0;
+            if (hasAxeAnywhere()) {
+                for (StripJob j : stripPending.values()) {
+                    if (!mc.level.isLoaded(j.pos()) || tick - j.since() > STRIP_GIVE_UP || eye.distanceTo(Vec3.atCenterOf(j.pos())) <= reach) continue;
+                    p.walkParts.add(j.pos());
+                    if (++toStrip >= 8) break;
+                }
+            }
+            if (toStrip < 8 && waterCanProgress()) {
+                for (WaterJob j : waterJobs.values()) {
+                    if (!mc.level.isLoaded(j.pos()) || tick > j.giveUp() || eye.distanceTo(Vec3.atCenterOf(j.pos())) <= reach) continue;
+                    p.walkParts.add(j.pos());
+                    if (++toStrip >= 8) break;
+                }
+            }
+            if (toStrip > 0) {
+                p.walkTarget = true;
+                p.waiting = false;
+            }
         }
         if (!p.walkTarget && !p.lacking) {
             // Standing in a cell that is still to be built keeps it from being placed: step out of it
@@ -1341,8 +1584,8 @@ public class Printer extends Module {
             // Everything ready is in the inventory, not the hotbar: one move this tick
             Prep first = plan.preps.get(0);
             if (savedSlot < 0) savedSlot = Players.selectedSlot();
-            currentItem = first.info().item();
-            currentCost = first.info().cost().count();
+            currentItem = first.use();
+            currentCost = first.useCount();
             if (budget.canSend(System.currentTimeMillis(), 1) && hotbar.ensure(need)) budget.record(System.currentTimeMillis(), 1);
             return;
         }
@@ -1407,7 +1650,7 @@ public class Printer extends Module {
         for (Prep p : chosen) {
             BuildOrderer.Cell c = p.cell();
             PlaceRecipe r = p.recipe();
-            PrinterActions.Click click = new PrinterActions.Click(posOf(c), p.hit(), r.airplace(), p.slot(), p.info().item(), p.info().cost().count(),
+            PrinterActions.Click click = new PrinterActions.Click(posOf(c), p.hit(), r.airplace(), p.slot(), p.use(), p.useCount(),
                 r.extraPlaces(), r.deferUse() ? 0 : r.useClicks(), r.sneak());
             PrinterActions.Outcome o = PrinterActions.clickPlace(click, swing.get());
             if (o == PrinterActions.Outcome.SUPPORT_GONE || o == PrinterActions.Outcome.CELL_TAKEN) recipes.clear();
@@ -1415,8 +1658,16 @@ public class Printer extends Module {
             if (lastClickTick != tick) lastClicked.clear();
             long k = key(c);
             orderer.placed(c);
-            awaiting.put(k, new Awaiting(c, p.info(), r, tick));
+            awaiting.put(k, new Awaiting(c, p.info(), r, tick, p.raw()));
             loop.placed(k);
+            if (p.raw()) {
+                addStrip(c.x(), c.y(), c.z(), p.info());
+                if (!hasAxeAnywhere() && !warnedNoAxe) {
+                    warnedNoAxe = true;
+                    warning("No axe in your inventory: logs are placed unstripped and are stripped when you carry an axe and are within reach of them.");
+                }
+            }
+            queueWater(p.info(), null, posOf(c), false);
             lastClicked.add(posOf(c));
             lastClickTick = tick;
             noPlaceTicks = 0;
@@ -1471,7 +1722,10 @@ public class Printer extends Module {
             BuildOrderer.Cell c = a.cell();
             scratch.set(c.x(), c.y(), c.z());
             BlockState st = mc.level.getBlockState(scratch);
-            boolean ok = PrinterActions.built(a.info().spec(), st);
+            // A block that only waits for the axe is placed
+            Seen seen = seen(a.info(), st);
+            boolean ok = seen != Seen.NO;
+            if (seen == Seen.NEEDS_STRIP) addStrip(c.x(), c.y(), c.z(), a.info());
             switch (loop.verdict(k, ok)) {
                 case OK -> {
                     PlaceRecipe r = a.recipe();
@@ -1512,6 +1766,531 @@ public class Printer extends Module {
             PrinterActions.useClicks(j.pos(), j.clicks(), swing.get());
             useJobs.remove(i);
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Stripping logs, waterlogging blocks, the layer range, the schematic area
+
+    private String rawIdOf(String strippedId) {
+        Block b = blocksById.get(strippedId);
+        Block raw = b == null ? null : StripTable.raw(b);
+        return raw == null ? null : StateClassifier.idOf(raw);
+    }
+
+    /** What the world shows at a cell next to what the schematic wants: built; "right block, needs strip" (the unstripped block with the wanted axis); or neither. */
+    private Seen seen(Info in, BlockState st) {
+        if (PrinterActions.built(in.spec(), st)) return Seen.BUILT;
+        if (in.rawItem() == null || st.isAir()) return Seen.NO;
+        String haveAxis = st.hasProperty(BlockStateProperties.AXIS) ? st.getValue(BlockStateProperties.AXIS).getSerializedName() : null;
+        return StripRules.classify(in.spec().blockId(), in.spec().props().get("axis"), StateClassifier.idOf(st.getBlock()), haveAxis, this::rawIdOf)
+            == StripRules.WorldState.NEEDS_STRIP ? Seen.NEEDS_STRIP : Seen.NO;
+    }
+
+    private void addStrip(int x, int y, int z, Info in) {
+        stripPending.putIfAbsent(key(x, y, z), new StripJob(new BlockPos(x, y, z), 0, -1000, tick, in.spec().blockId()));
+    }
+
+    /** The axe turns this world block into the block the schematic wants here (its unstripped partner), and nothing else. */
+    private static boolean stripsInto(BlockState st, String wantId) {
+        Block result = StripTable.stripped(st.getBlock());
+        return result != null && (wantId == null || StateClassifier.idOf(result).equals(wantId));
+    }
+
+    private boolean usableAxe(ItemStack s) {
+        return !s.isEmpty() && s.is(ItemTags.AXES) && (!s.isDamageableItem() || s.getMaxDamage() - s.getDamageValue() > 1);
+    }
+
+    private boolean hasAxeAnywhere() {
+        if (mc.player == null) return false;
+        for (int i = 0; i < 36; i++) if (usableAxe(mc.player.getInventory().getItem(i))) return true;
+        return usableAxe(mc.player.getOffhandItem());
+    }
+
+    /** The slot of the first matching item: 0 to 8 in the hotbar, {@link #OFFHAND}, -2 in the main inventory only, -1 not carried. */
+    private int slotOf(Predicate<ItemStack> test) {
+        for (int i = 0; i < 9; i++) if (test.test(mc.player.getInventory().getItem(i))) return i;
+        if (test.test(mc.player.getOffhandItem())) return OFFHAND;
+        for (int i = 9; i < 36; i++) if (test.test(mc.player.getInventory().getItem(i))) return -2;
+        return -1;
+    }
+
+    private int axeSlot() {
+        return slotOf(this::usableAxe);
+    }
+
+    private int waterBucketSlot() {
+        return slotOf(s -> s.is(Items.WATER_BUCKET));
+    }
+
+    private int emptyBucketSlot() {
+        return slotOf(s -> s.is(Items.BUCKET));
+    }
+
+    private BlockHitResult traceLook(ClipContext.Fluid fluid) {
+        Vec3 eye = mc.player.getEyePosition();
+        Vec3 end = eye.add(mc.player.getViewVector(1f).scale(mc.player.blockInteractionRange()));
+        return mc.level.clip(new ClipContext(eye, end, ClipContext.Block.OUTLINE, fluid, mc.player));
+    }
+
+    /** Runs the click with the look it needs (right away when rotation-mode is None). */
+    private void lookAndDo(Vec3 aim, Runnable action) {
+        if (rotationMode.get() == RotationMode.None) action.run();
+        else Rotations.rotate(Rotations.getYaw(aim), Rotations.getPitch(aim), action);
+    }
+
+    /** Moves a tool into the hotbar (one move); false when it could not be, with a pause before the next try. */
+    private boolean pullIntoHotbar(AutoHotbar.Need what, boolean axeSide) {
+        long now = System.currentTimeMillis();
+        if (budget.canSend(now, 1) && hotbar.ensure(what)) {
+            budget.record(now, 1);
+            return true;
+        }
+        if (axeSide) stripBlockedUntil = tick + 40;
+        else waterBlockedUntil = tick + 40;
+        return false;
+    }
+
+    /**
+     * Uses an axe on a log that was placed unstripped (or found so). Returns true when it spent this tick on it, so the
+     * placing waits one tick. Nothing here moves a weapon, food or a shulker box: the axe is pulled in by the same hotbar
+     * helper as the building blocks.
+     */
+    private boolean stripTick() {
+        if (stripPending.isEmpty() || mc.player == null || mc.level == null || mc.screen != null || session.active() || resupply.running()) return false;
+        Vec3 eye = mc.player.getEyePosition();
+        double reach = reach();
+        StripJob pick = null;
+        long pickKey = 0;
+        for (Iterator<Map.Entry<Long, StripJob>> it = stripPending.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<Long, StripJob> e = it.next();
+            StripJob j = e.getValue();
+            if (!mc.level.isLoaded(j.pos())) continue;
+            BlockState st = mc.level.getBlockState(j.pos());
+            if (!stripsInto(st, j.wantId())) {
+                // Stripped (by us or by hand), gone, or not the unstripped partner of the wanted block: nothing to do here
+                if (j.tries() > 0 && !st.isAir()) stripDone++;
+                it.remove();
+                continue;
+            }
+            if (j.tries() >= STRIP_TRIES && tick - j.lastTick() >= STRIP_WAIT) {
+                if (failedLines.size() < STORED_LIST) failedLines.add(StateClassifier.idOf(st.getBlock()) + " at " + j.pos().getX() + " " + j.pos().getY() + " " + j.pos().getZ() + ": could not be stripped");
+                it.remove();
+                continue;
+            }
+            if (tick - j.lastTick() < STRIP_WAIT) continue;
+            if (pick == null && eye.distanceTo(Vec3.atCenterOf(j.pos())) <= reach) {
+                pick = j;
+                pickKey = e.getKey();
+            }
+        }
+        if (pick == null) return false;
+        int slot = axeSlot();
+        if (slot == -1) {
+            if (!warnedNoAxe) {
+                warnedNoAxe = true;
+                warning("No axe in your inventory: logs are placed unstripped and are stripped when you carry an axe and are within reach of them.");
+            }
+            return false;
+        }
+        if (slot == -2) return tick >= stripBlockedUntil && pullIntoHotbar(axeNeed, true);
+
+        long now = System.currentTimeMillis();
+        // Axe in the main hand with a shield in the off hand: the game only strips while sneaking
+        if (slot != OFFHAND && Players.blocksWithoutSneak(mc.player.getOffhandItem())) {
+            if (!sneak.holding()) budget.record(now, 1);
+            sneak.press();
+            stripSneak = true;
+            if (!sneak.ready(sneakTicks.get())) return true;
+        }
+        if (!budget.trySpend(now, 3 + (swing.get() ? 1 : 0))) return false;
+        if (savedSlot < 0) savedSlot = Players.selectedSlot();
+
+        BlockPos pos = pick.pos();
+        Direction dir = DIRECTIONS[StripRules.faceToward(eye.x, eye.y, eye.z, pos.getX(), pos.getY(), pos.getZ()).ordinal()];
+        Vec3 hitVec = new Vec3(pos.getX() + 0.5 + dir.getStepX() * 0.5, pos.getY() + 0.5 + dir.getStepY() * 0.5, pos.getZ() + 0.5 + dir.getStepZ() * 0.5);
+        BlockHitResult hit = new BlockHitResult(hitVec, dir, pos, false);
+        stripPending.put(pickKey, new StripJob(pos, pick.tries() + 1, tick, pick.since(), pick.wantId()));
+        String wantId = pick.wantId();
+        lookAndDo(hitVec, () -> {
+            if (mc.player == null || mc.level == null || mc.gameMode == null) return;
+            if (!stripsInto(mc.level.getBlockState(pos), wantId)) return;
+            int use = axeSlot();
+            if (use < 0) return;
+            InteractionHand hand = InteractionHand.MAIN_HAND;
+            if (use == OFFHAND) hand = InteractionHand.OFF_HAND;
+            else if (Players.selectedSlot() != use) InvUtils.swap(use, false);
+            if (mc.gameMode.useItemOn(mc.player, hand, hit).consumesAction()) PrinterActions.swing(swing.get());
+        });
+        return true;
+    }
+
+    private boolean waterWorkAhead() {
+        return !waterJobs.isEmpty() || waterLeft > 0;
+    }
+
+    private void noteDry(String why, BlockPos pos) {
+        dryCount++;
+        if (pos != null && dryLines.size() < STORED_LIST) dryLines.add(pos.getX() + " " + pos.getY() + " " + pos.getZ());
+        if (warnedDry) return;
+        warnedDry = true;
+        warning("Blocks the schematic wants waterlogged are placed dry (%s). Keep waterlog on and carry a water bucket to fill them.", why);
+    }
+
+    /** A block that is wanted waterlogged was placed (or is there, dry): queue the bucket use. */
+    private void queueWater(Info in, BlockState st, BlockPos pos, boolean present) {
+        if (!wet(in)) return;
+        // Placed into water, the game waterlogs it by itself
+        BlockState now = st != null ? st : mc.level.getBlockState(pos);
+        if (now.hasProperty(BlockStateProperties.WATERLOGGED) && now.getValue(BlockStateProperties.WATERLOGGED)) return;
+        if (waterlog.get() && rotationMode.get() == RotationMode.None) {
+            // A bucket goes where you look; with rotation-mode None the Printer never turns
+            if (!present) noteDry("waterlog needs a rotation mode other than None", pos);
+            return;
+        }
+        boolean bucket = waterBucketSlot() != -1;
+        boolean canFill = bucket || refillWaterBucket.get() && emptyBucketSlot() != -1;
+        if (!waterlog.get() || !canFill) {
+            if (!present) noteDry(waterlog.get() ? "no water bucket" : "waterlog is off", pos);
+            return;
+        }
+        // A block that was already there is walked to if need be, so it is given longer
+        waterJobs.putIfAbsent(key(pos.getX(), pos.getY(), pos.getZ()), new WaterJob(pos, tick, tick + (present ? WATER_GIVE_UP_PRESENT : WATER_GIVE_UP), 0, -1000));
+    }
+
+    /** Uses a water bucket on a block that was placed dry; or picks water up for the next one. True when it spent the tick. */
+    private boolean waterTick() {
+        if (mc.player == null || mc.level == null || mc.screen != null || session.active() || resupply.running()) return false;
+        if (rotationMode.get() == RotationMode.None) return false; // a bucket goes where you look
+        if (waterJobs.isEmpty()) return refillTick(false);
+        if (tick < waterBlockedUntil) return false;
+        Vec3 eye = mc.player.getEyePosition();
+        double reach = reach();
+        for (Iterator<Map.Entry<Long, WaterJob>> it = waterJobs.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<Long, WaterJob> e = it.next();
+            WaterJob j = e.getValue();
+            BlockPos pos = j.pos();
+            if (tick > j.giveUp()) {
+                // Never reached or tried: dry without a misleading "too long" warning
+                it.remove();
+                if (j.tries() > 0) noteDry("it took too long", pos);
+                else {
+                    dryCount++;
+                    if (dryLines.size() < STORED_LIST) dryLines.add(pos.getX() + " " + pos.getY() + " " + pos.getZ());
+                }
+                continue;
+            }
+            if (!mc.level.isLoaded(pos)) continue;
+            BlockState st = mc.level.getBlockState(pos);
+            if (st.isAir() && tick - j.since() <= 40) continue; // the placement has not shown yet
+            if (!st.hasProperty(BlockStateProperties.WATERLOGGED)) {
+                it.remove();
+                continue;
+            }
+            if (st.getValue(BlockStateProperties.WATERLOGGED)) {
+                if (j.tries() > 0) waterDone++;
+                it.remove();
+                continue;
+            }
+            if (tick - j.lastTick() < WATER_WAIT) continue;
+            if (j.tries() >= WATER_TRIES) {
+                if (failedLines.size() < STORED_LIST) failedLines.add(StateClassifier.idOf(st.getBlock()) + " at " + pos.getX() + " " + pos.getY() + " " + pos.getZ() + ": could not be waterlogged");
+                it.remove();
+                continue;
+            }
+            if (eye.distanceTo(Vec3.atCenterOf(pos)) > reach) continue;
+            int slot = waterBucketSlot();
+            WaterlogRules.Action action = WaterlogRules.decide(waterlog.get(), true, false, slot != -1);
+            if (action == WaterlogRules.Action.NONE) {
+                it.remove();
+                continue;
+            }
+            if (action == WaterlogRules.Action.NEED_BUCKET) {
+                // Empty bucket and the refill setting: this block waits for water in reach. Otherwise it stays dry.
+                if (refillWaterBucket.get() && emptyBucketSlot() != -1) {
+                    if (refillTick(true)) return true;
+                    continue;
+                }
+                it.remove();
+                noteDry("no water bucket", pos);
+                continue;
+            }
+            if (slot == -2) return pullIntoHotbar(waterNeed, false);
+            Vec3 aim = waterAim(eye, pos, st, reach);
+            if (aim == null) continue;
+            long now = System.currentTimeMillis();
+            if (!budget.trySpend(now, 3 + (swing.get() ? 1 : 0))) return false;
+            if (savedSlot < 0) savedSlot = Players.selectedSlot();
+            e.setValue(new WaterJob(pos, j.since(), j.giveUp(), j.tries() + 1, tick));
+            lookAndDo(aim, () -> useBucket(Items.WATER_BUCKET, ClipContext.Fluid.NONE, p -> p.equals(pos)));
+            return true;
+        }
+        return refillTick(false);
+    }
+
+    /** Uses the bucket in hand when the look lands on the wanted block. Runs after the look went out. */
+    private void useBucket(Item bucket, ClipContext.Fluid fluid, Predicate<BlockPos> wanted) {
+        if (mc.player == null || mc.level == null || mc.gameMode == null) return;
+        BlockHitResult tr = traceLook(fluid);
+        if (tr.getType() != HitResult.Type.BLOCK || !wanted.test(tr.getBlockPos())) return;
+        int use = slotOf(s -> s.is(bucket));
+        if (use < 0) return;
+        InteractionHand hand = InteractionHand.MAIN_HAND;
+        if (use == OFFHAND) hand = InteractionHand.OFF_HAND;
+        else if (Players.selectedSlot() != use) InvUtils.swap(use, false);
+        if (mc.gameMode.useItem(mc.player, hand).consumesAction()) PrinterActions.swing(swing.get());
+    }
+
+    /** A point on the block that a ray from the eyes hits as the block itself (a bucket is aimed with the look, not with a face). */
+    private Vec3 waterAim(Vec3 eye, BlockPos pos, BlockState st, double reach) {
+        var shape = st.getShape(mc.level, pos);
+        AABB bb = shape.isEmpty() ? new AABB(0, 0, 0, 1, 1, 1) : shape.bounds();
+        double cx = (bb.minX + bb.maxX) / 2, cy = (bb.minY + bb.maxY) / 2, cz = (bb.minZ + bb.maxZ) / 2;
+        double[][] pts = { { cx, cy, cz }, { cx, bb.maxY, cz }, { cx, bb.minY, cz }, { bb.minX, cy, cz }, { bb.maxX, cy, cz }, { cx, cy, bb.minZ }, { cx, cy, bb.maxZ } };
+        Vec3 best = null;
+        double bestD = Double.MAX_VALUE;
+        for (double[] p : pts) {
+            Vec3 at = new Vec3(pos.getX() + p[0], pos.getY() + p[1], pos.getZ() + p[2]);
+            Vec3 dir = at.subtract(eye);
+            if (dir.lengthSqr() < 1e-6) continue;
+            Vec3 end = at.add(dir.normalize().scale(0.6));
+            BlockHitResult hit = mc.level.clip(new ClipContext(eye, end, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, mc.player));
+            if (hit.getType() != HitResult.Type.BLOCK || !hit.getBlockPos().equals(pos)) continue;
+            double d = eye.distanceTo(hit.getLocation());
+            if (d <= reach && d < bestD) {
+                bestD = d;
+                best = hit.getLocation();
+            }
+        }
+        return best;
+    }
+
+    private boolean isWaterSource(BlockPos pos) {
+        BlockState bs = mc.level.getBlockState(pos);
+        FluidState fluid = bs.getFluidState();
+        boolean wanted = false;
+        if (built != null) {
+            BlockState want = built.stateAt(pos);
+            wanted = want != null && !want.isAir();
+        }
+        return WaterlogRules.refillSource(bs.getBlock() instanceof LiquidBlock && fluid.is(FluidTags.WATER), fluid.isSource(), wanted);
+    }
+
+    /** Picks water up with an empty bucket from a source block in reach. True when it spent the tick. */
+    private boolean refillTick(boolean jobWaiting) {
+        if (!waterlog.get() || !refillWaterBucket.get() || rotationMode.get() == RotationMode.None || tick < waterBlockedUntil) return false;
+        int empty = emptyBucketSlot();
+        if (empty == -1 || waterBucketSlot() != -1) return false;
+        if (!jobWaiting && !waterWorkAhead()) return false;
+        Vec3 eye = mc.player.getEyePosition();
+        double reach = reach();
+        if (tick - refillScanTick >= 10) {
+            refillScanTick = tick;
+            refillSource = findWaterSource(eye, reach);
+        }
+        BlockPos src = refillSource;
+        boolean inReach = src != null && isWaterSource(src);
+        if (!WaterlogRules.shouldRefill(true, true, false, true, inReach)) return false;
+        if (empty == -2) return pullIntoHotbar(emptyBucketNeed, false);
+        Vec3 aim = sourceAim(eye, src, reach);
+        if (aim == null) {
+            refillSource = null;
+            return false;
+        }
+        if (!budget.trySpend(System.currentTimeMillis(), 3 + (swing.get() ? 1 : 0))) return false;
+        if (savedSlot < 0) savedSlot = Players.selectedSlot();
+        lookAndDo(aim, () -> useBucket(Items.BUCKET, ClipContext.Fluid.SOURCE_ONLY, this::isWaterSource));
+        waterBlockedUntil = tick + 5;
+        return true;
+    }
+
+    private BlockPos findWaterSource(Vec3 eye, double reach) {
+        int r = (int) Math.ceil(reach);
+        BlockPos base = BlockPos.containing(eye);
+        BlockPos best = null;
+        double bestD = Double.MAX_VALUE;
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    scratch2.set(base.getX() + dx, base.getY() + dy, base.getZ() + dz);
+                    if (!mc.level.isLoaded(scratch2) || !isWaterSource(scratch2)) continue;
+                    double d = eye.distanceToSqr(scratch2.getX() + 0.5, scratch2.getY() + 0.5, scratch2.getZ() + 0.5);
+                    if (d <= reach * reach && d < bestD && sourceAim(eye, scratch2, reach) != null) {
+                        bestD = d;
+                        best = scratch2.immutable();
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /** Where a bucket aimed from the eyes at a source block picks water up (the first source the ray meets), within reach. */
+    private Vec3 sourceAim(Vec3 eye, BlockPos src, double reach) {
+        Vec3 at = Vec3.atCenterOf(src);
+        Vec3 dir = at.subtract(eye);
+        if (dir.lengthSqr() < 1e-6) return null;
+        BlockHitResult hit = mc.level.clip(new ClipContext(eye, at.add(dir.normalize().scale(0.6)), ClipContext.Block.OUTLINE, ClipContext.Fluid.SOURCE_ONLY, mc.player));
+        if (hit.getType() != HitResult.Type.BLOCK || !isWaterSource(hit.getBlockPos())) return null;
+        return eye.distanceTo(hit.getLocation()) <= reach ? hit.getLocation() : null;
+    }
+
+    private boolean waterCanProgress() {
+        return waterlog.get() && rotationMode.get() != RotationMode.None && (waterBucketSlot() != -1 || refillWaterBucket.get() && emptyBucketSlot() != -1);
+    }
+
+    /**
+     * A strip or water job holds the end of the run only while it can progress now: the axe or bucket is carried, its block is
+     * loaded and its give-up time has not passed. Jobs that cannot (no axe, unloaded chunk) never keep the Printer on; the
+     * report lists them.
+     */
+    private boolean jobsCanProgress() {
+        if (mc.player == null || mc.level == null || stripPending.isEmpty() && waterJobs.isEmpty()) return false;
+        if (!stripPending.isEmpty() && hasAxeAnywhere()) {
+            for (StripJob j : stripPending.values()) {
+                if (JobHold.canProgress(true, mc.level.isLoaded(j.pos()), tick - j.since() > STRIP_GIVE_UP || j.tries() >= STRIP_TRIES)) return true;
+            }
+        }
+        if (!waterJobs.isEmpty() && waterCanProgress()) {
+            for (WaterJob j : waterJobs.values()) {
+                if (JobHold.canProgress(true, mc.level.isLoaded(j.pos()), tick > j.giveUp() || j.tries() >= WATER_TRIES)) return true;
+            }
+        }
+        return false;
+    }
+
+    /** The pause message when nothing is left to build inside Litematica's render layers but blocks remain outside them; else null. */
+    private String layerHold() {
+        if (!scanDone || layerDirty || dormantN == 0 || !layer.active() || !holdDone || holdTodo == 0) return null;
+        return "Layer done: move Litematica's render layer to continue (" + holdTodo + " block(s) outside it still to build).";
+    }
+
+    /** Lists what could not be built when the run pauses as stuck, once (the end report no longer comes from this). */
+    private void reportStuck() {
+        List<String> left = new ArrayList<>();
+        for (BuildOrderer.Cell c : sweep) {
+            if (left.size() >= MAX_LIST + 1) break;
+            if (targets.contains(c.x(), c.y(), c.z())) left.add(c.x() + " " + c.y() + " " + c.z());
+        }
+        QwerteAddon.LOG.info("printer: stuck, first cells: {}", left);
+        sendList("Can't be built right now (first)", left);
+    }
+
+    // The layer range
+
+    /** Re-reads Litematica's render layers; a change marks the build to be sorted again (blocks outside leave, blocks inside come back). */
+    private void readLayer() {
+        layerRead = true;
+        LayerFilter now = built != null && built.mode().startsWith("litematica") ? LitematicaBridge.layer() : LayerFilter.ALL;
+        if (now.equals(layer)) return;
+        layer = now;
+        layerDirty = true;
+        layerParkAt = 0;
+        layerDormantAt = 0;
+        holdDone = false;
+        holdScanAt = -1;
+        QwerteAddon.LOG.info("printer: Litematica render layers are now {}", now);
+    }
+
+    private void dormantAdd(int x, int y, int z) {
+        if (dormantN * 3 + 3 > dormant.length) dormant = java.util.Arrays.copyOf(dormant, Math.max(96, dormant.length * 2));
+        dormant[dormantN * 3] = x;
+        dormant[dormantN * 3 + 1] = y;
+        dormant[dormantN * 3 + 2] = z;
+        dormantN++;
+    }
+
+    private void parkCell(BuildOrderer.Cell c) {
+        BlockState want = built.stateAt(scratch.set(c.x(), c.y(), c.z()));
+        Info in = want == null || want.isAir() ? null : infoOf(want);
+        finish(c, in, Fin.DROPPED, null);
+        if (in != null) dormantAdd(c.x(), c.y(), c.z());
+    }
+
+    /**
+     * After a layer change: cells now outside the range leave the build (queue, count, materials, orders), cells now
+     * inside are scanned back in. A slice per tick, so a big schematic does not stall the game; placing already ignores
+     * cells outside the range at once.
+     */
+    private void layerPass() {
+        if (!layerDirty || built == null || mc.level == null) return;
+        long end = System.nanoTime() + LAYER_BUDGET_NANOS;
+        while (layerParkAt < sweep.size()) {
+            if (System.nanoTime() > end) return;
+            BuildOrderer.Cell c = sweep.get(layerParkAt++);
+            if (!targets.contains(c.x(), c.y(), c.z()) || layer.contains(c.x(), c.y(), c.z())) continue;
+            parkCell(c);
+        }
+        while (layerDormantAt < dormantN) {
+            if (System.nanoTime() > end) return;
+            int i = layerDormantAt * 3;
+            int x = dormant[i], y = dormant[i + 1], z = dormant[i + 2];
+            if (!layer.contains(x, y, z)) {
+                layerDormantAt++;
+                continue;
+            }
+            int last = (dormantN - 1) * 3;
+            dormant[i] = dormant[last];
+            dormant[i + 1] = dormant[last + 1];
+            dormant[i + 2] = dormant[last + 2];
+            dormantN--;
+            BlockState want = built.stateAt(scratch.set(x, y, z));
+            if (want != null && !want.isAir()) onCell(x, y, z, want);
+        }
+        layerDirty = false;
+        holdDone = false;
+        holdScanAt = -1;
+    }
+
+    /**
+     * With nothing left to build inside the range: counts, a slice per tick, the dormant cells whose block is not already
+     * right in the world. A finished build viewed through one layer then ends the run instead of waiting for a layer move.
+     * The count is made again every 5 seconds while it matters.
+     */
+    private void holdScan() {
+        if (!scanDone || layerDirty || dormantN == 0 || !layer.active() || targets.size() > 0 || built == null) return;
+        if (holdScanAt < 0) {
+            if (holdDone && tick - holdTick < 100) return;
+            holdScanAt = 0;
+            holdScanTodo = 0;
+        }
+        long end = System.nanoTime() + LAYER_BUDGET_NANOS;
+        while (holdScanAt < dormantN) {
+            if (System.nanoTime() > end) return;
+            int i = holdScanAt++ * 3;
+            scratch.set(dormant[i], dormant[i + 1], dormant[i + 2]);
+            BlockState want = built.stateAt(scratch);
+            if (want == null || want.isAir()) continue;
+            if (!mc.level.isLoaded(scratch)) {
+                holdScanTodo++;
+                continue;
+            }
+            if (seen(infoOf(want), mc.level.getBlockState(scratch)) == Seen.NO) holdScanTodo++;
+        }
+        holdTodo = holdScanTodo;
+        holdDone = true;
+        holdTick = tick;
+        holdScanAt = -1;
+    }
+
+    /** The first count is still being made. */
+    private boolean holdScanning() {
+        return scanDone && !layerDirty && dormantN > 0 && layer.active() && targets.size() == 0 && !holdDone;
+    }
+
+    // The schematic area
+
+    /** True while the player is farther than the reach from every region and blocks remain. Warns once per exit. */
+    private boolean checkArea() {
+        if (built == null || !scanDone || mc.player == null) return false;
+        if (areaBoxes.isEmpty()) {
+            List<int[]> boxes = new ArrayList<>();
+            for (BuildSource.Area a : built.areas()) boxes.add(new int[] { a.minX(), a.minY(), a.minZ(), a.maxX(), a.maxY(), a.maxZ() });
+            areaBoxes = boxes;
+        }
+        Vec3 eye = mc.player.getEyePosition();
+        boolean out = AreaWatch.outside(areaBoxes, eye.x, eye.y, eye.z, reach());
+        if (areaWatch.update(out)) logWarn("You left the schematic area. The Printer keeps running; it places again when you are back within reach of it.");
+        return out && targets.size() > 0;
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -2483,6 +3262,24 @@ public class Printer extends Module {
         sendList("Failed", failedLines);
         sendList("Wrong blocks skipped", wrongLines);
         if (brokenCount > 0) info("Broke %d wrong block(s); their drops were not collected.", brokenCount);
+        if (stripDone > 0) info("Stripped %d log(s) with an axe.", stripDone);
+        if (!stripPending.isEmpty()) {
+            info("%d log(s) were left unstripped (no axe, out of reach or not loaded).", stripPending.size());
+            List<String> logs = new ArrayList<>();
+            for (StripJob j : stripPending.values()) logs.add(j.pos().getX() + " " + j.pos().getY() + " " + j.pos().getZ());
+            sendList("Unstripped", logs);
+        }
+        if (waterDone > 0) info("Waterlogged %d block(s).", waterDone);
+        if (dryCount > 0) {
+            info("%d block(s) wanted waterlogged were left dry.", dryCount);
+            sendList("Left dry", dryLines);
+        }
+        if (!waterJobs.isEmpty()) {
+            List<String> wet = new ArrayList<>();
+            for (WaterJob j : waterJobs.values()) wet.add(j.pos().getX() + " " + j.pos().getY() + " " + j.pos().getZ());
+            sendList("Waiting for water", wet);
+        }
+        if (dormantN > 0) info("%d block(s) outside Litematica's render layers were left out.", dormantN);
         if (targets.size() > 0 && built != null) {
             List<String> left = new ArrayList<>();
             for (BuildOrderer.Cell c : sweep) {
@@ -2591,7 +3388,7 @@ public class Printer extends Module {
     @Override
     public String getInfoString() {
         if (loop == null) return null;
-        return targets.size() + " left";
+        return targets.size() + " left" + (stripPending.isEmpty() ? "" : ", " + stripPending.size() + " to strip");
     }
 
     /** What the shulker box session needs from this module. */

@@ -223,6 +223,66 @@ public final class LitematicaBridge {
         }
     }
 
+    // ---------- the render layer range ----------
+
+    // Litematica's DataManager.getRenderLayerRange() returns malilib's LayerRange (fi.dy.masa.malilib.util.LayerRange in
+    // malilib 0.23.5 for 1.21.4 and 0.27.x for 1.21.11; javap checked). Its class is taken from the method's return type, so
+    // this works wherever malilib keeps it. All handles are optional: if any is missing the printer simply builds everything.
+    private static MethodHandle layerGet, lrMode, lrAxis, lrSingle, lrAbove, lrBelow, lrMin, lrMax;
+    private static boolean layerTried, layerOk, layerFailLogged;
+    private static long layerRetryAt;
+    private static final LayerCache layerCache = new LayerCache();
+
+    /** The current render-layer range, or {@link LayerFilter#ALL} when Litematica is absent, unreadable or shows everything. Client thread only. */
+    public static synchronized LayerFilter layer() {
+        if (!available()) return LayerFilter.ALL;
+        if (!layerTried) {
+            layerTried = true;
+            try {
+                Class<?> dm = Class.forName(P + "data.DataManager", false, LitematicaBridge.class.getClassLoader());
+                java.lang.reflect.Method get = dm.getMethod("getRenderLayerRange");
+                Class<?> lr = get.getReturnType();
+                layerGet = MethodHandles.publicLookup().unreflect(get);
+                lrMode = h(lr, "getLayerMode");
+                lrAxis = h(lr, "getAxis");
+                lrSingle = h(lr, "getLayerSingle");
+                lrAbove = h(lr, "getLayerAbove");
+                lrBelow = h(lr, "getLayerBelow");
+                lrMin = h(lr, "getLayerRangeMin");
+                lrMax = h(lr, "getLayerRangeMax");
+                layerOk = true;
+            } catch (ReflectiveOperationException | LinkageError t) {
+                // The names are not the ones this was written for: the layer feature is off for good
+                QwerteAddon.LOG.warn("printer: Litematica's render layer range can't be read; the layer modes are ignored", t);
+            } catch (Throwable t) {
+                fatal(t);
+                QwerteAddon.LOG.warn("printer: Litematica's render layer range can't be read; the layer modes are ignored", t);
+            }
+        }
+        if (!layerOk) return LayerFilter.ALL;
+        // A read that failed is not tried again for about 5 seconds; meanwhile the last good range is used
+        if (System.currentTimeMillis() < layerRetryAt) return layerCache.fallback();
+        try {
+            Object range = layerGet.invoke();
+            if (range == null) return LayerFilter.ALL;
+            Object mode = lrMode.invoke(range);
+            Object axis = lrAxis.invoke(range);
+            LayerFilter read = LayerFilter.of(mode instanceof Enum<?> e ? e.name() : null, axis instanceof Enum<?> a ? a.ordinal() : 1,
+                (int) lrSingle.invoke(range), (int) lrAbove.invoke(range), (int) lrBelow.invoke(range), (int) lrMin.invoke(range), (int) lrMax.invoke(range));
+            layerCache.ok(read);
+            return read;
+        } catch (Throwable t) {
+            fatal(t);
+            // Keep the last good range (or build everything if none was ever read), another try in 5 seconds; the log hears of it once
+            layerRetryAt = System.currentTimeMillis() + 5000;
+            if (!layerFailLogged) {
+                layerFailLogged = true;
+                QwerteAddon.LOG.warn("printer: reading Litematica's render layer range failed; keeping the last filter and trying again", t);
+            }
+            return layerCache.fallback();
+        }
+    }
+
     // ---------- the in-memory schematic ----------
 
     /** The signed size of a sub-region ({@code getAreaSize}); null when unknown. */

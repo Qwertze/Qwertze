@@ -96,7 +96,7 @@ public final class PropertyRules {
             case ATTACH_FACE:
                 if (prop.equals("face") || prop.equals("facing")) return MATCH;
                 break;
-            case WALL_OR_STANDING:
+            case WALL_OR_STANDING, WALL_HANGING, COCOA:
                 if (prop.equals("facing")) return MATCH;
                 break;
             case ROTATION16:
@@ -142,7 +142,8 @@ public final class PropertyRules {
     private static Rule universal(StateKind kind, String prop, String value) {
         switch (prop) {
             case "waterlogged":
-                return value.equals("true") ? skip("waterlogged=true needs water placed by hand") : derived("waterlogged=false follows the fluid");
+                // Placed dry, then given water with a water bucket when the Printer has one (see WaterlogRules)
+                return value.equals("true") ? CLICK : derived("waterlogged=false follows the fluid");
             case "eye":
                 return value.equals("true") ? skip("an end portal frame eye is placed by hand") : derived("empty frame");
             case "bites":

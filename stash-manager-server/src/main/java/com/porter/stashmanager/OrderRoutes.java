@@ -124,6 +124,12 @@ final class OrderRoutes {
             Http.error(ex, 400, "at most " + OrderStore.MAX_LINES + " lines");
             return;
         }
+        JsonElement ra = o.get("repairAll");
+        if (ra != null && !ra.isJsonNull() && !(ra.isJsonPrimitive() && ra.getAsJsonPrimitive().isBoolean())) {
+            Http.error(ex, 400, "repairAll must be true or false");
+            return;
+        }
+        boolean repairAll = ra != null && ra.isJsonPrimitive() && ra.getAsBoolean();
         List<OrderStore.Line> lines = new ArrayList<>();
         for (int i = 0; i < raw.size(); i++) {
             String problem = null;
@@ -139,7 +145,14 @@ final class OrderRoutes {
                 if (!"item".equals(type) && !"shulker".equals(type)) problem = "type must be item or shulker";
                 else if (key == null || key.isEmpty() || key.length() > MAX_KEY) problem = "key must be a non-empty string";
                 else if (count < 1) problem = "count must be a whole number from 1 to " + Integer.MAX_VALUE;
-                else line = new OrderStore.Line(type, key, count);
+                else {
+                    JsonElement r = l.get("repair");
+                    if (r != null && !r.isJsonNull() && !(r.isJsonPrimitive() && r.getAsJsonPrimitive().isBoolean())) {
+                        problem = "repair must be true or false";
+                    } else {
+                        line = new OrderStore.Line(type, key, count, r != null && r.isJsonPrimitive() && r.getAsBoolean());
+                    }
+                }
             }
             if (problem != null) {
                 lineError(ex, 400, problem, i);
@@ -149,7 +162,7 @@ final class OrderRoutes {
         }
         try {
             Users.Principal who = Router.user(ex);
-            OrderStore.Order order = orders.place(server, stash, lines, names, who.id(), who.name());
+            OrderStore.Order order = orders.place(server, stash, lines, names, repairAll, who.id(), who.name());
             JsonObject out = Http.ok();
             out.add("order", shown(ex, order.toJson()));
             Http.json(ex, 200, out);
@@ -416,6 +429,70 @@ final class OrderRoutes {
         JsonObject out = new JsonObject();
         out.addProperty("shulkers", shulkers);
         out.add("lines", outLines);
+        JsonObject repair = repairResult(r.get("repair"));
+        if (repair != null) out.add("repair", repair);
+        return out;
+    }
+
+    /**
+     * result.repair (PROTOCOL.md, "Additions: repair with XP bottles"): {bottlesUsed, repaired, partial: [{key, damage,
+     * maxDamage}], skipped: [{key, reason}]}. Null/absent = none. Entries past 400 are dropped, reasons cut to 60.
+     */
+    static JsonObject repairResult(JsonElement e) {
+        if (e == null || e.isJsonNull()) return null;
+        if (!e.isJsonObject()) throw new IllegalArgumentException("result.repair must be an object or null");
+        JsonObject r = e.getAsJsonObject();
+        long used = r.has("bottlesUsed") && !r.get("bottlesUsed").isJsonNull() ? nonNegativeInt(r.get("bottlesUsed")) : 0;
+        long repaired = r.has("repaired") && !r.get("repaired").isJsonNull() ? nonNegativeInt(r.get("repaired")) : 0;
+        if (used < 0 || repaired < 0) throw new IllegalArgumentException("result.repair.bottlesUsed and repaired must be whole numbers >= 0");
+        JsonArray partial = new JsonArray();
+        JsonElement pe = r.get("partial");
+        if (pe != null && !pe.isJsonNull()) {
+            if (!pe.isJsonArray()) throw new IllegalArgumentException("result.repair.partial must be an array");
+            int n = 0;
+            for (JsonElement x : pe.getAsJsonArray()) {
+                if (n++ >= MAX_RESULT_LINES) break;
+                if (!x.isJsonObject()) throw new IllegalArgumentException("result.repair.partial entries must be objects");
+                JsonObject p = x.getAsJsonObject();
+                String key = AddonRoutes.string(p, "key");
+                long damage = nonNegativeInt(p.get("damage"));
+                boolean hasMax = p.has("maxDamage") && !p.get("maxDamage").isJsonNull();
+                long maxDamage = hasMax ? nonNegativeInt(p.get("maxDamage")) : 0;
+                if (key == null || key.isEmpty() || damage < 0 || maxDamage < 0) {
+                    throw new IllegalArgumentException("result.repair.partial entries need key, damage and maxDamage");
+                }
+                JsonObject po = new JsonObject();
+                po.addProperty("key", Http.truncate(key, MAX_KEY));
+                po.addProperty("damage", damage);
+                if (hasMax) po.addProperty("maxDamage", maxDamage);
+                partial.add(po);
+            }
+        }
+        JsonArray skipped = new JsonArray();
+        JsonElement se = r.get("skipped");
+        if (se != null && !se.isJsonNull()) {
+            if (!se.isJsonArray()) throw new IllegalArgumentException("result.repair.skipped must be an array");
+            int n = 0;
+            for (JsonElement x : se.getAsJsonArray()) {
+                if (n++ >= MAX_RESULT_LINES) break;
+                if (!x.isJsonObject()) throw new IllegalArgumentException("result.repair.skipped entries must be objects");
+                JsonObject s = x.getAsJsonObject();
+                String key = AddonRoutes.string(s, "key");
+                String reason = AddonRoutes.string(s, "reason");
+                if (key == null || key.isEmpty() || reason == null) {
+                    throw new IllegalArgumentException("result.repair.skipped entries need key and reason");
+                }
+                JsonObject so = new JsonObject();
+                so.addProperty("key", Http.truncate(key, MAX_KEY));
+                so.addProperty("reason", Http.truncate(reason, Repair.MAX_REASON));
+                skipped.add(so);
+            }
+        }
+        JsonObject out = new JsonObject();
+        out.addProperty("bottlesUsed", used);
+        out.addProperty("repaired", repaired);
+        out.add("partial", partial);
+        out.add("skipped", skipped);
         return out;
     }
 }

@@ -1,5 +1,6 @@
 package com.porter.qwerte.printer.loop;
 
+import com.porter.qwerte.printer.materials.MaterialPolicy;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -86,16 +87,21 @@ public final class PrintLoop {
      *                         was cut short, note clicks still to send, another module's shulker session
      * @param orderWait        what a stash order is still being waited for, as a phrase ("the order from stash X"), or null
      * @param orderProblem     why stash orders can't help right now (not logged in, not allowed, nothing to order from), or null
+     * @param layerHold        non-null when nothing is left to build inside Litematica's render layers but blocks remain outside them:
+     *                         the message to pause with (the run does not end; it resumes when the layers change)
+     * @param disableWhenOut   the setting {@code disable-when-out-of-materials}: when nothing can supply a missing item, turn the module
+     *                         off instead of pausing until the item turns up
      */
     public record Obs(boolean worldChanged, boolean cancelled, boolean loaded, String loadError, boolean scanDone, int pending,
                       int wrongPending, String wrongInfo, boolean breaking, Wrong wrongMode, boolean placeable, boolean walkTarget,
                       boolean lacking, String lackingInfo, boolean supplyPossible, boolean resupplyActive, String resupplyFailed,
-                      boolean sessionActive, boolean inventoryFull, boolean baritoneBusy, boolean canWalk, boolean waiting, String orderWait, String orderProblem) {
+                      boolean sessionActive, boolean inventoryFull, boolean baritoneBusy, boolean canWalk, boolean waiting, String orderWait, String orderProblem,
+                      boolean disableWhenOut, String layerHold) {
 
         /** A quiet observation to build tests and the first tick from. */
         public static Obs idle() {
             return new Obs(false, false, false, null, false, 0, 0, null, false, Wrong.SKIP_AND_LIST, false, false, false, null, true,
-                false, null, false, false, false, true, false, null, null);
+                false, null, false, false, false, true, false, null, null, false, null);
         }
     }
 
@@ -109,7 +115,10 @@ public final class PrintLoop {
     /** Ticks a failed resupply waits before it is tried again. */
     public static final int RESUPPLY_RETRY = 600;
 
-    private enum Pause { NONE, WRONG, BARITONE, WALK_OFF, FULL, NO_SOURCE, RESUPPLY_FAILED, AWAITING_ORDER }
+    private enum Pause { NONE, WRONG, BARITONE, WALK_OFF, FULL, NO_SOURCE, RESUPPLY_FAILED, AWAITING_ORDER, STUCK, LAYER }
+
+    /** The start of the pause message for blocks that can't be built right now; the module lists the cells when it sees it. */
+    public static final String STUCK_PREFIX = "Stuck: ";
 
     private final int verifyTicks, retries;
     private Phase phase = Phase.IDLE;
@@ -235,6 +244,10 @@ public final class PrintLoop {
     private Step build(Obs o) {
         if (!planned) return none();
 
+        if (o.pending() == 0 && o.wrongPending() == 0 && !o.breaking() && waiting.isEmpty() && !o.sessionActive() && !o.resupplyActive() && !o.waiting()
+                && o.layerHold() != null) {
+            return pause(Pause.LAYER, o.layerHold());
+        }
         if (o.pending() == 0 && o.wrongPending() == 0 && !o.breaking() && waiting.isEmpty() && !o.sessionActive() && !o.resupplyActive() && !o.waiting()) {
             return end(Phase.DONE, Act.FINISH, Level.INFO, "Finished: everything that can be built is built.");
         }
@@ -253,6 +266,10 @@ public final class PrintLoop {
         if (phase == Phase.RESUPPLYING) phase = Phase.BUILDING;
 
         if (o.resupplyFailed() != null) {
+            if (MaterialPolicy.decide(o.disableWhenOut(), false, o.supplyPossible(), true, o.orderWait() != null) == MaterialPolicy.Outcome.DISABLE) {
+                return end(Phase.STOPPED, Act.ABORT, Level.WARN, "Could not get the materials: " + o.resupplyFailed()
+                    + " disable-when-out-of-materials is on, so the Printer turns off.");
+            }
             retryAt = now + RESUPPLY_RETRY;
             return pause(Pause.RESUPPLY_FAILED, "Could not get the materials: " + o.resupplyFailed()
                 + " Add them to a source or your inventory; it tries again in " + RESUPPLY_RETRY / 20 + " seconds."
@@ -306,6 +323,10 @@ public final class PrintLoop {
                 if (now < retryAt) return none();
                 return resumed(wasPaused, new Step(Act.RESUPPLY, Level.INFO, null));
             }
+            if (MaterialPolicy.decide(o.disableWhenOut(), false, false, false, o.orderWait() != null) == MaterialPolicy.Outcome.DISABLE) {
+                return end(Phase.STOPPED, Act.ABORT, Level.WARN, "Out of " + what + " and nothing can supply it"
+                    + (o.orderProblem() == null ? "" : " (" + o.orderProblem() + ")") + ". disable-when-out-of-materials is on, so the Printer turns off.");
+            }
             if (o.orderWait() != null) {
                 return pause(Pause.AWAITING_ORDER, "Out of " + what + ". Waiting for " + o.orderWait()
                     + ": collect the delivery and put it in your inventory. Printing resumes by itself.");
@@ -323,13 +344,16 @@ public final class PrintLoop {
             stuck = 0;
             return resumed(wasPaused, none());
         }
+        // Stuck is a pause, not an end: it says so once and goes on by itself when something becomes placeable or walkable
+        if (phase == Phase.PAUSED && pause == Pause.STUCK) return none();
         if (wasPaused) {
             phase = Phase.BUILDING;
             pause = Pause.NONE;
         }
         if (++stuck >= STUCK_TICKS) {
-            return end(Phase.DONE, Act.FINISH, Level.WARN, "Stopped: " + o.pending() + " cell(s) can't be built right now (nothing to place against,"
-                + " blocked, or not loaded). They are listed below.");
+            return pause(Pause.STUCK, STUCK_PREFIX + o.pending() + " cell(s) can't be built right now (nothing to place against, blocked, or not loaded);"
+                + " the Printer stays on and tries again."
+                + " Turn it off yourself if you don't want to wait.");
         }
         return none();
     }
@@ -339,7 +363,9 @@ public final class PrintLoop {
         phase = Phase.BUILDING;
         pause = Pause.NONE;
         if (step.msg() != null) return step;
-        return new Step(step.act(), Level.INFO, "Printing resumed.");
+        // Only when work actually starts; leaving a pause because something else is going on says nothing
+        boolean work = step.act() == Act.PLACE || step.act() == Act.WALK || step.act() == Act.RESUPPLY || step.act() == Act.SKIP_WRONG || step.act() == Act.BREAK_WRONG;
+        return work ? new Step(step.act(), Level.INFO, "Printing resumed.") : step;
     }
 
     private Step pause(Pause why, String msg) {

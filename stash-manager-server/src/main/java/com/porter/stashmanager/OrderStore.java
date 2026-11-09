@@ -40,7 +40,12 @@ final class OrderStore {
     static final Set<String> FINISHED = Set.of("delivered", "failed", "cancelled");
     private static final SecureRandom RANDOM = new SecureRandom();
 
-    record Line(String type, String key, long count) {
+    /** repair: the line's "Repair" toggle (PROTOCOL.md, "Additions: repair with XP bottles"). */
+    record Line(String type, String key, long count, boolean repair) {
+        Line(String type, String key, long count) {
+            this(type, key, count, false);
+        }
+
         String ref() {
             return type + ":" + key;
         }
@@ -64,6 +69,8 @@ final class OrderStore {
         String stash;
         List<Line> lines;
         JsonObject names; // normalized (see normalizeNames), or null for no naming
+        boolean repairAll; // the cart-wide "Repair all items" switch
+        JsonObject repairEstimate; // computed at placement; null when no line is wanted for repair
         long createdAt;
         long updatedAt;
         String status;
@@ -88,10 +95,13 @@ final class OrderStore {
                 lo.addProperty("type", l.type);
                 lo.addProperty("key", l.key);
                 lo.addProperty("count", l.count);
+                if (l.repair) lo.addProperty("repair", true);
                 ls.add(lo);
             }
             o.add("lines", ls);
             o.add("names", names == null ? null : names.deepCopy());
+            o.addProperty("repairAll", repairAll);
+            o.add("repairEstimate", repairEstimate == null ? com.google.gson.JsonNull.INSTANCE : repairEstimate.deepCopy());
             o.addProperty("createdAt", createdAt);
             o.addProperty("updatedAt", updatedAt);
             o.addProperty("status", status);
@@ -121,8 +131,11 @@ final class OrderStore {
             r.lines = new ArrayList<>();
             for (JsonElement e : o.getAsJsonArray("lines")) {
                 JsonObject l = e.getAsJsonObject();
-                r.lines.add(new Line(l.get("type").getAsString(), l.get("key").getAsString(), l.get("count").getAsLong()));
+                r.lines.add(new Line(l.get("type").getAsString(), l.get("key").getAsString(), l.get("count").getAsLong(),
+                    l.has("repair") && l.get("repair").isJsonPrimitive() && l.get("repair").getAsBoolean()));
             }
+            r.repairAll = o.has("repairAll") && o.get("repairAll").isJsonPrimitive() && o.get("repairAll").getAsBoolean();
+            r.repairEstimate = o.has("repairEstimate") && o.get("repairEstimate").isJsonObject() ? o.getAsJsonObject("repairEstimate") : null;
             // "note" from orders stored before notes were removed is dropped here and never written again.
             try {
                 r.names = normalizeNames(o.get("names"));
@@ -258,6 +271,12 @@ final class OrderStore {
     /** The same, recording who placed it (byId null: unknown, counted as the owner's). */
     Order place(String server, String stash, List<Line> requested, JsonObject names, String byId, String byName)
         throws OrderException, IOException {
+        return place(server, stash, requested, names, false, byId, byName);
+    }
+
+    /** The same with the cart-wide repair switch (repairAll) and the lines' own repair flags. */
+    Order place(String server, String stash, List<Line> requested, JsonObject names, boolean repairAll, String byId, String byName)
+        throws OrderException, IOException {
         if (requested.isEmpty()) throw new OrderException(400, "an order needs at least one line", -1);
         if (requested.size() > MAX_LINES) throw new OrderException(400, "at most " + MAX_LINES + " lines", -1);
         IndexStore.OrderCounts counts = index.orderCounts(server, stash);
@@ -273,7 +292,7 @@ final class OrderStore {
                 merged.put(l.ref(), l);
                 firstIndex.put(l.ref(), i);
             } else {
-                merged.put(l.ref(), new Line(l.type, l.key, prev.count + l.count));
+                merged.put(l.ref(), new Line(l.type, l.key, prev.count + l.count, prev.repair || l.repair));
             }
         }
 
@@ -304,6 +323,8 @@ final class OrderStore {
             o.stash = stash;
             o.lines = new ArrayList<>(merged.values());
             o.names = names == null ? null : names.deepCopy();
+            o.repairAll = repairAll;
+            o.repairEstimate = repairEstimate(o.lines, repairAll, counts, bottlesAvailable(counts, reserved));
             o.createdAt = now;
             o.updatedAt = now;
             o.status = "pending";
@@ -315,6 +336,44 @@ final class OrderStore {
             save(b);
             return o;
         }
+    }
+
+    /** Bottles o' Enchanting in the index minus what open orders reserve (the cart estimate's "in stash"). */
+    static long bottlesAvailable(IndexStore.OrderCounts counts, Map<String, Long> reserved) {
+        if (counts == null) return 0;
+        long total = counts.total("item", Repair.BOTTLE_KEY);
+        if (total < 0) return 0;
+        return Math.max(0, total - reserved.getOrDefault("item:" + Repair.BOTTLE_KEY, 0L));
+    }
+
+    /**
+     * The repair estimate stored with an order (PROTOCOL.md): null when no line is wanted for repair, else
+     * {needed, available, short, lines: [{key, count, repairable, reason, bottles}]} with one entry per wanted line.
+     */
+    static JsonObject repairEstimate(List<Line> lines, boolean repairAll, IndexStore.OrderCounts counts, long available) {
+        JsonArray out = new JsonArray();
+        long needed = 0;
+        for (Line l : lines) {
+            if (!l.type.equals("item")) continue;
+            Repair.Info info = counts.repair(l.key);
+            if (!(l.repair || (repairAll && info.damaged()))) continue;
+            long bottles = info.repairable() ? Math.min(l.count * info.bottles(), Integer.MAX_VALUE) : 0;
+            needed += bottles;
+            JsonObject lo = new JsonObject();
+            lo.addProperty("key", l.key);
+            lo.addProperty("count", l.count);
+            lo.addProperty("repairable", info.repairable());
+            lo.addProperty("reason", info.reason());
+            lo.addProperty("bottles", bottles);
+            out.add(lo);
+        }
+        if (out.isEmpty()) return null;
+        JsonObject e = new JsonObject();
+        e.addProperty("needed", needed);
+        e.addProperty("available", available);
+        e.addProperty("short", available < needed);
+        e.add("lines", out);
+        return e;
     }
 
     /**
@@ -331,6 +390,7 @@ final class OrderStore {
         if (b == null) throw new OrderException(404, "no such order", -1);
         List<Line> lines;
         JsonObject names;
+        boolean repairAll;
         Order old;
         synchronized (b) {
             old = find(b, id);
@@ -346,10 +406,11 @@ final class OrderStore {
             old.retriedAs = PENDING;
             lines = new ArrayList<>(old.lines);
             names = old.names;
+            repairAll = old.repairAll;
         }
         Order again;
         try {
-            again = place(b.server, b.stash, lines, names, byId, byName);
+            again = place(b.server, b.stash, lines, names, repairAll, byId, byName);
         } catch (OrderException | IOException | RuntimeException e) {
             synchronized (b) {
                 if (PENDING.equals(old.retriedAs)) old.retriedAs = null;
@@ -504,6 +565,7 @@ final class OrderStore {
         }
         available.add("items", items);
         available.add("shulkers", shulkers);
+        available.addProperty("bottles", bottlesAvailable(counts, reserved));
         out.add("available", available);
         return out;
     }

@@ -167,6 +167,13 @@
                 <div class="names-warn" id="names-warn" role="status" hidden></div>
                 <div class="note" id="craft-info" role="status" hidden></div>
               </fieldset>
+              <fieldset class="names-box repair-box" id="repair-box">
+                <legend class="names-legend">Repair</legend>
+                <label class="unset user-check" for="repair-all"><input type="checkbox" id="repair-all"> Repair all items</label>
+                <div class="note">Only items with Mending are repaired, using Bottles o' Enchanting from the stash. Tick "Repair" on a single line to repair just that item.</div>
+                <div class="note" id="repair-info" role="status" hidden></div>
+                <div class="names-warn" id="repair-warn" role="status" hidden></div>
+              </fieldset>
               <div class="cart-actions">
                 <button type="button" class="mc-button" id="cart-place">Place order</button>
                 <button type="button" class="mc-button danger" id="cart-clear">Clear cart</button>
@@ -182,6 +189,48 @@
             <button type="button" class="mc-button small" id="orders-clear" disabled>Clear history</button>
           </div>
           <div id="order-list"></div>
+        </section>
+      </div>
+
+      <div class="view view-kits" id="view-kits" hidden>
+        <section class="inset kits-chest-box">
+          <div class="section-title">Kits chest</div>
+          <div class="kits-banner" id="kits-banner" role="status" hidden></div>
+          <div class="kits-chest-row">
+            <select id="kits-chest" class="mc-select" aria-label="Kits chest" disabled></select>
+            <button type="button" class="mc-button small" id="kits-chest-clear" disabled>Clear</button>
+          </div>
+          <div class="hint" id="kits-chest-info"></div>
+        </section>
+        <section class="inset kits-scoring">
+          <div class="section-title">Kit scoring</div>
+          <div class="hint">The bot scores every shulker box: points for a name with &ldquo;kit&rdquo; in it, a mix of different useful items, all 27 slots filled, and OP items (totems, crystals, elytra and so on). A box with at least the threshold in points is a kit. A part-filled box of one item is never a kit.</div>
+          <div class="kits-sc-row">
+            <label class="kits-sc-field">Threshold <input id="kits-sc-threshold" class="mc-input" type="number" min="1" max="40" step="1" inputmode="numeric" disabled></label>
+            <label class="kits-sc-field">Name <input id="kits-sc-name" class="mc-input" type="number" min="0" max="10" step="1" inputmode="numeric" disabled></label>
+            <label class="kits-sc-field">Mix <input id="kits-sc-mix" class="mc-input" type="number" min="0" max="10" step="1" inputmode="numeric" disabled></label>
+            <label class="kits-sc-field">Full <input id="kits-sc-full" class="mc-input" type="number" min="0" max="10" step="1" inputmode="numeric" disabled></label>
+            <label class="kits-sc-field">OP <input id="kits-sc-op" class="mc-input" type="number" min="0" max="10" step="1" inputmode="numeric" disabled></label>
+            <label class="kits-sc-field">OP items needed <input id="kits-sc-opMin" class="mc-input" type="number" min="1" max="1728" step="1" inputmode="numeric" disabled></label>
+          </div>
+          <div class="hint" id="kits-sc-max"></div>
+          <div class="kits-chest-row">
+            <button type="button" class="mc-button small" id="kits-sc-save" disabled>Save</button>
+            <button type="button" class="mc-button small" id="kits-sc-reset" disabled>Reset to defaults</button>
+          </div>
+          <div class="hint">The bots re-score every box on their next pass after you save.</div>
+        </section>
+        <section class="inset kits-list">
+          <div class="section-title">Kits</div>
+          <div class="hint">Every kit the bot found, with its score. Unnamed kits always go to the kits chest. Name a shulker (like &ldquo;PvP Kit&rdquo;) and you can give that name its own chest. The chests you pick hold nothing but kits.</div>
+          <div class="kits-scroll">
+            <table class="kits-table">
+              <thead><tr><th>Kit</th><th>Count</th><th>Where it is now</th><th>Goes to</th><th>Status</th><th>Chest</th></tr></thead>
+              <tbody id="kits-rows"></tbody>
+            </table>
+          </div>
+          <div class="hint" id="kits-empty" hidden></div>
+          <div class="hint" id="kits-count"></div>
         </section>
       </div>
     </main>

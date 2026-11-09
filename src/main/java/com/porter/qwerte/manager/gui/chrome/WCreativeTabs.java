@@ -36,6 +36,7 @@ public class WCreativeTabs extends WPressable {
         Map.entry("op_blocks", new String[] {"Operator Utilities", "minecraft:command_block"}),
         Map.entry("other", new String[] {"Other", "minecraft:chest"}),
         Map.entry("shulkers", new String[] {"Shulkers", "minecraft:shulker_box"}),
+        Map.entry("kits", new String[] {"Kits", "minecraft:purple_shulker_box"}),
         Map.entry("orders", new String[] {"Orders", "minecraft:writable_book"}));
 
     private static final int GAP = 1;
@@ -99,8 +100,14 @@ public class WCreativeTabs extends WPressable {
         left = new double[n];
         double xx = 0;
         int ordersIndex = ids.indexOf(IndexModel.TAB_ORDERS);
+        int kitsIndex = ids.indexOf(IndexModel.TAB_KITS);
         for (int i = 0; i < n; i++) {
-            if (i == ordersIndex) left[i] = Math.max(xx, avail - tabW);
+            // Kits sits right before Orders at the right end
+            if (i == kitsIndex && ordersIndex >= 0) {
+                left[i] = Math.max(xx, avail - 2 * tabW - GAP * u);
+                xx = left[i] + pitch;
+            }
+            else if (i == ordersIndex) left[i] = Math.max(xx, avail - tabW);
             else {
                 left[i] = xx;
                 xx += pitch;

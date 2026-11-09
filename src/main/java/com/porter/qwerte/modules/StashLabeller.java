@@ -66,6 +66,16 @@ final class StashLabeller {
 
         boolean keepWholeExists();
 
+        /** The kits chest or the chest of a kit rule (kit sorting): never given a new category sign. */
+        default boolean kitReserved(Box box) {
+            return false;
+        }
+
+        /** A kit shulker with a chest of its own (kit sorting): never homeless, and never gets a new category. */
+        default boolean kitRouted(ItemStack stack) {
+            return false;
+        }
+
         int misplacedCount(Box box);
 
         boolean signPending(Box box);
@@ -482,6 +492,7 @@ final class StashLabeller {
         Map<String, Group> groups = new HashMap<>();
         for (ItemStack stack : sources) {
             if (stack.is(ItemTags.SIGNS)) continue;
+            if (owner.kitRouted(stack)) continue;
             ItemStack subject = labelSubject(stack);
             if (owner.mixedShulker(stack) && owner.keepWholeExists()) continue;
 
@@ -555,7 +566,7 @@ final class StashLabeller {
         Stash stash = owner.stash();
         Map<Box, Containers.Face> out = new LinkedHashMap<>();
         for (Box b : stash.boxes) {
-            if (!b.sortable() || b.dropOff || b.labelFailed || !b.labels.isEmpty() || b.autoLabel != null) continue;
+            if (!b.sortable() || b.dropOff || b.labelFailed || !b.labels.isEmpty() || b.autoLabel != null || owner.kitReserved(b)) continue;
             if (owner.signPending(b) || owner.rereadPending(b)) continue;
 
             boolean empty = true;

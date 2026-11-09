@@ -10,7 +10,7 @@ Qwerte adds nine modules to [Meteor Client](https://meteorclient.com):
   never places dirt on top of dirt, and restocks its own dirt. With Baritone installed it can also walk to uncovered
   ground by itself.
 - **Stash Sorter** sorts the chests and barrels around you, either into tiers or by the signs on them. It repacks
-  mixed shulkers, merges partial stacks, empties drop-off chests, builds saved kits and can be searched. Want it on a
+  mixed shulkers, merges partial stacks, empties drop-off chests, builds saved kits, sends kit shulkers to their own chests and can be searched. Want it on a
   proxy bot instead?
   See [Stash Sorter for AquariusProxy](https://github.com/Qwertze/Stash-Sorter).
 - **Stash Overlay** shows what each container in a saved stash mostly holds, as an item icon on the container.
@@ -192,13 +192,16 @@ needs a free spot beside you on solid ground with air above, and a pickaxe in th
 
 Named shulkers are never taken apart. To keep kits whole, sign a chest `Kits` (or `Mixed Shulkers`): mixed shulkers
 then go there as they are instead of being repacked. A chest signed `Shulkers` is just for shulkers that don't belong
-anywhere else, and doesn't stop repacking.
+anywhere else, and doesn't stop repacking. Kit shulkers that have a chest under kit sorting are kept whole as well (see
+Kit sorting below).
 
 Once everything is in place, partial stacks of the same item in each container are merged ("downstacked"), so a
 chest with three stacks of 20 cobblestone ends up with one of 60.
 
 #### Kits
-A kit is a set of items packed together in one shulker, slot for slot with the same counts, like a PvP kit.
+A kit is a set of items packed together in one shulker, slot for slot with the same counts, like a PvP kit. These are the
+saved kits that `build-kits` builds. To send kit shulkers that are already in your stash to their own chests, see
+[Kit sorting](#kit-sorting) below.
 
 - **Saving:** put the kit in your 27 main inventory slots (not the hotbar, offhand or armor), type a name in the **Kits**
   section of the module's settings and press **Save kit**. The name needs letters or numbers, must be unique on the
@@ -221,6 +224,42 @@ A kit is a set of items packed together in one shulker, slot for slot with the s
   chest, is treated as an ordinary bulk shulker.
 - Each step makes up to two inventory clicks, then waits `delay` ticks. Raise `delay` if the server complains about
   clicks.
+
+#### Kit sorting
+New in 0.4.0-dev.14 and not tested in game yet. With the `kit-sorting` setting on (the default), a shulker box that scores
+as a kit goes to a chest you pick on the [Stash Manager](#stash-manager) website or in the Stash Window's Kits tab, and
+the sorter moves it there when it finds it somewhere else.
+
+- **The score.** Each shulker box gets points: `name` 2 for a custom name with the word "kit" or "kits" (a whole word:
+  "PvP Kit" and "kit_3" count, "Kitchen", "Toolkit" and "Kitsune" don't); `mix` 3 for a group of useful items from the
+  shared `kit-items.json` table (for example three pieces of gear, or five wool colours); `full` 1 when all 27 slots are
+  filled; and `op` 4 when the box holds at least `opMin` OP items (3 by default), counted per item by stack count (3
+  totems, or a sword and 2 god apples, qualify). A box is a kit when its total reaches the threshold (4 by default). A
+  part-filled box of one item is never a kit, and an empty box never is. Items are compared by their ids: enchantments,
+  potions, trims and names on the items don't matter, and a bundle counts as one item.
+- **Where kits go.** A named kit with a rule for its name goes to that rule's chest. Otherwise it goes to the kits chest,
+  and unnamed kits always go there. A kit with neither sorts exactly as before. So with no kits chest set, only kits with
+  a rule for their name change. A shulker that KitBuilder already routes (a finished or part-built kit, above) keeps
+  KitBuilder's routing.
+- **Kit-reserved chests.** The kits chest and every kit's chest hold only kits. Nothing else is sorted into them, and they
+  are left out of overflow, sign scoring, Tiers, compacting, repacking and auto-labelling. A put-back into one happens
+  only for a kit routed to it.
+- **Kits kept whole.** A kit with a target (a rule or the kits chest, including one that is missing right now) is never
+  unpacked, repacked or compacted. A kit with no target is repacked as before.
+- **Missing or full chests.** A chest that is missing or can't take kits (not read yet, excluded, a drop-off, unreachable)
+  gives the kit no destination: a kit already in the stash stays where it is, one from a drop-off or your inventory goes
+  to overflow, and you get one warning per kit and chest until the settings change. A full chest takes the normal path,
+  so kits in the stash move once it has room.
+- **Settings.** The bot takes its settings from the Stash Manager server: the kits chest, a chest per kit name, and the
+  points, threshold and `opMin`. It keeps the last ones it received in `meteor-client/qwerte/kit-settings.json`, so it
+  keeps routing while the server is offline. Settings that fail their check are ignored, and a warning is logged once.
+- **Off.** Turn `kit-sorting` off to sort kits like any other shulker box. Nothing about kits is sent to the server then,
+  and the saved settings are kept.
+- **A consequence of the defaults.** A full box of one OP item, for example 27 totems (the way the compactor may make
+  them), is a kit. Once a kits chest is set, it goes there. Raise the threshold, or set `op` to 0, to keep those boxes in
+  their item chests.
+- The settings and the report travel in the [stash-manager](#stash-manager) module's heartbeat, so that module needs to be
+  on, with `server-url` and `api-key` set and a stash loaded. Without it the bot has no kit settings and sorts kits as before.
 
 #### Excluded and drop-off containers
 - Set `pick` to **Exclude** and right-click containers it should never sort into or out of. Right-click again to undo.
@@ -366,7 +405,7 @@ New in 0.4.0-dev and still being tested.
 - Optionally turn on `connect-to-server`, set `server-url` and log in to see the stash of your Stash Manager server with
   your website account's permissions. Plain `http://` outside your own network is refused unless `allow-insecure-http` is on.
 - With a server connected, the window also has the server's pages, each shown only when your account's permissions allow
-  it: Orders, Live, Build Planner, Bots, Activity, Proxy, Console and Settings. Settings holds the bot settings, your
+  it: Kits, Orders, Live, Build Planner, Bots, Activity, Proxy, Console and Settings. Settings holds the bot settings, your
   account and, for the owner, the Users list; the bot settings show one section at a time, picked from a drop-down. The
   palette button in the header opens Settings > Appearance, where the window's themes are. The Build Planner works from
   your game's `schematics` folder (or an uploaded file) and can order a build's materials part by part.
@@ -387,6 +426,11 @@ New in 0.4.0-dev and still being tested.
   header to maximize it. Its place and size are remembered. It follows Minecraft's GUI scale (`window-scale` in the module
   overrides that; Meteor's own GUI scale does not apply to it) and uses the game's font, at about the website's size next to
   the slots (`window-text-scale`: Auto, Small, Normal or Large).
+- **Kits** (New in 0.4.0-dev.14 and not tested in game yet; needs `view`, and not shown to a user the owner forced into
+  streamer mode): the kits chest picker, a chest per kit name, a table of every kit the bot found with its score and
+  status, and the kit scoring editor (threshold, the four points and "OP items needed"). Changing a setting needs the
+  `settings` permission. The window's streamer mode shows kits as "Kit 1" and chests as "Chest 1" with no labels or
+  coordinates. See [Kit sorting](#kit-sorting).
 - `window-theme` (or the palette button in the header, which opens Settings > Appearance) picks its colours: Classic (the default), Modern, Light, Dark,
   Midnight, High contrast or Mac, the same palettes as the website. Classic matches the website's default.
 - The session token of a server login is stored in plain text in Meteor's `modules.nbt`. Do not share your `meteor-client`
@@ -457,6 +501,16 @@ what is missing, leaves the blocks that are already right alone, and lists what 
     `mirror`.
 - Litematica is optional. Qwerte reads it by reflection, so it is not a dependency. Without it, or when a placement's own
   file can't be read, the file named in `file-name` is read with the settings above.
+- `chat-messages` (off by default; in the General group): lets the Printer write to the chat. Off, it sends no chat line at
+  all (progress, warnings, errors, the stash order lines, Meteor's "toggled" line); everything is still written to the
+  game log.
+- Litematica's **render layers** are respected (single layer, all above, all below, layer range, on any axis). Only blocks
+  inside the current range are placed, counted, planned for and ordered; the range is read again every 5 ticks, so a change
+  applies while the Printer runs: blocks that fall outside leave the build, blocks that come inside join it. Without
+  Litematica, or with a `.litematic` file read by this module's own position, there is no filter. When every block inside
+  the range is built, the Printer pauses with "Layer done: move Litematica's render layer to continue" and resumes when the
+  layer changes. The same pause comes at the start when the range holds nothing to build. A failed read keeps the last
+  range that was read (everything is built until one has been read), is tried again 5 seconds later, and is logged once.
 - `file-name` is a path below the game's `schematics` folder. The `.litematic` ending is added when you leave it out, and
   any other extension is refused. Up to two subfolders, at most 128 characters. Refused: control characters, `: \ < > " | ? *`,
   a leading `/`, `.` or `..` parts, names that start or end with a space or end with a dot, Windows device names (such as
@@ -473,7 +527,9 @@ what is missing, leaves the blocks that are already right alone, and lists what 
 - Supported: full blocks; logs, pillars and chains; furnaces and other facing blocks (anvils, campfires, decorated pots,
   pumpkins, glazed terracotta, chiseled bookshelves, ender chests, looms, stonecutters, lecterns, beehives); pistons,
   droppers, dispensers, barrels, observers; hoppers; shulker boxes; stairs; slabs; trapdoors; doors; fence gates; beds;
-  buttons, levers and grindstones; torches; signs, banners and skulls (standing and on walls); ladders; hanging lanterns;
+  buttons, levers and grindstones (on floors, walls and ceilings); torches, including every wall torch (torch, redstone,
+  soul, copper); signs, banners and skulls (standing and on walls); wall hanging signs; ladders; tripwire hooks; wall coral
+  fans; cocoa pods; hanging lanterns;
   end rods and lightning rods; amethyst clusters; bells; repeaters; comparators; note blocks; daylight detectors; candles,
   sea pickles, turtle eggs and snow layers; single chests; carpets, pressure plates, rails, redstone wire and plants (placed
   on a block that holds them).
@@ -484,9 +540,26 @@ what is missing, leaves the blocks that are already right alone, and lists what 
 - Set by the game from its neighbours or redstone, so not set by the printer: stair shape, fence, wall, pane and bar
   connections, redstone wire connections and power, powered, lit and triggered states, leaf distance, crop age and the
   like. A rail whose shape doesn't match after placing is listed.
-- Skipped and listed, never placed: fluids; waterlogged blocks; fire; portals; bubble columns; vines, glow lichen and
-  sculk veins; pointed dripstone; cocoa; cauldrons; composters; respawn anchor charges; cake with bites; farmland and
-  dirt paths; command, structure and jigsaw blocks; piston heads and extended pistons; hanging signs; lily pads; double
+- **Stripped logs** (stripped logs, woods, stems, hyphae and bamboo blocks: any block that an axe makes from another). If you
+  carry the stripped item, it is placed as it is. Otherwise the unstripped block is placed with the wanted axis and an
+  axe is used on it right after, on the face toward you (the axe is moved into the hotbar by the same helper as the
+  building blocks, which never moves weapons, food or shulker boxes; with a shield in the off hand the game only strips
+  while you sneak, so the Printer sneaks for it). Without an axe the unstripped block is still placed, you get one
+  warning, and the log stays on a pending list: it is stripped as soon as you carry an axe and are in reach (the Printer
+  walks there with Baritone when nothing else is left). The Printer stays on for them only while an axe is carried and the log is loaded and within a time limit; otherwise the run
+  ends and the report lists the unstripped logs. An unstripped log
+  with the wanted axis is "right block, needs strip", never a wrong block. The table is vanilla's own
+  (`AxeItem.STRIPPABLES`).
+- **Waterlogged blocks.** `waterlog` (on): a block the schematic wants waterlogged is placed, then a water bucket from your
+  hotbar or inventory is used on it. The bucket is emptied by that. Without a bucket, or with `waterlog` off, the block is
+  placed dry and you get one warning for the run (and the count at the end). `refill-water-bucket` (off, shown with
+  `waterlog`): when an empty bucket is carried and a water source block is within reach, the water is picked up again for
+  the next block. It does not walk to water. Only a real water source block is used: never a waterlogged block, nor a cell
+  the schematic builds in. With `rotation-mode` None, waterlog and refill are skipped with one warning (a bucket needs a look).
+- Skipped and listed, never placed: fluids; fire; portals; bubble columns; vines, glow lichen and
+  sculk veins; pointed dripstone; cauldrons; composters; respawn anchor charges; cake with bites; farmland and
+  dirt paths; command, structure and jigsaw blocks; piston heads and extended pistons; hanging signs that hang from a
+  ceiling; lily pads; double
   chest halves; end portal frame eyes; unknown blocks and properties. Block-entity data is not copied (signs are placed
   blank, chests and shulker boxes empty), and entities are not placed.
 
@@ -505,7 +578,14 @@ what is missing, leaves the blocks that are already right alone, and lists what 
   **Snap** does the same rounded to 45 degrees; **None** never turns, so only blocks your current look already suits are
   placed.
 - `airplace` (on): a block may be placed against nothing, but only when no neighbour can be clicked.
-- `visible-faces-only` (off): only click a face with a clear line from your eyes to the spot.
+- `require-line-of-sight` (off; this was `visible-faces-only` before 0.4.0-dev.15, and the old saved value is dropped):
+  only click a face with a clear line from your eyes to the spot.
+- Leaving the schematic area (farther than your reach from every region) gives one warning per exit (in the game log, and in
+  chat only with `chat-messages`) and the Printer keeps
+  running: it only has nothing in reach to place. It walks back when `walk` is on, and places again when you are in reach.
+- When nothing can be built for 3 seconds (nothing to place against, blocked, or in unloaded chunks) the Printer pauses with
+  "Stuck: ..." and lists the first cells, and carries on by itself when something becomes placeable or walkable. It never
+  ends for that reason. Only "everything that can be built is built" ends the run.
 - `sneak-ticks` (2 by default, 1 to 6): ticks the sneak key is held before a click that needs it (a chest or door would
   otherwise open).
 - `action-delay` (3 ticks by default, 0 to 20): the wait between steps when fetching materials.
@@ -520,6 +600,11 @@ what is missing, leaves the blocks that are already right alone, and lists what 
 - **Pause**: stops until the block is gone, then carries on by itself.
 
 #### Materials
+- `disable-when-out-of-materials` (off): off, running out of an item never turns the Printer off: it skips the blocks it
+  has no item for, keeps placing the rest, and goes back to them when the item turns up (restock, stash delivery, ender
+  chest); with nothing else to do it pauses and resumes by itself. On, when an item is missing and no source and no
+  stash order can supply it (or a fetch just failed with no order open), the Printer turns itself off. Waiting for a stash
+  order is the same either way.
 - The inventory (main inventory and hotbar) is always a source. Items the build needs are moved to the hotbar when they
   are needed there.
 - `keep-foreign-items` (on): items that are not on the build list stay in their slots. Protected items (weapons, food,
@@ -616,8 +701,8 @@ Out of materials:
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) for Minecraft **1.21.11** or **1.21.4**.
 2. Put [Meteor Client](https://meteorclient.com) for the same Minecraft version in your `mods` folder.
 3. Download the `qwerte-addon` jar for your Minecraft version from the
-   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.4.0-dev.13.1`, see
-   [Dev builds](#dev-builds)): `qwerte-addon-0.4.0-dev.13.1+1.21.11.jar` or `qwerte-addon-0.4.0-dev.13.1+1.21.4.jar`. Put it
+   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.4.0-dev.14`, see
+   [Dev builds](#dev-builds)): `qwerte-addon-0.4.0-dev.14+1.21.11.jar` or `qwerte-addon-0.4.0-dev.14+1.21.4.jar`. Put it
    in your `mods` folder.
 4. *(Optional, for auto-walk and refilling)* Download `baritone-api-fabric-1.3.0-<minecraft>.jar` for your version from
    [dekrom's Baritone releases](https://github.com/dekrom/baritone/releases) (for example
@@ -702,6 +787,9 @@ around. The purple boxes are the blocks it's about to till.
 7. Turn on **stash-overlay** to see what each container holds.
 8. *(Optional)* To build kits, save them in the **Kits** section of the module's settings, put a chest signed with each
    kit's name, then turn on `build-kits` in Signs mode.
+9. *(Optional, not tested in game yet)* For kit sorting, link the addon to your Stash Manager server (see
+   `stash-manager` above), then pick a kits chest on the website or in the Stash Window's Kits tab, and a chest for any
+   kit name you want its own. `kit-sorting` is on by default.
 
 ## Settings reference
 
@@ -837,6 +925,7 @@ station. If you'd rather work hands-on, turn off `auto-walk`, `auto-water` and `
 | General | `walk` | off | Walk to containers out of reach with Baritone. |
 | General | `rotate` | on | Face containers when opening them. |
 | General | `unsigned-overflow` | on | Signs mode: items with nowhere to go, and no chest signed misc, other or overflow, go to a chest with no sign at all (one already in use first). Never a chest signed for something else. |
+| General | `kit-sorting` | on | Send shulker boxes that score as kits to the chests picked for them on the Stash Manager website or in the Stash Window's Kits tab (see Kit sorting). Off: kits sort like any shulker and nothing about kits is sent. The settings come from the Stash Manager server; the last ones it sent are kept while it is offline. |
 | General | `log-level` | Normal | Quiet: now/next lines, errors and alerts (alerts are also whispered to the whitelist). Normal: the usual messages. Debug: also why it decides what it does. Replaces `debug`. |
 | Bot | `stay-on` | off | Keep running after sorting, as a sorting bot. |
 | Bot | `recheck` | 30 | Seconds between drop-off checks (the shortest wait with `smart-recheck`). |
@@ -907,7 +996,7 @@ src/main/java/com/porter/qwerte/
 │   ├── AutoDirt.java         The auto-dirt module: covering ground with dirt
 │   ├── StashSorter.java      The stash-sorter module: sorting, kits, bot mode, picking, search
 │   ├── StashOverlay.java     The stash-overlay module: an icon of each container's main item
-│   ├── StashManager.java     The stash-manager module: sends the index to the Stash Manager server, takes its orders
+│   ├── StashManager.java     The stash-manager module: sends the index and the kit report to the Stash Manager server, takes its orders and kit settings
 │   ├── ResetPearl.java       The reset-pearl module: climbs out of a stasis chamber and re-arms it
 │   ├── StashWindow.java      The stash-window module: the in-game Stash Window and its local index
 │   ├── ContainerTweaks.java  The container-tweaks module: shulker previews and icons, Smart Shulker and Smart Echest
@@ -934,6 +1023,13 @@ src/main/java/com/porter/qwerte/
 │   ├── Containers.java       Where a container's signs can be, and what they say
 │   ├── Kit.java              A saved kit: 27 slots, and how to tell if a shulker is finished or part built
 │   ├── Kits.java             The saved kits of the current server, saved and loaded from disk
+│   ├── KitItems.java         The shared kit-items table (kit-items.json): the OP items and the item-mix groups
+│   ├── KitNames.java         Turns a shulker's custom name into a kit key, and says whether it is a kit
+│   ├── KitScore.java         The kit score of one shulker box: name, mix, full and OP points, and the threshold
+│   ├── KitRouting.java       Where a kit shulker goes: a name's chest, the kits chest, or normal sorting
+│   ├── KitSettings.java      One stash's kit settings from the Stash Manager server, checked whole (or refused)
+│   ├── KitStore.java         The kit settings kept per server and stash (kit-settings.json), for when the server is offline
+│   ├── KitReport.java        The kit report sent to the Stash Manager server: containers, kits and carried kits
 │   ├── Order.java            An order from the server: its lines, and the packer into shulker loads
 │   ├── Mending.java          Whether a stack has the Mending enchantment (by registry key)
 │   ├── RepairEstimate.java   The repair rules of the order contract: the formula, the reasons and the estimate
@@ -947,7 +1043,7 @@ src/main/java/com/porter/qwerte/
 │   ├── StashWatch.java       Notices other players' changes to containers and signs
 │   ├── ItemPreviewScreen.java  Shows a found item in a look-only container screen
 │   └── KitPreviewScreen.java   Shows a saved kit in a look-only container screen
-├── manager/                  The Stash Window: gui/ (the screen, tabs and widgets), model/ (its data and rules),
+├── manager/                  The Stash Window: gui/ (the screen, tabs such as KitsTab, and widgets), model/ (its data and rules, such as KitsModel),
 │                             net/ (the connection to the Stash Manager server), local/ (the local index and orders),
 │                             map/ (the live map)
 ├── pearl/                    Reset Pearl's parts: the chamber, the shaft scan, the trapdoor clicks and the sequence
@@ -955,11 +1051,15 @@ src/main/java/com/porter/qwerte/
 │   └── Orphans.java          The list of shulker boxes left behind (its format and checks), shared with the printer
 ├── printer/                  The printer's parts: pure logic (unit-tested) and the game-facing steps
 │   ├── schematic/            Reading .litematic files: the format, the reader and its limits, file names and transforms
-│   ├── source/               Where the schematic comes from: Litematica (by reflection), files, and block states from them
-│   ├── place/                How each block is placed: placement rules, look windows, build order, batching and the packet budget
-│   ├── materials/            What the build needs, and where it is fetched from (inventory, shulkers, containers, ender chest)
-│   ├── stash/                Stash orders: the low-stock rule, the stash picker, order batches and the order ledger
-│   └── loop/                 The printer's state machine: what to do next on each tick
+│   ├── source/               Where the schematic comes from: Litematica (by reflection, LitematicaBridge), files, block states,
+│                             and the render-layer filter (LayerFilter; LayerCache keeps the last range read)
+│   ├── place/                How each block is placed: placement rules (PlacementMapper, PropertyRules, StateClassifier), stripped
+│                             logs (StripRules, StripTable), waterlogging (WaterlogRules), look windows, build order, batching,
+│                             the packet budget, the area watch (AreaWatch) and the jobs that hold the end of a run (JobHold)
+│   ├── materials/            What the build needs, and where it is fetched from (inventory, shulkers, containers, ender chest),
+│                             and what happens when an item runs out (MaterialPolicy)
+│   ├── stash/                Stash orders: the low-stock rule, the stash picker, order batches, the order ledger and the chat text
+│   └── loop/                 The printer's state machine: what to do next on each tick, and why it pauses (PrintLoop)
 ├── craft/                    Crafting for stash-sorter: the recipes, the planner, and the table and anvil finders
 └── utils/
     ├── AutoHotbar.java       Keeps the items a module works with in the hotbar
@@ -988,7 +1088,8 @@ src/<minecraft>/java/com/porter/qwerte/compat/   (the same eleven files in src/1
 versions/<minecraft>.properties   Minecraft, Meteor and Baritone versions for each supported Minecraft version
 ```
 
-Shared code is in `src/main`. The little that differs between Minecraft versions is in `src/<minecraft>`, and only the
+Shared code is in `src/main`, and so is the shared kit-items table, `src/main/resources/kit-items.json` (the same file the
+ZenithProxy plugin uses). The little that differs between Minecraft versions is in `src/<minecraft>`, and only the
 folder for the version being built is compiled. The addon version, Fabric Loader and Loom versions live in
 `gradle/libs.versions.toml`.
 

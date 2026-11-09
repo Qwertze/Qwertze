@@ -100,6 +100,8 @@ public record StateSpec(
                 return Dir.DOWN;
             case WALL_OR_STANDING:
                 return f != null && f.horizontal() ? f.opposite() : null;
+            case COCOA:
+                return f != null && f.horizontal() ? f : null;
             case ATTACH_FACE: {
                 String face = props.get("face");
                 if ("floor".equals(face)) return Dir.DOWN;

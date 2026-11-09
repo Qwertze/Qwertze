@@ -53,6 +53,15 @@ public final class BrowseTab {
         default void openOrders() {
         }
 
+        /** True when the Kits tab is offered (a window with a server, an account that may view). */
+        default boolean kitsTab() {
+            return false;
+        }
+
+        /** The Kits tab of the creative tabs was clicked: show the Kits page. */
+        default void openKits() {
+        }
+
         /** True when right-clicking an item can put it in the order cart (for the hint under the grid). */
         default boolean cartEnabled() {
             return false;
@@ -115,6 +124,10 @@ public final class BrowseTab {
         page.tabs.onTab = id -> {
             if (IndexModel.TAB_ORDERS.equals(id)) {
                 host.openOrders();
+                return;
+            }
+            if (IndexModel.TAB_KITS.equals(id)) {
+                host.openKits();
                 return;
             }
             if (!id.equals(tab)) {
@@ -201,7 +214,7 @@ public final class BrowseTab {
         if (grid == null) return;
         dirty = false;
         IndexModel index = source.index();
-        List<String> ids = index.visibleTabs();
+        List<String> ids = index.visibleTabs(host.kitsTab());
         if (!ids.contains(tab)) tab = IndexModel.TAB_ALL;
         page.tabs.setTabs(ids, tab);
         page.label = IndexModel.TAB_ALL.equals(tab) ? "Search Items" : WCreativeTabs.nameOf(tab);

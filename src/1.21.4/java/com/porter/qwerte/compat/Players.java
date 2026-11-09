@@ -1,6 +1,7 @@
 package com.porter.qwerte.compat;
 
 import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 
 import static meteordevelopment.meteorclient.MeteorClient.mc;
 
@@ -23,5 +24,13 @@ public final class Players {
      */
     public static boolean isSpear(ItemStack stack) {
         return false;
+    }
+
+    /**
+     * The off hand holds something that makes an axe (or other tool) in the main hand pass while not sneaking. In this
+     * version that is a shield.
+     */
+    public static boolean blocksWithoutSneak(ItemStack stack) {
+        return stack.is(Items.SHIELD);
     }
 }

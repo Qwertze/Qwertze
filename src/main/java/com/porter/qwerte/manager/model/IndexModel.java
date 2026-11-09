@@ -392,6 +392,8 @@ public final class IndexModel {
     public static final String TAB_ALL = "all";
     public static final String TAB_SHULKERS = "shulkers";
     public static final String TAB_ORDERS = "orders";
+    /** The Kits page (server mode only): shown left of Orders. */
+    public static final String TAB_KITS = "kits";
 
     /** The creative tab ids in the website's order. */
     public static List<String> creativeTabs() {
@@ -403,12 +405,18 @@ public final class IndexModel {
      * when any filled ones exist, then Orders.
      */
     public List<String> visibleTabs() {
+        return visibleTabs(false);
+    }
+
+    /** As {@link #visibleTabs()}; {@code kits} adds the Kits tab before Orders (a window with a server, for an account that may view). */
+    public List<String> visibleTabs(boolean kits) {
         java.util.Set<String> present = new java.util.HashSet<>();
         for (Item item : items) present.add(item.tab());
         List<String> out = new ArrayList<>();
         out.add(TAB_ALL);
         for (String t : TABS) if (present.contains(t)) out.add(t);
         if (!shulkers.isEmpty()) out.add(TAB_SHULKERS);
+        if (kits) out.add(TAB_KITS);
         out.add(TAB_ORDERS);
         return out;
     }
