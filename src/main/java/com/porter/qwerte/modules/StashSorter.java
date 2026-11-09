@@ -577,7 +577,7 @@ public class StashSorter extends Module {
         Pattern.compile("^(\\w{3,16}) -> (?:me|you): (.+)$")
     };
 
-    private enum Job { Survey, Take, Deposit, Dump, Fetch, Clean, Fill, Compact, Deliver, Return, KitTake, KitUnpack, KitFill, FetchSigns, Label, Gather, Ground, Explore, Unbundle, Name, CraftTake, CraftUnpack, Craft, AnvilPlace, ChestPlace }
+    private enum Job { Survey, Take, Deposit, Dump, Fetch, Clean, Fill, Compact, Deliver, Return, KitTake, KitUnpack, KitFill, FetchSigns, Label, Gather, Ground, Explore, Unbundle, Name, CraftTake, CraftUnpack, Craft, AnvilPlace, ChestPlace, Repair }
 
     private enum Step { Walking, Opening, Working }
 
@@ -1568,6 +1568,12 @@ public class StashSorter extends Module {
         public Box deliveryChest(boolean verify) {
             return deliveryChestFor(verify);
         }
+
+        @Override
+        public void stopRepair() {
+            if (repairer.active()) repairer.abortNow();
+            if (job == Job.Repair) job = null;
+        }
     });
     private int collectedSlot = -1;
     private int seenKits;
@@ -1769,6 +1775,11 @@ public class StashSorter extends Module {
     private void teardown() {
         setUp = false;
         // An order stops where it is: its saved plan carries on at the next claim
+        // A repair in progress puts the bot's gear back first
+        if (repairer.active()) {
+            repairer.abortNow();
+            if (job == Job.Repair) job = null;
+        }
         orderRunner.reset();
 
         // A crafting table being made in the inventory's 2x2 grid: what is in the grid is taken back
@@ -1963,6 +1974,14 @@ public class StashSorter extends Module {
             return;
         }
         ticks++;
+        // Gear stowed for a repair that was cut short (death, disconnect, a crash) is put back as soon as it can be
+        if (!stash.repairGear.isEmpty() && mc.player != null && mc.player.tickCount > 40 && !repairer.active() && mc.screen == null
+            && mc.player.containerMenu == mc.player.inventoryMenu && mc.player.containerMenu.getCarried().isEmpty()) {
+            Repairer.undoGear(stash.repairGear);
+            stash.repairGear.clear();
+            stash.markDirty();
+            stash.save();
+        }
         // Whatever the sorter is doing, a skipped container whose time has come is made eligible again
         releaseDueSurveys();
         if (handle != null) lastOwnAct = ticks;
@@ -2065,6 +2084,10 @@ public class StashSorter extends Module {
         }
         if (job == Job.Name) {
             nameTick();
+            return;
+        }
+        if (job == Job.Repair) {
+            repairTick();
             return;
         }
         if (job == Job.Craft) {
@@ -3489,6 +3512,7 @@ public class StashSorter extends Module {
             case OrderRunner.Rename rename -> startName(rename);
             case OrderRunner.Craft craft -> startOrderCraft(craft);
             case OrderRunner.FindAnvil find -> startFindAnvil();
+            case OrderRunner.Repair repair -> startRepair(repair);
         };
     }
 
@@ -5326,6 +5350,78 @@ public class StashSorter extends Module {
         idle = false;
     }
 
+
+    // Repairing the order's items with XP bottles (Job.Repair). Not a container job: the items and bottles are already carried
+    private final Repairer repairer = new Repairer(new Repairer.Owner() {
+        @Override
+        public Set<Integer> carry() {
+            return ownedCarry();
+        }
+
+        @Override
+        public boolean calledOff() {
+            return orderRunner.calledOff() || !running();
+        }
+
+        @Override
+        public int delay() {
+            return StashSorter.this.delay.get();
+        }
+
+        @Override
+        public void saveGear(List<int[]> pairs) {
+            if (stash == null || (pairs.isEmpty() && stash.repairGear.isEmpty())) return;
+            stash.repairGear.clear();
+            stash.repairGear.addAll(pairs);
+            stash.markDirty();
+            stash.save();
+        }
+    });
+
+    private boolean startRepair(OrderRunner.Repair repair) {
+        repairer.start(repair.keys(), orderRunner.repairTicks(), orderRunner.repairRetries());
+        job = Job.Repair;
+        target = null;
+        handle = null;
+        actions = 0;
+        jobCounted = false;
+        stepTicks = 0;
+        startSigSet = endSigSet = false;
+        settled = false;
+        openPos = null;
+        openMenuBefore = null;
+        recoveries = 0;
+        swapStep = 0;
+        step("order: repairing items with XP bottles; next: build the shulker.");
+        return true;
+    }
+
+    private void repairTick() {
+        lastOwnAct = ticks;
+        if (!repairer.tick()) return;
+        repairEnd();
+    }
+
+    private void repairEnd() {
+        var outcome = repairer.outcome();
+        // What the repair changed in the carry slots (durability) is still the order's
+        if (mc.player != null) {
+            for (int slot : new ArrayList<>(orderHeld.keySet())) {
+                ItemStack now = mc.player.getInventory().getItem(slot);
+                ItemStack was = orderHeld.get(slot);
+                if (!now.isEmpty() && was != null && ItemStack.isSameItem(now, was)) {
+                    orderHeld.put(slot, now.copy());
+                    stashHeld.put(slot, now.copy());
+                }
+            }
+        }
+        job = null;
+        target = null;
+        wait = delay.get();
+        orderRunner.repairEnded(outcome);
+        version++;
+        idle = false;
+    }
 
     private boolean startName(OrderRunner.Rename rename) {
         String bad = anvilProblem();
@@ -7634,7 +7730,7 @@ public class StashSorter extends Module {
         }
 
         boolean busy = switch (job) {
-            case Survey, Clean, Fill, KitUnpack, KitFill, Label, Ground, Explore, Unbundle, Name, CraftUnpack, Craft, AnvilPlace, ChestPlace -> false;
+            case Survey, Clean, Fill, KitUnpack, KitFill, Label, Ground, Explore, Unbundle, Name, CraftUnpack, Craft, AnvilPlace, ChestPlace, Repair -> false;
             case FetchSigns -> labeller.fetchSignsOne(target, actions);
             case Gather -> compactor.gatherOne(target);
             case KitTake -> kitBuilder.takeOne(target);
@@ -9418,7 +9514,10 @@ public class StashSorter extends Module {
                     }
                     // A crafting table being gathered, crafted or placed is lost with the old player: whoever waited for it is told
                     boolean tableWork = tableSession || (placingTable && job == Job.AnvilPlace);
-                    if (job == Job.Ground || job == Job.Explore || job == Job.Unbundle || job == Job.Name || job == Job.Craft || job == Job.AnvilPlace || job == Job.ChestPlace) job = null;
+                    if (job == Job.Ground || job == Job.Explore || job == Job.Unbundle || job == Job.Name || job == Job.Craft || job == Job.AnvilPlace || job == Job.ChestPlace || job == Job.Repair) {
+                        if (job == Job.Repair) repairer.abortNow();
+                        job = null;
+                    }
                     anvilSlot = -1;
                     anvilSession = false;
                     tableSession = false;

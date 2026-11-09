@@ -2,6 +2,7 @@ package com.porter.qwerte.manager.gui.tabs;
 
 import com.porter.qwerte.manager.gui.DataSource;
 import com.porter.qwerte.manager.gui.ItemStacks;
+import com.porter.qwerte.manager.gui.style.Ui;
 import com.porter.qwerte.manager.gui.chrome.WCreativeTabs;
 import com.porter.qwerte.manager.gui.widgets.WItemGrid;
 import com.porter.qwerte.manager.gui.widgets.WSlotGrid;
@@ -122,6 +123,7 @@ public final class BrowseTab {
             }
         };
         grid = page.grid = page.add(new WItemGrid(host::graphics)).widget();
+        grid.tipFor = cell -> cell.ref() instanceof String key && byKey.get(key) != null ? com.porter.qwerte.manager.gui.widgets.ItemTip.lines(source.index(), byKey.get(key)) : null;
         grid.onCell = (cell, button) -> {
             // Right-click puts a stack in the order cart when orders are possible
             if (button == 1 && adder != null && adder.enabled() && cell.ref() instanceof String key && byKey.get(key) != null) {
@@ -175,7 +177,11 @@ public final class BrowseTab {
     }
 
     /** Called from the window every frame: applies a typed search after a short pause. */
+    /** The drawer width the details were wrapped for. */
+    private double detailsFor = -1;
+
     public void tick(long now) {
+        if (page != null && page.drawer != null && page.drawerOpen() && page.drawer.width > 0 && Math.abs(page.drawer.width - detailsFor) > 2) showDetails();
         if (dirty && now - dirtyAt >= SEARCH_DEBOUNCE_MS) {
             dirty = false;
             refresh();
@@ -252,7 +258,10 @@ public final class BrowseTab {
     private void showDetails() {
         if (details == null) return;
         details.clear();
-        double wrap = theme.scale(300);
+        // The drawer's real width comes from the layout (0 until the first one: tick() shows the details again then)
+        int du = com.porter.qwerte.manager.gui.style.SmGuiTheme.unitOf(theme);
+        detailsFor = page.drawer != null ? page.drawer.width : 0;
+        double wrap = detailsFor > 0 ? Math.max(theme.scale(100), detailsFor - 8 * du - theme.scale(16)) : theme.scale(240);
         Entry e = selectedKey == null ? null : byKey.get(selectedKey);
         if (e == null) {
             selectedKey = null;
@@ -262,17 +271,17 @@ public final class BrowseTab {
         page.setDrawerOpen(true);
         if (e.item() != null) {
             IndexModel.Item it = e.item();
-            details.add(theme.label(it.name(), true, wrap)).expandX();
-            if (!it.id().equals(it.name())) details.add(theme.label(it.id(), wrap)).expandX();
-            details.add(theme.label(countLine(it), wrap)).expandX();
-            if (e.count() != it.count()) details.add(theme.label(Text.grouped(e.count()) + " empty, " + Text.grouped(it.count() - e.count()) + " filled (listed next to it)", wrap)).expandX();
+            details.add(Ui.wrap(theme, "§l" + it.name(), wrap)).expandX();
+            if (!it.id().equals(it.name())) details.add(Ui.wrap(theme, it.id(), wrap)).expandX();
+            details.add(Ui.wrap(theme, countLine(it), wrap)).expandX();
+            if (e.count() != it.count()) details.add(Ui.wrap(theme, Text.grouped(e.count()) + " empty, " + Text.grouped(it.count() - e.count()) + " filled (listed next to it)", wrap)).expandX();
             boolean hasDurabilityLine = false;
             for (String line : it.details()) {
-                details.add(theme.label(line, wrap)).expandX();
+                details.add(Ui.wrap(theme, line, wrap)).expandX();
                 hasDurabilityLine |= line.toLowerCase(Locale.ROOT).startsWith("durability");
             }
             if (it.durabilityLeft() >= 0 && !hasDurabilityLine) {
-                details.add(theme.label("Durability: " + Text.grouped(it.maxDamage() - it.damage()) + " / " + Text.grouped(it.maxDamage()), wrap)).expandX();
+                details.add(Ui.wrap(theme, "Durability: " + Text.grouped(it.maxDamage() - it.damage()) + " / " + Text.grouped(it.maxDamage()), wrap)).expandX();
             }
             if (host.canInspect()) {
                 WButton inspect = details.add(theme.button("Inspect")).widget();
@@ -286,8 +295,8 @@ public final class BrowseTab {
         } else {
             IndexModel.Shulker g = e.shulker();
             IndexModel index = source.index();
-            details.add(theme.label(g.name(), true, wrap)).expandX();
-            details.add(theme.label(Text.grouped(g.count()) + (g.count() == 1 ? " shulker" : " identical shulkers"), wrap)).expandX();
+            details.add(Ui.wrap(theme, "§l" + g.name(), wrap)).expandX();
+            details.add(Ui.wrap(theme, Text.grouped(g.count()) + (g.count() == 1 ? " shulker" : " identical shulkers"), wrap)).expandX();
             WSlotGrid contents = details.add(new WSlotGrid(host::graphics, IndexModel.SHULKER_SLOTS)).widget();
             List<WItemGrid.Cell> cells = new ArrayList<>(java.util.Collections.nCopies(IndexModel.SHULKER_SLOTS, (WItemGrid.Cell) null));
             for (IndexModel.Content c : index.contentsOf(g)) {
@@ -324,12 +333,12 @@ public final class BrowseTab {
         if (!source.supportsWhere()) return;
         details.add(theme.label("Where", true)).expandX();
         if (host.hideCoords()) {
-            details.add(theme.label("Locations are hidden while streamer display is on.", wrap)).expandX();
+            details.add(Ui.wrap(theme, "Locations are hidden while streamer display is on.", wrap)).expandX();
             return;
         }
         List<Where> hits = source.where(key);
         if (hits.isEmpty()) {
-            details.add(theme.label("Not in any stored container.", wrap)).expandX();
+            details.add(Ui.wrap(theme, "Not in any stored container.", wrap)).expandX();
             return;
         }
         for (int i = 0; i < Math.min(WHERE_SHOWN, hits.size()); i++) {
@@ -337,12 +346,14 @@ public final class BrowseTab {
             WHorizontalList row = details.add(theme.horizontalList()).expandX().widget();
             String block = w.block().substring(w.block().indexOf(':') + 1).replace('_', ' ');
             String away = w.distance() >= 0 ? ", " + w.distance() + " m" : "";
-            row.add(theme.label(w.key().x() + " " + w.key().y() + " " + w.key().z() + " - " + block + " x" + Text.grouped(w.count()) + away, wrap)).expandX();
-            WButton forget = row.add(theme.button("Forget")).widget();
+            WButton forget = null;
+            double room = Math.max(theme.scale(60), wrap - (theme.textWidth("Forget") + 2 * theme.scale(10)) - theme.scale(10));
+            row.add(Ui.wrap(theme, w.key().x() + " " + w.key().y() + " " + w.key().z() + " - " + block + " x" + Text.grouped(w.count()) + away, room)).expandX();
+            forget = row.add(theme.button("Forget")).widget();
             forget.tooltip = "Removes this container from the local index. It is remembered again when you open it.";
             forget.action = () -> source.forget(w.key());
         }
-        if (hits.size() > WHERE_SHOWN) details.add(theme.label("...and " + (hits.size() - WHERE_SHOWN) + " more", wrap)).expandX();
+        if (hits.size() > WHERE_SHOWN) details.add(Ui.wrap(theme, "...and " + (hits.size() - WHERE_SHOWN) + " more", wrap)).expandX();
     }
 
     private static String countLine(IndexModel.Item it) {

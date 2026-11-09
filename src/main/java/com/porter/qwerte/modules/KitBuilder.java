@@ -113,6 +113,8 @@ final class KitBuilder {
     // The session: the kit being built and where its shulker is
     private Kit kit;
     private int baseSlot = -1;
+    // A kit that only gathers (the stuff for repairs): no shulker, it is done when everything is carried
+    private boolean gatherOnly;
     private boolean needBase;
     private boolean pendingBase;
     private boolean hadBase;
@@ -178,6 +180,7 @@ final class KitBuilder {
     }
 
     private void clearSession() {
+        gatherOnly = false;
         kit = null;
         baseSlot = -1;
         needBase = false;
@@ -504,6 +507,27 @@ final class KitBuilder {
         return true;
     }
 
+    /**
+     * Starts gathering the stacks of an order kit into the carry slots, with no shulker to put them in: {@link #next} says Done when
+     * everything is carried. Used to bring the damaged items and the XP bottles for a repair.
+     * @return false when a kit is already being built
+     */
+    boolean beginGather(Kit gatherKit) {
+        if (kit != null || owner.stash() == null || mc.player == null) return false;
+        kit = gatherKit;
+        gatherOnly = true;
+        baseSlot = -1;
+        needBase = false;
+        pendingBase = false;
+        hadBase = false;
+        heldKit = null;
+        startedAt = System.currentTimeMillis();
+        stalls = 0;
+        lastSignature = -1;
+        cursorFixes = 0;
+        return true;
+    }
+
     /** The empty shulkers the stash could give an order, by the same scan kits use. */
     List<ItemStack> emptyShulkers() {
         List<ItemStack> out = new ArrayList<>();
@@ -513,7 +537,17 @@ final class KitBuilder {
 
     /** How much of each of the kit's items this builder could take from the stash right now (by its own scan). */
     Map<Key, Integer> supply(Kit k) {
-        return new Scan(List.of(k)).available(k);
+        Map<Key, Integer> avail = new Scan(List.of(k)).available(k);
+        // What is carried already counts too (items repaired for an order are carried, no longer in the stash)
+        if (mc.player != null) {
+            for (int slot : owner.carry()) {
+                ItemStack s = mc.player.getInventory().getItem(slot);
+                if (s.isEmpty() || !k.hasItem(s.getItem())) continue;
+                Key key = k.key(s);
+                if (k.need(key) != null) avail.merge(key, s.getCount(), Integer::sum);
+            }
+        }
+        return avail;
     }
 
     /** Lets go of an order kit without a word, when its order is over. */
@@ -616,7 +650,7 @@ final class KitBuilder {
             }
         }
 
-        if (!isShulker(baseSlot)) return new Abort("lost the kit shulker");
+        if (!gatherOnly && !isShulker(baseSlot)) return new Abort("lost the kit shulker");
 
         // A shulker asked for that did not come: not asked for again
         if (lastPacked != null) {
@@ -657,7 +691,7 @@ final class KitBuilder {
             if (gather != null) return gather;
         }
 
-        if (live.useful > 0 || live.gather == 0) return new Fill(baseSlot);
+        if (!gatherOnly && (live.useful > 0 || live.gather == 0)) return new Fill(baseSlot);
 
         return new Abort(owner.freeCarryCount() < 1 ? "not enough free carry slots to gather the rest" : "can't find the rest of the items");
     }
@@ -687,7 +721,7 @@ final class KitBuilder {
         Inventory inv = mc.player.getInventory();
         Live live = new Live();
 
-        ItemStack[] base = Kits.inside(inv.getItem(baseSlot));
+        ItemStack[] base = gatherOnly ? new ItemStack[0] : Kits.inside(inv.getItem(baseSlot));
         Map<Key, Integer> inBase = kit.totalsOf(base);
         Map<Key, Integer> loose = new HashMap<>();
         for (int slot : owner.carry()) {
@@ -712,7 +746,7 @@ final class KitBuilder {
             }
         }
 
-        live.layoutOk = kit.exactLayout(base);
+        live.layoutOk = gatherOnly ? live.gather == 0 : kit.exactLayout(base);
         return live;
     }
 
@@ -800,7 +834,7 @@ final class KitBuilder {
      * @return false when there's nothing more to take, or nowhere to carry it
      */
     boolean takeOne(Box box) {
-        if (kit == null || !isShulker(baseSlot) || stuck(mc.player.containerMenu)) return false;
+        if (kit == null || (!gatherOnly && !isShulker(baseSlot)) || stuck(mc.player.containerMenu)) return false;
         Live live = live();
         int into = owner.freeCarrySlot();
         if (into == -1) {
@@ -823,7 +857,7 @@ final class KitBuilder {
      * Takes one stack the kit needs out of the open shulker into a free carry slot.
      */
     boolean unpackOne(AbstractContainerMenu menu) {
-        if (kit == null || !isShulker(baseSlot) || stuck(menu)) return false;
+        if (kit == null || (!gatherOnly && !isShulker(baseSlot)) || stuck(menu)) return false;
         if (!menu.getCarried().isEmpty()) return settleCursor(menu);
 
         Live live = live();

@@ -12,17 +12,35 @@ public record BotInfo(boolean hasNaming, boolean anvil, String anvilSource, int 
                       boolean hasCrafting, boolean craftingOn, boolean table, String tableSource,
                       boolean hasStorage, boolean autoExpand, int chests, int full, boolean canExpand, String blocked,
                       String orderBlocker, boolean hasDelivery, String contentsKey,
-                      int openOrders, String activeOrder, String deliveryAt, String conflictPlayer, long conflictAt) {
+                      int openOrders, String activeOrder, String deliveryAt, String conflictPlayer, long conflictAt, boolean repair) {
 
-    public static final BotInfo NONE = new BotInfo(false, false, "", -1, false, false, false, "", false, false, 0, 0, false, "", "", false, "");
+    public static final BotInfo NONE = new BotInfo(false, false, "", -1, false, false, false, "", false, false, 0, 0, false, "", "", false, "", 0, "", "", "", 0, false);
 
-    /** Without the bot overview's fields (open orders, the active order, the delivery spot, a stash-name conflict). */
+    /** Without the repair flag (false: a bot that never said it can repair). */
+    public BotInfo(boolean hasNaming, boolean anvil, String anvilSource, int xpLevels,
+                   boolean hasCrafting, boolean craftingOn, boolean table, String tableSource,
+                   boolean hasStorage, boolean autoExpand, int chests, int full, boolean canExpand, String blocked,
+                   String orderBlocker, boolean hasDelivery, String contentsKey,
+                   int openOrders, String activeOrder, String deliveryAt, String conflictPlayer, long conflictAt) {
+        this(hasNaming, anvil, anvilSource, xpLevels, hasCrafting, craftingOn, table, tableSource, hasStorage, autoExpand, chests, full,
+            canExpand, blocked, orderBlocker, hasDelivery, contentsKey, openOrders, activeOrder, deliveryAt, conflictPlayer, conflictAt, false);
+    }
+
+    public BotInfo withRepair(boolean on) {
+        return new BotInfo(hasNaming, anvil, anvilSource, xpLevels, hasCrafting, craftingOn, table, tableSource, hasStorage, autoExpand, chests, full,
+            canExpand, blocked, orderBlocker, hasDelivery, contentsKey, openOrders, activeOrder, deliveryAt, conflictPlayer, conflictAt, on);
+    }
+
+    /**
+     * Without the bot overview's fields (open orders, the active order, the delivery spot, a stash-name conflict). This is the form
+     * the local source uses, and this client's order executor can repair items, so {@code repair} is true here.
+     */
     public BotInfo(boolean hasNaming, boolean anvil, String anvilSource, int xpLevels,
                    boolean hasCrafting, boolean craftingOn, boolean table, String tableSource,
                    boolean hasStorage, boolean autoExpand, int chests, int full, boolean canExpand, String blocked,
                    String orderBlocker, boolean hasDelivery, String contentsKey) {
         this(hasNaming, anvil, anvilSource, xpLevels, hasCrafting, craftingOn, table, tableSource, hasStorage, autoExpand, chests, full,
-            canExpand, blocked, orderBlocker, hasDelivery, contentsKey, 0, "", "", "", 0);
+            canExpand, blocked, orderBlocker, hasDelivery, contentsKey, 0, "", "", "", 0, true);
     }
 
     public static BotInfo parse(JsonObject o) {
@@ -55,7 +73,8 @@ public record BotInfo(boolean hasNaming, boolean anvil, String anvilSource, int 
             contents == null ? "" : Json.str(contents, "hash") + "|" + (long) Json.num(contents, "receivedAt", 0),
             orders == null ? 0 : (int) Math.max(0, Math.min(Integer.MAX_VALUE, Json.num(orders, "open", 0))), activeText,
             deliverySet ? (long) Json.num(delivery, "x", 0) + ", " + (long) Json.num(delivery, "y", 0) + ", " + (long) Json.num(delivery, "z", 0) : "",
-            conflict == null ? "" : Text.sanitize(Json.str(conflict, "player"), 32), conflict == null ? 0 : Json.lng(conflict, "at", 0));
+            conflict == null ? "" : Text.sanitize(Json.str(conflict, "player"), 32), conflict == null ? 0 : Json.lng(conflict, "at", 0),
+            Json.bool(o, "repair"));
     }
 
     /** The website's STATUS_LABEL for an order status. */
@@ -84,6 +103,11 @@ public record BotInfo(boolean hasNaming, boolean anvil, String anvilSource, int 
     /** True when the server holds a delivery report for the stash. */
     public boolean hasContents() {
         return !contentsKey.isEmpty();
+    }
+
+    /** The order form's warning when the bot can't repair and repairs are wanted, "" otherwise. */
+    public String repairWarning(boolean wanted) {
+        return wanted && !repair ? "This bot can't repair items; they'll arrive as they are." : "";
     }
 
     /** The naming warning for {@code n} named shulkers, or "" (the website's {@code namesWarnText}). */

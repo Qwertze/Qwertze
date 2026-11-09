@@ -57,6 +57,12 @@ public class WCreativeTabs extends WPressable {
     }
 
     /** The name of a tab as the website shows it. */
+    /** The item id of a tab's icon. */
+    public static String iconOf(String id) {
+        String[] info = INFO.get(id);
+        return info == null ? "minecraft:chest" : info[1];
+    }
+
     public static String nameOf(String id) {
         String[] info = INFO.get(id);
         return info == null ? id : info[0];

@@ -23,6 +23,59 @@ class TextWrapTest {
         return s.length();
     }
 
+    /** Codes take no room, like the game's font. */
+    static double plain(String s) {
+        double w = 0;
+        for (int i = 0; i < s.length(); i++) {
+            if (s.charAt(i) == '§' && i + 1 < s.length()) i++;
+            else w++;
+        }
+        return w;
+    }
+
+    @Test
+    void activeFormattingCodesCarryToTheNextRow() {
+        List<String> rows = TextWrap.wrap("§lHello brave new world", 11, TextWrapTest::plain);
+        assertTrue(rows.size() >= 2, rows.toString());
+        for (String r : rows) assertTrue(r.startsWith("§l"), r);
+        // a colour and italic together
+        rows = TextWrap.wrap("§b§oone two three four five six", 9, TextWrapTest::plain);
+        for (String r : rows) assertTrue(r.startsWith("§b§o"), r);
+        // a reset ends the carrying
+        rows = TextWrap.wrap("§lbold§r plain words follow here", 10, TextWrapTest::plain);
+        assertTrue(rows.get(rows.size() - 1).indexOf('§') < 0, rows.toString());
+    }
+
+    @Test
+    void aRowNeverEndsOnALoneSectionSign() {
+        // with mono widths the code letters count too, so the cut would fall between the sign and its letter
+        for (int limit = 1; limit < 12; limit++) {
+            for (String r : TextWrap.wrap("abc§ldefghi§bjklm", limit, TextWrapTest::mono)) {
+                assertTrue(r.isEmpty() || r.charAt(r.length() - 1) != '§', "limit " + limit + ": " + r);
+            }
+        }
+    }
+
+    @Test
+    void aTinyOrBrokenLimitStillWrapsAndLosesNothing() {
+        for (double limit : new double[] {0, -5, Double.NaN, 0.1}) {
+            List<String> rows = TextWrap.wrap("abc def", limit, TextWrapTest::mono);
+            assertEquals("abcdef", String.join("", rows).replace(" ", ""), "limit " + limit);
+            assertTrue(rows.size() >= 6, "limit " + limit + ": " + rows);
+        }
+    }
+
+    @Test
+    void surrogatePairsStayTogetherEvenWhenTheRowIsOneCharacterWide() {
+        String emoji = new String(Character.toChars(0x1F600));
+        List<String> rows = TextWrap.wrap(emoji + emoji + "a", 1, TextWrapTest::mono);
+        assertEquals(emoji + emoji + "a", String.join("", rows));
+        for (String r : rows) {
+            assertTrue(r.isEmpty() || !Character.isHighSurrogate(r.charAt(r.length() - 1)), r);
+            assertTrue(r.isEmpty() || !Character.isLowSurrogate(r.charAt(0)), r);
+        }
+    }
+
     @Test
     void shortTextIsOneRowAndEmptyIsOneEmptyRow() {
         assertEquals(List.of("hello"), TextWrap.wrap("hello", 10, TextWrapTest::mono));

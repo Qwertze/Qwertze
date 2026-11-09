@@ -20,7 +20,7 @@ public final class ConfirmPanel extends PasswordPanel {
         this.theme = theme;
         this.onConfirm = onConfirm;
         parent.add(theme.label("Confirm your password", true));
-        parent.add(theme.label(why, theme.scale(420))).expandX();
+        parent.add(com.porter.qwerte.manager.gui.style.Ui.wrap(theme, why, Math.min(theme.scale(420), com.porter.qwerte.manager.gui.style.PageRoom.width(parent, 0)))).expandX();
         password = secret(parent, "Password");
         WHorizontalList buttons = parent.add(theme.horizontalList()).widget();
         WButton ok = buttons.add(theme.button("Confirm")).widget();

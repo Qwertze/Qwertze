@@ -170,7 +170,9 @@ public final class ViewerEvents {
         if (o == null) return null;
         double held = Json.num(o, "held", -1);
         return new Hud(num(o, "hp"), num(o, "food"), num(o, "sat"), num(o, "xp"), num(o, "xpP"), num(o, "armor"),
-            held >= 0 && held <= 8 ? (int) held : -1, slots(o.get("hotbar"), 9), slots(o.get("armorSlots"), 4), slot(o.get("offhand")));
+            held >= 0 && held <= 8 ? (int) held : -1, slots(o.get("hotbar"), 9), slots(o.get("armorSlots"), 4), slot(o.get("offhand")),
+            // like the website: the 27 inventory slots count only when all 27 are there
+            Json.arr(o.get("inv")) != null && Json.arr(o.get("inv")).size() == 27 ? slots(o.get("inv"), 27) : slots(null, 27));
     }
 
     private static double num(JsonObject o, String key) {

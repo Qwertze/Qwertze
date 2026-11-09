@@ -131,6 +131,20 @@ final class ServerOrderBackend implements OrderBackend {
         return item.isShulkerBox() ? index.emptyShulkerAvailable(key) : item.count();
     }
 
+    private long availVersion;
+
+    @Override
+    public long availabilityVersion() {
+        return availVersion;
+    }
+
+    @Override
+    public long bottles() {
+        if (listing.bottles() >= 0) return listing.bottles();
+        IndexModel.Item item = host.index().item(com.porter.qwerte.stash.RepairEstimate.BOTTLE_KEY);
+        return item == null ? 0 : item.count();
+    }
+
     @Override
     public DeliveryModel delivery() {
         return delivery;
@@ -229,12 +243,13 @@ final class ServerOrderBackend implements OrderBackend {
                 return;
             }
             if (!sameOrders(listing, parsed)) dirty = true;
+            if (!listing.availableItems().equals(parsed.availableItems()) || !listing.availableShulkers().equals(parsed.availableShulkers())) availVersion++;
             listing = parsed;
         });
     }
 
     private static boolean sameOrders(OrderModel.Listing a, OrderModel.Listing b) {
-        return a.orders().equals(b.orders()) && a.availableItems().equals(b.availableItems()) && a.availableShulkers().equals(b.availableShulkers());
+        return a.orders().equals(b.orders()) && a.availableItems().equals(b.availableItems()) && a.availableShulkers().equals(b.availableShulkers()) && a.bottles() == b.bottles();
     }
 
     private void pollDelivery(StashRef s, long now) {
@@ -274,7 +289,7 @@ final class ServerOrderBackend implements OrderBackend {
     // ---------- writing ----------
 
     @Override
-    public void place(List<Order.Line> lines, NamesDraft names, int units, Consumer<PlaceResult> done) {
+    public void place(List<Order.Line> lines, NamesDraft names, int units, boolean repairAll, Consumer<PlaceResult> done) {
         StashRef s = stash();
         if (s == null) {
             done.accept(new PlaceResult(false, "No stash is selected.", -1));
@@ -285,12 +300,14 @@ final class ServerOrderBackend implements OrderBackend {
         body.addProperty("stash", s.stash());
         JsonObject n = names.toJson(units);
         if (n != null) body.add("names", n);
+        if (repairAll) body.addProperty("repairAll", true);
         JsonArray array = new JsonArray();
         for (Order.Line l : lines) {
             JsonObject o = new JsonObject();
             o.addProperty("type", l.type());
             o.addProperty("key", l.key());
             o.addProperty("count", l.count());
+            if (l.repair()) o.addProperty("repair", true);
             array.add(o);
         }
         body.add("lines", array);

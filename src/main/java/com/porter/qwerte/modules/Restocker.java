@@ -132,7 +132,7 @@ class Restocker {
         reset();
 
         if (!InvUtils.find(Items.ENDER_CHEST).found()) return "No ender chest in your inventory.";
-        if (!InvUtils.find(this::isSilkPickaxe).found()) return "No silk touch pickaxe to pick the ender chest back up with.";
+        if (!InvUtils.find(Restocker::isSilkPickaxe).found()) return "No silk touch pickaxe to pick the ender chest back up with.";
         if (emptySlots() < 2) return "Need 2 free inventory slots to restock from the ender chest.";
 
         // Meteor remembers what was in the ender chest last time it was opened, check that before placing anything
@@ -169,7 +169,7 @@ class Restocker {
                 yield timedOut(PLACE_TIMEOUT) ? fail("Couldn't place the ender chest.") : Result.Busy;
             }
             case OpenEChest -> {
-                if (open(echestSpot, this::isEChestMenu)) go(Step.TakeShulker);
+                if (open(echestSpot, Restocker::isEChestMenu)) go(Step.TakeShulker);
                 else if (timedOut(OPEN_TIMEOUT)) cleanUp("Couldn't open the ender chest.");
                 yield Result.Busy;
             }
@@ -212,7 +212,7 @@ class Restocker {
                 yield Result.Busy;
             }
             case ReopenEChest -> {
-                if (open(echestSpot, this::isEChestMenu)) go(Step.ReturnShulker);
+                if (open(echestSpot, Restocker::isEChestMenu)) go(Step.ReturnShulker);
                 else if (timedOut(OPEN_TIMEOUT)) cleanUp("Couldn't reopen the ender chest to put the shulker back, it's in your inventory.");
                 yield Result.Busy;
             }
@@ -223,7 +223,7 @@ class Restocker {
             case BreakEChest -> {
                 if (mc.level.getBlockState(echestSpot).isAir()) go(Step.CollectEChest);
                 else if (timedOut(BREAK_TIMEOUT)) yield fail(prefix() + "Couldn't break the ender chest, it's still placed at " + echestSpot.toShortString() + ".");
-                else breakWith(echestSpot, this::isSilkPickaxe);
+                else breakWith(echestSpot, Restocker::isSilkPickaxe);
                 yield Result.Busy;
             }
             case CollectEChest -> {
@@ -421,14 +421,22 @@ class Restocker {
         }
 
         if (stepTicks == 1 || stepTicks % 20 == 0) {
-            BlockHitResult hit = new BlockHitResult(Vec3.atCenterOf(pos), Direction.UP, pos, false);
-            Runnable click = () -> BlockUtils.interact(hit, InteractionHand.MAIN_HAND, true);
-
-            if (module.rotates()) Rotations.rotate(Rotations.getYaw(pos), Rotations.getPitch(pos), click);
-            else click.run();
+            clickOpen(pos, module.rotates(), true);
         }
 
         return false;
+    }
+
+    /**
+     * One click on a container to open it, rotating first if asked. Shared with Container Tweaks.
+     * @param swing false skips the client-side swing animation only, the swing packet is sent either way
+     */
+    static void clickOpen(BlockPos pos, boolean rotate, boolean swing) {
+        BlockHitResult hit = new BlockHitResult(Vec3.atCenterOf(pos), Direction.UP, pos, false);
+        Runnable click = () -> BlockUtils.interact(hit, InteractionHand.MAIN_HAND, swing);
+
+        if (rotate) Rotations.rotate(Rotations.getYaw(pos), Rotations.getPitch(pos), click);
+        else click.run();
     }
 
     /**
@@ -439,15 +447,22 @@ class Restocker {
         FindItemResult result = InvUtils.findInHotbar(item);
         if (!result.found()) return;
 
+        clickPlaceOnTop(spot, result.slot(), module.rotates(), true);
+    }
+
+    /**
+     * Selects the hotbar slot and clicks the top of the block under {@code spot}. Shared with Container Tweaks.
+     */
+    static void clickPlaceOnTop(BlockPos spot, int hotbarSlot, boolean rotate, boolean swing) {
         BlockPos below = spot.below();
         BlockHitResult hit = new BlockHitResult(Vec3.atCenterOf(below).add(0, 0.5, 0), Direction.UP, below, false);
 
         Runnable click = () -> {
-            InvUtils.swap(result.slot(), false);
-            BlockUtils.interact(hit, InteractionHand.MAIN_HAND, true);
+            InvUtils.swap(hotbarSlot, false);
+            BlockUtils.interact(hit, InteractionHand.MAIN_HAND, swing);
         };
 
-        if (module.rotates()) Rotations.rotate(Rotations.getYaw(hit.getLocation()), Rotations.getPitch(hit.getLocation()), click);
+        if (rotate) Rotations.rotate(Rotations.getYaw(hit.getLocation()), Rotations.getPitch(hit.getLocation()), click);
         else click.run();
     }
 
@@ -462,8 +477,16 @@ class Restocker {
             if (best.found()) InvUtils.swap(best.slot(), false);
         }
 
-        if (module.rotates()) Rotations.rotate(Rotations.getYaw(pos), Rotations.getPitch(pos));
-        BlockUtils.breakBlock(pos, true);
+        clickBreak(pos, module.rotates(), true);
+    }
+
+    /**
+     * One tick of breaking a block with whatever is held, rotating first if asked. Needs a tick-pre event. Shared with
+     * Container Tweaks.
+     */
+    static void clickBreak(BlockPos pos, boolean rotate, boolean swing) {
+        if (rotate) Rotations.rotate(Rotations.getYaw(pos), Rotations.getPitch(pos));
+        BlockUtils.breakBlock(pos, swing);
     }
 
     /**
@@ -490,12 +513,17 @@ class Restocker {
         return fallback;
     }
 
-    private boolean isGoodSpot(BlockPos pos) {
+    static boolean isGoodSpot(BlockPos pos) {
         if (!mc.level.getBlockState(pos).isAir() || !mc.level.getBlockState(pos.above()).isAir()) return false;
         if (mc.player.getBoundingBox().intersects(new AABB(pos))) return false;
 
-        // Solid to place on, and nothing that would open a screen instead when clicked
-        BlockPos below = pos.below();
+        return isGoodSupport(pos.below());
+    }
+
+    /**
+     * Solid to place on, and nothing that would open a screen instead when clicked.
+     */
+    static boolean isGoodSupport(BlockPos below) {
         BlockState ground = mc.level.getBlockState(below);
         return ground.isCollisionShapeFullBlock(mc.level, below) && ground.getFluidState().isEmpty()
             && mc.level.getBlockEntity(below) == null && !BlockUtils.isClickable(ground.getBlock());
@@ -531,15 +559,15 @@ class Restocker {
         return count;
     }
 
-    private boolean isEChestMenu(AbstractContainerMenu menu) {
+    static boolean isEChestMenu(AbstractContainerMenu menu) {
         return menu instanceof ChestMenu chest && chest.getRowCount() == 3;
     }
 
-    private boolean isSilkPickaxe(ItemStack stack) {
+    static boolean isSilkPickaxe(ItemStack stack) {
         return stack.is(ItemTags.PICKAXES) && Utils.hasEnchantment(stack, Enchantments.SILK_TOUCH);
     }
 
-    private int emptySlots() {
+    static int emptySlots() {
         int count = 0;
         for (int i = 0; i < 36; i++) {
             if (mc.player.getInventory().getItem(i).isEmpty()) count++;

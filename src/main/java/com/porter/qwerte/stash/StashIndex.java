@@ -263,6 +263,8 @@ public final class StashIndex {
             if (tableSource != null) c.addProperty("tableSource", tableSource);
             o.add("crafting", c);
         }
+        // This bot can repair items with XP bottles before delivery (REPAIR-CONTRACT.md)
+        o.addProperty("repair", true);
         if (rescanDone >= 0) o.addProperty("rescanDone", rescanDone);
         if (rescanBlocked == null) o.add("rescanBlocked", com.google.gson.JsonNull.INSTANCE);
         else o.addProperty("rescanBlocked", clamp(rescanBlocked, 100));
@@ -498,7 +500,7 @@ public final class StashIndex {
         TabSlot tab = tabOf(stack.getItem());
         return new Info(key(ops, id, stripped), id, stack.getHoverName().getString(), englishName(stack), stack.getMaxStackSize(),
             details(info), info != null && !info.enchants.isEmpty(), tab.tab(), tab.order(),
-            durability(stack.getDamageValue(), stack.getMaxDamage())[0], durability(stack.getDamageValue(), stack.getMaxDamage())[1]);
+            durability(stack.getDamageValue(), stack.getMaxDamage())[0], durability(stack.getDamageValue(), stack.getMaxDamage())[1], Mending.has(stack));
     }
 
     /** {damage, maxDamage} to send for an item, or {0, 0} to send neither: only damageable (maxDamage > 0) and damaged (damage > 0). */

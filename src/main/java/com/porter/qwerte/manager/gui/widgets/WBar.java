@@ -10,13 +10,17 @@ public final class WBar extends WWidget {
     private static final Color TEXT = new Color(255, 255, 255, 255);
 
     private final Color fill;
-    private final double max;
+    private double max;
     private double value;
     private String text = "-";
 
     public WBar(Color fill, double max) {
         this.fill = fill;
         this.max = max;
+    }
+
+    public void setMax(double max) {
+        this.max = Math.max(1, max);
     }
 
     /** NaN draws an empty bar with a dash. */

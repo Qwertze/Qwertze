@@ -15,7 +15,7 @@ import java.util.Map;
 import java.util.function.Consumer;
 
 /**
- * What the server-only tabs (Map, Settings, Proxy, Users, Bots) need from the window. They never exist in local mode, so everything
+ * What the server-only tabs (Map, Settings, Proxy, Bots) need from the window. They never exist in local mode, so everything
  * here is the server's: a client, the account, and the shared bot list.
  */
 public interface ServerTabHost {
@@ -80,6 +80,11 @@ public interface ServerTabHost {
 
     /** Ends every session of this account (the owner: of every account). */
     void logoutEverywhere();
+
+    /** The window's theme (kept in the module, not on the server). */
+    com.porter.qwerte.manager.gui.style.WindowTheme windowTheme();
+
+    void setWindowTheme(com.porter.qwerte.manager.gui.style.WindowTheme theme);
 
     /** Text for a failed answer, like the window's own ("Too many attempts. Try again in 5 s."). */
     String describe(ApiResult r, String fallback);

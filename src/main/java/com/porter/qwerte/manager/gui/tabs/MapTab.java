@@ -2,6 +2,14 @@ package com.porter.qwerte.manager.gui.tabs;
 
 import com.porter.qwerte.compat.MapTexture;
 import com.porter.qwerte.manager.gui.ItemStacks;
+import com.porter.qwerte.manager.gui.chrome.WFlow;
+import com.porter.qwerte.manager.gui.style.PageRoom;
+import com.porter.qwerte.manager.gui.style.SmButton;
+import com.porter.qwerte.manager.gui.style.SmCard;
+import com.porter.qwerte.manager.gui.style.SmColumns;
+import com.porter.qwerte.manager.gui.style.SmGuiTheme;
+import com.porter.qwerte.manager.gui.style.SmPill;
+import com.porter.qwerte.manager.gui.style.Ui;
 import com.porter.qwerte.manager.gui.widgets.WBar;
 import com.porter.qwerte.manager.gui.widgets.WItemGrid;
 import com.porter.qwerte.manager.gui.widgets.WMapView;
@@ -49,15 +57,6 @@ public final class MapTab {
         String viewerId(String botId);
     }
 
-    private static final Color WARN = new Color(255, 190, 80);
-    private static final Color GOOD = new Color(120, 220, 140);
-    private static final Color BAD = new Color(255, 110, 110);
-    private static final Color HP = new Color(214, 48, 49, 255);
-    private static final Color FOOD = new Color(214, 140, 40, 255);
-    private static final Color CHAT_PUBLIC = new Color(235, 235, 240, 255);
-    private static final Color CHAT_WHISPER = new Color(200, 140, 255, 255);
-    private static final Color CHAT_SYSTEM = new Color(150, 200, 255, 255);
-    private static final Color CHAT_DEATH = new Color(255, 130, 130, 255);
     private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm");
     private static final long UPLOAD_MS = 200;
     private static final int PER_FRAME = 64;
@@ -83,7 +82,9 @@ public final class MapTab {
     private GuiTheme theme;
     private WLabel statusLabel, noteLabel, coordsLabel, xpLabel;
     private WBar hpBar, foodBar;
-    private WItemGrid hotbar, gear;
+    private WItemGrid hotbar, gear, inventory;
+    private SmPill statePill;
+    private ViewerEvent.Hud lastHud;
     private WTextLog chatLog;
     private WLabel chatHidden;
     private String botSignature = "";
@@ -328,78 +329,114 @@ public final class MapTab {
     public void build(WContainer parent, GuiTheme theme) {
         this.theme = theme;
         statusLabel = noteLabel = coordsLabel = xpLabel = null;
+        statePill = null;
         hpBar = foodBar = null;
-        hotbar = gear = null;
+        hotbar = gear = inventory = null;
+        lastHud = null;
         chatLog = null;
         chatHidden = null;
         botSignature = botsSignature();
+        double wide = PageRoom.width(parent, 0);
         if (!host.auth().can("viewer")) {
-            parent.add(theme.label("Your account can't use the live viewer. Ask the owner to turn on Live viewer for it.", theme.scale(520))).expandX();
+            parent.add(Ui.wrap(theme, "Your account can't use the live viewer. Ask the owner to turn on Live viewer for it.", wide)).expandX();
             return;
         }
         ensureState();
+        SmGuiTheme st = (SmGuiTheme) theme;
         boolean hide = host.policy().hideNames();
+        BotList.Bot picked = host.bots().selectedBot();
+        String botName = picked == null ? "" : host.bots().list().name(picked, hide);
 
-        WHorizontalList top = parent.add(theme.horizontalList()).expandX().widget();
-        List<BotList.Bot> bots = host.bots().list().bots();
-        if (bots.isEmpty()) {
-            top.add(theme.label(host.bots().loaded() ? "No dashboard bots yet. Turn the Qwerte Stash plugin's dashboard on in the proxy." : "Loading the bots...")).expandX();
-        } else {
-            String[] labels = new String[bots.size()];
-            String current = null;
-            String selected = host.bots().selected();
-            for (int i = 0; i < labels.length; i++) {
-                BotList.Bot b = bots.get(i);
-                labels[i] = (b.online() ? "[on] " : "[off] ") + host.bots().list().name(b, hide);
-                if (b.botId().equals(selected)) current = labels[i];
-            }
-            WDropdown<String> pick = top.add(theme.dropdown(labels, current == null ? labels[0] : current)).widget();
-            pick.action = () -> {
-                String picked = pick.get();
-                for (int i = 0; i < labels.length; i++) {
-                    if (labels[i].equals(picked)) {
-                        String id = bots.get(i).botId();
-                        host.later(() -> selectBot(id));
-                    }
-                }
-            };
+        // "live - bot" with the state at its right end
+        WHorizontalList title = parent.add(theme.horizontalList()).expandX().widget();
+        title.add(Ui.muted(theme, "live" + (botName.isEmpty() ? "" : " \u00b7 " + botName))).expandX();
+        statePill = title.add(new SmPill("", SmPill.Kind.NEUTRAL)).widget();
+        statusLabel = statePill;
+        if (host.bots().list().bots().isEmpty()) {
+            parent.add(Ui.wrap(theme, host.bots().loaded() ? "No dashboard bots yet. Turn the Qwerte Stash plugin's dashboard on in the proxy." : "Loading the bots...", wide)).expandX();
         }
-        statusLabel = top.add(theme.label("")).expandX().widget();
-        WButton zoomIn = top.add(theme.button("+")).widget();
-        zoomIn.tooltip = "Zoom in (the mouse wheel zooms around the pointer)";
-        zoomIn.action = () -> view.zoomBy(MapView.STEP);
-        WButton zoomOut = top.add(theme.button("-")).widget();
-        zoomOut.tooltip = "Zoom out";
-        zoomOut.action = () -> view.zoomBy(1 / MapView.STEP);
-        WButton again = top.add(theme.button("Reconnect")).widget();
-        again.tooltip = "Open the live stream again now.";
-        again.action = this::reconnect;
-        WButton follow = top.add(theme.button("Follow bot")).widget();
+
+        double gap = theme.scale(10);
+        // A narrow window stacks the map above the chat, each as wide as the page; a wide one puts the chat in a column at the right
+        boolean stack = wide < theme.scale(560);
+        double chatW = stack ? wide : Math.max(theme.scale(200), (wide - gap) * 0.25);
+        double mainW = stack ? wide : wide - gap - chatW;
+        SmColumns cols = null;
+        if (!stack) {
+            cols = parent.add(new SmColumns()).expandX().widget();
+            cols.maxWidth = wide;
+            cols.gap = 10;
+            cols.stretch = true;
+            cols.weights(mainW, chatW);
+        }
+
+        SmCard left = new SmCard("");
+        if (stack) {
+            parent.add(left).expandX();
+            left.fill = wide;
+        } else {
+            cols.add(left);
+        }
+        left.padding = 6;
+        // the stats row, and Centre / + / - at its right end
+        double leftInner = mainW - theme.scale(12 + 4);
+        WFlow top = left.add(new WFlow()).expandX().widget();
+        top.maxWidth = leftInner;
+        top.gapX = 8;
+        top.gapY = 4;
+        hpBar = top.add(new WBar(st.color(st.palette().hp()), 20)).widget();
+        foodBar = top.add(new WBar(st.color(st.palette().food()), 20)).widget();
+        xpLabel = top.add(Ui.wrap(theme, "", leftInner)).widget();
+        coordsLabel = top.add(Ui.wrap(theme, "", leftInner)).widget();
+        // the buttons have their own row, so the position text never runs under them
+        WFlow buttons = left.add(new WFlow()).expandX().widget();
+        buttons.maxWidth = leftInner;
+        buttons.gapX = 6;
+        buttons.gapY = 4;
+        SmButton follow = (SmButton) buttons.add(theme.button("Centre")).widget();
+        follow.pill = true;
+        follow.primary = true;
         follow.tooltip = "Centre on the bot and keep following it. Drag the map to look around; right-click also follows.";
         follow.action = view::follow;
+        SmButton zoomIn = (SmButton) buttons.add(theme.button("+")).widget();
+        zoomIn.pill = true;
+        zoomIn.tooltip = "Zoom in (the mouse wheel zooms around the pointer)";
+        zoomIn.action = () -> view.zoomBy(MapView.STEP);
+        SmButton zoomOut = (SmButton) buttons.add(theme.button("-")).widget();
+        zoomOut.pill = true;
+        zoomOut.tooltip = "Zoom out";
+        zoomOut.action = () -> view.zoomBy(1 / MapView.STEP);
+        SmButton again = (SmButton) buttons.add(theme.button("Reconnect")).widget();
+        again.pill = true;
+        again.tooltip = "Open the live stream again now.";
+        again.action = this::reconnect;
 
-        noteLabel = parent.add(theme.label("", theme.scale(560))).expandX().widget();
-        noteLabel.color(WARN);
+        noteLabel = left.add(Ui.muted(theme, "", mainW - theme.scale(16))).expandX().widget();
+        noteLabel.color(Ui.warn(theme));
+        WMapView map = left.add(new WMapView(view, atlas, state, () -> texture, () -> host.policy().hideNames(), this::mapHint)).centerX().widget();
+        map.maxWidth = Math.max(theme.scale(120), mainW - theme.scale(16));
 
-        WHorizontalList main = parent.add(theme.horizontalList()).expandX().widget();
-        main.add(new WMapView(view, atlas, state, () -> texture, () -> host.policy().hideNames(), this::mapHint));
+        // The bot's inventory and hotbar, centred under the map
+        WVerticalList inv = new WVerticalList();
+        inv.spacing = 2;
+        left.add(inv).centerX();
+        inventory = inv.add(new WItemGrid(host::graphics).compact(9, 3)).widget();
+        hotbar = inv.add(new WItemGrid(host::graphics).compact(9, 1)).widget();
+        WHorizontalList gearRow = inv.add(theme.horizontalList()).widget();
+        gearRow.add(Ui.muted(theme, "Gear"));
+        gear = gearRow.add(new WItemGrid(host::graphics).compact(5, 1)).widget();
 
-        WVerticalList side = main.add(theme.verticalList()).widget();
-        side.add(theme.label("Health", true));
-        hpBar = side.add(new WBar(HP, 20)).widget();
-        side.add(theme.label("Food", true));
-        foodBar = side.add(new WBar(FOOD, 20)).widget();
-        xpLabel = side.add(theme.label("")).widget();
-        coordsLabel = side.add(theme.label("")).widget();
-        side.add(theme.label("Hotbar", true));
-        hotbar = side.add(new WItemGrid(host::graphics).compact(9, 1)).widget();
-        side.add(theme.label("Armour and offhand", true));
-        gear = side.add(new WItemGrid(host::graphics).compact(5, 1)).widget();
-        if (host.policy().hideChat()) {
-            chatHidden = side.add(theme.label("Chat is hidden in streamer display.")).widget();
+        SmCard chat = new SmCard("Chat");
+        if (stack) {
+            parent.add(chat).expandX();
+            chat.fill = wide;
         } else {
-            side.add(theme.label("Chat", true));
-            chatLog = side.add(new WTextLog(300)).widget();
+            cols.add(chat);
+        }
+        if (host.policy().hideChat()) {
+            chatHidden = chat.add(Ui.muted(theme, "Chat is hidden in streamer display.", chatW - theme.scale(16))).widget();
+        } else {
+            chatLog = chat.add(new WTextLog(0).size(chatW - theme.scale(16), 30)).expandX().widget();
         }
         refreshAll();
     }
@@ -437,6 +474,7 @@ public final class MapTab {
         if (state == null) return;
         String st = state.state();
         if (statusLabel != null) {
+            if (statePill != null) statePill.setKind(st.equals("live") ? SmPill.Kind.OK : st.equals("closed") || st.equals("offline") ? SmPill.Kind.ERROR : SmPill.Kind.WARN);
             statusLabel.set(switch (st) {
                 case "connecting" -> "Connecting";
                 case "waiting" -> "Waiting for the bot";
@@ -445,7 +483,6 @@ public final class MapTab {
                 case "offline" -> "Bot offline";
                 default -> "Closed";
             });
-            statusLabel.color(st.equals("live") ? GOOD : st.equals("closed") || st.equals("offline") ? BAD : WARN);
         }
         if (noteLabel != null) {
             String note = explanation;
@@ -486,6 +523,11 @@ public final class MapTab {
             if (h != null && !Double.isNaN(h.armor())) xp += "   Armour " + Math.round(h.armor());
             xpLabel.set(xp);
         }
+        if (h != null && h.equals(lastHud)) return;
+        lastHud = h;
+        List<WItemGrid.Cell> invCells = new ArrayList<>(27);
+        for (int i = 0; i < 27; i++) invCells.add(cell(h == null ? null : h.inv().get(i), 200 + i));
+        inventory.setCells(invCells);
         List<WItemGrid.Cell> cells = new ArrayList<>(9);
         for (int i = 0; i < 9; i++) cells.add(cell(h == null ? null : h.hotbar().get(i), i));
         hotbar.setCells(cells);
@@ -521,15 +563,20 @@ public final class MapTab {
             String who = l.sender();
             String head = l.kind().equals("whisper") ? (who.isEmpty() ? "?" : who) + " -> " + (l.to().isEmpty() ? "?" : l.to()) + ": " : who.isEmpty() ? "" : who + ": ";
             String time = l.time() > 0 ? Instant.ofEpochMilli(l.time()).atZone(ZoneId.systemDefault()).format(CLOCK) + " " : "";
-            lines.add(new WTextLog.Line(time + head + l.text(), switch (l.kind()) {
-                case "whisper" -> CHAT_WHISPER;
-                case "system" -> CHAT_SYSTEM;
-                case "death" -> CHAT_DEATH;
-                default -> CHAT_PUBLIC;
-            }));
+            lines.add(new WTextLog.Line(time + head + l.text(), chatColor(l.kind())));
         }
-        if (!any) lines.add(new WTextLog.Line("No chat yet.", CHAT_SYSTEM));
+        if (!any) lines.add(new WTextLog.Line("No chat yet.", Ui.dim(theme)));
         chatLog.setLines(lines);
 
+    }
+
+    private meteordevelopment.meteorclient.utils.render.color.Color chatColor(String kind) {
+        SmGuiTheme st = (SmGuiTheme) theme;
+        return switch (kind) {
+            case "whisper" -> st.color(st.palette().accent());
+            case "system" -> st.color(st.palette().muted());
+            case "death" -> Ui.err(theme);
+            default -> st.color(st.palette().text());
+        };
     }
 }

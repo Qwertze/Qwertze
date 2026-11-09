@@ -1,6 +1,11 @@
 package com.porter.qwerte.manager.gui.tabs;
 
 import com.google.gson.JsonObject;
+import com.porter.qwerte.manager.gui.style.PageRoom;
+import com.porter.qwerte.manager.gui.style.SmButton;
+import com.porter.qwerte.manager.gui.style.SmCard;
+import com.porter.qwerte.manager.gui.style.SmPill;
+import com.porter.qwerte.manager.gui.style.Ui;
 import com.porter.qwerte.manager.gui.widgets.MaskedRenderer;
 import com.porter.qwerte.manager.model.BotList;
 import com.porter.qwerte.manager.model.StashRef;
@@ -23,7 +28,6 @@ import meteordevelopment.meteorclient.gui.widgets.input.WTextBox;
 import meteordevelopment.meteorclient.gui.widgets.pressable.WButton;
 import meteordevelopment.meteorclient.gui.widgets.pressable.WCheckbox;
 import meteordevelopment.meteorclient.utils.Utils;
-import meteordevelopment.meteorclient.utils.render.color.Color;
 
 import java.time.Instant;
 import java.time.ZoneId;
@@ -35,7 +39,7 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * The Users tab (owner only): sub-users as the website's Settings page manages them. List, add, edit permissions (all of
+ * The Users list (owner only), shown as a card in the Settings tab: sub-users as the website's Settings page manages them. List, add, edit permissions (all of
  * them, including the live viewer and forced streamer mode), disable or enable, reset the password, log out, delete, rename
  * the owner, and read the audit log. Every write goes through the window's confirm-password retry. The server checks
  * everything; the forms only save a round trip. Names and audit text come from other people and are drawn as plain text.
@@ -43,9 +47,6 @@ import java.util.Set;
 public final class UsersTab {
     private enum Kind { NONE, ADD, EDIT, RESET, OWNER }
 
-    private static final Color WARN = new Color(255, 190, 80);
-    private static final Color BAD = new Color(255, 110, 110);
-    private static final Color DIM = new Color(170, 170, 180);
     private static final long ARM_MS = 4_000;
     private static final DateTimeFormatter WHEN = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
 
@@ -115,9 +116,16 @@ public final class UsersTab {
         if (host.closed() || !host.auth().owner()) return;
         host.bots().tick(now, true);
         if (data == null && !loading && !locked && error.isEmpty()) load();
+        if (deferred && box != null && !TabFocus.anyFocused(box)) {
+            deferred = false;
+            renderBody();
+        }
         if (!armedKey.isEmpty() && now > armedUntil) {
-            armedKey = "";
-            if (box != null) renderBody();
+            // The arming ran out: the buttons are redrawn, but not under a form someone is typing in
+            if (box == null || !TabFocus.anyFocused(box)) {
+                armedKey = "";
+                if (box != null) renderBody();
+            }
         }
     }
 
@@ -140,9 +148,21 @@ public final class UsersTab {
                 host.failed(r);
                 if (r.kind() == ApiError.Kind.NETWORK) data = null;
             }
-            if (box != null) renderBody();
+            if (box != null) renderBodyIdle();
         });
     }
+
+    /** Redraws the users after an answer, but waits while a box of a form has the keyboard (the typed text stays in the form fields). */
+    private void renderBodyIdle() {
+        if (!TabFocus.anyFocused(box)) {
+            deferred = false;
+            renderBody();
+        } else {
+            deferred = true;
+        }
+    }
+
+    private boolean deferred;
 
     private void reload() {
         data = null;
@@ -174,7 +194,7 @@ public final class UsersTab {
         secrets.clear();
         boolean hide = host.policy().hideNames();
         if (locked) {
-            box.add(theme.label("The users are only shown after you confirm your password.", theme.scale(520))).expandX();
+            box.add(theme.label("The users are only shown after you confirm your password.", PageRoom.width(box, 40))).expandX();
             WButton unlock = box.add(theme.button("Confirm password")).widget();
             unlock.action = () -> host.later(() -> host.confirm("Managing users needs your password again. It is not asked for again for 15 minutes.", () -> {
                 locked = false;
@@ -184,7 +204,7 @@ public final class UsersTab {
             return;
         }
         if (data == null) {
-            box.add(theme.label(error.isEmpty() ? "Loading..." : error, theme.scale(520))).expandX().widget().color(error.isEmpty() ? DIM : BAD);
+            box.add(theme.label(error.isEmpty() ? "Loading..." : error, PageRoom.width(box, 40))).expandX().widget().color(error.isEmpty() ? Ui.dim(theme) : Ui.err(theme));
             if (!error.isEmpty()) {
                 WButton retry = box.add(theme.button("Try again")).widget();
                 retry.action = () -> host.later(() -> {
@@ -195,10 +215,15 @@ public final class UsersTab {
             return;
         }
         // The owner
-        WHorizontalList owner = box.add(theme.horizontalList()).expandX().widget();
-        owner.add(theme.label(hide ? "Owner" : data.ownerName() + " (owner)")).expandX();
-        owner.add(theme.label("Every permission, always.")).widget().color(DIM);
-        WButton rename = owner.add(theme.button("Rename")).widget();
+        SmCard ownerCard = box.add(new SmCard("")).expandX().widget();
+        ownerCard.padding = 6;
+        ownerCard.spacing = 4;
+        WHorizontalList owner = ownerCard.add(theme.horizontalList()).expandX().widget();
+        owner.add(theme.label(hide ? "owner" : data.ownerName(), true));
+        owner.add(new SmPill("Owner", SmPill.Kind.NEUTRAL));
+        ownerCard.add(Ui.muted(theme, "Every permission, always. Logs in with this name or a blank username.")).expandX();
+        SmButton rename = (SmButton) ownerCard.add(theme.button("Rename")).widget();
+        rename.pill = true;
         rename.action = () -> {
             toggle(Kind.OWNER, "owner");
             formName = data.ownerName();
@@ -225,9 +250,9 @@ public final class UsersTab {
         };
         if (kind == Kind.ADD) addForm();
 
-        if (data.users().isEmpty()) box.add(theme.label("No sub-users yet. Add one to let someone else in with fewer permissions.", theme.scale(520))).expandX().widget().color(DIM);
+        if (data.users().isEmpty()) box.add(theme.label("No sub-users yet. Add one to let someone else in with fewer permissions.", PageRoom.width(box, 40))).expandX().widget().color(Ui.dim(theme));
         for (User u : data.users()) userRow(u, hide);
-        box.add(theme.label(UsersModel.IMPLIED_HINT, theme.scale(560))).expandX().widget().color(DIM);
+        box.add(theme.label(UsersModel.IMPLIED_HINT, PageRoom.width(box, 40))).expandX().widget().color(Ui.dim(theme));
         if (showAudit) auditPanel(hide);
     }
 
@@ -249,22 +274,25 @@ public final class UsersTab {
     }
 
     private void userRow(User u, boolean hide) {
-        WVerticalList card = box.add(theme.verticalList()).expandX().widget();
+        SmCard card = box.add(new SmCard("")).expandX().widget();
+        card.padding = 6;
+        card.spacing = 4;
         WHorizontalList head = card.add(theme.horizontalList()).expandX().widget();
         head.add(theme.label(hide ? "User" : u.name(), true));
-        head.add(theme.label("[" + UsersModel.presetLabel(u.perms(), data) + "]")).widget().color(DIM);
-        if (u.disabled()) head.add(theme.label("Disabled")).widget().color(BAD);
-        if (u.mustChange()) head.add(theme.label("Must change password")).widget().color(WARN);
+        head.add(new SmPill(UsersModel.presetLabel(u.perms(), data), SmPill.Kind.NEUTRAL));
+        if (u.disabled()) head.add(new SmPill("Disabled", SmPill.Kind.ERROR));
+        if (u.mustChange()) head.add(new SmPill("Must change password", SmPill.Kind.WARN));
         List<String> meta = new ArrayList<>();
         meta.add("Last login " + (u.lastLoginAt() < 0 ? "never" : Text.ago(System.currentTimeMillis() - u.lastLoginAt())));
         meta.add(u.sessions() + (u.sessions() == 1 ? " session" : " sessions"));
         String scope = UsersModel.scopeText(u.perms());
         if (!scope.isEmpty()) meta.add(scope);
-        card.add(theme.label(String.join(" - ", meta))).expandX().widget().color(DIM);
+        card.add(Ui.muted(theme, String.join(" \u00b7 ", meta))).expandX();
 
         WHorizontalList actions = card.add(theme.horizontalList()).widget();
         String name = hide ? "this user" : u.name();
-        WButton edit = actions.add(theme.button("Edit")).widget();
+        SmButton edit = (SmButton) actions.add(theme.button("Edit")).widget();
+        edit.pill = true;
         edit.action = () -> {
             toggle(Kind.EDIT, u.id());
             formName = u.name();
@@ -272,14 +300,16 @@ public final class UsersTab {
             formAllow = UsersModel.joinAllow(formPerms.consoleAllow);
         };
         String disableKey = "disable:" + u.id();
-        WButton disable = actions.add(theme.button(u.disabled() ? "Enable" : armedKey.equals(disableKey) ? "Confirm disable?" : "Disable")).widget();
+        SmButton disable = (SmButton) actions.add(theme.button(u.disabled() ? "Enable" : armedKey.equals(disableKey) ? "Confirm disable?" : "Disable")).widget();
+        disable.pill = true;
         disable.tooltip = u.disabled() ? "Lets " + name + " log in again." : "Ends every session of " + name + " now and blocks logging in. Click twice.";
         disable.action = () -> {
             JsonObject b = new JsonObject();
             b.addProperty("disabled", !u.disabled());
             if (u.disabled() || armed(disableKey)) post("/api/v1/users/" + ServerUrl.seg(u.id()), b, u.disabled() ? "Enabled." : "Disabled.");
         };
-        WButton reset = actions.add(theme.button("Reset password")).widget();
+        SmButton reset = (SmButton) actions.add(theme.button("Reset password")).widget();
+        reset.pill = true;
         reset.action = () -> {
             toggle(Kind.RESET, u.id());
             formPassword = "";
@@ -287,13 +317,15 @@ public final class UsersTab {
             formMust = true;
         };
         String logoutKey = "logout:" + u.id();
-        WButton logout = actions.add(theme.button(armedKey.equals(logoutKey) ? "Confirm log out?" : "Log out everywhere")).widget();
+        SmButton logout = (SmButton) actions.add(theme.button(armedKey.equals(logoutKey) ? "Confirm log out?" : "Log out everywhere")).widget();
+        logout.pill = true;
         logout.tooltip = "Ends every session of " + name + ". Click twice.";
         logout.action = () -> {
             if (armed(logoutKey)) post("/api/v1/users/" + ServerUrl.seg(u.id()) + "/logout", new JsonObject(), "Sessions ended.");
         };
         String deleteKey = "delete:" + u.id();
-        WButton delete = actions.add(theme.button(armedKey.equals(deleteKey) ? "Confirm delete?" : "Delete")).widget();
+        SmButton delete = (SmButton) actions.add(theme.button(armedKey.equals(deleteKey) ? "Confirm delete?" : "Delete")).widget();
+        delete.pill = true;
         delete.tooltip = "Deletes " + name + ". Their sessions end now; their orders stay. This can't be undone. Click twice.";
         delete.action = () -> {
             if (armed(deleteKey)) post("/api/v1/users/" + ServerUrl.seg(u.id()) + "/delete", new JsonObject(), "Deleted.");
@@ -358,8 +390,8 @@ public final class UsersTab {
     }
 
     private WLabel message(WContainer parent) {
-        WLabel l = parent.add(theme.label(formMessage, theme.scale(520))).expandX().widget();
-        l.color(BAD);
+        WLabel l = parent.add(theme.label(formMessage, PageRoom.width(box, 40))).expandX().widget();
+        l.color(Ui.err(theme));
         return l;
     }
 
@@ -391,7 +423,7 @@ public final class UsersTab {
         WVerticalList f = formBox();
         f.add(theme.label("Rename the owner", true));
         field(f, "Owner name (1-32 letters, digits, _ . -)", formName, v -> formName = v);
-        f.add(theme.label("The owner can still log in with a blank username.")).widget().color(DIM);
+        f.add(theme.label("The owner can still log in with a blank username.")).widget().color(Ui.dim(theme));
         buttons(f, "Rename", () -> {
             String n = formName.trim();
             if (n.equals(data.ownerName())) {
@@ -439,7 +471,7 @@ public final class UsersTab {
         if (formPreset.equals("custom")) {
             permsEditor(f);
         } else {
-            f.add(theme.label(UsersModel.describe(data.presets().get(formPreset)), theme.scale(520))).expandX().widget().color(DIM);
+            f.add(theme.label(UsersModel.describe(data.presets().get(formPreset)), PageRoom.width(box, 40))).expandX().widget().color(Ui.dim(theme));
         }
         WHorizontalList must = f.add(theme.horizontalList()).widget();
         WCheckbox mc = must.add(theme.checkbox(formMust)).widget();
@@ -498,7 +530,7 @@ public final class UsersTab {
         WCheckbox mc = must.add(theme.checkbox(formMust)).widget();
         mc.action = () -> formMust = mc.checked;
         must.add(theme.label("Must change the password at next login"));
-        f.add(theme.label("Every session of this user ends now.")).widget().color(DIM);
+        f.add(theme.label("Every session of this user ends now.")).widget().color(Ui.dim(theme));
         buttons(f, "Reset password", () -> {
             String bad = UsersModel.checkPassword(formPassword, formAgain, data.minLength());
             if (!bad.isEmpty()) {
@@ -532,7 +564,7 @@ public final class UsersTab {
             WCheckbox c = row.add(theme.checkbox(forced || p.flag(s.key()))).widget();
             WLabel l = row.add(theme.label(s.label() + (forced ? " (on, implied)" : ""))).widget();
             l.tooltip = s.help();
-            if (s.key().equals("streamer")) l.color(WARN);
+            if (s.key().equals("streamer")) l.color(Ui.warn(theme));
             c.action = () -> {
                 if (forced) {
                     c.checked = true;
@@ -565,7 +597,7 @@ public final class UsersTab {
             Map<String, StashScope> known = new LinkedHashMap<>();
             for (StashRef s : host.stashes()) known.put(new StashScope(s.server(), s.stash()).key(), new StashScope(s.server(), s.stash()));
             for (StashScope s : p.stashes) known.putIfAbsent(s.key(), s);
-            if (known.isEmpty()) e.add(theme.label("None known yet.")).widget().color(DIM);
+            if (known.isEmpty()) e.add(theme.label("None known yet.")).widget().color(Ui.dim(theme));
             boolean hide = host.policy().hideNames();
             for (StashScope s : known.values()) {
                 WHorizontalList row = e.add(theme.horizontalList()).widget();
@@ -589,7 +621,7 @@ public final class UsersTab {
             List<String> ids = new ArrayList<>();
             for (BotList.Bot b : list.bots()) ids.add(b.botId());
             for (String id : p.bots) if (!ids.contains(id)) ids.add(id);
-            if (ids.isEmpty()) e.add(theme.label("None known yet.")).widget().color(DIM);
+            if (ids.isEmpty()) e.add(theme.label("None known yet.")).widget().color(Ui.dim(theme));
             boolean hide = host.policy().hideNames();
             for (String id : ids) {
                 BotList.Bot b = list.find(id);
@@ -630,21 +662,21 @@ public final class UsersTab {
             } else {
                 auditStatus = serverText(r, "Could not load the audit log.");
             }
-            if (box != null) renderBody();
+            if (box != null) renderBodyIdle();
         });
     }
 
     private void auditPanel(boolean hide) {
         WHorizontalList head = box.add(theme.horizontalList()).expandX().widget();
         head.add(theme.label("Audit log", true));
-        head.add(theme.label(auditStatus)).expandX().widget().color(DIM);
+        head.add(theme.label(auditStatus)).expandX().widget().color(Ui.dim(theme));
         WButton refresh = head.add(theme.button("Refresh")).widget();
         refresh.action = () -> {
             loadAudit();
             later();
         };
         if (audit.isEmpty()) {
-            if (auditStatus.isEmpty()) box.add(theme.label("Nothing logged yet.")).widget().color(DIM);
+            if (auditStatus.isEmpty()) box.add(theme.label("Nothing logged yet.")).widget().color(Ui.dim(theme));
             return;
         }
         var view = box.add(theme.view()).expandX().widget();
@@ -655,7 +687,7 @@ public final class UsersTab {
             String when = a.at() > 0 ? Instant.ofEpochMilli(a.at()).atZone(ZoneId.systemDefault()).format(WHEN) : "";
             String text = when + "  " + (hide ? "-" : a.user().isEmpty() ? "-" : a.user()) + "  " + a.action()
                 + (a.detail().isEmpty() ? "" : "  " + a.detail()) + (a.address().isEmpty() || hide ? "" : "  (" + a.address() + ")");
-            view.add(theme.label(text, theme.scale(620))).expandX().widget().color(a.failed() ? BAD : new Color(225, 225, 230));
+            view.add(theme.label(text, PageRoom.width(box, 40))).expandX().widget().color(a.failed() ? Ui.err(theme) : ((com.porter.qwerte.manager.gui.style.SmGuiTheme) theme).color(((com.porter.qwerte.manager.gui.style.SmGuiTheme) theme).palette().text()));
         }
     }
 }

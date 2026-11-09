@@ -42,6 +42,9 @@ public class WOverlayLayer extends WPressable {
     private double lastY;
 
     private List<String> cardLines;
+    private List<String> wrapSrc;
+    private List<String> wrapOut = List.of();
+    private double wrapRoom;
     private double cardX;
     private double cardY;
     private double cardW;
@@ -173,6 +176,19 @@ public class WOverlayLayer extends WPressable {
         double widest = 0;
         for (String line : lines) widest = Math.max(widest, t.textWidth(line));
         double pad = 3 * u;
+        // The card is never wider than the screen: longer lines wrap (made again only when the lines or the room change)
+        double room = getWindowWidth() - 4 * u - 2 * pad;
+        if (widest > room) {
+            if (lines != wrapSrc || room != wrapRoom) {
+                List<String> out = new java.util.ArrayList<>();
+                for (String line : lines) out.addAll(com.porter.qwerte.manager.gui.widgets.TextWrap.wrap(line, room, t::textWidth));
+                wrapSrc = lines;
+                wrapRoom = room;
+                wrapOut = out;
+            }
+            lines = wrapOut;
+            widest = room;
+        }
         double w = widest + 2 * pad;
         double h = lines.size() * t.textHeight() + (lines.size() - 1) * u + 2 * pad;
         double screenW = getWindowWidth();

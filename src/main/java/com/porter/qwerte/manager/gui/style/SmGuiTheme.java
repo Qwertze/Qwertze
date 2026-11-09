@@ -232,6 +232,17 @@ public class SmGuiTheme extends MeteorGuiTheme {
         return w(new SmLabel(text, false, true));
     }
 
+    /** Normal-size text wrapped to {@code maxWidth} physical pixels, long words broken. */
+    public WLabel wrapLabel(String text, double maxWidth) {
+        return w(new WWrapLabel(text, false, maxWidth));
+    }
+
+    /** Wrapped text in the website's smaller size; {@code maxWidth} in physical pixels. */
+    public WLabel smallLabel(String text, double maxWidth) {
+        if (maxWidth <= 0) return smallLabel(text);
+        return w(new WWrapLabel(text, true, maxWidth));
+    }
+
     @Override
     protected WButton button(String text, GuiTexture texture) {
         return w(new SmButton(text, texture));

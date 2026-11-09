@@ -32,7 +32,8 @@ abstract class PasswordPanel {
     }
 
     protected void addNotice(WContainer parent, String message) {
-        notice = parent.add(theme.label("")).expandX().widget();
+        // wraps to the room the panel has, so a long server message never runs past its edge
+        notice = parent.add(com.porter.qwerte.manager.gui.style.Ui.wrap(theme, "", Math.min(theme.scale(420), com.porter.qwerte.manager.gui.style.PageRoom.width(parent, 0)))).expandX().widget();
         notice.color(ERROR);
         setNotice(message);
     }

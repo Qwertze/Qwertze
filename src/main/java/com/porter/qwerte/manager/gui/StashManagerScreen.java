@@ -13,6 +13,7 @@ import com.porter.qwerte.manager.gui.panels.ChangePasswordPanel;
 import com.porter.qwerte.manager.gui.panels.ConfirmPanel;
 import com.porter.qwerte.manager.gui.panels.LoginPanel;
 import com.porter.qwerte.manager.gui.tabs.ActivityTab;
+import com.porter.qwerte.manager.gui.tabs.AppearanceCard;
 import com.porter.qwerte.manager.gui.tabs.BotsTab;
 import com.porter.qwerte.manager.gui.tabs.ConsoleTab;
 import com.porter.qwerte.manager.gui.tabs.PlannerTab;
@@ -21,6 +22,7 @@ import com.porter.qwerte.manager.gui.tabs.MapTab;
 import com.porter.qwerte.manager.gui.tabs.ServerTabHost;
 import com.porter.qwerte.manager.gui.tabs.SettingsTab;
 import com.porter.qwerte.manager.gui.tabs.UsersTab;
+import com.porter.qwerte.manager.gui.chrome.WPaletteButton;
 import com.porter.qwerte.manager.gui.style.Palette;
 import com.porter.qwerte.manager.gui.style.SmButton;
 import com.porter.qwerte.manager.gui.style.SmGuiTheme;
@@ -82,7 +84,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
      * instead of content.
      */
     private enum Tab {
-        BROWSE(NavPage.STASH), ORDERS(NavPage.ORDERS), MAP(NavPage.LIVE), SETTINGS(NavPage.SETTINGS), USERS(NavPage.USERS),
+        BROWSE(NavPage.STASH), ORDERS(NavPage.ORDERS), MAP(NavPage.LIVE), SETTINGS(NavPage.SETTINGS),
         // Server pages with an in-game version (NavPage.inGame), for a window that has a server
         PROXY(NavPage.PROXY), BOTS(NavPage.BOTS), ACTIVITY(NavPage.ACTIVITY), CONSOLE(NavPage.CONSOLE), PLANNER(NavPage.PLANNER);
         // A page without an in-game version would show a note that points to the website. To add one: flip its
@@ -103,7 +105,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
     }
 
     /** The pages local mode lists: the ones that work without a server, plus the server-only ones that show a hint. */
-    private static final List<Tab> LOCAL_TABS = List.of(Tab.BROWSE, Tab.ORDERS, Tab.MAP, Tab.SETTINGS, Tab.USERS);
+    private static final List<Tab> LOCAL_TABS = List.of(Tab.BROWSE, Tab.ORDERS, Tab.MAP, Tab.SETTINGS);
 
     private static final long AUTH_POLL_MS = 30_000;
     private static final long STASH_POLL_MS = 10_000;
@@ -147,6 +149,10 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
     private boolean started;
     private boolean closed;
     private long shownAt;
+    /** The frame's width when the page was built (0: not laid out yet), and since when it differs: a resized window rebuilds its page. */
+    private double builtWidth;
+    private long widthChangedAt;
+    private double lastSeenW;
 
     private ServerUrl url;
     private AuthState auth;
@@ -217,6 +223,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             this.consoleTab = new ConsoleTab(th);
             this.plannerTab = new PlannerTab(th);
             this.usersTab = new UsersTab(th);
+            this.settingsTab.attachUsers(usersTab);
         }
         this.localOrders = new LocalOrderBackend(module.localOrders());
         this.serverOrders = local ? null : new ServerOrderBackend(client, new ServerOrderBackend.Host() {
@@ -348,6 +355,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         bodyCell = frame.page.add(theme.verticalList());
         bodyCell.expandX();
         body = bodyCell.widget();
+        body.spacing = 8;
         rebuild();
     }
 
@@ -389,6 +397,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
     protected void onClosed() {
         closed = true;
         WindowCursor.reset();
+        com.porter.qwerte.manager.gui.widgets.SlotArt.clearCache();
         if (frame != null) frame.overlay.close();
         // The place is remembered when a move, resize or maximize ends; it is written to disk on a real close only
         if (!previewing) module.flushWindowGeometry();
@@ -434,6 +443,39 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         if (view == View.MAIN && tab == Tab.BROWSE) browse.tick(now);
         if (view == View.MAIN) tickOrders(now);
         if (view == View.MAIN && !local) tickServerTabs(now);
+        checkResized(now);
+    }
+
+    /**
+     * Pages are laid out for the width the window had when they were built (cards, columns, wrapped text), so a window that
+     * was resized rebuilds its page once the size has been still for a moment, and never while a text box has the keyboard.
+     */
+    private void checkResized(long now) {
+        if (frame == null || closed || view != View.MAIN) return;
+        double w = frame.width;
+        if (builtWidth == 0) {
+            if (w > 1) {
+                builtWidth = w;
+                lastSeenW = w;
+            }
+            return;
+        }
+        // Still moving: the timer starts again at every change, so a drag never rebuilds
+        if (Math.abs(w - lastSeenW) >= 1) {
+            lastSeenW = w;
+            widthChangedAt = now;
+            return;
+        }
+        if (Math.abs(w - builtWidth) < 2) {
+            widthChangedAt = 0;
+            return;
+        }
+        if (widthChangedAt == 0) widthChangedAt = now;
+        if (now - widthChangedAt > 250 && !textBoxFocused(frame)) {
+            widthChangedAt = 0;
+            builtWidth = 0;
+            rebuild();
+        }
     }
 
     private void tickServerTabs(long now) {
@@ -446,7 +488,6 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             case ACTIVITY -> activityTab.tick(now);
             case CONSOLE -> consoleTab.tick(now);
             case PLANNER -> plannerTab.tick(now);
-            case USERS -> usersTab.tick(now);
             default -> {
             }
         }
@@ -1127,6 +1168,8 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             }
         }
         if (mapTab != null) mapTab.setShown(view == View.MAIN && tab == Tab.MAP && !closed);
+        builtWidth = 0;
+        widthChangedAt = 0;
         invalidate();
     }
 
@@ -1227,14 +1270,22 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             headerSignature = "";
             later(this::rebuild);
         };
-        themeSelect(second);
+        WPaletteButton palette = second.add(new WPaletteButton()).widget();
+        palette.tooltip = "Themes: Settings > Appearance";
+        palette.action = () -> {
+            if (tab != Tab.SETTINGS) {
+                dropConfirm();
+                tab = Tab.SETTINGS;
+                later(this::rebuild);
+            }
+        };
         if (local) {
             clearButton = second.add(theme.button("Clear local index")).widget();
             clearButton.tooltip = "Forgets every container stored for this server and deletes its file. Click twice.";
             clearButton.action = this::clearClicked;
         } else {
             String who = auth.userName().isBlank() ? "owner" : Text.sanitize(auth.userName(), 40);
-            barLabel(second, policy.hideNames() ? "Logged in" : who + (auth.owner() && !who.equals("owner") ? " (owner)" : ""), false);
+            barSmall(second, policy.hideNames() ? "Logged in" : who + (auth.owner() && !who.equals("owner") ? " (owner)" : ""));
             WButton logout = second.add(theme.button("Log out")).widget();
             logout.action = () -> later(this::logout);
         }
@@ -1263,7 +1314,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         nav.gapX = 4;
         nav.gapY = 4;
         for (Tab t : navTabs()) {
-            String title = local && t != Tab.BROWSE && t != Tab.ORDERS ? t.title + " (server)" : t.title;
+            String title = local && t != Tab.BROWSE && t != Tab.ORDERS && t != Tab.SETTINGS ? t.title + " (server)" : t.title;
             WNavPill pill = nav.add(new WNavPill(title, t == tab)).widget();
             pill.action = () -> {
                 if (tab != t) {
@@ -1355,13 +1406,13 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
 
     private void buildMain() {
         if (url != null && !url.secure() && !url.localHost()) {
-            body.add(theme.label("Warning: plain http outside your network (allow-insecure-http is on). Your session is sent unencrypted.", theme.scale(520)))
+            body.add(com.porter.qwerte.manager.gui.style.Ui.wrap(theme, "Warning: plain http outside your network (allow-insecure-http is on). Your session is sent unencrypted.", com.porter.qwerte.manager.gui.style.PageRoom.width(body, 0)))
                 .expandX().widget().color(warn());
         }
 
         if (tab.webOnly()) {
             // No in-game version: say so, and where the page is (the address is hidden while streamer mode is on)
-            body.add(theme.label(tab.page.websiteNote(url == null || policy().hideServer() ? null : url.origin()), Math.max(theme.scale(200), Math.min(theme.scale(520), sm().g(frame.effective().w() - 28))))).expandX();
+            body.add(com.porter.qwerte.manager.gui.style.Ui.wrap(theme, tab.page.websiteNote(url == null || policy().hideServer() ? null : url.origin()), com.porter.qwerte.manager.gui.style.PageRoom.width(body, 0))).expandX();
             return;
         }
         if (tab == Tab.ORDERS) {
@@ -1401,10 +1452,6 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         }
         if (tab == Tab.PLANNER) {
             plannerTab.build(body, theme);
-            return;
-        }
-        if (tab == Tab.USERS) {
-            usersTab.build(body, theme);
             return;
         }
         if (!auth.can("view")) {
@@ -1541,6 +1588,16 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         }
 
         @Override
+        public WindowTheme windowTheme() {
+            return module.windowTheme();
+        }
+
+        @Override
+        public void setWindowTheme(WindowTheme theme) {
+            module.setWindowTheme(theme);
+        }
+
+        @Override
         public String viewerId(String botId) {
             return module.viewerId(botId);
         }
@@ -1597,8 +1654,13 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             orders.build(body, theme);
             return;
         }
+        if (tab == Tab.SETTINGS) {
+            // Works without a server: the themes
+            AppearanceCard.build(body, theme, module.windowTheme(), module::setWindowTheme);
+            return;
+        }
         if (tab != Tab.BROWSE) {
-            body.add(theme.label(NEEDS_SERVER, Math.max(theme.scale(200), Math.min(theme.scale(520), sm().g(frame.effective().w() - 28))))).expandX();
+            body.add(com.porter.qwerte.manager.gui.style.Ui.wrap(theme, NEEDS_SERVER, com.porter.qwerte.manager.gui.style.PageRoom.width(body, 0))).expandX();
             return;
         }
         browse.build(body, theme);

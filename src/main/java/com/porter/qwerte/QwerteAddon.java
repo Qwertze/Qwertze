@@ -4,6 +4,8 @@ import com.mojang.logging.LogUtils;
 import com.porter.qwerte.commands.StashWindowCommand;
 import com.porter.qwerte.modules.AutoDirt;
 import com.porter.qwerte.modules.AutoTill;
+import com.porter.qwerte.modules.ContainerTweaks;
+import com.porter.qwerte.modules.Printer;
 import com.porter.qwerte.modules.ResetPearl;
 import com.porter.qwerte.modules.StashManager;
 import com.porter.qwerte.modules.StashOverlay;
@@ -32,6 +34,8 @@ public class QwerteAddon extends MeteorAddon {
         Modules.get().add(new StashManager());
         Modules.get().add(new ResetPearl());
         Modules.get().add(new StashWindow());
+        Modules.get().add(new ContainerTweaks());
+        Modules.get().add(new Printer());
 
         // Commands
         Commands.add(new StashWindowCommand());

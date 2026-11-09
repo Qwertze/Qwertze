@@ -24,7 +24,7 @@ public final class ChangePasswordPanel extends PasswordPanel {
         this.minLength = minLength;
         this.handler = handler;
         parent.add(theme.label("Choose a new password", true));
-        parent.add(theme.label("Your account must change its password before anything else works.", theme.scale(420))).expandX();
+        parent.add(com.porter.qwerte.manager.gui.style.Ui.wrap(theme, "Your account must change its password before anything else works.", Math.min(theme.scale(420), com.porter.qwerte.manager.gui.style.PageRoom.width(parent, 0)))).expandX();
         current = secret(parent, "The password you were given");
         next = secret(parent, "New password (at least " + minLength + " characters)");
         again = secret(parent, "New password again");

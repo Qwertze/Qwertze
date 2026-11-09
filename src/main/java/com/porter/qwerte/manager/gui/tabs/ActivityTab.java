@@ -1,5 +1,13 @@
 package com.porter.qwerte.manager.gui.tabs;
 
+import com.porter.qwerte.manager.gui.chrome.WModuleChip;
+import com.porter.qwerte.manager.gui.style.PageRoom;
+import com.porter.qwerte.manager.gui.style.SmCard;
+import com.porter.qwerte.manager.gui.style.SmColumns;
+import com.porter.qwerte.manager.gui.style.SmGrid;
+import com.porter.qwerte.manager.gui.style.SmGuiTheme;
+import com.porter.qwerte.manager.gui.style.SmPill;
+import com.porter.qwerte.manager.gui.style.Ui;
 import com.porter.qwerte.manager.gui.widgets.WBar;
 import com.porter.qwerte.manager.gui.widgets.WTextLog;
 import com.porter.qwerte.manager.model.ActivityModel;
@@ -11,14 +19,13 @@ import com.porter.qwerte.manager.net.ApiError;
 import com.porter.qwerte.manager.net.ServerUrl;
 import meteordevelopment.meteorclient.gui.GuiTheme;
 import meteordevelopment.meteorclient.gui.widgets.WLabel;
+import meteordevelopment.meteorclient.gui.widgets.WWidget;
 import meteordevelopment.meteorclient.gui.widgets.containers.WContainer;
 import meteordevelopment.meteorclient.gui.widgets.containers.WHorizontalList;
-import meteordevelopment.meteorclient.gui.widgets.containers.WTable;
 import meteordevelopment.meteorclient.gui.widgets.containers.WVerticalList;
 import meteordevelopment.meteorclient.gui.widgets.input.WDropdown;
 import meteordevelopment.meteorclient.gui.widgets.input.WTextBox;
 import meteordevelopment.meteorclient.gui.widgets.pressable.WCheckbox;
-import meteordevelopment.meteorclient.utils.Utils;
 import meteordevelopment.meteorclient.utils.render.color.Color;
 
 import java.time.ZoneId;
@@ -37,11 +44,6 @@ import java.util.Objects;
  * module status and event text are hidden, like on the website.
  */
 public final class ActivityTab {
-    private static final Color WARN = new Color(255, 190, 80);
-    private static final Color GOOD = new Color(120, 220, 140);
-    private static final Color BAD = new Color(255, 110, 110);
-    private static final Color DIM = new Color(170, 170, 180);
-    private static final Color TEXT = new Color(225, 225, 230);
     private static final long POLL_MS = 2_000;
     private static final long RETRY_MS = 5_000;
     private static final long CHECK_MS = 1_000;
@@ -84,6 +86,9 @@ public final class ActivityTab {
     private WTextLog eventsLog;
     private WVerticalList modBox;
     private WLabel modCount;
+    /** Writes the current task values into the labels and bars of the last build. */
+    private final List<java.util.function.LongConsumer> taskLive = new ArrayList<>();
+    private final List<WModuleChip> chips = new ArrayList<>();
 
     public ActivityTab(ServerTabHost host) {
         this.host = host;
@@ -154,7 +159,7 @@ public final class ActivityTab {
         if (updatedLabel != null && data != null) {
             long sn = serverNow();
             updatedLabel.set(ActivityModel.updated(data.receivedAt(), sn));
-            updatedLabel.color(ActivityModel.stale(data.receivedAt(), sn) ? WARN : DIM);
+            updatedLabel.color(ActivityModel.stale(data.receivedAt(), sn) ? Ui.warn(theme) : Ui.dim(theme));
         }
         liveValues();
         if (!builtSignature.equals(signature())) rebuildIfIdle();
@@ -177,6 +182,9 @@ public final class ActivityTab {
         if (specLabel != null) specLabel.set(String.valueOf(Math.round(c.spectators())));
         setBar(healthBar, c.health());
         setBar(foodBar, c.food());
+        long sn = serverNow();
+        for (java.util.function.LongConsumer u : taskLive) u.accept(sn);
+        if (!chips.isEmpty()) updateChips();
     }
 
     private static void setBar(WBar bar, double value) {
@@ -195,7 +203,15 @@ public final class ActivityTab {
         StringBuilder sb = new StringBuilder();
         sb.append(p.streamer()).append(bot).append(capableBot() != null).append(host.bots().loaded()).append(message);
         if (data != null) {
-            sb.append(ActivityModel.structureSignature(data, serverNow(), AGE_BUCKET_MS)).append("#").append(ActivityModel.sources(data.events()));
+            // Only what changes the widgets: the connection layout, the task set, the module names and switches, the plugins.
+            // Progress, texts, module status and the "since" ages are written into their widgets (liveValues).
+            sb.append(data.online()).append(data.hasActivity()).append('|').append(ActivityModel.connectionSignature(data.connection()));
+            for (ActivityModel.Task t : data.current()) {
+                sb.append('|').append(t.source()).append(t.level()).append(t.title().isEmpty()).append(t.detail().isEmpty()).append(t.hasProgress()).append(t.since() > 0);
+            }
+            for (ActivityModel.Module m : data.modules()) sb.append('|').append(m.name()).append(m.plugin()).append(m.enabled()).append(m.status().isEmpty());
+            for (ActivityModel.Plugin pl : data.plugins()) sb.append('|').append(pl.id()).append(pl.name()).append(pl.version());
+            sb.append("#").append(ActivityModel.sources(data.events()));
         }
         return sb.toString();
     }
@@ -241,105 +257,159 @@ public final class ActivityTab {
         modBox = null;
         modCount = null;
         modPending = false;
+        taskLive.clear();
+        chips.clear();
+        double wide = PageRoom.width(parent, 0);
         if (!host.auth().can("activity")) {
-            parent.add(theme.label("Your account can not see the bot activity; ask the owner.", theme.scale(520))).expandX().widget().color(WARN);
+            parent.add(Ui.wrap(theme, "Your account can not see the bot activity; ask the owner.", wide)).expandX().widget().color(Ui.warn(theme));
             builtSignature = signature();
             return;
         }
         // the first build after the tab was picked: tick has not seen the bot yet
         if (bot == null) bot = host.bots().selected();
         builtSignature = signature();
+        BotList.Bot picked = host.bots().selectedBot();
+        String botName = picked == null ? "" : host.bots().list().name(picked, host.policy().hideNames());
+        Ui.pageTitle(parent, theme, "activity" + (botName.isEmpty() ? "" : " \u00b7 " + botName));
         if (bot == null) {
-            parent.add(theme.label(host.bots().loaded() ? "No dashboard bot yet." : "Loading the bots...", theme.scale(520))).expandX().widget().color(DIM);
+            parent.add(Ui.wrap(theme, host.bots().loaded() ? "No dashboard bot yet." : "Loading the bots...", wide)).expandX().widget().color(Ui.dim(theme));
             return;
         }
         if (capableBot() == null) {
-            parent.add(theme.label("This bot does not send its activity (update the Qwerte Stash plugin).", theme.scale(520))).expandX().widget().color(WARN);
+            parent.add(Ui.wrap(theme, "This bot does not send its activity (update the Qwerte Stash plugin).", wide)).expandX().widget().color(Ui.warn(theme));
             return;
         }
         if (data == null || !data.hasActivity()) {
             String m = !message.isEmpty() ? message : data == null ? "Loading the activity..." : "Waiting for the first activity report of the bot...";
-            parent.add(theme.label(m, theme.scale(520))).expandX().widget().color(message.isEmpty() ? DIM : BAD);
+            parent.add(Ui.wrap(theme, m, wide)).expandX().widget().color(message.isEmpty() ? Ui.dim(theme) : Ui.err(theme));
             return;
         }
         DisplayPolicy policy = host.policy();
         long sn = serverNow();
         status(parent, policy, sn);
-        parent.add(theme.label("Now doing", true));
-        tasks(parent, policy, sn);
-        parent.add(theme.label("Events", true));
-        events(parent);
-        modules(parent);
-        plugins(parent);
+        double gap = theme.scale(10);
+        double half = (wide - gap) / 2;
+        SmColumns cols = parent.add(new SmColumns()).expandX().widget();
+        cols.maxWidth = wide;
+        cols.gap = 10;
+        cols.stretch = true;
+        cols.weights(1, 1);
+        SmCard doing = cols.add(new SmCard("Now doing")).widget();
+        tasks(doing, policy, sn, half - theme.scale(16));
+        SmCard ev = cols.add(new SmCard("Events")).widget();
+        events(ev, half - theme.scale(16));
+        modules(parent, wide);
+        plugins(parent, wide);
     }
 
     private void status(WContainer parent, DisplayPolicy policy, long sn) {
+        SmGuiTheme st = (SmGuiTheme) theme;
         Connection c = data.connection();
-        WHorizontalList head = parent.add(theme.horizontalList()).expandX().widget();
-        Color stateColor = c.state().equals("online") ? GOOD : c.state().equals("offline") ? BAD : WARN;
-        head.add(theme.label(ActivityModel.badge(c), true)).widget().color(stateColor);
-        if (!c.server().isEmpty()) head.add(theme.label(policy.hideServer() ? "Hidden (streamer)" : c.server())).widget().color(DIM);
-        updatedLabel = head.add(theme.label(ActivityModel.updated(data.receivedAt(), sn))).widget();
-        updatedLabel.color(ActivityModel.stale(data.receivedAt(), sn) ? WARN : DIM);
+        SmCard strip = Ui.card(parent, "");
+        strip.padding = 6;
+        WHorizontalList head = strip.add(theme.horizontalList()).expandX().widget();
+        SmPill.Kind kind = c.state().equals("online") ? SmPill.Kind.OK : c.state().equals("offline") ? SmPill.Kind.ERROR : SmPill.Kind.WARN;
+        head.add(new SmPill(ActivityModel.badge(c), kind));
+        head.add(theme.label(c.server().isEmpty() ? "" : policy.hideServer() ? "Hidden (streamer)" : c.server(), true)).expandX();
+        updatedLabel = head.add(Ui.muted(theme, ActivityModel.updated(data.receivedAt(), sn))).widget();
+        updatedLabel.color(ActivityModel.stale(data.receivedAt(), sn) ? Ui.warn(theme) : Ui.dim(theme));
 
-        WTable t = parent.add(theme.table()).expandX().widget();
-        if (!c.dimension().isEmpty()) row(t, "Dimension", ActivityModel.dimension(c.dimension()));
-        if (c.hasPosition()) {
-            posLabel = row(t, "Position", positionText(policy, c));
-        }
-        if (!Double.isNaN(c.health())) healthBar = bar(t, "Health", c.health(), new Color(220, 60, 60));
-        if (!Double.isNaN(c.food())) foodBar = bar(t, "Food", c.food(), new Color(210, 140, 50));
-        if (!Double.isNaN(c.ping())) pingLabel = row(t, "Ping", Math.round(c.ping()) + " ms");
-        if (!Double.isNaN(c.uptimeSeconds())) uptimeLabel = row(t, "Uptime", ActivityModel.duration((long) (c.uptimeSeconds() * 1000)));
-        if (!Double.isNaN(c.spectators())) specLabel = row(t, "Spectators", String.valueOf(Math.round(c.spectators())));
-        row(t, "Controlled by", c.controllingPlayer().isEmpty() ? "nobody" : policy.hideNames() ? "Hidden (streamer)" : c.controllingPlayer());
+        com.porter.qwerte.manager.gui.chrome.WFlow flow = strip.add(new com.porter.qwerte.manager.gui.chrome.WFlow()).expandX().widget();
+        flow.gapX = 18;
+        flow.gapY = 6;
+        flow.maxWidth = PageRoom.width(strip, 12);
+        if (!c.dimension().isEmpty()) stat(flow, "Dimension", ActivityModel.dimension(c.dimension()));
+        if (c.hasPosition()) posLabel = stat(flow, "Position", positionText(policy, c));
+        if (!Double.isNaN(c.health())) healthBar = bar(flow, "Health", c.health(), st.color(st.palette().hp()));
+        if (!Double.isNaN(c.food())) foodBar = bar(flow, "Food", c.food(), st.color(st.palette().food()));
+        if (!Double.isNaN(c.ping())) pingLabel = stat(flow, "Ping", Math.round(c.ping()) + " ms");
+        if (!Double.isNaN(c.uptimeSeconds())) uptimeLabel = stat(flow, "Uptime", ActivityModel.duration((long) (c.uptimeSeconds() * 1000)));
+        if (!Double.isNaN(c.spectators())) specLabel = stat(flow, "Spectators", String.valueOf(Math.round(c.spectators())));
+        stat(flow, "Controlled by", c.controllingPlayer().isEmpty() ? "nobody" : policy.hideNames() ? "Hidden (streamer)" : c.controllingPlayer());
     }
 
-    private WLabel row(WTable t, String name, String value) {
-        t.add(theme.label(name)).widget().color(DIM);
-        WLabel l = t.add(theme.label(value)).widget();
-        t.row();
-        return l;
+    private WLabel stat(WContainer row, String name, String value) {
+        WVerticalList col = row.add(theme.verticalList()).widget();
+        col.spacing = 1;
+        col.add(Ui.muted(theme, name));
+        return col.add(theme.label(value)).widget();
     }
 
-    private WBar bar(WTable t, String name, double value, Color fill) {
-        t.add(theme.label(name)).widget().color(DIM);
-        WBar b = t.add(new WBar(fill, 20)).widget();
+    private WBar bar(WContainer row, String name, double value, Color fill) {
+        WVerticalList col = row.add(theme.verticalList()).widget();
+        col.spacing = 1;
+        col.add(Ui.muted(theme, name));
+        WBar b = col.add(new WBar(fill, 20)).widget();
         setBar(b, value);
-        t.row();
         return b;
     }
 
-    private void tasks(WContainer parent, DisplayPolicy policy, long sn) {
+    private void tasks(SmCard card, DisplayPolicy policy, long sn, double wrap) {
         if (data.current().isEmpty()) {
-            parent.add(theme.label("Nothing running right now.")).widget().color(DIM);
+            card.add(Ui.muted(theme, "Nothing running right now.")).expandX();
             return;
         }
-        for (ActivityModel.Task k : data.current()) {
-            WVerticalList card = parent.add(theme.verticalList()).expandX().widget();
-            WHorizontalList top = card.add(theme.horizontalList()).expandX().widget();
-            top.add(theme.label(k.source().isEmpty() ? "?" : k.source(), true)).widget().color(levelColor(k.level()));
-            if (k.since() > 0) top.add(theme.label("since " + ActivityModel.duration(sn - k.since()))).widget().color(DIM);
-            if (!k.title().isEmpty()) card.add(theme.label(k.title(), theme.scale(520))).expandX();
-            if (!k.detail().isEmpty()) {
-                card.add(theme.label(policy.streamer() ? "(hidden)" : k.detail(), theme.scale(520))).expandX().widget().color(DIM);
-            }
+        taskLive.clear();
+        List<ActivityModel.Task> list = data.current();
+        for (int i = 0; i < list.size(); i++) {
+            ActivityModel.Task k = list.get(i);
+            int index = i;
+            SmCard t = card.add(new SmCard("", SmCard.Style.TILE)).expandX().widget();
+            t.padding = 6;
+            t.spacing = 3;
+            WHorizontalList top = t.add(theme.horizontalList()).expandX().widget();
+            top.add(theme.label(k.source().isEmpty() ? "?" : k.source(), true)).expandX().widget().color(levelColor(k.level()));
+            WLabel since = k.since() > 0 ? top.add(Ui.muted(theme, "since " + ActivityModel.duration(sn - k.since()))).widget() : null;
+            WLabel title = k.title().isEmpty() ? null : t.add(Ui.wrap(theme, k.title(), wrap - theme.scale(12))).expandX().widget();
+            WLabel detail = k.detail().isEmpty() ? null : t.add(Ui.muted(theme, policy.streamer() ? "(hidden)" : k.detail(), wrap - theme.scale(12))).expandX().widget();
+            WBar bar = null;
+            WLabel counts = null;
             if (k.hasProgress()) {
-                WHorizontalList pr = card.add(theme.horizontalList()).widget();
+                WHorizontalList pr = t.add(theme.horizontalList()).widget();
+                SmGuiTheme st = (SmGuiTheme) theme;
                 long total = Math.max(1, k.total());
-                long done = Math.max(0, Math.min(total, k.done()));
-                pr.add(new WBar(new Color(90, 150, 230), total)).widget().set(done, Math.round(100.0 * done / total) + "%");
-                pr.add(theme.label(k.done() + " / " + k.total())).widget().color(DIM);
+                bar = pr.add(new WBar(st.color(st.palette().accent()), total)).widget();
+                counts = pr.add(Ui.muted(theme, "")).widget();
             }
+            WBar fbar = bar;
+            WLabel fcounts = counts;
+            taskLive.add(now -> {
+                if (data == null || index >= data.current().size()) return;
+                ActivityModel.Task cur = data.current().get(index);
+                if (since != null && cur.since() > 0) since.set("since " + ActivityModel.duration(now - cur.since()));
+                if (title != null) title.set(cur.title());
+                if (detail != null) detail.set(host.policy().streamer() ? "(hidden)" : cur.detail());
+                if (fbar != null && cur.hasProgress()) {
+                    long total = Math.max(1, cur.total());
+                    long done = Math.max(0, Math.min(total, cur.done()));
+                    fbar.setMax(total);
+                    fbar.set(done, Math.round(100.0 * done / total) + "%");
+                    fcounts.set(cur.done() + " / " + cur.total());
+                }
+            });
+        }
+        liveValues();
+    }
+
+    private void updateChips() {
+        if (data == null || host.policy().streamer()) return;
+        int i = 0;
+        for (ActivityModel.Module m : currentModules) {
+            if (i >= chips.size()) break;
+            chips.get(i++).setStatus(m.status());
         }
     }
 
-    private static Color levelColor(String level) {
-        return level.equals("error") ? BAD : level.equals("warn") ? WARN : TEXT;
+    /** The modules in the order the chips were made (the filtered, grouped list). */
+    private final List<ActivityModel.Module> currentModules = new ArrayList<>();
+
+    private Color levelColor(String level) {
+        SmGuiTheme st = (SmGuiTheme) theme;
+        return level.equals("error") ? Ui.err(theme) : level.equals("warn") ? Ui.warn(theme) : st.color(st.palette().text());
     }
 
-    private void events(WContainer parent) {
-        WHorizontalList filters = parent.add(theme.horizontalList()).expandX().widget();
+    private void events(SmCard card, double wrap) {
+        WHorizontalList filters = card.addRight(theme.horizontalList()).widget();
         List<String> sources = ActivityModel.sources(data.events());
         String[] sourceLabels = new String[sources.size() + 1];
         sourceLabels[0] = "All sources";
@@ -360,7 +430,7 @@ public final class ActivityTab {
             for (int i = 0; i < LEVEL_LABELS.length; i++) if (LEVEL_LABELS[i].equals(v)) levelFilter = LEVEL_VALUES[i];
             fillEvents();
         };
-        eventsLog = parent.add(new WTextLog(520)).expandX().widget();
+        eventsLog = card.add(new WTextLog(0).size(wrap, 16)).expandX().widget();
         fillEvents();
     }
 
@@ -371,7 +441,7 @@ public final class ActivityTab {
         List<WTextLog.Line> lines = new ArrayList<>();
         List<ActivityModel.Event> shown = ActivityModel.filterEvents(data.events(), sourceFilter, levelFilter);
         if (shown.isEmpty()) {
-            lines.add(new WTextLog.Line(data.events().isEmpty() ? "No events yet." : "No events match.", DIM));
+            lines.add(new WTextLog.Line(data.events().isEmpty() ? "No events yet." : "No events match.", Ui.dim(theme)));
         }
         ZoneId zone = ZoneId.systemDefault();
         for (ActivityModel.Event e : shown) {
@@ -382,13 +452,10 @@ public final class ActivityTab {
         shownEvents = eventsKey();
     }
 
-    private void modules(WContainer parent) {
-        WHorizontalList head = parent.add(theme.horizontalList()).expandX().widget();
-        head.add(theme.label("Modules", true));
-        modCount = head.add(theme.label(data.modulesOn() + " of " + data.modules().size() + " on")).widget();
-        modCount.color(DIM);
-        WHorizontalList filter = parent.add(theme.horizontalList()).expandX().widget();
-        WTextBox box = filter.add(theme.textBox(moduleQuery, "Filter modules")).minWidth(theme.scale(220)).expandX().widget();
+    private void modules(WContainer parent, double wide) {
+        SmCard card = Ui.card(parent, "Modules");
+        WHorizontalList right = card.addRight(theme.horizontalList()).widget();
+        WTextBox box = right.add(theme.textBox(moduleQuery, "Filter modules")).minWidth(theme.scale(180)).widget();
         box.action = () -> {
             String q = box.get();
             if (q.equals(moduleQuery)) return;
@@ -396,59 +463,71 @@ public final class ActivityTab {
             modDirtyAt = System.currentTimeMillis();
             modPending = true;
         };
-        WCheckbox only = filter.add(theme.checkbox(enabledOnly)).widget();
+        WCheckbox only = right.add(theme.checkbox(enabledOnly)).widget();
         only.action = () -> {
             enabledOnly = only.checked;
             fillModules();
         };
-        filter.add(theme.label("Enabled only"));
-        modBox = parent.add(theme.verticalList()).expandX().widget();
+        right.add(theme.label("enabled only"));
+        modCount = card.add(Ui.muted(theme, data.modulesOn() + " of " + data.modules().size() + " on")).widget();
+        modBox = card.add(theme.verticalList()).expandX().widget();
+        modBox.spacing = 4;
+        modWidth = PageRoom.width(card, 16);
         fillModules();
     }
+
+    private double modWidth;
 
     private void fillModules() {
         if (modBox == null || data == null) return;
         modBox.clear();
+        chips.clear();
+        currentModules.clear();
         boolean hide = host.policy().streamer();
         Map<String, List<ActivityModel.Module>> groups = ActivityModel.filterModules(data.modules(), moduleQuery, enabledOnly);
         if (groups.isEmpty()) {
-            modBox.add(theme.label(data.modules().isEmpty() ? "The bot did not report any modules." : "No modules match.")).widget().color(DIM);
+            modBox.add(Ui.muted(theme, data.modules().isEmpty() ? "The bot did not report any modules." : "No modules match.")).expandX();
             return;
         }
-        var view = modBox.add(theme.view()).expandX().widget();
-        view.maxHeight = Math.max(theme.scale(160), Utils.getWindowHeight() * 0.3);
         int shown = 0;
         for (Map.Entry<String, List<ActivityModel.Module>> g : groups.entrySet()) {
             if (shown >= MODULES_SHOWN) break;
-            view.add(theme.label(ActivityModel.groupTitle(g.getKey()), true));
-            WTable table = view.add(theme.table()).expandX().widget();
-            int col = 0;
+            modBox.add(theme.label(ActivityModel.groupTitle(g.getKey()), true)).expandX();
+            SmGrid grid = modBox.add(new SmGrid()).expandX().widget();
+            grid.minCell = 140;
+            grid.gapX = 6;
+            grid.gapY = 4;
+            grid.maxWidth = modWidth;
             for (ActivityModel.Module m : g.getValue()) {
                 if (shown++ >= MODULES_SHOWN) break;
-                WLabel l = table.add(theme.label((m.enabled() ? "[on] " : "[off] ") + m.name())).widget();
-                l.color(m.enabled() ? GOOD : DIM);
-                if (!m.status().isEmpty() && !hide) l.tooltip = m.status();
-                if (++col == 3) {
-                    col = 0;
-                    table.row();
-                }
+                chips.add(grid.add(new WModuleChip(m.name(), hide ? "" : m.status(), m.enabled())).widget());
+                currentModules.add(m);
             }
         }
-        if (shown >= MODULES_SHOWN) modBox.add(theme.label("Showing the first " + MODULES_SHOWN + " modules. Use the filter for the rest.")).widget().color(DIM);
+        if (shown >= MODULES_SHOWN) modBox.add(Ui.muted(theme, "Showing the first " + MODULES_SHOWN + " modules. Use the filter for the rest.")).expandX();
     }
 
-    private void plugins(WContainer parent) {
-        parent.add(theme.label("Plugins", true));
+    private void plugins(WContainer parent, double wide) {
+        SmCard card = Ui.card(parent, "Plugins");
         if (data.plugins().isEmpty()) {
-            parent.add(theme.label("The bot did not report any plugins.")).widget().color(DIM);
+            card.add(Ui.muted(theme, "The bot did not report any plugins.")).expandX();
             return;
         }
-        WTable t = parent.add(theme.table()).expandX().widget();
+        pluginCards(card, wide);
+    }
+
+    private void pluginCards(SmCard card, double wide) {
+        com.porter.qwerte.manager.gui.chrome.WFlow flow = card.add(new com.porter.qwerte.manager.gui.chrome.WFlow()).expandX().widget();
+        flow.gapX = 8;
+        flow.gapY = 8;
+        flow.maxWidth = PageRoom.width(card, 16);
         for (ActivityModel.Plugin p : data.plugins()) {
-            t.add(theme.label(p.name().isEmpty() ? p.id() : p.name()));
+            SmCard c = flow.add(new SmCard("", SmCard.Style.TILE)).widget();
+            c.padding = 6;
+            c.spacing = 1;
+            c.add(theme.label(p.name().isEmpty() ? p.id() : p.name(), true));
             String meta = (!p.id().isEmpty() && !p.name().isEmpty() ? p.id() + " " : "") + (p.version().isEmpty() ? "" : "v" + p.version());
-            t.add(theme.label(meta)).widget().color(DIM);
-            t.row();
+            if (!meta.isEmpty()) c.add(Ui.muted(theme, meta));
         }
     }
 

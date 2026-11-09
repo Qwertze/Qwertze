@@ -15,7 +15,7 @@ public enum NavPage {
     ACTIVITY("Activity", true),
     LIVE("Live", true),
     SETTINGS("Settings", true),
-    /** Not on the website's bar (it lives inside Settings there); the owner's user list has its own page here. */
+    /** Not on the website's bar (it lives inside Settings there). The window has no Users tab: the owner's user list is a card in Settings. */
     USERS("Users", true),
     PROXY("Proxy", true),
     CONSOLE("Console", true);

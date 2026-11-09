@@ -1060,6 +1060,7 @@ public class StashManager extends Module {
                 lines.add(line);
             }
             result.add("lines", lines);
+            if (r.repair() != null) result.add("repair", r.repair().toJson());
             o.add("result", result);
         }
         return o;

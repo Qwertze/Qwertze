@@ -58,6 +58,11 @@ public class WItemGrid extends WPressable {
     /** Called with the cell under the mouse and the mouse button (0 left, 1 right). */
     public BiConsumer<Cell, Integer> onCell;
 
+    /** Builds the hover card of a cell (null lines: the cell's own tip). Called once when the hovered cell changes. */
+    public java.util.function.Function<Cell, List<String>> tipFor;
+    private Cell tipCell;
+    private List<String> tipLines;
+
     public WItemGrid(Supplier<GuiGraphics> graphics) {
         this.graphics = graphics;
     }
@@ -262,7 +267,17 @@ public class WItemGrid extends WPressable {
             Cell c = cells.get(hover);
             int hr = hover / cols - scrollRow;
             int hc = hover % cols;
-            SlotArt.card(t, c.tip(), c.stack(), x + (offX() + hc * GridLayout.SLOT) * u, y + (PAD + hr * GridLayout.SLOT) * u, GridLayout.SLOT * u);
+            double cx = x + (offX() + hc * GridLayout.SLOT) * u;
+            double cy = y + (PAD + hr * GridLayout.SLOT) * u;
+            if (tipFor != null && c.ref() != null && c != tipCell) {
+                tipCell = c;
+                tipLines = tipFor.apply(c);
+            }
+            if (tipFor != null && c == tipCell && tipLines != null && !tipLines.isEmpty()) {
+                SlotArt.card(t, tipLines, cx, cy, GridLayout.SLOT * u);
+            } else {
+                SlotArt.card(t, c.tip(), c.stack(), cx, cy, GridLayout.SLOT * u);
+            }
         }
 
         GuiGraphics g = graphics.get();

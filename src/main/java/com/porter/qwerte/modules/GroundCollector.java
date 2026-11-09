@@ -304,7 +304,7 @@ final class GroundCollector {
      * Lava, fire, a cactus, magma, a berry bush or powder snow in the item's cell or the one below, or a chunk that
      * isn't loaded.
      */
-    private static boolean hazardous(BlockPos cell) {
+    static boolean hazardous(BlockPos cell) {
         for (BlockPos pos : new BlockPos[] { cell, cell.below() }) {
             if (!mc.level.isLoaded(pos)) return true;
             BlockState state = mc.level.getBlockState(pos);

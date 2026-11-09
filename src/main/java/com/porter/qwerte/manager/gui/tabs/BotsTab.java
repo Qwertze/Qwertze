@@ -1,6 +1,16 @@
 package com.porter.qwerte.manager.gui.tabs;
 
 import com.google.gson.JsonObject;
+import com.porter.qwerte.manager.gui.chrome.WDot;
+import com.porter.qwerte.manager.gui.chrome.WFlow;
+import com.porter.qwerte.manager.gui.style.PageRoom;
+import com.porter.qwerte.manager.gui.style.SmButton;
+import com.porter.qwerte.manager.gui.style.SmCard;
+import com.porter.qwerte.manager.gui.style.SmGrid;
+import com.porter.qwerte.manager.gui.style.SmGuiTheme;
+import com.porter.qwerte.manager.gui.style.SmPill;
+import com.porter.qwerte.manager.gui.style.SmTable;
+import com.porter.qwerte.manager.gui.style.Ui;
 import com.porter.qwerte.manager.model.BotList;
 import com.porter.qwerte.manager.model.BotsModel;
 import com.porter.qwerte.manager.model.DisplayPolicy;
@@ -9,13 +19,11 @@ import com.porter.qwerte.manager.model.Text;
 import com.porter.qwerte.manager.net.ApiError;
 import meteordevelopment.meteorclient.gui.GuiTheme;
 import meteordevelopment.meteorclient.gui.widgets.WLabel;
+import meteordevelopment.meteorclient.gui.widgets.WWidget;
 import meteordevelopment.meteorclient.gui.widgets.containers.WContainer;
 import meteordevelopment.meteorclient.gui.widgets.containers.WHorizontalList;
-import meteordevelopment.meteorclient.gui.widgets.containers.WTable;
 import meteordevelopment.meteorclient.gui.widgets.containers.WVerticalList;
 import meteordevelopment.meteorclient.gui.widgets.pressable.WButton;
-import meteordevelopment.meteorclient.utils.Utils;
-import meteordevelopment.meteorclient.utils.render.color.Color;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -35,10 +43,6 @@ import java.util.function.LongConsumer;
  * notices.
  */
 public final class BotsTab {
-    private static final Color WARN = new Color(255, 190, 80);
-    private static final Color GOOD = new Color(120, 220, 140);
-    private static final Color BAD = new Color(255, 110, 110);
-    private static final Color DIM = new Color(170, 170, 180);
     private static final long ARM_MS = 4_000;
     private static final long SIGNATURE_MS = 1_000;
     private static final int MAX_STASH_ROWS = 200;
@@ -110,66 +114,107 @@ public final class BotsTab {
         live.clear();
         signature = computeSignature();
         nextSignature = System.currentTimeMillis() + SIGNATURE_MS;
+        Ui.pageTitle(parent, theme, "bots");
         if (!host.auth().can("activity")) {
-            parent.add(theme.label("Your account can't see the bots; ask the owner.", theme.scale(520))).expandX().widget().color(WARN);
+            parent.add(Ui.wrap(theme, "Your account can't see the bots; ask the owner.", PageRoom.width(parent, 0))).expandX().widget().color(Ui.warn(theme));
             return;
         }
         DisplayPolicy policy = host.policy();
         long now = System.currentTimeMillis();
         List<BotList.Bot> bots = host.bots().list().bots();
+        SmCard dash = Ui.card(parent, "Dashboard bots");
+        double inner = PageRoom.width(dash, 16);
+        dash.add(Ui.muted(theme, "Proxy bots running the Qwerte Stash plugin with the dashboard on. Pick one to change its settings or use its console.", inner)).expandX();
         if (bots.isEmpty()) {
-            parent.add(theme.label(host.bots().loaded()
+            dash.add(Ui.wrap(theme, host.bots().loaded()
                 ? "No dashboard bots yet. In the proxy, turn the Qwerte Stash plugin's dashboard on (stash manager dashboard on)."
-                : "Loading the bots...", theme.scale(520))).expandX().widget().color(host.bots().loaded() ? DIM : WARN);
+                : "Loading the bots...", inner)).expandX().widget().color(host.bots().loaded() ? Ui.dim(theme) : Ui.warn(theme));
         }
-        WVerticalList cards = parent.add(theme.verticalList()).expandX().widget();
-        for (BotList.Bot b : bots) card(cards, b, policy, now);
+        SmGrid cards = dash.add(new SmGrid()).expandX().widget();
+        cards.minCell = 250;
+        cards.gapX = 8;
+        cards.gapY = 8;
+        cards.maxWidth = inner;
+        // the room a card's text has: the grid's own column width, less the card's padding
+        double cardWrap = Math.max(theme.scale(80), cards.columnWidth() - theme.scale(16));
+        for (BotList.Bot b : bots) card(cards, b, policy, now, cardWrap);
 
-        parent.add(theme.label("Stashes", true));
-        stashTable(parent, policy, now);
+        SmCard stashes = Ui.card(parent, "Stashes");
+        stashes.add(Ui.muted(theme, "Every stash, with the bot that owns it.", inner)).expandX();
+        stashTable(stashes, policy, now, inner);
     }
 
     // ---------- cards ----------
 
-    private void card(WVerticalList parent, BotList.Bot b, DisplayPolicy policy, long now) {
+    private void card(WContainer parent, BotList.Bot b, DisplayPolicy policy, long now, double wrap) {
         boolean selected = b.botId().equals(host.bots().selected());
-        WVerticalList card = parent.add(theme.verticalList()).expandX().widget();
-        WHorizontalList head = card.add(theme.horizontalList()).expandX().widget();
-        head.add(theme.label((selected ? "> " : "") + host.bots().list().name(b, policy.hideNames()), true));
-        head.add(theme.label(b.online() ? "Online" : "Offline")).widget().color(b.online() ? GOOD : BAD);
-        WLabel seen = head.add(theme.label("last seen " + ago(b.lastSeen(), now))).widget();
-        seen.color(DIM);
+        SmCard card = parent.add(new SmCard("", selected ? SmCard.Style.SELECTED : SmCard.Style.TILE)).widget();
+        card.padding = 6;
+        card.spacing = 4;
+        SmGuiTheme st = (SmGuiTheme) theme;
+        WFlow head = card.add(new WFlow()).expandX().widget();
+        head.maxWidth = wrap;
+        head.gapX = 6;
+        head.gapY = 2;
+        head.add(new WDot(b.online() ? st.palette().okFg() : st.palette().errFg()));
+        // each item of the row is at most a card wide: a long name or age text wraps inside its own box
+        head.add(Ui.wrap(theme, "§l" + host.bots().list().name(b, policy.hideNames()), wrap - theme.scale(30)));
+        head.add(new SmPill(b.online() ? "Online" : "Offline", b.online() ? SmPill.Kind.OK : SmPill.Kind.ERROR));
+        WLabel seen = head.add(Ui.muted(theme, "last seen " + ago(b.lastSeen(), now), wrap)).widget();
         String id = b.botId();
         live.add(t -> {
             BotList.Bot cur = host.bots().list().find(id);
             if (cur != null) seen.set("last seen " + ago(cur.lastSeen(), t));
         });
         if (!b.summary().isEmpty()) {
-            WLabel sum = card.add(theme.label(policy.hideCoords() ? "Now: (hidden)" : "Now: " + b.summary(), theme.scale(520))).expandX().widget();
+            WLabel sum = card.add(Ui.wrap(theme, policy.hideCoords() ? "Now: (hidden)" : "Now: " + b.summary(), wrap)).expandX().widget();
             live.add(t -> {
                 BotList.Bot cur = host.bots().list().find(id);
                 if (cur != null && !cur.summary().isEmpty()) sum.set(host.policy().hideCoords() ? "Now: (hidden)" : "Now: " + cur.summary());
             });
         }
-        card.add(theme.label(BotsModel.meta(b), theme.scale(520))).expandX().widget().color(DIM);
+        card.add(Ui.muted(theme, BotsModel.meta(b), wrap)).expandX();
 
-        WHorizontalList stashes = card.add(theme.horizontalList()).expandX().widget();
-        stashes.add(theme.label(b.stashes().isEmpty() ? "No stash linked to this player." : "Stashes:")).widget().color(DIM);
+        WFlow stashes = card.add(new WFlow()).expandX().widget();
+        stashes.maxWidth = wrap;
+        stashes.gapX = 4;
+        stashes.gapY = 4;
+        stashes.add(Ui.muted(theme, b.stashes().isEmpty() ? "No stash linked to this player." : "Stashes:"));
         for (BotList.Link link : b.stashes()) {
             StashRef ref = find(link);
             String where = policy.hideServer() ? "(hidden)" : Text.sanitize(link.server(), 48);
             String what = policy.hideNames() ? "(hidden)" : Text.sanitize(link.stash(), 48);
-            WButton jump = stashes.add(theme.button(what + " @ " + where)).widget();
-            jump.tooltip = ref == null ? "Not in your stash list." : "Show this stash";
+            String full = what + " @ " + where;
+            String shown = ellipsize(full, wrap - 2 * theme.scale(10));
+            SmButton jump = (SmButton) stashes.add(theme.button(shown)).widget();
+            jump.pill = true;
+            jump.tooltip = (ref == null ? "Not in your stash list." : "Show this stash") + (full.equals(shown) ? "" : ": " + full);
             if (ref != null) jump.action = () -> host.later(() -> host.showStash(ref));
         }
 
-        WHorizontalList actions = card.add(theme.horizontalList()).expandX().widget();
+        WFlow actions = card.add(new WFlow()).expandX().widget();
+        actions.maxWidth = wrap;
+        actions.gapX = 4;
+        actions.gapY = 4;
         for (BotsModel.Jump j : BotsModel.jumps(b, host.auth())) {
-            WButton btn = actions.add(theme.button(j.label())).widget();
+            SmButton btn = (SmButton) actions.add(theme.button(j.label())).widget();
+            btn.pill = true;
             btn.tooltip = "Open " + j.label() + " for this bot";
             btn.action = () -> host.later(() -> host.openPage(j.page(), b.botId()));
         }
+    }
+
+    /** Text cut with ".." to fit {@code limit} physical pixels (a pill must never be wider than its card). */
+    private String ellipsize(String text, double limit) {
+        if (theme.textWidth(text) <= limit) return text;
+        int lo = 0;
+        int hi = text.length();
+        while (lo < hi) {
+            int mid = (lo + hi + 1) >>> 1;
+            if (theme.textWidth(text.substring(0, mid) + "..") <= limit) lo = mid;
+            else hi = mid - 1;
+        }
+        return text.substring(0, lo) + "..";
     }
 
     private StashRef find(BotList.Link link) {
@@ -183,60 +228,59 @@ public final class BotsTab {
 
     // ---------- the stash table ----------
 
-    private void stashTable(WContainer parent, DisplayPolicy policy, long now) {
+    private void stashTable(WContainer parent, DisplayPolicy policy, long now, double inner) {
         List<StashRef> stashes = host.stashes();
         if (stashes.isEmpty()) {
-            parent.add(theme.label("No bots yet. Use Link addon (on the website) to connect one.", theme.scale(520))).expandX().widget().color(DIM);
+            parent.add(Ui.muted(theme, "No bots yet. Use Link addon (on the website) to connect one.", inner)).expandX();
             return;
         }
-        var view = parent.add(theme.view()).expandX().widget();
-        view.maxHeight = Math.max(theme.scale(160), Utils.getWindowHeight() * 0.35);
-        WTable table = view.add(theme.table()).expandX().widget();
-        for (String h : new String[]{"Bot", "Stash", "Status", "Doing", "Delivery container", "Open orders", ""}) {
-            table.add(theme.label(h, true));
-        }
-        table.row();
+        SmGuiTheme st = (SmGuiTheme) theme;
+        SmTable table = parent.add(new SmTable("Bot", "Stash", "Status", "Doing", "Delivery container", "Open orders", "")).expandX().widget();
+        table.weights(2, 3, 2, 3, 2, 1, 1);
+        table.rightAlign(6);
+        table.maxWidth = inner;
         int shown = 0;
+        List<String> conflicts = new ArrayList<>();
         for (StashRef s : stashes) {
             if (shown++ >= MAX_STASH_ROWS) break;
-            table.add(theme.label(policy.hideNames() ? "Bot" : BotsModel.who(s)));
-            table.add(theme.label(BotsModel.stashName(s, policy.hideNames()) + " @ " + (policy.hideServer() ? "(hidden)" : Text.sanitize(s.server(), 48))));
-            WLabel state = table.add(theme.label((s.online() ? "online" : "offline") + " · " + ago(s.lastSeen(), now))).widget();
-            state.color(s.online() ? GOOD : DIM);
+            WLabel who = theme.label(policy.hideNames() ? "Bot" : BotsModel.who(s), true);
+            WLabel stash = theme.label(BotsModel.stashName(s, policy.hideNames()) + " @ " + (policy.hideServer() ? "(hidden)" : Text.sanitize(s.server(), 48)));
+            WLabel state = theme.label((s.online() ? "online" : "offline") + " \u00b7 " + ago(s.lastSeen(), now));
+            state.color(s.online() ? Ui.ok(theme) : Ui.dim(theme));
             BotsModel.Doing doing = BotsModel.doing(s);
-            WLabel doingLabel = table.add(theme.label(policy.hideCoords() ? "(hidden)" : doing.text())).widget();
-            doingLabel.color(doing.warn() ? WARN : theme.textColor());
+            WLabel doingLabel = theme.label(policy.hideCoords() ? "(hidden)" : doing.text());
+            doingLabel.color(doing.warn() ? Ui.warn(theme) : st.color(st.palette().text()));
             String stashKey = s.key();
             live.add(t -> {
                 StashRef cur = find(stashKey);
                 if (cur == null) return;
-                state.set((cur.online() ? "online" : "offline") + " · " + ago(cur.lastSeen(), t));
+                state.set((cur.online() ? "online" : "offline") + " \u00b7 " + ago(cur.lastSeen(), t));
                 BotsModel.Doing d = BotsModel.doing(cur);
                 doingLabel.set(host.policy().hideCoords() ? "(hidden)" : d.text());
-                doingLabel.color(d.warn() ? WARN : theme.textColor());
+                doingLabel.color(d.warn() ? Ui.warn(theme) : st.color(st.palette().text()));
             });
             boolean noDelivery = s.bot().deliveryAt().isEmpty();
-            table.add(theme.label(noDelivery ? BotsModel.delivery(s) : policy.hideCoords() ? "(hidden)" : BotsModel.delivery(s)))
-                .widget().color(noDelivery ? WARN : theme.textColor());
-            table.add(theme.label(String.valueOf(s.bot().openOrders())));
+            WWidget delivery = noDelivery
+                ? new SmPill(BotsModel.delivery(s), SmPill.Kind.ERROR)
+                : theme.label(policy.hideCoords() ? "(hidden)" : BotsModel.delivery(s));
+            WLabel orders = theme.label(String.valueOf(s.bot().openOrders()));
+            WWidget release = null;
             if (BotsModel.canRelease(s, host.auth())) {
                 String key = s.key();
                 boolean armed = armedKey.equals(key) && now <= armedUntil;
-                WButton rel = table.add(theme.button(armed ? "Confirm release?" : "Release")).widget();
+                SmButton rel = (SmButton) theme.button(armed ? "Confirm release?" : "Release");
+                rel.pill = true;
                 rel.tooltip = armed ? BotsModel.releaseWarning(s, policy.streamer()) : "Lets another bot take this stash name. Click twice.";
                 rel.action = () -> clickedRelease(s);
-            } else {
-                table.add(theme.label(""));
+                release = rel;
             }
-            table.row();
+            table.addRow(who, stash, state, doingLabel, delivery, orders, release);
             String conflict = BotsModel.conflict(s, now, policy.streamer());
-            if (!conflict.isEmpty()) {
-                table.add(theme.label(conflict, theme.scale(520))).widget().color(WARN);
-                table.row();
-            }
+            if (!conflict.isEmpty()) conflicts.add(conflict);
         }
+        for (String c : conflicts) parent.add(Ui.wrap(theme, c, inner)).expandX().widget().color(Ui.warn(theme));
         if (stashes.size() > MAX_STASH_ROWS) {
-            parent.add(theme.label("Showing the first " + MAX_STASH_ROWS + " of " + stashes.size() + " stashes.")).widget().color(DIM);
+            parent.add(Ui.muted(theme, "Showing the first " + MAX_STASH_ROWS + " of " + stashes.size() + " stashes."));
         }
     }
 

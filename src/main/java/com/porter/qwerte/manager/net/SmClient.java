@@ -45,13 +45,26 @@ public final class SmClient {
     public static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(8);
     public static final Duration INDEX_TIMEOUT = Duration.ofSeconds(30);
     public static final Duration UPLOAD_TIMEOUT = Duration.ofSeconds(30);
+    /** Extra time, after the request's own timeout, for the body of an answer to arrive. */
+    static final Duration BODY_DEADLINE = Duration.ofSeconds(30);
     private static final int MAX_BODY = 32 * 1024 * 1024;
     /** The largest body {@link #postBytes} sends (the schematic limit of the server). */
     public static final int MAX_UPLOAD = 8 * 1024 * 1024;
     private static final Gson GSON = new Gson();
     private static final Logger LOG = LoggerFactory.getLogger("Qwerte/stash-window");
+    private static final java.util.concurrent.ScheduledThreadPoolExecutor TIMER = new java.util.concurrent.ScheduledThreadPoolExecutor(1, r -> {
+        Thread t = new Thread(r, "qwerte-sm-window-deadline");
+        t.setDaemon(true);
+        return t;
+    });
+
+    static {
+        TIMER.setRemoveOnCancelPolicy(true);
+    }
 
     private final HttpClient http;
+    private final Duration bodyDeadline;
+    private final Executor clientThreads;
     private final ThreadPoolExecutor pool;
     private final Executor main;
     private final AtomicInteger generation = new AtomicInteger();
@@ -66,7 +79,16 @@ public final class SmClient {
 
     /** @param main runs a task on the client thread */
     public SmClient(Executor main) {
+        this(main, BODY_DEADLINE);
+    }
+
+    /**
+     * @param bodyDeadline how long after a request's own timeout (the headers) the whole answer may still take before the request
+     *                     fails like a network error; a body that stalls can never hang anything
+     */
+    public SmClient(Executor main, Duration bodyDeadline) {
         this.main = main;
+        this.bodyDeadline = bodyDeadline;
         AtomicInteger n = new AtomicInteger();
         this.pool = new ThreadPoolExecutor(2, 2, 30, TimeUnit.SECONDS, new LinkedBlockingQueue<>(), r -> {
             Thread t = new Thread(r, "qwerte-sm-window-http-" + n.incrementAndGet());
@@ -74,12 +96,20 @@ public final class SmClient {
             return t;
         });
         this.pool.allowCoreThreadTimeOut(true);
+        // The HttpClient gets threads of its own: it delivers body bytes with tasks on its executor, so those must never wait
+        // behind (or be starved by) the callback work on {@code pool}
+        AtomicInteger c = new AtomicInteger();
+        this.clientThreads = java.util.concurrent.Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "qwerte-sm-window-net-" + c.incrementAndGet());
+            t.setDaemon(true);
+            return t;
+        });
         this.http = HttpClient.newBuilder()
             .version(HttpClient.Version.HTTP_1_1)
             .followRedirects(HttpClient.Redirect.NEVER)
             .proxy(HttpClient.Builder.NO_PROXY)
             .connectTimeout(Duration.ofSeconds(5))
-            .executor(pool)
+            .executor(clientThreads)
             .build();
     }
 
@@ -311,15 +341,26 @@ public final class SmClient {
         }
 
         final boolean sent = sentCookie;
-        CompletableFuture<HttpResponse<InputStream>> future;
+        // The total limit for an answer, body included, is the request timeout plus bodyDeadline (saturated, worked out before sending)
+        long limitMs;
         try {
-            future = http.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream());
+            limitMs = timeout.plus(bodyDeadline).toMillis();
+        } catch (ArithmeticException e) {
+            limitMs = Long.MAX_VALUE;
+        }
+        CompletableFuture<HttpResponse<byte[]>> future;
+        try {
+            future = http.sendAsync(request, SmClient::cappedBody);
         } catch (RuntimeException e) {
             main.execute(() -> {
                 if (gen == generation.get()) delivery.deliver(ApiResult.network(), null, null);
             });
             return;
         }
+        // One deadline for the whole answer including its body (the request timeout only covers the headers)
+        java.util.concurrent.ScheduledFuture<?> deadline = TIMER.schedule(() -> clientThreads.execute(() -> future.cancel(true)),
+            limitMs, TimeUnit.MILLISECONDS);
+        future.whenComplete((r, e) -> deadline.cancel(false));
         future.handleAsync((response, error) -> {
             ApiResult result;
             String loginToken = null;
@@ -357,19 +398,12 @@ public final class SmClient {
         }, pool);
     }
 
-    private static ApiResult read(String path, HttpResponse<InputStream> response) {
+    private static ApiResult read(String path, HttpResponse<byte[]> response) {
         int status = response.statusCode();
         JsonElement json = JsonNull.INSTANCE;
-        // A body announced as too big is refused before reading any of it
-        if (response.headers().firstValueAsLong("content-length").orElse(0) > MAX_BODY) {
-            try {
-                response.body().close();
-            } catch (IOException ignored) {
-                // closing only frees the connection
-            }
-            return ApiResult.network();
-        }
-        try (InputStream raw = response.body()) {
+        // A body announced as too big was refused before any of it was read (the handler leaves it null)
+        if (response.body() == null) return ApiResult.network();
+        try (InputStream raw = new java.io.ByteArrayInputStream(response.body())) {
             InputStream in = raw;
             String encoding = response.headers().firstValue("content-encoding").orElse("");
             if (encoding.equalsIgnoreCase("gzip")) in = new GZIPInputStream(raw);
@@ -398,6 +432,107 @@ public final class SmClient {
             // no or odd Date header: no clock skew
         }
         return new ApiResult(status, json, etag, retry, ApiError.classify(path, status, json), date);
+    }
+
+    /**
+     * Collects the body without ever blocking a thread: bytes are copied as the HttpClient hands them over, and the subscription
+     * is cancelled (failing the answer) as soon as more than {@link #MAX_BODY} arrive.
+     */
+    private static HttpResponse.BodySubscriber<byte[]> cappedBody(HttpResponse.ResponseInfo info) {
+        // A body announced as too big is refused before reading any of it
+        long length = -1;
+        try {
+            length = info.headers().firstValueAsLong("content-length").orElse(-1);
+        } catch (NumberFormatException ignored) {
+            // junk: treat as no length
+        }
+        if (length > MAX_BODY) return new RefusedBody();
+        return new CappedBody(length >= 0 ? (int) Math.min(length, MAX_BODY) : 8192);
+    }
+
+    /** Cancels at once (aborting the connection instead of draining it) and answers with no body. */
+    private static final class RefusedBody implements HttpResponse.BodySubscriber<byte[]> {
+        private final CompletableFuture<byte[]> result = new CompletableFuture<>();
+
+        @Override
+        public CompletableFuture<byte[]> getBody() {
+            return result;
+        }
+
+        @Override
+        public void onSubscribe(java.util.concurrent.Flow.Subscription s) {
+            s.cancel();
+            result.complete(null);
+        }
+
+        @Override
+        public void onNext(java.util.List<java.nio.ByteBuffer> items) {
+        }
+
+        @Override
+        public void onError(Throwable t) {
+            result.complete(null);
+        }
+
+        @Override
+        public void onComplete() {
+            result.complete(null);
+        }
+    }
+
+    private static final class CappedBody implements HttpResponse.BodySubscriber<byte[]> {
+        private final CompletableFuture<byte[]> result = new CompletableFuture<>();
+        private final ByteArrayOutputStream out;
+        private final byte[] scratch = new byte[16384];
+
+        CappedBody(int expected) {
+            this.out = new ByteArrayOutputStream(Math.max(32, expected));
+        }
+        private java.util.concurrent.Flow.Subscription subscription;
+        private boolean finished;
+
+        @Override
+        public CompletableFuture<byte[]> getBody() {
+            return result;
+        }
+
+        @Override
+        public void onSubscribe(java.util.concurrent.Flow.Subscription s) {
+            this.subscription = s;
+            s.request(Long.MAX_VALUE);
+        }
+
+        @Override
+        public void onNext(java.util.List<java.nio.ByteBuffer> items) {
+            if (finished) return;
+            for (java.nio.ByteBuffer b : items) {
+                int n = b.remaining();
+                if (out.size() + (long) n > MAX_BODY) {
+                    finished = true;
+                    subscription.cancel();
+                    result.completeExceptionally(new IOException("too large"));
+                    return;
+                }
+                while (b.hasRemaining()) {
+                    int k = Math.min(b.remaining(), scratch.length);
+                    b.get(scratch, 0, k);
+                    out.write(scratch, 0, k);
+                }
+            }
+        }
+
+        @Override
+        public void onError(Throwable t) {
+            finished = true;
+            result.completeExceptionally(t);
+        }
+
+        @Override
+        public void onComplete() {
+            if (finished) return;
+            finished = true;
+            result.complete(out.toByteArray());
+        }
     }
 
     private static byte[] readCapped(InputStream in) throws IOException {

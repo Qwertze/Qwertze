@@ -22,7 +22,16 @@ public final class Order {
     public static final int SLOTS = 27;
 
     /** One line: {@code type} is "item" (key is an items[] key) or "shulker" (key is a shulkers[] group key). */
-    public record Line(String type, String key, int count) {}
+    public record Line(String type, String key, int count, boolean repair) {
+        public Line(String type, String key, int count) {
+            this(type, key, count, false);
+        }
+
+        /** The same line with another count (its repair toggle is kept). */
+        public Line withCount(int n) {
+            return new Line(type, key, n, repair);
+        }
+    }
 
     /** The stacks to put in one slot: an item key and how many. */
     public record Lot(String key, int count) {}
@@ -91,15 +100,36 @@ public final class Order {
     public final List<Line> lines;
     /** Null: no naming. */
     public final Names names;
+    /** The cart-wide "Repair all items" switch (a line is wanted for repair when this or its own toggle is on). */
+    public final boolean repairAll;
+    /** The estimate made when the order was placed (a local order stores it; null when no line is wanted for repair or none was made). */
+    public final RepairEstimate.Estimate repairEstimate;
 
     public Order(String id, List<Line> lines) {
         this(id, lines, null);
     }
 
     public Order(String id, List<Line> lines, Names names) {
+        this(id, lines, names, false, null);
+    }
+
+    public Order(String id, List<Line> lines, Names names, boolean repairAll, RepairEstimate.Estimate repairEstimate) {
         this.id = id;
         this.lines = lines;
         this.names = names;
+        this.repairAll = repairAll;
+        this.repairEstimate = repairEstimate;
+    }
+
+    /** Whether any line is wanted for repair. */
+    public boolean wantsRepair() {
+        for (Line l : lines) if (RepairEstimate.wanted(l, repairAll)) return true;
+        return false;
+    }
+
+    /** Whether this line is wanted for repair. */
+    public boolean wantsRepair(Line l) {
+        return RepairEstimate.wanted(l, repairAll);
     }
 
     /**
@@ -116,13 +146,15 @@ public final class Order {
                 String type = l.get("type").getAsString();
                 String key = l.get("key").getAsString();
                 int count = l.get("count").getAsInt();
-                if ((type.equals(ITEM) || type.equals(SHULKER)) && !key.isEmpty() && count >= 1) lines.add(new Line(type, key, count));
+                boolean repair = l.has("repair") && l.get("repair").isJsonPrimitive() && l.get("repair").getAsJsonPrimitive().isBoolean() && l.get("repair").getAsBoolean();
+                if ((type.equals(ITEM) || type.equals(SHULKER)) && !key.isEmpty() && count >= 1) lines.add(new Line(type, key, count, repair));
             } catch (RuntimeException ex) {
                 // A broken line is left out and shows up as undelivered
             }
         }
         String id = o.get("id").getAsString();
-        return id.isEmpty() || lines.isEmpty() ? null : new Order(id, lines, parseNames(o));
+        boolean repairAll = o.has("repairAll") && o.get("repairAll").isJsonPrimitive() && o.get("repairAll").getAsJsonPrimitive().isBoolean() && o.get("repairAll").getAsBoolean();
+        return id.isEmpty() || lines.isEmpty() ? null : new Order(id, lines, parseNames(o), repairAll, RepairEstimate.parseEstimate(o.get("repairEstimate")));
     }
 
     private static boolean isText(JsonElement e) {

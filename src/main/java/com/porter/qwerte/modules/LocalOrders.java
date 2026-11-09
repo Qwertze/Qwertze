@@ -316,7 +316,7 @@ public final class LocalOrders {
 
     /** Starts the same order again as a new one. @return null when it started, else why not */
     public String retry(Entry old) {
-        Order o = new Order(newId(), old.lines(), Order.Names.of(old.namesMode(), old.namesAll(), old.namesEach()));
+        Order o = new Order(newId(), old.lines(), Order.Names.of(old.namesMode(), old.namesAll(), old.namesEach()), old.repairAll(), old.repairEstimate());
         String why = start(o);
         if (why == null) {
             store.put(stashName, LocalOrderStore.withRetried(old, o.id));
@@ -502,7 +502,8 @@ public final class LocalOrders {
         boolean terminal = r.terminal();
         entry = new Entry(entry.id(), r.status(), clean(r.phase(), 120), clean(r.message(), 320), r.done(), r.total(), entry.cancelRequested(), 0,
             System.currentTimeMillis(), entry.createdAt(), entry.hasPlacedBy(), entry.placedById(), entry.placedByName(), entry.retriedAs(),
-            entry.lines(), entry.namesMode(), entry.namesAll(), entry.namesEach(), terminal ? r.shulkers() : 0, terminal && !r.status().equals("cancelled"));
+            entry.lines(), entry.namesMode(), entry.namesAll(), entry.namesEach(), terminal ? r.shulkers() : 0, terminal && !r.status().equals("cancelled"),
+            entry.repairAll(), entry.repairEstimate(), terminal && !r.status().equals("cancelled") ? r.repair() : null);
     }
 
     private static String clean(String s, int max) {
@@ -532,6 +533,6 @@ public final class LocalOrders {
         Order.Names n = o.names;
         List<String> each = new ArrayList<>(n == null ? List.of() : n.each());
         return new Entry(o.id, OrderModel.IN_PROGRESS, "starting", "", 0, 0, false, 0, now, now, false, "", "", "", List.copyOf(o.lines),
-            n == null ? "" : n.mode(), n == null ? "" : n.all(), each, 0, false);
+            n == null ? "" : n.mode(), n == null ? "" : n.all(), each, 0, false, o.repairAll, o.repairEstimate, null);
     }
 }

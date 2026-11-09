@@ -161,6 +161,10 @@ public class Stash {
             public String key = "";
             public final List<String> lotKeys = new ArrayList<>();
             public final List<Integer> lotCounts = new ArrayList<>();
+            /** The keys the lots were ordered with, when a lot was repaired and so has a new key (empty: no lot changed). */
+            public final List<String> lotAsked = new ArrayList<>();
+            /** Lots whose items were gathered for a repair (carried, not in the stash any more), by lot index. */
+            public final List<Integer> lotCarried = new ArrayList<>();
             /** How naming went: done (named or given up on), named, why not, and the key it has with its name. */
             public boolean nameDone, named;
             public String nameFailure = "", namedKey = "";
@@ -183,7 +187,16 @@ public class Stash {
         public final List<String> unnamedReasons = new ArrayList<>();
         /** Shulker boxes crafted for this order so far (the per-order cap and the end message count them). */
         public int crafted;
+        /** Repairs so far (see OrderRunner): bottles thrown, items repaired, throwing ticks used, why repairs stopped ("" for not). */
+        public int repairBottles, repaired, repairTicks, repairRetries;
+        public String repairStopped = "";
+        public final List<String> repairReasons = new ArrayList<>();
+        public final List<String[]> repairPartial = new ArrayList<>();
+        public final List<String[]> repairSkipped = new ArrayList<>();
     }
+
+    /** Menu slot pairs {from, to} of the bot's own gear stowed for a repair and not put back yet (restored at the next chance). */
+    public final List<int[]> repairGear = new ArrayList<>();
 
     public ActiveOrder activeOrder;
     // The delivery storage (0.4.0-dev.5): the delivery container and the chests put up above it, which are full. Positions only
@@ -526,6 +539,16 @@ public class Stash {
             });
         }
         root.put("held", heldList);
+        if (!repairGear.isEmpty()) {
+            ListTag gear = new ListTag();
+            for (int[] g : repairGear) {
+                CompoundTag tag = new CompoundTag();
+                tag.putInt("from", g[0]);
+                tag.putInt("to", g[1]);
+                gear.add(tag);
+            }
+            root.put("repairGear", gear);
+        }
 
         if (inFlight != null) root.put("inFlight", writeInFlight(inFlight, ops));
 
@@ -568,9 +591,15 @@ public class Stash {
                     CompoundTag lot = new CompoundTag();
                     lot.putString("key", u.lotKeys.get(i));
                     lot.putInt("count", u.lotCounts.get(i));
+                    if (u.lotAsked.size() == u.lotKeys.size() && !u.lotAsked.get(i).equals(u.lotKeys.get(i))) lot.putString("asked", u.lotAsked.get(i));
                     lots.add(lot);
                 }
                 unit.put("lots", lots);
+                if (!u.lotCarried.isEmpty()) {
+                    ListTag carried = new ListTag();
+                    for (int c : u.lotCarried) carried.add(net.minecraft.nbt.IntTag.valueOf(c));
+                    unit.put("carried", carried);
+                }
                 if (u.nameDone) unit.putBoolean("nameDone", true);
                 if (u.named) unit.putBoolean("named", true);
                 if (!u.nameFailure.isEmpty()) unit.putString("nameFailure", u.nameFailure);
@@ -586,6 +615,29 @@ public class Stash {
                 order.put("namesEach", each);
             }
             if (activeOrder.crafted > 0) order.putInt("crafted", activeOrder.crafted);
+            if (activeOrder.repairBottles > 0) order.putInt("repairBottles", activeOrder.repairBottles);
+            if (activeOrder.repaired > 0) order.putInt("repaired", activeOrder.repaired);
+            if (activeOrder.repairTicks > 0) order.putInt("repairTicks", activeOrder.repairTicks);
+            if (activeOrder.repairRetries > 0) order.putInt("repairRetries", activeOrder.repairRetries);
+            if (!activeOrder.repairStopped.isEmpty()) order.putString("repairStopped", activeOrder.repairStopped);
+            if (!activeOrder.repairReasons.isEmpty()) {
+                ListTag rs = new ListTag();
+                for (String r : activeOrder.repairReasons) rs.add(StringTag.valueOf(r));
+                order.put("repairReasons", rs);
+            }
+            for (int pass = 0; pass < 2; pass++) {
+                List<String[]> src = pass == 0 ? activeOrder.repairPartial : activeOrder.repairSkipped;
+                if (src.isEmpty()) continue;
+                ListTag repairList = new ListTag();
+                for (String[] e : src) {
+                    CompoundTag tag = new CompoundTag();
+                    tag.putString("key", e[0]);
+                    tag.putString("a", e[1]);
+                    tag.putString("b", e[2]);
+                    repairList.add(tag);
+                }
+                order.put(pass == 0 ? "repairPartial" : "repairSkipped", repairList);
+            }
             if (activeOrder.unnamed > 0) {
                 order.putInt("unnamed", activeOrder.unnamed);
                 ListTag why = new ListTag();
@@ -770,6 +822,9 @@ public class Stash {
                     if (slot >= 0 && !stack.isEmpty()) stash.held.put(slot, stack);
                 }
             }
+            if (root.get("repairGear") instanceof ListTag gear) {
+                for (Tag t : gear) if (t instanceof CompoundTag tag) stash.repairGear.add(new int[] { number(tag.get("from"), -1), number(tag.get("to"), -1) });
+            }
             if (root.get("inFlight") instanceof CompoundTag flight) stash.inFlight = readInFlight(flight, ops);
             if (root.get("deliveryStorage") instanceof ListTag chests) {
                 for (Tag t : chests) {
@@ -804,9 +859,12 @@ public class Stash {
                                 if (lt instanceof CompoundTag lot) {
                                     u.lotKeys.add(text(lot, "key"));
                                     u.lotCounts.add(number(lot.get("count"), 0));
+                                    String asked = text(lot, "asked");
+                                    u.lotAsked.add(asked.isEmpty() ? text(lot, "key") : asked);
                                 }
                             }
                         }
+                        if (unit.get("carried") instanceof ListTag carried) for (Tag ct : carried) u.lotCarried.add(number(ct, -1));
                         u.nameDone = flag(unit, "nameDone");
                         u.named = flag(unit, "named");
                         u.nameFailure = text(unit, "nameFailure");
@@ -825,6 +883,20 @@ public class Stash {
                 }
                 active.unnamed = number(order.get("unnamed"), 0);
                 active.crafted = number(order.get("crafted"), 0);
+                active.repairBottles = number(order.get("repairBottles"), 0);
+                active.repaired = number(order.get("repaired"), 0);
+                active.repairTicks = number(order.get("repairTicks"), 0);
+                active.repairRetries = number(order.get("repairRetries"), 0);
+                String rst = string(order.get("repairStopped"));
+                active.repairStopped = rst == null ? "" : rst;
+                if (order.get("repairReasons") instanceof ListTag rs) for (Tag t : rs) if (string(t) != null) active.repairReasons.add(string(t));
+                for (int pass = 0; pass < 2; pass++) {
+                    if (order.get(pass == 0 ? "repairPartial" : "repairSkipped") instanceof ListTag list) {
+                        for (Tag t : list) {
+                            if (t instanceof CompoundTag tag) (pass == 0 ? active.repairPartial : active.repairSkipped).add(new String[] { text(tag, "key"), text(tag, "a"), text(tag, "b") });
+                        }
+                    }
+                }
                 if (order.get("unnamedWhy") instanceof ListTag why) {
                     for (Tag t : why) if (string(t) != null) active.unnamedReasons.add(string(t));
                 }

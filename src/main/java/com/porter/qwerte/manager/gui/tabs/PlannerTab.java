@@ -2,6 +2,13 @@ package com.porter.qwerte.manager.gui.tabs;
 
 import com.google.gson.JsonObject;
 import com.porter.qwerte.manager.gui.ItemStacks;
+import com.porter.qwerte.manager.gui.style.PageRoom;
+import com.porter.qwerte.manager.gui.style.SmButton;
+import com.porter.qwerte.manager.gui.style.SmCard;
+import com.porter.qwerte.manager.gui.style.SmGrid;
+import com.porter.qwerte.manager.gui.style.SmGuiTheme;
+import com.porter.qwerte.manager.gui.style.SmTable;
+import com.porter.qwerte.manager.gui.style.Ui;
 import com.porter.qwerte.manager.gui.widgets.WItemIcon;
 import com.porter.qwerte.manager.model.PlanModel;
 import com.porter.qwerte.manager.model.SchematicFiles;
@@ -13,9 +20,9 @@ import com.porter.qwerte.manager.net.ServerUrl;
 import com.porter.qwerte.manager.net.SmClient;
 import meteordevelopment.meteorclient.gui.GuiTheme;
 import meteordevelopment.meteorclient.gui.widgets.WLabel;
+import meteordevelopment.meteorclient.gui.widgets.WWidget;
 import meteordevelopment.meteorclient.gui.widgets.containers.WContainer;
 import meteordevelopment.meteorclient.gui.widgets.containers.WHorizontalList;
-import meteordevelopment.meteorclient.gui.widgets.containers.WTable;
 import meteordevelopment.meteorclient.gui.widgets.containers.WVerticalList;
 import meteordevelopment.meteorclient.gui.widgets.input.WDropdown;
 import meteordevelopment.meteorclient.gui.widgets.input.WTextBox;
@@ -49,10 +56,6 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
  * {@link #clearSecrets()} drops the plan and any file bytes.
  */
 public final class PlannerTab {
-    private static final Color WARN = new Color(255, 190, 80);
-    private static final Color GOOD = new Color(120, 220, 140);
-    private static final Color BAD = new Color(255, 110, 110);
-    private static final Color DIM = new Color(170, 170, 180);
     private static final long POLL_MS = 10_000;
     private static final long LOAD_DEBOUNCE_MS = 250;
     private static final long FILTER_DEBOUNCE_MS = 250;
@@ -101,6 +104,8 @@ public final class PlannerTab {
     private String dryKey;
     private WContainer root;
     private WLabel rangeLabel;
+    private double wrapW = 500;
+    private double tableW = 500;
 
     // the table
     private String filter = "";
@@ -253,7 +258,7 @@ public final class PlannerTab {
         statusWarn = warn;
         if (statusLabel != null) {
             statusLabel.set(text);
-            statusLabel.color(warn ? WARN : DIM);
+            statusLabel.color(warn ? Ui.warn(theme) : Ui.dim(theme));
         }
     }
 
@@ -262,7 +267,7 @@ public final class PlannerTab {
         orderWarn = warn;
         if (orderLabel != null) {
             orderLabel.set(text);
-            orderLabel.color(warn ? WARN : DIM);
+            orderLabel.color(warn ? Ui.warn(theme) : Ui.dim(theme));
         }
     }
 
@@ -655,25 +660,40 @@ public final class PlannerTab {
         tableBox = null;
         statusLabel = null;
         orderLabel = null;
-        double wrap = theme.scale(520);
+        double wrap = PageRoom.width(parent, 16);
+        wrapW = wrap;
+        tableW = PageRoom.width(parent, 16);
         if (!host.auth().can("planner")) {
-            parent.add(theme.label("Your account can not use the Build Planner; ask the owner.", wrap)).expandX().widget().color(WARN);
+            Ui.pageTitle(parent, theme, "build planner");
+            parent.add(Ui.wrap(theme, "Your account can not use the Build Planner; ask the owner.", wrap)).expandX().widget().color(Ui.warn(theme));
             return;
         }
         builtHint = hintKey();
-        parent.add(theme.label("Pick a schematic from the schematics folder of your game, upload it, and see what it needs from a stash.", wrap)).expandX().widget().color(DIM);
-        stashPicker(parent);
-        picker(parent, wrap);
-        statusLabel = parent.add(theme.label(status, wrap)).expandX().widget();
-        statusLabel.color(statusWarn ? WARN : DIM);
+        // "material list", with Dismiss at the right end once there is a plan, like the website
+        WHorizontalList titleRow = parent.add(theme.horizontalList()).expandX().widget();
+        titleRow.add(Ui.muted(theme, plan == null ? "build planner" : "material list")).expandX();
+        if (plan != null) {
+            SmButton dismiss = (SmButton) titleRow.add(theme.button("Dismiss")).widget();
+            dismiss.pill = true;
+            dismiss.tooltip = "Delete this material list from the server";
+            dismiss.action = this::dismiss;
+        }
+
+        SmCard schem = Ui.card(parent, "Schematic");
+        schem.add(Ui.muted(theme, "Pick a schematic from the schematics folder of your game and upload it. Only its material list is kept, in memory, on the server.", wrap)).expandX();
+        picker(schem, wrap);
+        statusLabel = schem.add(Ui.muted(theme, status, wrap)).expandX().widget();
+        statusLabel.color(statusWarn ? Ui.warn(theme) : Ui.dim(theme));
         if (plan == null) return;
         if (loading && plan.items().isEmpty() && plan.stash() == null) {
-            parent.add(theme.label("Loading the material list...", wrap)).expandX().widget().color(DIM);
+            parent.add(Ui.muted(theme, "Loading the material list...", wrap)).expandX();
             return;
         }
-        summary(parent, wrap);
-        optionsRow(parent, wrap);
-        orderArea(parent, wrap);
+        fileCard(parent, wrap);
+        SmCard opts = Ui.card(parent, "Options");
+        stashPicker(opts);
+        optionsRow(opts, wrap);
+        tiles(parent, wrap);
         tableSection(parent, wrap);
         lists(parent, wrap);
     }
@@ -692,12 +712,12 @@ public final class PlannerTab {
         WHorizontalList row = parent.add(theme.horizontalList()).expandX().widget();
         row.add(theme.label("Stash"));
         if (all.isEmpty() || cur == null) {
-            row.add(theme.label("No stash yet: the list can not be checked against one.")).widget().color(WARN);
+            row.add(theme.label("No stash yet: the list can not be checked against one.")).widget().color(Ui.warn(theme));
             return;
         }
         if (locked()) {
             row.add(theme.label(cur.label(streamer)));
-            row.add(theme.label("(fixed while parts are ordered)")).widget().color(DIM);
+            row.add(theme.label("(fixed while parts are ordered)")).widget().color(Ui.dim(theme));
             return;
         }
         Set<String> used = new HashSet<>();
@@ -722,7 +742,7 @@ public final class PlannerTab {
     }
 
     private void picker(WContainer parent, double wrap) {
-        parent.add(theme.label("Schematics", true));
+        wrapW = wrap;
         WHorizontalList bar = parent.add(theme.horizontalList()).expandX().widget();
         WTextBox box = bar.add(theme.textBox(pickQuery, "Search schematics")).minWidth(theme.scale(220)).expandX().widget();
         box.action = () -> {
@@ -743,65 +763,99 @@ public final class PlannerTab {
     private void fillPicker() {
         if (pickBox == null || theme == null) return;
         pickBox.clear();
-        double wrap = theme.scale(520);
+        double wrap = wrapW;
         if (scanning) {
-            pickBox.add(theme.label("Looking for schematics...", wrap)).expandX().widget().color(DIM);
+            pickBox.add(Ui.muted(theme, "Looking for schematics...", wrap)).expandX();
             return;
         }
-        if (!scanNote.isEmpty()) pickBox.add(theme.label(scanNote, wrap)).expandX().widget().color(WARN);
+        if (!scanNote.isEmpty()) pickBox.add(Ui.wrap(theme, scanNote, wrap)).expandX().widget().color(Ui.warn(theme));
         List<SchematicFiles.Entry> list = SchematicFiles.filter(files, pickQuery);
         if (list.isEmpty()) {
-            pickBox.add(theme.label(files.isEmpty()
+            pickBox.add(Ui.muted(theme, files.isEmpty()
                 ? "No schematics found. Put .litematic, .schem, .schematic or .nbt files in the schematics folder of your game (at most 2 folders deep), then press Refresh."
-                : "No schematic matches.", wrap)).expandX().widget().color(DIM);
+                : "No schematic matches.", wrap)).expandX();
             return;
         }
-        WTable table = pickBox.add(theme.table()).expandX().widget();
+        SmTable table = pickBox.add(new SmTable("File", "Size", "Changed", "")).expandX().widget();
+        table.weights(5, 1, 1, 1);
+        table.rightAlign(3);
+        table.maxWidth = tableW;
         long now = System.currentTimeMillis();
         int shown = 0;
         for (SchematicFiles.Entry e : list) {
             if (shown++ >= PICK_SHOWN) break;
-            table.add(theme.label(Text.sanitize(e.relative(), 60)));
-            table.add(theme.label(PlanModel.size(e.size()))).widget().color(DIM);
-            table.add(theme.label(Text.ago(Math.max(0, now - e.modified())))).widget().color(DIM);
+            WWidget action;
             if (e.empty() || e.tooBig()) {
-                table.add(theme.label(e.empty() ? "empty" : "over 8 MiB")).widget().color(WARN);
+                WLabel w = theme.label(e.empty() ? "empty" : "over 8 MiB");
+                w.color(Ui.warn(theme));
+                action = w;
             } else {
-                WButton up = table.add(theme.button("Upload")).widget();
+                SmButton up = (SmButton) theme.button("Upload");
+                up.pill = true;
                 up.tooltip = "Upload this file and list its materials";
                 up.action = () -> upload(e);
+                action = up;
             }
-            table.row();
+            table.addRow(theme.label(Text.sanitize(e.relative(), 60)), Ui.muted(theme, PlanModel.size(e.size())), Ui.muted(theme, Text.ago(Math.max(0, now - e.modified()))), action);
         }
         if (list.size() > PICK_SHOWN) {
-            pickBox.add(theme.label("Showing the first " + PICK_SHOWN + " of " + list.size() + ". Type in the search box to narrow it.", wrap)).expandX().widget().color(DIM);
+            pickBox.add(Ui.muted(theme, "Showing the first " + PICK_SHOWN + " of " + list.size() + ". Type in the search box to narrow it.", wrap)).expandX();
         }
     }
 
-    private void summary(WContainer parent, double wrap) {
+    private void kv(SmCard card, String key, String value) {
+        WHorizontalList row = card.add(theme.horizontalList()).expandX().widget();
+        row.add(Ui.muted(theme, key)).minWidth(theme.scale(90));
+        row.add(theme.label(value));
+    }
+
+    /** The website's File card: what was uploaded, as name and value rows. */
+    private void fileCard(WContainer parent, double wrap) {
         PlanModel.Plan p = plan;
-        parent.add(theme.label(Text.sanitize(p.fileName(), 80), true));
-        parent.add(theme.label(p.format() + " | " + Text.grouped(p.blocks()) + " blocks | " + p.dimX() + " x " + p.dimY() + " x " + p.dimZ()
-            + (p.regions() > 1 ? " | " + p.regions() + " regions" : "") + " | " + PlanModel.size(p.size()), wrap)).expandX().widget().color(DIM);
+        SmCard card = Ui.card(parent, "File");
+        card.spacing = 3;
+        kv(card, "File", Text.sanitize(p.fileName(), 80));
+        kv(card, "Format", p.format());
+        kv(card, "Size", PlanModel.size(p.size()));
+        kv(card, "Dimensions", p.dimX() + " x " + p.dimY() + " x " + p.dimZ() + (p.regions() > 1 ? " (" + p.regions() + " regions)" : ""));
+        kv(card, "Blocks", Text.grouped(p.blocks()));
         if (p.newerThanTable()) {
-            parent.add(theme.label("This schematic is from a newer Minecraft than the item table, so a few blocks may be missing from the list.", wrap)).expandX().widget().color(WARN);
+            card.add(Ui.wrap(theme, "This schematic is from a newer Minecraft than the item table, so a few blocks may be missing from the list.", wrap)).expandX().widget().color(Ui.warn(theme));
         }
         PlanModel.StashInfo st = p.stash();
         if (st == null) {
-            parent.add(theme.label("Pick a stash to compare the list with it.", wrap)).expandX().widget().color(WARN);
+            card.add(Ui.wrap(theme, "Pick a stash to compare the list with it.", wrap)).expandX().widget().color(Ui.warn(theme));
         } else if (!st.indexed()) {
-            parent.add(theme.label("This stash has no index yet, so nothing counts as in stock.", wrap)).expandX().widget().color(WARN);
+            card.add(Ui.wrap(theme, "This stash has no index yet, so nothing counts as in stock.", wrap)).expandX().widget().color(Ui.warn(theme));
         }
+    }
+
+    private void tile(SmGrid grid, String name, String value, String sub, boolean danger) {
+        double cellW = (grid.maxWidth - 4 * theme.scale(6)) / 5 - theme.scale(12);
+        SmCard t = grid.add(new SmCard(name, danger ? SmCard.Style.DANGER : SmCard.Style.INSET)).widget();
+        t.quietTitle = true;
+        t.padding = 6;
+        t.spacing = 1;
+        t.add(theme.label(value, true));
+        t.add(Ui.muted(theme, sub, Math.max(theme.scale(60), cellW)));
+    }
+
+    /** The five summary tiles, then the order buttons. */
+    private void tiles(WContainer parent, double wrap) {
+        PlanModel.Plan p = plan;
         PlanModel.Totals t = p.totals();
-        WHorizontalList totals = parent.add(theme.horizontalList()).expandX().widget();
-        totals.add(theme.label("Need " + Text.grouped(t.need())));
-        totals.add(theme.label("Available " + Text.grouped(t.available()))).widget().color(GOOD);
-        totals.add(theme.label("Missing " + Text.grouped(t.missing()))).widget().color(t.missing() > 0 ? WARN : GOOD);
-        totals.add(theme.label("To order " + Text.grouped(t.want())));
-        if (t.hasSplit()) {
-            parent.add(theme.label("The order: " + t.parts() + (t.parts() == 1 ? " part" : " parts") + ", " + Text.grouped(t.shulkers()) + " shulkers, "
-                + Text.grouped(t.lines()) + " lines" + (t.frozen() ? " (fixed: parts are ordered)" : ""), wrap)).expandX().widget().color(DIM);
-        }
+        SmCard card = Ui.card(parent, "");
+        SmGrid grid = card.add(new SmGrid()).expandX().widget();
+        grid.columns = 5;
+        grid.gapX = 6;
+        grid.maxWidth = PageRoom.width(card, 16);
+        tile(grid, "Needed", Text.grouped(t.need()), p.items().size() + (p.items().size() == 1 ? " kind" : " kinds"), false);
+        tile(grid, "Available", Text.grouped(t.available()), "in the stash, after open orders", false);
+        tile(grid, "Missing", Text.grouped(t.missing()), "not in the stash", t.missing() > 0);
+        tile(grid, "To order", Text.grouped(t.want()), t.lines() + (t.lines() == 1 ? " line" : " lines"), false);
+        tile(grid, "Shulkers", Text.grouped(t.shulkers()), t.parts() + (t.parts() == 1 ? " order" : " orders") + " of up to 54", false);
+        if (t.frozen()) card.add(Ui.muted(theme, "The order is fixed: parts are ordered.", wrap)).expandX();
+        orderArea(card, wrap);
     }
 
     private static String yesNo(boolean on) {
@@ -809,11 +863,10 @@ public final class PlannerTab {
     }
 
     private void optionsRow(WContainer parent, double wrap) {
-        parent.add(theme.label("Options", true));
         if (locked()) {
             parent.add(theme.label("Parts are ordered, so the options are fixed. Copies " + options.multiplier() + " | rounding " + options.round()
                 + " | fluids " + yesNo(options.fluids()) + " | chest contents " + yesNo(options.containerItems()) + " | skipped "
-                + options.exclude().size() + ". Dismiss the list to start over.", wrap)).expandX().widget().color(DIM);
+                + options.exclude().size() + ". Dismiss the list to start over.", wrap)).expandX().widget().color(Ui.dim(theme));
             return;
         }
         WHorizontalList row = parent.add(theme.horizontalList()).expandX().widget();
@@ -832,11 +885,11 @@ public final class PlannerTab {
             }
             if (rangeLabel != null) {
                 rangeLabel.set(tooMany ? "At most " + PlanModel.MAX_MULTIPLIER + " copies: that number is not used" : "(1-" + PlanModel.MAX_MULTIPLIER + ")");
-                rangeLabel.color(tooMany ? WARN : DIM);
+                rangeLabel.color(tooMany ? Ui.warn(theme) : Ui.dim(theme));
             }
         };
         rangeLabel = row.add(theme.label("(1-" + PlanModel.MAX_MULTIPLIER + ")")).widget();
-        rangeLabel.color(DIM);
+        rangeLabel.color(Ui.dim(theme));
         int ri = 0;
         for (int i = 0; i < PlanModel.ROUNDS.length; i++) if (PlanModel.ROUNDS[i].equals(options.round())) ri = i;
         WDropdown<String> round = row.add(theme.dropdown(ROUND_LABELS, ROUND_LABELS[ri])).widget();
@@ -855,45 +908,42 @@ public final class PlannerTab {
         chests.action = () -> changed(options.withContainers(chests.checked));
         checks.add(theme.label("Chest contents"));
         if (!options.exclude().isEmpty()) {
-            checks.add(theme.label(options.exclude().size() + " skipped")).widget().color(DIM);
+            checks.add(theme.label(options.exclude().size() + " skipped")).widget().color(Ui.dim(theme));
         }
     }
 
     // ---------- ordering ----------
 
     private void orderArea(WContainer parent, double wrap) {
-        parent.add(theme.label("Order", true));
         StashRef s = stash();
         PlanModel.Ordered o = plan.ordered();
         boolean started = o != null && o.started() && (o.sameOptions() || o.locked());
-        orderLabel = parent.add(theme.label(orderNote, wrap)).expandX().widget();
-        orderLabel.color(orderWarn ? WARN : DIM);
+        orderLabel = parent.add(Ui.wrap(theme, orderNote, wrap)).expandX().widget();
+        orderLabel.color(orderWarn ? Ui.warn(theme) : Ui.dim(theme));
         if (!host.auth().can("plannerOrder")) {
-            parent.add(theme.label("Your account can look at the list but not order from it.", wrap)).expandX().widget().color(DIM);
+            parent.add(Ui.wrap(theme, "Your account can look at the list but not order from it.", wrap)).expandX().widget().color(Ui.dim(theme));
         } else if (dry != null) {
             confirmBox(parent, s, wrap);
         } else if (!started) {
             String why = s == null || plan.stash() == null ? "Pick a stash first."
                 : !plan.stash().indexed() ? "This stash has no index yet."
                 : plan.totals().want() <= 0 ? "Nothing in this stash is available for the list." : "";
-            WButton order = parent.add(theme.button(ordering ? "Planning..." : "Order materials")).widget();
+            SmButton order = (SmButton) parent.add(((SmGuiTheme) theme).primaryButton(ordering ? "Planning..." : "Order build materials now")).widget();
             order.tooltip = why.isEmpty() ? "Plan the order and show the parts before anything is ordered" : why;
             order.action = why.isEmpty() ? this::planOrder : () -> host.notice(why);
         } else {
             partButtons(parent, o, wrap);
         }
         WHorizontalList extra = parent.add(theme.horizontalList()).expandX().widget();
-        WButton copy = extra.add(theme.button("Copy missing")).widget();
+        SmButton copy = (SmButton) extra.add(theme.button("Copy missing")).widget();
+        copy.pill = true;
         copy.tooltip = "Copy the list of missing materials to the clipboard";
         copy.action = this::copyMissing;
-        WButton dismiss = extra.add(theme.button("Dismiss")).widget();
-        dismiss.tooltip = "Delete this material list from the server";
-        dismiss.action = this::dismiss;
     }
 
     private void partButtons(WContainer parent, PlanModel.Ordered o, double wrap) {
         PlanModel.OrderHint hint = PlanModel.hint(o, statuses);
-        if (!hint.text().isEmpty()) parent.add(theme.label(hint.text(), wrap)).expandX().widget().color(hint.warn() ? WARN : DIM);
+        if (!hint.text().isEmpty()) parent.add(Ui.wrap(theme, hint.text(), wrap)).expandX().widget().color(hint.warn() ? Ui.warn(theme) : Ui.dim(theme));
         WHorizontalList buttons = parent.add(theme.horizontalList()).expandX().widget();
         if (!o.remaining().isEmpty()) {
             int next = o.remaining().get(0);
@@ -902,7 +952,7 @@ public final class PlannerTab {
                 WButton b = buttons.add(theme.button(label)).widget();
                 b.action = () -> place(next);
             } else {
-                buttons.add(theme.label(label + ": wait for the last part")).widget().color(DIM);
+                buttons.add(theme.label(label + ": wait for the last part")).widget().color(Ui.dim(theme));
             }
         }
         if (!o.again().isEmpty() && !ordering) {
@@ -920,15 +970,11 @@ public final class PlannerTab {
             ? "This needs " + total + " orders. One order fills at most 54 shulkers (one double chest), so the bot delivers it part by part: order the next part once the previous one is delivered."
             : "This fits in one order.", wrap)).expandX();
         if (!d.parts().isEmpty()) {
-            WTable table = parent.add(theme.table()).expandX().widget();
-            for (String h : new String[]{"Part", "Lines", "Shulkers", "Items"}) table.add(theme.label(h, true));
-            table.row();
+            SmTable table = parent.add(new SmTable("Part", "Lines", "Shulkers", "Items")).expandX().widget();
+            table.maxWidth = tableW - theme.scale(16);
             for (PlanModel.Part part : d.parts()) {
-                table.add(theme.label(part.part() + (part.order().isEmpty() ? "" : " (ordered)")));
-                table.add(theme.label(Text.grouped(part.lineCount())));
-                table.add(theme.label(Text.grouped(part.shulkers())));
-                table.add(theme.label(Text.grouped(part.items())));
-                table.row();
+                table.addRow(theme.label(part.part() + (part.order().isEmpty() ? "" : " (ordered)")), theme.label(Text.grouped(part.lineCount())),
+                    theme.label(Text.grouped(part.shulkers())), theme.label(Text.grouped(part.items())));
             }
         }
         if (!d.notAvailable().isEmpty()) {
@@ -939,10 +985,10 @@ public final class PlannerTab {
                 sb.append(n > 1 ? ", " : "").append(PlanModel.pretty(c.id())).append(" x ").append(Text.grouped(c.count()));
             }
             if (d.notAvailable().size() > 12) sb.append(" and ").append(d.notAvailable().size() - 12).append(" more");
-            parent.add(theme.label(sb.append(".").toString(), wrap)).expandX().widget().color(WARN);
+            parent.add(Ui.wrap(theme, sb.append(".").toString(), wrap)).expandX().widget().color(Ui.warn(theme));
         }
         if (!d.missing().isEmpty()) {
-            parent.add(theme.label(d.missing().size() + (d.missing().size() == 1 ? " kind" : " kinds") + " of material will still be missing (see the list; Copy missing).", wrap)).expandX().widget().color(DIM);
+            parent.add(theme.label(d.missing().size() + (d.missing().size() == 1 ? " kind" : " kinds") + " of material will still be missing (see the list; Copy missing).", wrap)).expandX().widget().color(Ui.dim(theme));
         }
         confirmButtons(parent, s, d, total, wrap);
     }
@@ -967,9 +1013,9 @@ public final class PlannerTab {
                 if (!w.isEmpty()) warnings.add(w);
             }
         }
-        if (!warnings.isEmpty()) parent.add(theme.label(String.join(" ", warnings), wrap)).expandX().widget().color(WARN);
+        if (!warnings.isEmpty()) parent.add(Ui.wrap(theme, String.join(" ", warnings), wrap)).expandX().widget().color(Ui.warn(theme));
         if (d.parts().isEmpty()) {
-            parent.add(theme.label("Nothing to order: the stash has none of these materials available.", wrap)).expandX().widget().color(WARN);
+            parent.add(Ui.wrap(theme, "Nothing to order: the stash has none of these materials available.", wrap)).expandX().widget().color(Ui.warn(theme));
         }
         WHorizontalList buttons = parent.add(theme.horizontalList()).expandX().widget();
         if (!d.parts().isEmpty()) {
@@ -987,9 +1033,10 @@ public final class PlannerTab {
     // ---------- the materials ----------
 
     private void tableSection(WContainer parent, double wrap) {
-        parent.add(theme.label("Materials", true));
-        WHorizontalList f = parent.add(theme.horizontalList()).expandX().widget();
-        WTextBox fb = f.add(theme.textBox(filter, "Filter materials")).minWidth(theme.scale(200)).expandX().widget();
+        SmCard card = Ui.card(parent, "Materials");
+        tableW = PageRoom.width(card, 16);
+        WHorizontalList f = card.addRight(theme.horizontalList()).widget();
+        WTextBox fb = f.add(theme.textBox(filter, "Filter")).minWidth(theme.scale(160)).widget();
         fb.action = () -> {
             if (fb.get().equals(filter)) return;
             filter = fb.get();
@@ -1002,7 +1049,7 @@ public final class PlannerTab {
             page = 0;
             fillTable();
         };
-        f.add(theme.label("Only missing"));
+        f.add(theme.label("only missing"));
         PlanModel.Sort[] sorts = PlanModel.Sort.values();
         String[] labels = new String[sorts.length];
         for (int i = 0; i < labels.length; i++) labels[i] = sorts[i].label();
@@ -1018,13 +1065,14 @@ public final class PlannerTab {
             page = 0;
             fillTable();
         };
-        f.add(theme.label("Descending"));
-        tableBox = parent.add(theme.verticalList()).expandX().widget();
+        f.add(theme.label("descending"));
+        tableBox = card.add(theme.verticalList()).expandX().widget();
         fillTable();
+        card.add(Ui.muted(theme, "sh = a shulker (27 stacks), st = a stack. Untick a row to leave it out. Items with extra data (enchantments, names) are shown but never counted or ordered.", tableW)).expandX();
     }
 
-    private static Color needColor(PlanModel.Row r) {
-        return r.excluded() ? DIM : r.missing() > 0 ? WARN : GOOD;
+    private Color needColor(PlanModel.Row r) {
+        return r.excluded() ? Ui.dim(theme) : r.missing() > 0 ? Ui.err(theme) : Ui.ok(theme);
     }
 
     /** Fills one page of the table in place (the filter box keeps its cursor). */
@@ -1035,73 +1083,89 @@ public final class PlannerTab {
         int pages = PlanModel.pageCount(rows.size());
         page = Math.max(0, Math.min(page, pages - 1));
         WHorizontalList pager = tableBox.add(theme.horizontalList()).expandX().widget();
-        pager.add(theme.label(rows.size() + " of " + plan.items().size() + " materials")).widget().color(DIM);
-        WButton prev = pager.add(theme.button("<")).widget();
+        pager.add(Ui.muted(theme, rows.size() + " of " + plan.items().size() + " materials")).expandX();
+        SmButton prev = (SmButton) pager.add(theme.button("<")).widget();
+        prev.pill = true;
         prev.action = () -> host.later(() -> {
             if (page > 0) page--;
             fillTable();
         });
         pager.add(theme.label("Page " + (page + 1) + " / " + pages));
-        WButton next = pager.add(theme.button(">")).widget();
+        SmButton next = (SmButton) pager.add(theme.button(">")).widget();
+        next.pill = true;
         next.action = () -> host.later(() -> {
             page++;
             fillTable();
         });
         if (rows.isEmpty()) {
-            tableBox.add(theme.label("Nothing matches.")).widget().color(DIM);
+            tableBox.add(Ui.muted(theme, "Nothing matches.")).expandX();
             return;
         }
-        WTable table = tableBox.add(theme.table()).expandX().widget();
-        for (String h : new String[]{"", "Item", "Need", "In stash", "Available", "Missing", "Skip"}) table.add(theme.label(h, true));
-        table.row();
+        SmTable table = tableBox.add(new SmTable("", "Name", "Need", "In stash", "Available", "Missing")).expandX().widget();
+        table.weights(1, 6, 2, 2, 2, 2);
+        table.rightAlign(2, 3, 4, 5);
+        table.maxWidth = tableW;
         for (PlanModel.Row r : PlanModel.page(rows, page)) {
-            table.add(new WItemIcon(host::graphics, ItemStacks.displayId(r.id())));
-            WLabel name = table.add(theme.label(Text.sanitize(r.title(), 40))).widget();
-            name.tooltip = r.id() + ": blocks " + Text.grouped(r.fromBlocks()) + ", fluids " + Text.grouped(r.fromFluids()) + ", chests "
-                + Text.grouped(r.fromContainers()) + (r.variants() > 0 ? ", " + Text.grouped(r.variants()) + " renamed or damaged variants in the stash" : "");
-            table.add(theme.label(PlanModel.stacks(r.need(), r.maxStack()))).widget().tooltip = Text.grouped(r.need());
-            table.add(theme.label(r.inIndex() ? PlanModel.stacks(r.inStash(), r.maxStack()) : "-")).widget().color(DIM);
-            table.add(theme.label(r.inIndex() ? PlanModel.stacks(r.available(), r.maxStack()) : "-")).widget().color(DIM);
-            table.add(theme.label(PlanModel.stacks(r.missing(), r.maxStack()))).widget().color(needColor(r));
-            WCheckbox skip = table.add(theme.checkbox(options.exclude().contains(r.id()))).widget();
-            skip.tooltip = "Leave this item out of the order";
+            WHorizontalList first = new WHorizontalList();
+            WCheckbox include = first.add(theme.checkbox(!options.exclude().contains(r.id()))).widget();
+            include.tooltip = "Untick to leave this item out of the order";
             String id = r.id();
-            skip.action = () -> changed(options.withExcluded(id, skip.checked));
-            table.row();
+            include.action = () -> changed(options.withExcluded(id, !include.checked));
+            WHorizontalList name = new WHorizontalList();
+            name.add(new WItemIcon(host::graphics, ItemStacks.displayId(r.id())));
+            WVerticalList names2 = name.add(theme.verticalList()).widget();
+            names2.spacing = 0;
+            WLabel title = names2.add(theme.label(Text.sanitize(r.title(), 40), true)).widget();
+            title.tooltip = r.id() + ": blocks " + Text.grouped(r.fromBlocks()) + ", fluids " + Text.grouped(r.fromFluids()) + ", chests "
+                + Text.grouped(r.fromContainers()) + (r.variants() > 0 ? ", " + Text.grouped(r.variants()) + " renamed or damaged variants in the stash" : "");
+            names2.add(Ui.muted(theme, r.id()));
+            WLabel need = theme.label(PlanModel.stacks(r.need(), r.maxStack()));
+            need.tooltip = Text.grouped(r.need());
+            WLabel inStash = theme.label(r.inIndex() ? PlanModel.stacks(r.inStash(), r.maxStack()) : "-");
+            inStash.color(Ui.dim(theme));
+            WLabel avail = theme.label(r.inIndex() ? PlanModel.stacks(r.available(), r.maxStack()) : "-");
+            avail.color(Ui.dim(theme));
+            WLabel missing = theme.label(PlanModel.stacks(r.missing(), r.maxStack()));
+            missing.color(needColor(r));
+            table.addRow(first, name, need, inStash, avail, missing);
         }
     }
 
     private void lists(WContainer parent, double wrap) {
         if (!plan.unknown().isEmpty() || plan.unknownOmitted() > 0) {
-            parent.add(theme.label("Unknown blocks", true));
-            parent.add(theme.label("These blocks have no item the planner knows (a mod, or a newer version).", wrap)).expandX().widget().color(DIM);
-            WTable t = parent.add(theme.table()).expandX().widget();
+            SmCard card = Ui.card(parent, "Unknown blocks");
+            card.add(Ui.muted(theme, "These blocks have no item the planner knows (a mod, or a newer version).", wrap)).expandX();
+            SmTable t = card.add(new SmTable("Block", "Count")).expandX().widget();
+            t.weights(5, 1);
+            t.rightAlign(1);
+            t.maxWidth = PageRoom.width(card, 16);
             int n = 0;
             for (PlanModel.Count c : plan.unknown()) {
                 if (n++ >= LIST_SHOWN) break;
-                t.add(theme.label(Text.sanitize(c.id(), 60)));
-                t.add(theme.label(Text.grouped(c.count())));
-                t.row();
+                t.addRow(theme.label(Text.sanitize(c.id(), 60)), theme.label(Text.grouped(c.count())));
             }
             long more = Math.max(0, plan.unknown().size() - LIST_SHOWN) + plan.unknownOmitted();
-            if (more > 0) parent.add(theme.label("and " + Text.grouped(more) + " more")).widget().color(DIM);
+            if (more > 0) card.add(Ui.muted(theme, "and " + Text.grouped(more) + " more")).expandX();
         }
         if (!plan.containerItems().isEmpty()) {
-            parent.add(theme.label("Chest contents", true));
-            parent.add(theme.label(options.containerItems()
+            SmCard card = Ui.card(parent, "Chest contents");
+            card.add(Ui.muted(theme, options.containerItems()
                 ? "Counted in the list above."
-                : "Items stored in the build chests. Turn on Chest contents to count them.", wrap)).expandX().widget().color(DIM);
-            WTable t = parent.add(theme.table()).expandX().widget();
+                : "Items stored in the build chests. Turn on Chest contents to count them.", wrap)).expandX();
+            SmTable t = card.add(new SmTable("Item", "Count")).expandX().widget();
+            t.weights(5, 1);
+            t.rightAlign(1);
+            t.maxWidth = PageRoom.width(card, 16);
             int n = 0;
             for (PlanModel.Count c : plan.containerItems()) {
                 if (n++ >= LIST_SHOWN) break;
-                t.add(new WItemIcon(host::graphics, ItemStacks.displayId(c.id())));
-                t.add(theme.label(PlanModel.pretty(c.id())));
-                t.add(theme.label(Text.grouped(c.count())));
-                t.row();
+                WHorizontalList name = new WHorizontalList();
+                name.add(new WItemIcon(host::graphics, ItemStacks.displayId(c.id())));
+                name.add(theme.label(PlanModel.pretty(c.id())));
+                t.addRow(name, theme.label(Text.grouped(c.count())));
             }
             if (plan.containerItems().size() > LIST_SHOWN) {
-                parent.add(theme.label("and " + (plan.containerItems().size() - LIST_SHOWN) + " more")).widget().color(DIM);
+                card.add(Ui.muted(theme, "and " + (plan.containerItems().size() - LIST_SHOWN) + " more")).expandX();
             }
         }
     }

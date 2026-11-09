@@ -6,6 +6,13 @@ import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonPrimitive;
 import com.porter.qwerte.manager.gui.panels.OwnPasswordPanel;
+import com.porter.qwerte.manager.gui.style.PageRoom;
+import com.porter.qwerte.manager.gui.style.SmCard;
+import com.porter.qwerte.manager.gui.style.SmColumns;
+import com.porter.qwerte.manager.gui.style.SmGuiTheme;
+import com.porter.qwerte.manager.gui.style.SmPill;
+import com.porter.qwerte.manager.gui.style.SmToggle;
+import com.porter.qwerte.manager.gui.style.Ui;
 import com.porter.qwerte.manager.model.AuthState;
 import com.porter.qwerte.manager.model.BotList;
 import com.porter.qwerte.manager.model.Json;
@@ -30,7 +37,6 @@ import meteordevelopment.meteorclient.gui.widgets.input.WTextBox;
 import meteordevelopment.meteorclient.gui.widgets.pressable.WButton;
 import meteordevelopment.meteorclient.gui.widgets.pressable.WCheckbox;
 import meteordevelopment.meteorclient.utils.Utils;
-import meteordevelopment.meteorclient.utils.render.color.Color;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -42,7 +48,8 @@ import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
- * The Settings tab. Two pages:
+ * The Settings tab. In non-proxy mode it shows, in order: the Appearance card (the window's themes), the Users card (owner
+ * only; the user list is {@link UsersTab}), the Account card, and the bot settings. Two pages, the bot settings and the Account:
  * <ul>
  *   <li><b>Bot settings</b>: the settings form of a dashboard bot, as the website's Settings page (scope {@code plugin}) and
  *   Proxy page (scopes {@code proxy} and {@code plugin:<id>}) show it: sections, search, an editor per kind of setting, Save
@@ -57,18 +64,12 @@ import java.util.regex.Pattern;
  * {@code proxy} and {@code plugin:<id>} scopes, no Account page and no stash-plugin ({@code plugin}) scope, starting on the proxy.
  */
 public final class SettingsTab {
-    private enum Page { BOT, ACCOUNT }
-
     private record Job(String path, JsonElement sent, long since) {
     }
 
     private record Note(String kind, String text) {
     }
 
-    private static final Color WARN = new Color(255, 190, 80);
-    private static final Color BAD = new Color(255, 110, 110);
-    private static final Color GOOD = new Color(120, 220, 140);
-    private static final Color DIM = new Color(170, 170, 180);
     private static final long POLL_MS = 3_000;
     private static final long LOADING_POLL_MS = 1_000;
     private static final long JOB_POLL_MS = 700;
@@ -86,7 +87,6 @@ public final class SettingsTab {
     /** The Proxy page: only the proxy and plugin:* scopes, no Account page. */
     private final boolean proxyMode;
     private GuiTheme theme;
-    private Page page = Page.BOT;
 
     // which form is loaded
     private String formBot;
@@ -154,8 +154,8 @@ public final class SettingsTab {
         clearForm();
         formScope = proxyMode ? "proxy" : "plugin";
         loadedScope = formScope;
-        page = Page.BOT;
         passwordBusy = false;
+        if (users != null) users.reset();
         passwordMessage = "";
     }
 
@@ -234,9 +234,15 @@ public final class SettingsTab {
             logoutAllArmedUntil = 0;
             if (logoutAllButton != null) logoutAllButton.set("Log out everywhere");
         }
-        if (page != Page.BOT || !denied().isEmpty()) return;
+        if (!proxyMode && users != null && host.auth().owner()) users.tick(now);
+        if (!denied().isEmpty()) return;
         host.bots().tick(now, true);
-        if (host.bots().takeChanged() && !botSignature().equals(botSignature)) host.later(host::rebuild);
+        if (host.bots().takeChanged() && !botSignature().equals(botSignature)) pendingBotRebuild = true;
+        // A rebuild empties every box of the page (the users' forms too): it waits while one has the keyboard
+        if (pendingBotRebuild && !(root != null && TabFocus.anyFocused(root))) {
+            pendingBotRebuild = false;
+            host.later(host::rebuild);
+        }
         syncForm();
         if (!locked && now >= nextGet && !getBusy && host.bots().selected() != null && !scopes().isEmpty()) fetch(now);
         if (!jobs.isEmpty() && now >= nextJobs && !jobBusy) pollJobs(now);
@@ -254,6 +260,14 @@ public final class SettingsTab {
     }
 
     private long lastTyped;
+    private boolean pendingBotRebuild;
+    private WContainer root;
+    private UsersTab users;
+
+    /** The Users card of the Settings page (owner only) is the Users tab's content; the window gives it here. */
+    public void attachUsers(UsersTab users) {
+        this.users = users;
+    }
 
     private String botSignature() {
         StringBuilder sb = new StringBuilder();
@@ -531,15 +545,16 @@ public final class SettingsTab {
         if (l != null) showNote(l, notes.get(path));
     }
 
-    private static void showNote(WLabel l, Note n) {
+    private void showNote(WLabel l, Note n) {
         l.set(n == null ? "" : n.text());
-        l.color(n == null ? DIM : n.kind().equals("ok") ? GOOD : n.kind().equals("error") ? BAD : WARN);
+        l.color(n == null ? Ui.dim(theme) : n.kind().equals("ok") ? Ui.ok(theme) : n.kind().equals("error") ? Ui.err(theme) : Ui.warn(theme));
     }
 
     // ---------- widgets ----------
 
     public void build(WContainer parent, GuiTheme theme) {
         this.theme = theme;
+        root = parent;
         formBox = null;
         saveButton = revertButton = null;
         barLabel = null;
@@ -549,25 +564,21 @@ public final class SettingsTab {
         lockButton = logoutAllButton = null;
         botSignature = botSignature();
 
-        if (proxyMode) page = Page.BOT;
-        WHorizontalList pages = parent.add(theme.horizontalList()).widget();
-        for (Page p : proxyMode ? new Page[0] : Page.values()) {
-            String title = p == Page.BOT ? "Bot settings" : "Account";
-            WButton b = pages.add(theme.button(p == page ? "[ " + title + " ]" : title)).widget();
-            b.action = () -> {
-                if (page != p) {
-                    page = p;
-                    host.later(host::rebuild);
-                }
-            };
-        }
-        if (page == Page.ACCOUNT) {
+        if (!proxyMode) {
+            // Like the website's Settings page: Appearance, Users (owner), then the bot's settings
+            AppearanceCard.build(parent, theme, host.windowTheme(), host::setWindowTheme);
+            if (auth().owner() && users != null) {
+                SmCard card = Ui.card(parent, "Users");
+                card.addRight(new SmPill("Owner only", SmPill.Kind.NEUTRAL));
+                card.add(Ui.muted(theme, "Sub-users log in with their own name and password. Changes here need Admin unlocked (your password, typed in the last 15 minutes).",
+                    PageRoom.width(card, 16)));
+                users.build(card, theme);
+            }
             buildAccount(parent);
-            return;
         }
         String why = denied();
         if (!why.isEmpty()) {
-            parent.add(theme.label(why, theme.scale(520))).expandX();
+            parent.add(Ui.wrap(theme, why, PageRoom.width(parent, 0))).expandX().widget().color(Ui.warn(theme));
             return;
         }
         buildBotPage(parent);
@@ -577,36 +588,20 @@ public final class SettingsTab {
         boolean hide = host.policy().hideNames();
         List<BotList.Bot> bots = host.bots().list().bots();
         if (bots.isEmpty()) {
-            parent.add(theme.label(host.bots().loaded() ? "No dashboard bots yet. Turn the Qwerte Stash plugin's dashboard on in the proxy." : "Loading the bots...", theme.scale(520))).expandX();
+            parent.add(Ui.wrap(theme, host.bots().loaded() ? "No dashboard bots yet. Turn the Qwerte Stash plugin's dashboard on in the proxy." : "Loading the bots...", PageRoom.width(parent, 0))).expandX();
             return;
         }
-        WHorizontalList top = parent.add(theme.horizontalList()).expandX().widget();
-        String[] labels = new String[bots.size()];
-        String current = null;
         String selected = host.bots().selected();
-        for (int i = 0; i < labels.length; i++) {
-            BotList.Bot b = bots.get(i);
-            labels[i] = (b.online() ? "[on] " : "[off] ") + host.bots().list().name(b, hide);
-            if (b.botId().equals(selected)) current = labels[i];
-        }
-        WDropdown<String> pick = top.add(theme.dropdown(labels, current == null ? labels[0] : current)).widget();
-        pick.action = () -> {
-            String picked = pick.get();
-            for (int i = 0; i < labels.length; i++) {
-                if (labels[i].equals(picked)) {
-                    String id = bots.get(i).botId();
-                    host.later(() -> {
-                        host.bots().select(id);
-                        host.rebuild();
-                    });
-                }
-            }
-        };
+        BotList.Bot picked = host.bots().selectedBot();
+        String botName = picked == null ? "" : host.bots().list().name(picked, hide);
+        // "settings - bot", with Revert and Save at its right end, like the website
+        WHorizontalList top = parent.add(theme.horizontalList()).expandX().widget();
+        top.add(Ui.muted(theme, (proxyMode ? "proxy" : "settings") + (botName.isEmpty() ? "" : " \u00b7 " + botName))).expandX();
         List<String> scopes = scopes();
         if (scopes.isEmpty()) {
             // Proxy mode: this bot has no proxy settings (not reported yet, or the proxy has none)
-            parent.add(theme.label(online(bots, selected) ? "This bot has not sent any proxy settings yet." : "The bot is offline; its proxy settings show here once it is back.",
-                theme.scale(520))).expandX().widget().color(WARN);
+            parent.add(Ui.wrap(theme, online(bots, selected) ? "This bot has not sent any proxy settings yet." : "The bot is offline; its proxy settings show here once it is back.",
+                PageRoom.width(parent, 0))).expandX().widget().color(Ui.warn(theme));
             return;
         }
         if (scopes.size() > 1) {
@@ -614,9 +609,9 @@ public final class SettingsTab {
             for (int i = 0; i < sl.length; i++) sl[i] = scopeLabel(scopes.get(i));
             WDropdown<String> sp = top.add(theme.dropdown(sl, scopeLabel(formScope))).widget();
             sp.action = () -> {
-                String picked = sp.get();
+                String chosen = sp.get();
                 for (int i = 0; i < sl.length; i++) {
-                    if (sl[i].equals(picked) && !scopes.get(i).equals(formScope)) {
+                    if (sl[i].equals(chosen) && !scopes.get(i).equals(formScope)) {
                         String scope = scopes.get(i);
                         host.later(() -> {
                             formScope = scope;
@@ -626,13 +621,13 @@ public final class SettingsTab {
                 }
             };
         }
-        barLabel = top.add(theme.label("")).expandX().widget();
-        barLabel.color(WARN);
+        barLabel = top.add(theme.label("")).widget();
+        barLabel.color(Ui.warn(theme));
         if (!readOnly()) {
-            saveButton = top.add(theme.button("Save")).widget();
-            saveButton.action = this::save;
             revertButton = top.add(theme.button("Revert")).widget();
             revertButton.action = () -> host.later(this::revert);
+            saveButton = top.add(((SmGuiTheme) theme).primaryButton("Save")).widget();
+            saveButton.action = this::save;
         }
         formBox = parent.add(theme.verticalList()).expandX().widget();
         renderForm();
@@ -662,7 +657,7 @@ public final class SettingsTab {
         boxes.clear();
         updateBar();
         if (!message.isEmpty()) {
-            formBox.add(theme.label(message, theme.scale(520))).expandX().widget().color(WARN);
+            formBox.add(Ui.wrap(theme, message, PageRoom.width(formBox, 0))).expandX().widget().color(Ui.warn(theme));
             if (locked) {
                 WButton unlock = formBox.add(theme.button("Confirm password")).widget();
                 unlock.action = () -> host.later(() -> host.confirm("These settings are only shown after you confirm your password.", () -> {
@@ -682,9 +677,9 @@ public final class SettingsTab {
         if (!online) {
             String name = bot == null ? "The bot" : host.bots().list().name(bot, hide);
             formBox.add(theme.label(name + " is offline" + (lastSeen > 0 ? " (last seen " + Text.ago(System.currentTimeMillis() - lastSeen) + ")" : "")
-                + ". Settings are read-only until it is back.", theme.scale(520))).expandX().widget().color(WARN);
+                + ". Settings are read-only until it is back.", PageRoom.width(formBox, 0))).expandX().widget().color(Ui.warn(theme));
         }
-        if (readOnly()) formBox.add(theme.label("Read only: your account can't change these settings.", theme.scale(520))).expandX().widget().color(DIM);
+        if (readOnly()) formBox.add(Ui.muted(theme, "Read only: your account can't change these settings.")).expandX();
 
         WHorizontalList bar = formBox.add(theme.horizontalList()).expandX().widget();
         WTextBox search = bar.add(theme.textBox(query, "Search all settings")).minWidth(theme.scale(200)).expandX().widget();
@@ -733,27 +728,28 @@ public final class SettingsTab {
         listBox.clear();
         noteLabels.clear();
         boxes.removeIf(b -> b != searchBox);
-        WVerticalList formBox = listBox;
-        List<Leaf> shown = query.trim().isEmpty() ? (section == null ? List.of() : SettingsSchema.inSection(leaves, section)) : SettingsSchema.search(leaves, query, 300);
+        boolean searching = !query.trim().isEmpty();
+        List<Leaf> shown = searching ? SettingsSchema.search(leaves, query, 300) : (section == null ? List.of() : SettingsSchema.inSection(leaves, section));
         if (shown.isEmpty()) {
-            formBox.add(theme.label(query.trim().isEmpty() ? "No settings." : "Nothing matches.")).expandX();
+            listBox.add(Ui.muted(theme, searching ? "Nothing matches." : "No settings.")).expandX();
             return;
         }
-        var view = formBox.add(theme.view()).expandX().widget();
-        view.maxHeight = Math.max(theme.scale(200), Utils.getWindowHeight() * 0.5);
+        String title = searching ? "Search results" : section == null ? "Settings" : section;
+        SmCard card = listBox.add(new SmCard(title)).expandX().widget();
+        card.fill = PageRoom.body(card);
         String lastGroup = null;
         int count = 0;
         for (Leaf l : shown) {
             if (count++ >= PAGE_LIMIT) {
-                view.add(theme.label("Showing the first " + PAGE_LIMIT + " of " + shown.size() + ". Use the search or another section for the rest.")).expandX().widget().color(DIM);
+                card.add(Ui.muted(theme, "Showing the first " + PAGE_LIMIT + " of " + shown.size() + ". Use the search or another section for the rest.")).expandX();
                 break;
             }
-            String group = (!query.trim().isEmpty() ? l.section() + (l.trail().isEmpty() ? "" : " > ") : "") + String.join(" > ", l.trail());
+            String group = (searching ? l.section() + (l.trail().isEmpty() ? "" : " > ") : "") + String.join(" > ", l.trail());
             if (!group.equals(lastGroup)) {
                 lastGroup = group;
-                if (!group.isEmpty()) view.add(theme.label(Text.sanitize(group, 120), true)).expandX();
+                if (!group.isEmpty()) card.add(theme.label(Text.sanitize(group, 120), true)).expandX();
             }
-            buildField(view, l.node(), hide);
+            buildField(card, l.node(), hide);
         }
     }
 
@@ -770,20 +766,29 @@ public final class SettingsTab {
     }
 
     private void buildField(WContainer parent, Node n, boolean hide) {
-        WHorizontalList row = parent.add(theme.horizontalList()).expandX().widget();
-        WLabel title = row.add(theme.label(n.title())).minWidth(theme.scale(190)).widget();
+        // The website's row: the name and what it does on the left, the control on the right
+        double room = PageRoom.width(parent, 16 + 16);
+        SmColumns cols = parent.add(new SmColumns()).expandX().widget();
+        cols.maxWidth = room;
+        cols.gap = 12;
+        cols.weights(2, 3);
+        WVerticalList left = cols.add(theme.verticalList()).widget();
+        left.spacing = 1;
+        WLabel title = left.add(theme.label(n.title(), true)).widget();
         title.tooltip = n.help().isEmpty() ? n.path() : n.path() + ": " + n.help();
+        if (!n.help().isEmpty()) left.add(Ui.muted(theme, Text.sanitize(n.help(), 240), (room - theme.scale(12)) * 2 / 5 - theme.scale(4)));
+        WHorizontalList row = cols.add(theme.horizontalList()).widget();
         String path = n.path();
         JsonElement shownValue = draft.get(path) != null ? draft.get(path) : serverValue(path);
         boolean hidden = n.secret() || (hide && sensitive(path));
         boolean editable = !hidden && !readOnly() && online && !n.locked() && !busy.contains(path) && jobs.isEmpty();
         if (n.secret()) {
-            row.add(theme.label(n.set() ? "secret, set" : "secret, not set")).widget().color(DIM);
+            row.add(theme.label(n.set() ? "secret, set" : "secret, not set")).widget().color(Ui.dim(theme));
         } else if (hidden) {
-            row.add(theme.label("(hidden in streamer display)")).widget().color(DIM);
+            row.add(theme.label("(hidden in streamer display)")).widget().color(Ui.dim(theme));
         } else if (!editable) {
             row.add(theme.label(SettingsSchema.show(shownValue))).widget();
-            if (n.locked() && !n.reason().isEmpty()) row.add(theme.label(n.reason())).widget().color(DIM);
+            if (n.locked() && !n.reason().isEmpty()) row.add(theme.label(n.reason())).widget().color(Ui.dim(theme));
         } else {
             try {
                 control(row, n, shownValue);
@@ -819,14 +824,9 @@ public final class SettingsTab {
     private void control(WHorizontalList row, Node n, JsonElement value) {
         switch (n.type()) {
             case "bool" -> {
-                JsonElement[] cur = {value};
-                WButton t = row.add(theme.button(boolText(cur[0]))).widget();
-                t.action = () -> {
-                    boolean on = cur[0].isJsonPrimitive() && cur[0].getAsJsonPrimitive().isBoolean() && cur[0].getAsBoolean();
-                    cur[0] = new JsonPrimitive(cur[0].isJsonNull() || !on);
-                    t.set(boolText(cur[0]));
-                    editedValue(n, cur[0]);
-                };
+                boolean on = value.isJsonPrimitive() && value.getAsJsonPrimitive().isBoolean() && value.getAsBoolean();
+                SmToggle t = row.add(new SmToggle(on)).widget();
+                t.action = () -> editedValue(n, new JsonPrimitive(t.on));
             }
             case "enum" -> {
                 List<String> opts = new ArrayList<>();
@@ -862,11 +862,6 @@ public final class SettingsTab {
         }
     }
 
-    private static String boolText(JsonElement v) {
-        if (v.isJsonNull()) return "(none)";
-        return v.isJsonPrimitive() && v.getAsJsonPrimitive().isBoolean() ? (v.getAsBoolean() ? "ON" : "OFF") : "?";
-    }
-
     /** A list of text: the entries with a remove button each, and a box to add one. */
     private void listControl(WHorizontalList row, Node n, JsonElement value) {
         List<String> items = new ArrayList<>();
@@ -884,7 +879,7 @@ public final class SettingsTab {
                 host.later(this::renderForm);
             };
         }
-        if (items.size() > LIST_SHOWN) col.add(theme.label("and " + (items.size() - LIST_SHOWN) + " more (kept as they are)")).widget().color(DIM);
+        if (items.size() > LIST_SHOWN) col.add(theme.label("and " + (items.size() - LIST_SHOWN) + " more (kept as they are)")).widget().color(Ui.dim(theme));
         WHorizontalList add = col.add(theme.horizontalList()).widget();
         WTextBox box = add.add(theme.textBox("", "add...")).minWidth(theme.scale(160)).widget();
         boxes.add(box);
@@ -906,21 +901,22 @@ public final class SettingsTab {
 
     // ---------- account ----------
 
-    private void buildAccount(WContainer parent) {
+    private void buildAccount(WContainer outer) {
         AuthState a = auth();
         boolean hide = host.policy().hideNames();
         String who = a.userName().isBlank() ? "owner" : Text.sanitize(a.userName(), 40);
-        parent.add(theme.label("Account", true));
+        double room = PageRoom.width(outer, 16);
+        SmCard parent = Ui.card(outer, "Account");
         parent.add(theme.label(hide ? "Logged in" : "Logged in as " + who + (a.owner() ? " (owner)" : ""))).expandX();
         if (a.owner()) {
-            parent.add(theme.label("The owner has every permission.", theme.scale(520))).expandX().widget().color(DIM);
+            parent.add(Ui.muted(theme, "The owner has every permission.", room)).expandX();
         } else {
             List<String> can = new ArrayList<>();
             for (UsersModel.Switch s : UsersModel.SWITCHES) if (a.can(s.key()) && !s.key().equals("streamer")) can.add(s.label());
             if (!a.permMode("proxy").equals("none")) can.add("Proxy settings: " + a.permMode("proxy"));
             if (!a.permMode("console").equals("none")) can.add("Console: " + a.permMode("console"));
-            parent.add(theme.label("Your account can: " + (can.isEmpty() ? "nothing yet" : String.join(", ", can)) + ".", theme.scale(520))).expandX().widget().color(DIM);
-            if (a.forcedStreamer()) parent.add(theme.label("Streamer mode is enforced for your account by the owner.", theme.scale(520))).expandX().widget().color(WARN);
+            parent.add(Ui.muted(theme, "Your account can: " + (can.isEmpty() ? "nothing yet" : String.join(", ", can)) + ".", room)).expandX();
+            if (a.forcedStreamer()) parent.add(Ui.wrap(theme, "Streamer mode is enforced for your account by the owner.", room)).expandX().widget().color(Ui.warn(theme));
         }
         passwordPanel = new OwnPasswordPanel();
         passwordPanel.build(parent, theme, a.minLength(), passwordMessage, this::changePassword);

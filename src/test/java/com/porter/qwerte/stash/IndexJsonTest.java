@@ -149,4 +149,21 @@ class IndexJsonTest {
             + "\"englishName\":\"English minecraft:apple\",\"count\":5,\"maxStack\":64,\"details\":[],\"enchanted\":false,"
             + "\"tab\":\"combat\",\"tabOrder\":1}]", GSON.toJson(IndexJson.items(one)));
     }
+
+    @Test
+    void mendingIsSentOnlyWhenTrue() {
+        Map<String, Agg> groups = new LinkedHashMap<>();
+        Agg a = new Agg(new Info("m", "minecraft:diamond_pickaxe", "n", "e", 1, List.of(), true, "tools", 1, 5, 1561, true));
+        a.count = 1;
+        groups.put("m", a);
+        Agg b = new Agg(info("s", "minecraft:stone", 1, 0, 0, false));
+        b.count = 1;
+        groups.put("s", b);
+        JsonArray items = IndexJson.items(groups);
+        JsonObject m = items.get(0).getAsJsonObject();
+        JsonObject s = items.get(1).getAsJsonObject();
+        assertEquals("m", m.get("key").getAsString());
+        assertTrue(m.get("mending").getAsBoolean());
+        assertTrue(!s.has("mending"), "left out when false, so older hashes do not change");
+    }
 }

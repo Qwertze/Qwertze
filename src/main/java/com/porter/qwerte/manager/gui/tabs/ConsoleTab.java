@@ -1,6 +1,12 @@
 package com.porter.qwerte.manager.gui.tabs;
 
 import com.google.gson.JsonObject;
+import com.porter.qwerte.manager.gui.style.PageRoom;
+import com.porter.qwerte.manager.gui.style.SmButton;
+import com.porter.qwerte.manager.gui.style.SmCard;
+import com.porter.qwerte.manager.gui.style.SmFillPage;
+import com.porter.qwerte.manager.gui.style.SmGuiTheme;
+import com.porter.qwerte.manager.gui.style.Ui;
 import com.porter.qwerte.manager.gui.widgets.WTextLog;
 import com.porter.qwerte.manager.model.BotList;
 import com.porter.qwerte.manager.model.ConsoleLog;
@@ -33,9 +39,6 @@ import java.util.Objects;
  * need two clicks. Everything typed or received is dropped by {@link #clearSecrets()}.
  */
 public final class ConsoleTab {
-    private static final Color WARN = new Color(255, 190, 80);
-    private static final Color BAD = new Color(255, 110, 110);
-    private static final Color DIM = new Color(170, 170, 180);
     private static final long FAST_MS = 1_000;
     private static final long SLOW_MS = 5_000;
     private static final long ARM_MS = 4_000;
@@ -143,7 +146,7 @@ public final class ConsoleTab {
         }
         if (!armedCommand.isEmpty() && now > armedUntil) {
             armedCommand = "";
-            if (sendButton != null) sendButton.set("Send");
+            if (sendButton != null) sendButton.set("Run");
         }
         keys();
         if (capableBot() != null && !locked && !polling && now >= nextGet) poll(now);
@@ -198,7 +201,7 @@ public final class ConsoleTab {
         for (ConsoleLog.Line l : log.lines(hide, ZoneId.systemDefault())) {
             lines.add(new WTextLog.Line(l.text(), new Color((l.rgb() >> 16) & 0xFF, (l.rgb() >> 8) & 0xFF, l.rgb() & 0xFF)));
         }
-        if (lines.isEmpty()) lines.add(new WTextLog.Line("Nothing sent yet. Commands you send show up here with the answer of the bot.", DIM));
+        if (lines.isEmpty()) lines.add(new WTextLog.Line("Nothing sent yet. Commands you send show up here with the answer of the bot.", Ui.dim(theme)));
         logBox.setLines(lines);
         if (toEnd) logBox.scrollToEnd();
         shownLog = Boolean.toString(hide);
@@ -266,7 +269,7 @@ public final class ConsoleTab {
             return;
         }
         armedCommand = "";
-        if (sendButton != null) sendButton.set("Send");
+        if (sendButton != null) sendButton.set("Run");
         sending = true;
         setNote("");
         int t = token;
@@ -306,21 +309,30 @@ public final class ConsoleTab {
         stateLabel = null;
         if (bot == null) bot = host.bots().selected();
         builtSignature = signature();
+        double wide = PageRoom.width(parent, 0);
+        BotList.Bot picked = host.bots().selectedBot();
+        String botName = picked == null ? "" : host.bots().list().name(picked, host.policy().hideNames());
+        String title = "console" + (botName.isEmpty() ? "" : " \u00b7 " + botName);
         if (!allowed()) {
-            parent.add(theme.label("Your account can not use the console; ask the owner.", theme.scale(520))).expandX().widget().color(WARN);
+            Ui.pageTitle(parent, theme, "console");
+            parent.add(Ui.wrap(theme, "Your account can not use the console; ask the owner.", wide)).expandX().widget().color(Ui.warn(theme));
             return;
         }
+        boolean ready = bot != null && capableBot() != null && !locked;
+        if (!ready) Ui.pageTitle(parent, theme, title);
         if (bot == null) {
-            parent.add(theme.label(host.bots().loaded() ? "No dashboard bot yet." : "Loading the bots...", theme.scale(520))).expandX().widget().color(DIM);
+            parent.add(Ui.wrap(theme, host.bots().loaded() ? "No dashboard bot yet." : "Loading the bots...", wide)).expandX().widget().color(Ui.dim(theme));
             return;
         }
         if (capableBot() == null) {
-            parent.add(theme.label("This bot does not offer a console (update the Qwerte Stash plugin).", theme.scale(520))).expandX().widget().color(WARN);
+            parent.add(Ui.wrap(theme, "This bot does not offer a console (update the Qwerte Stash plugin).", wide)).expandX().widget().color(Ui.warn(theme));
             return;
         }
         if (locked) {
-            parent.add(theme.label("The console is only shown after you confirm your password.", theme.scale(520))).expandX();
-            WButton unlock = parent.add(theme.button("Confirm password")).widget();
+            SmCard card = Ui.card(parent, "");
+            card.add(Ui.muted(theme, "The console is only shown after you confirm your website password.", wide - theme.scale(16))).expandX();
+            SmButton unlock = (SmButton) card.add(theme.button("Confirm password")).widget();
+            unlock.pill = true;
             unlock.action = () -> host.later(() -> host.confirm("The console needs your password again. It is not asked for again for 15 minutes.", () -> {
                 locked = false;
                 log.clear();
@@ -329,24 +341,28 @@ public final class ConsoleTab {
             }));
             return;
         }
-        stateLabel = parent.add(theme.label(stateText(), theme.scale(520))).expandX().widget();
-        stateLabel.color(WARN);
-        logBox = parent.add(new WTextLog(520)).expandX().widget();
+        // The log fills the page and the input row is pinned at the bottom (the page reads the window's room itself)
+        SmFillPage page = parent.add(new SmFillPage()).expandX().widget();
+        page.add(Ui.muted(theme, title));
+        stateLabel = page.add(Ui.muted(theme, stateText(), wide)).widget();
+        stateLabel.color(Ui.warn(theme));
+        logBox = page.addFill(new WTextLog(0).size(wide, 12)).widget();
         fillLog(true);
-        WHorizontalList row = parent.add(theme.horizontalList()).expandX().widget();
-        WTextBox box = row.add(theme.textBox(input, "Command, for example: help")).minWidth(theme.scale(300)).expandX().widget();
+        noteLabel = page.add(Ui.wrap(theme, note, wide)).widget();
+        noteLabel.color(Ui.err(theme));
+        page.add(Ui.muted(theme, "Commands that can disconnect the bot or restart the proxy ask for a second click.", wide));
+        WHorizontalList row = page.add(theme.horizontalList()).widget();
+        row.add(theme.label(">", true));
+        WTextBox box = row.add(theme.textBox(input, "A proxy command, e.g. help")).minWidth(theme.scale(300)).expandX().widget();
         inputBox = box;
         box.action = () -> {
             String clean = ConsoleLog.clean(box.get());
             if (!clean.equals(box.get())) box.set(clean);
             input = clean;
         };
-        sendButton = row.add(theme.button(armedCommand.isEmpty() ? "Send" : "Run it?")).widget();
+        sendButton = row.add(((SmGuiTheme) theme).primaryButton(armedCommand.isEmpty() ? "Run" : "Run it?")).widget();
         sendButton.tooltip = "Send the command (Enter). Up and Down bring back earlier commands.";
         sendButton.action = this::send;
-        noteLabel = parent.add(theme.label(note, theme.scale(520))).expandX().widget();
-        noteLabel.color(BAD);
-        parent.add(theme.label("Commands that can disconnect the bot or restart the proxy ask for a second click.", theme.scale(520))).expandX().widget().color(DIM);
     }
 
     /** Called by the window when the streamer display flips, so the log is drawn again. */

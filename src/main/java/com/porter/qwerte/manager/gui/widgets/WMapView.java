@@ -41,6 +41,9 @@ public final class WMapView extends WPressable {
     private final BooleanSupplier hideNames;
     private final Supplier<String> hint;
 
+    /** The widest the map may be (its column), in physical pixels; 0 for no cap. */
+    public double maxWidth;
+
     private double cursorX = -1;
     private double cursorY = -1;
     private boolean dragged;
@@ -72,7 +75,18 @@ public final class WMapView extends WPressable {
             }
         }
         width = Math.max(theme.scale(260), Math.min(theme.scale(640), w * 0.5));
-        height = Math.max(theme.scale(220), Math.min(theme.scale(520), h * 0.6));
+        double fit = h * 0.6;
+        for (meteordevelopment.meteorclient.gui.widgets.WWidget up = parent; up != null; up = up.parent) {
+            if (up instanceof com.porter.qwerte.manager.gui.frame.WFrame f) {
+                // The bot's inventory, hotbar and gear sit under the map (about 102 GUI pixels), with the stat rows and the page
+                // padding: the map takes what is left of the page, so all of it fits without scrolling
+                int u = com.porter.qwerte.manager.gui.style.SmGuiTheme.unitOf(theme);
+                fit = f.pageH - u * 190.0;
+                break;
+            }
+        }
+        height = Math.max(theme.scale(120), Math.min(theme.scale(520), fit));
+        if (maxWidth > 0) width = Math.max(theme.scale(120), Math.min(width, maxWidth));
     }
 
     @Override

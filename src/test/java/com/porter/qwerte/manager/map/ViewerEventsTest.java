@@ -87,6 +87,15 @@ class ViewerEventsTest {
         assertEquals(4, h.hud().armorSlots().size());
         assertNotNull(h.hud().offhand());
         assertEquals(2, h.hud().held());
+        // no inv sent: 27 empty slots
+        assertEquals(27, h.hud().inv().size());
+        assertNull(h.hud().inv().get(0));
+        StringBuilder inv = new StringBuilder("[{\"id\":\"minecraft:stone\",\"c\":5}");
+        for (int i = 1; i < 27; i++) inv.append(",null");
+        ViewerEvent.HudUpdate full = (ViewerEvent.HudUpdate) ViewerEvents.parse("hud", "{\"hud\":{\"hp\":1,\"inv\":" + inv + "]}}");
+        assertEquals(5, full.hud().inv().get(0).count());
+        ViewerEvent.HudUpdate shortInv = (ViewerEvent.HudUpdate) ViewerEvents.parse("hud", "{\"hud\":{\"hp\":1,\"inv\":[{\"id\":\"minecraft:stone\"}]}}");
+        assertNull(shortInv.hud().inv().get(0));
 
         ViewerEvent.Chat c = (ViewerEvent.Chat) ViewerEvents.parse("chat",
             "{\"lines\":[{\"t\":5,\"k\":\"whisper\",\"s\":\"A\",\"to\":\"B\",\"m\":\"hi\\u00a7k\"},{\"k\":\"public\"},{\"m\":\"x\",\"k\":\"zzz\"}]}");

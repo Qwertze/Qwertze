@@ -1,7 +1,7 @@
 # Qwerte
 A Meteor Addon For 2b2t Dedicated to Regrowing &amp; Creating Farmland
 
-Qwerte adds four modules to [Meteor Client](https://meteorclient.com):
+Qwerte adds nine modules to [Meteor Client](https://meteorclient.com):
 
 - **Auto Till** turns nearby dirt and grass into farmland, digs and fills water holes so the farmland stays hydrated,
   plants and bone meals crops, and restocks its own seeds. With [Baritone](https://github.com/dekrom/baritone)
@@ -14,6 +14,16 @@ Qwerte adds four modules to [Meteor Client](https://meteorclient.com):
   proxy bot instead?
   See [Stash Sorter for AquariusProxy](https://github.com/Qwertze/Stash-Sorter).
 - **Stash Overlay** shows what each container in a saved stash mostly holds, as an item icon on the container.
+- **Stash Manager** sends what's in the stash saved by Stash Sorter to a [Stash Manager server](stash-manager-server/README.md)
+  on your network: a small website that shows the stash and takes orders for the bot to fill.
+- **Reset Pearl** climbs out of a saved stasis chamber after you're pulled through it, throws a fresh pearl into the water
+  and closes the cover again.
+- **Stash Window** is a window to search your stash in game, and with a Stash Manager server, the server's pages too.
+- **Container Tweaks** shows what is inside a shulker box when you hover it, and draws its most common item on it. With
+  Smart Shulker or Smart Echest turned on, right-clicking a shulker box or ender chest places it, opens it and picks it up again.
+- **Printer** builds a Litematica schematic (or a `.litematic` file) in the world, block by block, with each block's facing
+  and state. It walks with Baritone, fetches the materials from your inventory, shulker boxes, listed containers and your
+  ender chest, or orders what it runs short of from the stash bots, and lists what it had to skip. Litematica is optional.
 
 | | |
 |---|---|
@@ -21,11 +31,11 @@ Qwerte adds four modules to [Meteor Client](https://meteorclient.com):
 | **Meteor Client** | The build for your Minecraft version |
 | **Fabric Loader** | 0.18.2 or newer |
 | **Java** | 21 or newer |
-| **Optional** | [dekrom's Baritone fork](https://github.com/dekrom/baritone/releases) for walking, refilling and storage trips |
+| **Optional** | [dekrom's Baritone fork](https://github.com/dekrom/baritone/releases) for walking, refilling and storage trips. Litematica for the Printer's schematic placements (the Printer can read a file without it) |
 
 ## Features
 
-All four modules are in Meteor's **Qwerte** category. Every feature can be
+All nine modules are in Meteor's **Qwerte** category. Every feature can be
 switched on and off on its own.
 
 ### Auto Till
@@ -317,6 +327,19 @@ A kit is a set of items packed together in one shulker, slot for slot with the s
 - A container mostly full of shulkers shows what the shulkers mostly hold, with a small shulker in the corner.
 - Icons update as the stash does: whenever stash-sorter sorts or you open a container yourself.
 
+### Reset Pearl
+New in 0.4.0-dev and still being tested.
+- After you're pulled through a saved stasis chamber, it climbs out of the shaft (opening the trapdoors on the way),
+  throws a fresh pearl into the water from the rim, and closes the trapdoors it opened.
+- Save a chamber with the module's **Set location here** button, standing on the closed cover above the shaft, on the rim
+  beside it, or in the water.
+- `speed`: Safe, Fast (the default) or Max. Safe keeps the longer waits; the faster modes overlap the safe steps.
+- `pearl-wait` (20 seconds by default): when you're pulled without a pearl, it waits this long for one. 0 gives up at once.
+- `elytra-handling` (Auto by default) takes an elytra off for the climb and puts it back afterwards.
+- It stops with a chat message on a timeout, damage, a nearby player or hostile mob, an open screen, or a dimension change.
+- `debug` logs every decision to the client log with a `reset-pearl:` prefix. `experimental-sprint-swim` and
+  `experimental-climb-throw` are off by default.
+
 ### Stash Manager
 New in 0.4.0-dev and still being tested.
 - Sends what is in the stash saved by stash-sorter to the [Stash Manager server](stash-manager-server/README.md), a
@@ -328,6 +351,12 @@ New in 0.4.0-dev and still being tested.
   or this module.
 - Pick the delivery container with `select-delivery` and a right-click on the container. It is never sorted into.
 - An order in progress is saved with the stash, so it carries on after a disconnect.
+- **Repairing items.** An order can ask for "Repair all items" (only damaged Mending items are repaired) or a "Repair"
+  toggle on a single line. The bot repairs those items with Bottles o' Enchanting from the stash before it packs them
+  (about 14 durability per bottle). If a player comes within 8 blocks or the orbs vanish, the throwing stops and is tried
+  once more; after that the items still damaged go out as they are. Repair never refuses an order for too few bottles: items that are not
+  fully repaired are delivered as they are, and the order's message says how many. The addon also takes bottles out of
+  shulker boxes in the stash; the Stash Sorter plugin on AquariusProxy uses loose bottles only.
 
 ### Stash Window
 New in 0.4.0-dev and still being tested.
@@ -337,27 +366,259 @@ New in 0.4.0-dev and still being tested.
 - Optionally turn on `connect-to-server`, set `server-url` and log in to see the stash of your Stash Manager server with
   your website account's permissions. Plain `http://` outside your own network is refused unless `allow-insecure-http` is on.
 - With a server connected, the window also has the server's pages, each shown only when your account's permissions allow
-  it: Orders, Live (the map), Build Planner, Bots, Activity, Settings, Proxy, Console and, for the owner, Users. The Build
-  Planner works from your game's `schematics` folder (or an uploaded file) and can order a build's materials part by part.
-- The window is laid out like the website's stash page: a header bar, the creative tabs, the item grid with small counts in
-  the corner of each slot, a search box and sort select under it, and the details of a clicked item in a drawer over the right
+  it: Orders, Live, Build Planner, Bots, Activity, Proxy, Console and Settings. Settings holds the bot settings, your
+  account and, for the owner, the Users list; the bot settings show one section at a time, picked from a drop-down. The
+  palette button in the header opens Settings > Appearance, where the window's themes are. The Build Planner works from
+  your game's `schematics` folder (or an uploaded file) and can order a build's materials part by part.
+- The server pages follow the website's layout. Orders has two columns: the order maker (with item-type buttons) and the
+  cart (the delivery chest, the lines, the shulker names and the Repair box), with the order history below. Build Planner
+  shows five summary tiles, Bots one card per bot above the stash table, and Activity puts Now doing and Events side by
+  side. Live has a Chat column beside the map and the bot's 27-slot inventory with its hotbar and gear. The console's input
+  row stays pinned at the bottom. Not matched to the website yet: no drag-and-drop in Orders, no drop zone in the Build
+  Planner, and no latency overlay on Live.
+- The Repair box in the cart has "Repair all items" and a "Repair" toggle on each repairable item line; a damaged line
+  that can't be repaired says why. It shows the estimate ("about N bottles needed, M in the stash") and warns when the
+  stash is short or the bot can't repair. The order is still placed. Finished orders show the bottles used and the items
+  that were not fully repaired.
+- The window is laid out like the website's stash page: a header bar (the palette button, your role label, the stash and
+  bot pickers), the creative tabs, the item grid with small counts in the corner of each slot, a search box and sort select under it, and the details of a clicked item in a drawer over the right
   side of the grid (closed, it takes no room). Drag
   its header to move it, drag its edges or corners to resize it (the grid gets more or fewer columns), double-click the
   header to maximize it. Its place and size are remembered. It follows Minecraft's GUI scale (`window-scale` in the module
   overrides that; Meteor's own GUI scale does not apply to it) and uses the game's font, at about the website's size next to
   the slots (`window-text-scale`: Auto, Small, Normal or Large).
-- `window-theme` (or the Theme select in the window's header) picks its colours: Classic (the default), Modern, Light, Dark,
+- `window-theme` (or the palette button in the header, which opens Settings > Appearance) picks its colours: Classic (the default), Modern, Light, Dark,
   Midnight, High contrast or Mac, the same palettes as the website. Classic matches the website's default.
 - The session token of a server login is stored in plain text in Meteor's `modules.nbt`. Do not share your `meteor-client`
   folder or Meteor profiles, and use the window's Log out to end (revoke) the session.
+
+### Container Tweaks
+New in 0.4.0-dev and still being tested.
+
+#### Shulker preview
+- Hover a shulker box in a container or your inventory to see what is inside as a grid, in the box's colour.
+- Hold `freeze-key` (Left Alt by default) to freeze the grid where it is. Hover an item in the frozen grid to see its full
+  tooltip. Clicks inside the frozen grid do nothing.
+- While `preview` is on, Meteor's own shulker preview is hidden, and Meteor's BetterTooltips settings are left as they are.
+  `hide-text-list` (on by default) also leaves the text list of contents (such as "Dirt x64, and 5 more") out of the tooltip.
+  On 1.21.11 that applies to every item with contents, since the game doesn't say which item the list belongs to.
+- `icon` (on) draws the item a shulker box holds the most of on top of it, in containers and your inventory, and with
+  `hotbar-icon` (on) on your hotbar too. It counts items by type across the whole box, and empty shulker boxes get no icon.
+  `icon-scale` sets its size (0.5 of a slot by default, from 0.3 to 1) and `icon-corner` its corner (top left by default).
+
+#### Smart Shulker and Smart Echest
+Both are off by default. Turn on `smart-shulker` for shulker boxes and `smart-echest` for ender chests.
+- Right-click a shulker box (or an ender chest) in your main inventory, your hotbar or an open container. Qwerte places it at
+  the closest spot in reach, opens it, and mines it again when you close the screen, so it goes back into your inventory.
+- A shulker box in your inventory must be in the main inventory or the hotbar. From a container, the hotbar needs an empty
+  slot, since nothing of yours goes into someone else's container. It does nothing in creative mode.
+- If there is no spot, it says why (for example "no solid block to place it on" or "no room above for the lid") and
+  does nothing.
+- Qwerte does at most one thing in the world per tick, and waits `action-delay` ticks between steps.
+- With Baritone it walks back to the block and to the dropped item when they are out of reach. Without Baritone, anything
+  out of reach is left where it is and listed (see below).
+- **Left behind.** If Qwerte has to stop (the cancel key, turning off the module or the feature, a world change, a full
+  inventory that stays full for 5 minutes, or an item not picked up in time), it says where the item is and lists it as
+  "Left behind" with its coordinates when you next enter that world. An entry goes away once the block and the drop are
+  gone. Dropped items despawn after 5 minutes.
+- **Smart Echest** needs a silk touch pickaxe in your inventory to pick the chest up again. `no-silk-touch` says what to do
+  without one:
+  - Refuse (the default): does nothing and says so.
+  - Place and leave: places and opens it, then leaves it there and tells you where. Left ender chests are not added to the
+    "Left behind" list.
+  - Mine anyway: mines it with any pickaxe, but it drops 8 obsidian and the ender chest is lost. Without a pickaxe it is
+    left there, as with Place and leave.
+
+#### General
+- `rotate` (on) looks at the block before placing, opening and mining it.
+- `swing` (on) swings your arm. Off only hides the animation on your screen; the swing is still sent to the server.
+- `action-delay` (3 ticks, from 0 to 20) is the wait between steps.
+- `pickup-with-baritone` (on) lets Baritone walk back for things out of reach. `safe-walk` (on, shown while that is on)
+  keeps the walk away from parkour, diagonal drops, falls of more than one block, and breaking or placing blocks. Qwerte
+  refuses to start while Baritone is busy with something else.
+- `pickup-timeout` (20 seconds, from 5 to 120) is how long to try getting back in reach, and to pick the item up, before
+  leaving it.
+- `cancel-key` (none by default) stops a running flow. The block stays where it is and is listed under "Left behind".
+
+### Printer
+New in 0.4.0-dev and still being tested. Not tested in game yet.
+
+Printer builds a Litematica schematic in the world, one block at a time, with each block's facing and state. It places
+what is missing, leaves the blocks that are already right alone, and lists what it skipped. Turn it on with the
+**Printer** module (category Qwerte) and off to stop it.
+
+#### Source
+- `source` chooses what to build:
+  - **LitematicaLatest** (the default): the schematic placement you last selected in Litematica, or the last one you
+    added when none is selected. It keeps the placement's own position, rotation and mirror.
+  - **LitematicaByName**: the Litematica placement named in `file-name`. Capitals don't matter, and part of a name works
+    when only one placement matches.
+  - **File**: the `.litematic` file named in `file-name`, placed with `origin-x`, `origin-y`, `origin-z`, `rotation` and
+    `mirror`.
+- Litematica is optional. Qwerte reads it by reflection, so it is not a dependency. Without it, or when a placement's own
+  file can't be read, the file named in `file-name` is read with the settings above.
+- `file-name` is a path below the game's `schematics` folder. The `.litematic` ending is added when you leave it out, and
+  any other extension is refused. Up to two subfolders, at most 128 characters. Refused: control characters, `: \ < > " | ? *`,
+  a leading `/`, `.` or `..` parts, names that start or end with a space or end with a dot, Windows device names (such as
+  `CON` or `COM1`), and links out of the folder.
+- Limits: a file up to 64 MiB compressed or 256 MiB unpacked, at most 64 regions and 33,554,432 blocks in total, read within
+  20 seconds. Litematica format versions 4 to 7 are read (a file from an older version must be opened in Litematica and
+  saved again); a newer version gets a warning and is tried. Schematics from Minecraft 1.13 or later are converted to your version. Unknown block IDs are listed and
+  never placed.
+
+#### Placing
+- Each block is placed with a click that the game's own placement rules turn into the schematic's state: facing, half,
+  hinge, axis, attachment and so on. The printer checks the block a few ticks after placing it and places it again, up to
+  twice, if it did not appear.
+- Supported: full blocks; logs, pillars and chains; furnaces and other facing blocks (anvils, campfires, decorated pots,
+  pumpkins, glazed terracotta, chiseled bookshelves, ender chests, looms, stonecutters, lecterns, beehives); pistons,
+  droppers, dispensers, barrels, observers; hoppers; shulker boxes; stairs; slabs; trapdoors; doors; fence gates; beds;
+  buttons, levers and grindstones; torches; signs, banners and skulls (standing and on walls); ladders; hanging lanterns;
+  end rods and lightning rods; amethyst clusters; bells; repeaters; comparators; note blocks; daylight detectors; candles,
+  sea pickles, turtle eggs and snow layers; single chests; carpets, pressure plates, rails, redstone wire and plants (placed
+  on a block that holds them).
+- Set by extra clicks: a repeater's delay; a comparator's mode; a note block's pitch (after the block below it exists);
+  a door, trapdoor or fence gate that is open; a daylight detector that is inverted; the count of candles, pickles, eggs
+  and snow layers; a double slab (a second click). Iron doors and trapdoors can't be opened by hand, so an open one is
+  skipped and listed.
+- Set by the game from its neighbours or redstone, so not set by the printer: stair shape, fence, wall, pane and bar
+  connections, redstone wire connections and power, powered, lit and triggered states, leaf distance, crop age and the
+  like. A rail whose shape doesn't match after placing is listed.
+- Skipped and listed, never placed: fluids; waterlogged blocks; fire; portals; bubble columns; vines, glow lichen and
+  sculk veins; pointed dripstone; cocoa; cauldrons; composters; respawn anchor charges; cake with bites; farmland and
+  dirt paths; command, structure and jigsaw blocks; piston heads and extended pistons; hanging signs; lily pads; double
+  chest halves; end portal frame eyes; unknown blocks and properties. Block-entity data is not copied (signs are placed
+  blank, chests and shulker boxes empty), and entities are not placed.
+
+#### Speed
+- `blocks-per-tick` (1 by default, the slider goes to 10, but the setting has no upper limit): the most blocks placed in
+  one tick. 1 is the safe rate for 2b2t. Raising it can get you kicked, and the printer does not check the server's limits.
+- `packet-budget` (55 by default, 0 turns it off): packets per second the printer may send (placements, swings, looks and
+  slot changes). The limit is that number times 7 in any 7-second window, so the default allows 385. The default is
+  chosen to stay under a 500-packets-per-7-seconds limit; that figure is an assumption about the server, not something
+  the addon checks.
+- `tick-delay` (0 by default, 0 to 10): ticks to wait after a tick that placed blocks.
+- `multi-rotate-per-tick` (off): allows several different looks in one tick when `blocks-per-tick` is above 1. Each extra
+  look is another packet.
+- `range` (4.5 by default): how far from your eyes a block is placed. It is never more than your reach, minus 0.25.
+- `rotation-mode`: **Smart** (the default) looks at the spot that is clicked, kept inside the look the block needs;
+  **Snap** does the same rounded to 45 degrees; **None** never turns, so only blocks your current look already suits are
+  placed.
+- `airplace` (on): a block may be placed against nothing, but only when no neighbour can be clicked.
+- `visible-faces-only` (off): only click a face with a clear line from your eyes to the spot.
+- `sneak-ticks` (2 by default, 1 to 6): ticks the sneak key is held before a click that needs it (a chest or door would
+  otherwise open).
+- `action-delay` (3 ticks by default, 0 to 20): the wait between steps when fetching materials.
+- `order`: **LayerThenDistance** (the default), **Distance** or **Layer**. `bottom-up` (on) builds from the lowest layer up.
+
+#### Wrong blocks
+`wrong-blocks` says what to do with a block that is where the schematic wants another one:
+- **SkipAndList** (the default): leaves it and lists it at the end.
+- **BreakAndReplace**: breaks it and builds the right block. The drops are not collected. It skips blocks next to a fluid,
+  a falling block, a hazard or anything it can't break. With `never-break-containers` on (the default, shown only with
+  this mode), a block that has contents is skipped too.
+- **Pause**: stops until the block is gone, then carries on by itself.
+
+#### Materials
+- The inventory (main inventory and hotbar) is always a source. Items the build needs are moved to the hotbar when they
+  are needed there.
+- `keep-foreign-items` (on): items that are not on the build list stay in their slots. Protected items (weapons, food,
+  potions, totems, armour, arrows, ender pearls, elytra, shulker boxes and similar) are never moved out of the hotbar.
+- `free-slots` (2 by default, 1 to 20): slots kept empty when taking materials out of a container, so a shulker box can
+  come back.
+- `use-shulkers` (on): places a shulker box in your inventory in reach, takes what is needed out of it, mines it and picks
+  it up again. Up to 6 boxes per fetch. `pickup-timeout` (20 seconds by default, from 5 to 120) is how long to mine and pick
+  it up before it is left where it is and listed. It is shown while `use-shulkers` or `use-ender-chest` is on.
+- `use-containers` (on) and `containers`: the containers to take from, one per line as `x,y,z|dimension` (for example
+  `10,64,-20|minecraft:overworld`). Press `add-container-key` (none by default) while looking at a container to add it, or
+  to remove it when it is already listed. Only storage is used: chests (trapped ones too), barrels, shulker boxes, ender
+  chests, hoppers and dispensers, in the dimension they are listed for, in a loaded chunk and within 128 blocks of you.
+  Anything else is refused with a message when the printer is about to open it.
+- `use-ender-chest` (off): takes materials out of the ender chest you carry, in this order:
+  1. The printer places the chest, and takes out the shulker boxes that hold materials it needs, and loose stacks of
+     them. Up to 6 boxes per fetch, the same limit as `use-shulkers`.
+  2. The boxes are unpacked, as with `use-shulkers`.
+  3. The printer places the chest again, puts the emptied or leftover boxes back, and mines the chest with silk touch.
+
+  It needs an ender chest in your inventory or hotbar, and a silk touch pickaxe unless `ender-chest-no-silk` says
+  otherwise. After a trip that found none of the items it needs, the chest is not tried again for those items for 10
+  minutes.
+- `ender-chest-no-silk` (**Refuse** by default, or **MineAnyway**; shown while `use-ender-chest` is on): what to do without
+  a silk touch pickaxe. **Refuse** does not use the chest. **MineAnyway** mines it with any pickaxe, and the chest block is
+  then lost (it drops 8 obsidian). The items inside stay safe on the server, but the boxes can't be put back: they stay in
+  your inventory, and the printer says how many.
+- The boxes are told apart by their item and components. In rare cases a different box of the same kind goes back into the
+  chest. The count is right and nothing is lost.
+- The Stash Window's local index is no longer a source (`use-stash-index` was removed). For stock from the stash, use
+  `order-from-stash` below.
+- A full inventory pauses the printer with a message until a slot is free.
+
+#### Stash orders
+Off by default. With `order-from-stash` on, the printer orders what it is running low on from the Stash Manager server,
+from the stash bots on this game server that have it. Nothing is asked of you: the orders are placed by themselves, with no
+confirmation. The bot delivers into its delivery chest, and you collect it. Stock is taken from the bots, not from the
+Stash Window's local index.
+
+- `order-from-stash` (off): turns it on. It needs the **Stash Window** module with `connect-to-server` on, a server address
+  set there, and a logged-in account with the order permission. When one of these is missing, the chat says which, once.
+  If the server asks for your password again, the printer says so and waits 5 minutes; it never asks for the password
+  itself.
+- `order-when-below` (64 by default, from 1 to 2304; the slider goes from 16 to 576): an item is ordered when you carry
+  fewer than this many of it (or fewer than the build still needs, when that is less), and what is already on order or
+  waiting to be collected does not cover the rest. So orders go ahead of need.
+- `order-max-shulkers` (9 by default, from 1 to 54): the most shulker boxes one order may need. The server takes at most 54.
+- `order-max-shulkers-per-run` (27 by default, from 1 to 540; the slider goes from 1 to 108): the most shulker boxes all
+  orders of one build may need together. The count starts again when you turn the module on, when you leave the world, and
+  when the source, file name, origin, rotation or mirror changes. A reload keeps it.
+
+How orders are placed:
+- Orders go to the stash bots on this game server that have the items, online bots first, and at most 12 stashes are asked
+  in one round. A stash that already has an open order of yours is not asked again, and a stash with 20 open orders (the
+  server's limit) is skipped. With a forced-streamer account, orders go only to the stash selected in the Stash Window.
+- Each order is cut to the limits above: whole stacks, plus one partial stack when a slot is left.
+- Nothing already covered is ordered again. Open order lines count as covered, and so do delivered lines you have not
+  collected yet. A delivery is assumed to cover what was ordered until it is collected or 20 minutes have passed, so after
+  a partial delivery, a re-order for the rest can wait up to 20 minutes.
+- One chat line when an order is placed, for example `Ordered 2 shulkers [3 kinds, 150 items] from stash NAME @ SERVER
+  [order ID].` (the server is left out in streamer mode). One more when it is delivered, fails, is cancelled or is no
+  longer listed on the server.
+
+Out of materials:
+- The printer keeps building with what it carries until it is out of the next block's material. Then it pauses:
+  `Out of ITEM. Waiting for the order from stash STASH: collect the delivery and put it in your inventory. Printing
+  resumes by itself.`
+- It never walks to the delivery chest. You collect the delivery and put it in your inventory, and printing resumes by
+  itself.
+- Other waits are "your open stash order(s) to finish" and "the stash order to be placed". When stash orders can't help,
+  the pause says why, for example "no stash bot for this server has it" or "order-max-shulkers-per-run was reached".
+
+#### Baritone
+- `walk` (on) lets Baritone walk to blocks that are out of reach and to containers. It needs
+  [dekrom's Baritone fork](https://github.com/dekrom/baritone/releases). Off: only what is in reach is built.
+- Once it starts walking, Baritone may not break or place blocks until the run ends, and `safe-walk` (on) keeps the walk
+  away from parkour, diagonal drops and falls of more than one block. Everything is given back when the run ends.
+- The printer never stands in a block it has yet to build.
+- It pauses while Baritone is busy with something else, and while you press a movement key (`pause-on-input`, on).
+- It won't walk while another module has confined Baritone.
+
+#### Controls and leftovers
+- `reload-key` (none by default) loads the schematic again and starts over. Blocks already built are noticed and skipped.
+- `cancel-key` (none by default) stops, puts everything back (sneaking, Baritone and your selected hotbar slot) and turns
+  the module off.
+- When the run ends, the chat says how many blocks were placed, already there, failed, skipped as wrong, not buildable
+  and left unbuilt, and lists them.
+- A shulker box that couldn't be picked up is listed as **Left behind** with its coordinates when you next enter that
+  world. The entry goes away once the box and its drop are gone. An ender chest that was left in the world is listed the
+  same way.
 
 ## Installation
 
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) for Minecraft **1.21.11** or **1.21.4**.
 2. Put [Meteor Client](https://meteorclient.com) for the same Minecraft version in your `mods` folder.
 3. Download the `qwerte-addon` jar for your Minecraft version from the
-   [latest release](https://github.com/Qwertze/Qwertze/releases/latest): `qwerte-addon-0.3.1+1.21.11.jar` or
-   `qwerte-addon-0.3.1+1.21.4.jar`. Put it in your `mods` folder.
+   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.4.0-dev.13.1`, see
+   [Dev builds](#dev-builds)): `qwerte-addon-0.4.0-dev.13.1+1.21.11.jar` or `qwerte-addon-0.4.0-dev.13.1+1.21.4.jar`. Put it
+   in your `mods` folder.
 4. *(Optional, for auto-walk and refilling)* Download `baritone-api-fabric-1.3.0-<minecraft>.jar` for your version from
    [dekrom's Baritone releases](https://github.com/dekrom/baritone/releases) (for example
    [1.21.11](https://github.com/dekrom/baritone/releases/tag/v1.3.0-1.21.11) or
@@ -631,38 +892,98 @@ On Windows use `gradlew.bat` instead of `./gradlew`. The jar ends up in
 `build/libs/qwerte-addon-<version>+<minecraft>.jar`.
 
 To test in a development client, run `./gradlew runClient`, adding `-Pmc=1.21.4` for 1.21.4. Baritone isn't included
-there; add its jar to `run/mods` if you want to try the automation.
+there; add its jar to `run/mods` if you want to try the automation. Litematica isn't included either; add its jar to
+`run/mods` to try the Printer with a Litematica placement.
 
 ### Project layout
 
 ```
 src/main/java/com/porter/qwerte/
-├── QwerteAddon.java          Addon entrypoint, registers the Qwerte category and modules
-├── modules/
+├── QwerteAddon.java          Addon entrypoint: the Qwerte category, the nine modules and the stash-window command
+├── commands/
+│   └── StashWindowCommand.java  The .stash-window (and .stash) command
+├── modules/                  The Meteor modules, and the helpers they use (the nine modules are registered in QwerteAddon)
 │   ├── AutoTill.java         The auto-till module: tilling, watering, planting, automation
 │   ├── AutoDirt.java         The auto-dirt module: covering ground with dirt
 │   ├── StashSorter.java      The stash-sorter module: sorting, kits, bot mode, picking, search
-│   ├── KitBuilder.java       Building saved kits out of the stash, for stash-sorter
-│   ├── GroundCollector.java  Picking up items left on the ground in the stash area, for stash-sorter
 │   ├── StashOverlay.java     The stash-overlay module: an icon of each container's main item
+│   ├── StashManager.java     The stash-manager module: sends the index to the Stash Manager server, takes its orders
+│   ├── ResetPearl.java       The reset-pearl module: climbs out of a stasis chamber and re-arms it
+│   ├── StashWindow.java      The stash-window module: the in-game Stash Window and its local index
+│   ├── ContainerTweaks.java  The container-tweaks module: shulker previews and icons, Smart Shulker and Smart Echest
+│   ├── Printer.java          The printer module: builds a schematic block by block, fetching or ordering its materials
+│   ├── PrinterActions.java   The printer's clicks: placing, breaking, sneaking, checking blocks and quick-moves out of containers
+│   ├── SmartPlaceSession.java  The shulker box session (place, open, take, mine, pick up), shared by Container Tweaks and Printer
+│   ├── OrderRunner.java      Carries out a server order for stash-sorter: plans, builds and delivers the shulkers
+│   ├── LocalOrders.java      Carries out the window's own orders with this client as the bot (no server)
+│   ├── KitBuilder.java       Building saved kits out of the stash, for stash-sorter
+│   ├── Repairer.java         Repairing an order's items with XP bottles, for stash-sorter (a helper, not a module)
+│   ├── Compactor.java        Packs a full shulker's worth of one item into a shulker, for stash-sorter
+│   ├── Crafter.java          Crafts plain shulker boxes for stash-sorter
+│   ├── ChestPlacer.java      Puts up the extra chests of the delivery storage
+│   ├── StashLabeller.java    Puts up signs for new categories, for stash-sorter
+│   ├── GroundCollector.java  Picking up items left on the ground in the stash area, for stash-sorter
+│   ├── StashYield.java       Tells when someone else is using the client, so the sorter gives way
 │   ├── Restocker.java        Storage and ender chest restocking, shared by auto-till and auto-dirt
 │   └── StorageList.java      The list of storages a module restocks from, in the order it tries them
-├── stash/
+├── stash/                    The saved stash, its index, the orders and the repair rules
 │   ├── Stash.java            A saved stash: its containers and contents, saving, loading and search
+│   ├── StashIndex.java       Builds the index the stash-manager module sends to the server
+│   ├── IndexJson.java        The JSON shape of an index's items and shulkers
 │   ├── Categories.java       What sign words and searches mean: categories, slang and synonyms
+│   ├── Containers.java       Where a container's signs can be, and what they say
 │   ├── Kit.java              A saved kit: 27 slots, and how to tell if a shulker is finished or part built
 │   ├── Kits.java             The saved kits of the current server, saved and loaded from disk
+│   ├── Order.java            An order from the server: its lines, and the packer into shulker loads
+│   ├── Mending.java          Whether a stack has the Mending enchantment (by registry key)
+│   ├── RepairEstimate.java   The repair rules of the order contract: the formula, the reasons and the estimate
+│   ├── RepairRun.java        The pure parts of repairing: batches, the throwing guard and the result
+│   ├── DeliveryBook.java     The delivery storage: its container and the chests put up above it
+│   ├── DeliveryContents.java The delivery storage's contents, as the Stash Manager server gets them
+│   ├── DeliveryRoom.java     What the delivery storage can take now
+│   ├── SpaceWait.java        An order waiting for room in the delivery storage
+│   ├── StackInfo.java        What the sorter knows about one stack
+│   ├── StashSafety.java      Guards against stash data that points far away
+│   ├── StashWatch.java       Notices other players' changes to containers and signs
 │   ├── ItemPreviewScreen.java  Shows a found item in a look-only container screen
 │   └── KitPreviewScreen.java   Shows a saved kit in a look-only container screen
+├── manager/                  The Stash Window: gui/ (the screen, tabs and widgets), model/ (its data and rules),
+│                             net/ (the connection to the Stash Manager server), local/ (the local index and orders),
+│                             map/ (the live map)
+├── pearl/                    Reset Pearl's parts: the chamber, the shaft scan, the trapdoor clicks and the sequence
+├── tweaks/                   Container Tweaks' parts: the preview grid and its cache, the spot search and the Smart Shulker/Echest steps
+│   └── Orphans.java          The list of shulker boxes left behind (its format and checks), shared with the printer
+├── printer/                  The printer's parts: pure logic (unit-tested) and the game-facing steps
+│   ├── schematic/            Reading .litematic files: the format, the reader and its limits, file names and transforms
+│   ├── source/               Where the schematic comes from: Litematica (by reflection), files, and block states from them
+│   ├── place/                How each block is placed: placement rules, look windows, build order, batching and the packet budget
+│   ├── materials/            What the build needs, and where it is fetched from (inventory, shulkers, containers, ender chest)
+│   ├── stash/                Stash orders: the low-stock rule, the stash picker, order batches and the order ledger
+│   └── loop/                 The printer's state machine: what to do next on each tick
+├── craft/                    Crafting for stash-sorter: the recipes, the planner, and the table and anvil finders
 └── utils/
-    └── BaritoneHelper.java   The main class that calls Baritone, used only when it's installed
+    ├── AutoHotbar.java       Keeps the items a module works with in the hotbar
+    ├── BaritoneHelper.java   The main class that calls Baritone, used only when it's installed
+    ├── ChestStack.java       The rules for putting up the delivery storage's chests
+    ├── ContainerPacing.java  The container-delay rule
+    ├── PlaceSearch.java      Where to put a shulker or anvil down when there's no room beside the bot
+    ├── SnapshotSearch.java   Searches a list the game changes on another thread (the tab list)
+    ├── SurveyRetry.java      When a container that couldn't be read is tried again
+    ├── WalkProgress.java     Whether a walk is getting anywhere
+    └── WorkPattern.java      The order auto-walk covers an area in: Nearest, Rows, Spiral Out or Spiral In
 
-src/<minecraft>/java/com/porter/qwerte/compat/
-├── Players.java              The selected hotbar slot
-├── Drops.java                Telling from outgoing packets when you drop items or break blocks
-├── RightClick.java           Right clicks, for picking storages and stations
-├── ItemIcons.java            Drawing item icons on screen, for stash-overlay
-└── BaritoneFluids.java       Keeping Baritone from placing blocks in water, where the version allows it
+src/<minecraft>/java/com/porter/qwerte/compat/   (the same eleven files in src/1.21.11 and src/1.21.4)
+├── BaritoneFluids.java       Keeps Baritone from placing blocks in water, where the version allows it
+├── Drops.java                Tells from outgoing packets when you drop items or break blocks
+├── GameVersion.java          The game's version name and data version (its accessor is named differently across versions)
+├── ItemIcons.java            Drawing items on screen, for stash-overlay and the Stash Window
+├── LegacyItems.java          Shulker items kept in block entity data (ViaVersion), read the way Meteor reads them
+├── MapTexture.java           The texture the Stash Window's live map is drawn into
+├── Players.java              Player helpers that differ between versions (the selected hotbar slot)
+├── RightClick.java           Right mouse button presses, for picking storages and stations
+├── ScaledText.java           Text at the Stash Window's own size
+├── ScreenOverlay.java        Drawing on top of everything in a screen, for Container Tweaks' preview
+└── SignEditors.java          Sign editor screens (the accessor for the sign being edited differs per version)
 
 versions/<minecraft>.properties   Minecraft, Meteor and Baritone versions for each supported Minecraft version
 ```
@@ -671,12 +992,14 @@ Shared code is in `src/main`. The little that differs between Minecraft versions
 folder for the version being built is compiled. The addon version, Fabric Loader and Loom versions live in
 `gradle/libs.versions.toml`.
 
-The 1.21.11 build also has one mixin, `ClientPacketListenerMixin` in `src/1.21.11/java/com/porter/qwerte/mixin/` (listed in
+The 1.21.11 build also has `ClientPacketListenerMixin` in `src/1.21.11/java/com/porter/qwerte/mixin/` (listed in
 `src/1.21.11/resources/qwerte.mixins.json`). It works around a game crash when a name-only player head is looked up while
-chests are read on a busy server. The 1.21.4 build has no mixin: its `qwerte.mixins.json` lists none.
+chests are read on a busy server. Container Tweaks adds its own mixins for drawing the shulker previews and icons:
+`AbstractContainerScreenMixin` and `GuiMixin` are shared (in `src/main/java/com/porter/qwerte/mixin/`), and each build has
+its own slot mixin and tooltip mixin, listed in its `qwerte.mixins.json`.
 
 To add another Minecraft version, add a `versions/<minecraft>.properties` and a `src/<minecraft>/java` folder with the
-four compat classes, then build with `-Pmc=<minecraft>`.
+compat classes (copy the eleven in `src/1.21.4/java/com/porter/qwerte/compat/` and adapt them), then build with `-Pmc=<minecraft>`.
 
 ## License
 

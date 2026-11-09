@@ -7,7 +7,57 @@ Versions before 0.2.8 are listed on the [GitHub releases page](https://github.co
 
 ## [Unreleased]
 
-Mirrors Stash Sorter plugin 1.12.2 (version 0.4.0-dev.10.11).
+Mirrors Stash Sorter plugin 1.13.0 (version 0.4.0-dev.11). The repair feature below follows the order repair contract, v1.2 (see the "Additions: repair with XP bottles" section of `stash-manager-server/PROTOCOL.md`).
+
+### Changed (0.4.0-dev.13.1)
+- Printer: `pickup-timeout` is shown while `use-shulkers` or `use-ender-chest` is on (before, only with `use-shulkers`).
+- Not tested in game yet.
+
+### Added (0.4.0-dev.13.1)
+- Printer: a **Stash Orders** group. With `order-from-stash` on (off by default), the Printer orders what it is running low on from the stash bots on the current game server, through the Stash Manager server, with no confirmation. It orders ahead of need and in batches, keeps one open order per stash, never re-orders what an open or uncollected delivery already covers (a partial delivery may hold off a re-order for up to 20 minutes), and prints one chat line per order. Settings: `order-when-below` (64), `order-max-shulkers` (9) and `order-max-shulkers-per-run` (27). It needs the Stash Window module with connect-to-server on, and a logged-in account with the order permission.
+- Printer: when it is out of materials, it keeps building with what it carries, then pauses "waiting for" the stash order. It never travels to the delivery chest: you collect the delivery and put it in your inventory, and printing resumes by itself.
+- Printer: a new ender chest source, `use-ender-chest` (off by default), with `ender-chest-no-silk` (Refuse by default, or MineAnyway). It places your carried ender chest, takes out shulker boxes that hold needed materials, unpacks them, places the chest again to put the emptied or leftover boxes back, and mines it back with silk touch. With MineAnyway and no silk touch, the chest block is lost (its contents stay safe on the server) and the boxes stay in your inventory with a warning.
+- Not tested in game yet.
+
+### Removed (0.4.0-dev.13.1)
+- Printer: the `use-stash-index` setting, which walked to containers in the Stash Window's local index. Meteor drops the old saved value. For stock from the stash, use `order-from-stash`.
+
+### Added (0.4.0-dev.13)
+- Printer: a new module in the Qwerte category that builds a Litematica schematic in the world, one block at a time, with each block's facing and state. The source is the latest Litematica placement, a placement by name, or a `.litematic` file from your `schematics` folder. Litematica is optional.
+- Printer places stairs, slabs, doors, trapdoors, fence gates, beds, repeaters, comparators, note blocks, chests, signs, candles and many more. It skips fluids, waterlogged blocks, block-entity contents (sign text, chest contents) and anything else it can't reproduce, and lists what it skipped.
+- Printer fetches materials from your inventory, its shulker boxes, the containers you list and the Stash Window's index. It walks with Baritone when that is installed. It places one block per tick by default; raising `blocks-per-tick` can get you kicked on 2b2t.
+- Printer lists the shulker boxes it leaves behind, the same way Container Tweaks does.
+- Not tested in game yet.
+
+### Added (0.4.0-dev.12)
+- Container Tweaks: a new module in the Qwerte category. Hover a shulker box in a container or your inventory to see what is inside as a grid. Hold the freeze key (Left Alt by default) to freeze the grid, then hover an item for its full tooltip. Meteor's own shulker preview is hidden while it is on, and Meteor's settings are left alone. `hide-text-list` also hides the text list of contents.
+- Shulker icons: the item a shulker box holds the most of is drawn on it in containers, your inventory and the hotbar. Settings: `icon`, `icon-scale`, `icon-corner` and `hotbar-icon`.
+- Smart Shulker and Smart Echest (both off by default): right-click a shulker box or ender chest in your inventory or a container to place it at the closest spot in reach, open it, and pick it up again when you close it. It says why when there is no spot. With Baritone it walks back for anything out of reach. Anything left behind is listed with its coordinates when you return to that world.
+- Smart Echest without a silk touch pickaxe: `no-silk-touch` is Refuse (the default), Place and leave, or Mine anyway (drops 8 obsidian and loses the ender chest).
+- Not tested in game yet.
+
+### Fixed (0.4.0-dev.11.2)
+- Stash Window: no longer gets stuck on "Connecting..." after it has been opened a couple of times. Two slow replies could tie up both of the window's network threads, so every later request waited forever. Replies are now read without holding a thread, every request has a total time limit, and an oversized reply is refused at once.
+- Not tested in game yet.
+
+### Fixed (0.4.0-dev.11.1)
+- Stash Window: text no longer runs past its card or over other text (Bots cards, Activity "Now doing", Live stats row, the Stash detail drawer, every page at small windows and large GUI scales). Bold and coloured text keeps its formatting when it wraps; long ids break.
+- Live: the hotbar is no longer cut off; the map shrinks to fit, and the map and chat stack in narrow windows.
+- Item tooltips in the Stash grid, the Orders picker and the delivery chest now show what the website shows (details, durability, count with stacks and shulkers, shulker contents, dimmed id).
+- Not tested in game yet.
+
+### Added (0.4.0-dev.11)
+Not tested in game yet.
+- Orders: repair items with XP bottles before delivery. An order can ask for the cart-wide `repairAll` switch or a per-line `repair` toggle (Mending items only). Before each shulker is built, the bot takes the damaged item and the bottles o' enchanting out of the stash, stows its own Mending gear (armour, offhand) and always puts it back, holds the item in the main hand and the bottles in the offhand, and throws bottles at its own feet, looking straight down and standing still, checking the item after each batch. One bottle is about 14 durability (`ceil(damage / 14)`). If a player comes within 8 blocks or the orbs vanish without repairing, the throwing stops and is tried once more per order (kept with the saved order); after that the rest of the order's repairs are delivered as it is ("interrupted"). The throwing is capped at about 2 minutes per order. Leftover bottles are put back by the usual leftover return. Repair never fails an order: items that were not fully repaired are delivered as they are, `result.repair` (`bottlesUsed`, `repaired`, `partial`, `skipped`) tells how it went, and the order message says "N item(s) not fully repaired: reasons". The heartbeat sends `repair: true`.
+- The index sends `mending: true` for stacks with the Mending enchantment (by registry key). The window's models read `repairAll`, line `repair`, `repairEstimate`, `available.bottles`, index `repairable` / `repairBottles` / `mending` (older indexes: a `Mending` entry in the details), the stash entry's `repair`, and `result.repair`; local orders store the same fields. `RepairEstimate` holds the shared formula and the estimate.
+
+### Changed (0.4.0-dev.11)
+Not tested in game yet.
+- Stash Window rebuilt to match the website's layout. The header has the palette button (it opens Settings > Appearance) and your account's role label. Users and Appearance moved into Settings: Users is a card there for the owner, and the Users tab is gone. The bot settings are in Settings, one section at a time, picked from a drop-down.
+- Orders has two columns: the order maker, with item-type buttons, and the cart, with the delivery chest, the cart lines, the shulker names and the Repair box ("Repair all items", and a "Repair" toggle on each repairable line). The order history is below them.
+- Build Planner shows five summary tiles. Bots shows a card per bot above the stash table. Activity shows Now doing and Events side by side, then the modules and plugins.
+- Live has a Chat column beside the map, and the bot's 27-slot inventory with its hotbar and gear. Console keeps its input row pinned at the bottom.
+- Not matched to the website yet: no drag-and-drop in Orders, no drop zone in Build Planner, no latency overlay on Live, and Settings shows one section at a time.
 
 ### Added (0.4.0-dev.10.11)
 - Stash Window: new in-game pages for the Stash Manager server. They need `connect-to-server` on and a login, and each one shows only when your account's permissions allow it. **Build Planner** (`planner`): pick a schematic from the game's `schematics` folder or upload one, see its materials against a stash (need, in stash, missing), order them part by part (`plannerOrder`), and Copy missing. **Bots** and **Activity** (`activity`; Activity also needs the picked bot to report activity). **Proxy** (`proxy`): the picked bot's proxy settings, in the same editor as Settings. **Console** (`console`): the picked bot's console, which asks for your password again when it wasn't typed in the last 15 minutes.

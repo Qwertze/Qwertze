@@ -5,6 +5,9 @@ import com.porter.qwerte.craft.CraftPlanner;
 import com.porter.qwerte.stash.DeliveryRoom;
 import com.porter.qwerte.stash.Kit;
 import com.porter.qwerte.stash.Kits;
+import com.porter.qwerte.stash.Mending;
+import com.porter.qwerte.stash.RepairEstimate;
+import com.porter.qwerte.stash.RepairRun;
 import com.porter.qwerte.stash.Order;
 import com.porter.qwerte.stash.Stash;
 import com.porter.qwerte.stash.Stash.Box;
@@ -85,11 +88,14 @@ final class OrderRunner {
         /** How many chests the delivery storage has (at least 1). */
         int deliveryChests();
 
+        /** The repair job is given up on (a repair the sorter never reported on): it puts the gear back and ends. */
+        default void stopRepair() {}
+
         /** The delivery chest the next shulker goes into: the lowest with room; with {@code verify} the one the last went into. */
         Box deliveryChest(boolean verify);
     }
 
-    sealed interface Intent permits Idle, Build, Fetch, Deliver, Rename, Craft, FindAnvil, Expand, Recheck {}
+    sealed interface Intent permits Idle, Build, Fetch, Deliver, Rename, Craft, FindAnvil, Expand, Recheck, Repair {}
 
     /** Nothing for the sorter to do for the order now. */
     record Idle() implements Intent {}
@@ -118,16 +124,29 @@ final class OrderRunner {
     /** Open this delivery chest, found full before and perhaps emptied since, and read what it holds. */
     record Recheck(Box box) implements Intent {}
 
+    /**
+     * Repair the damaged Mending items now carried (the index keys, in order) with the XP bottles carried too. The sorter runs it and
+     * tells the outcome with {@link #repairEnded}; it always ends, whatever happens.
+     */
+    record Repair(List<String> keys) implements Intent {}
+
     enum State { Running, Delivered, Failed, Cancelled }
 
     /** A snapshot of the order for the server. */
-    record Report(String id, String status, String phase, int done, int total, String message, int shulkers, Map<String, Integer> delivered) {
+    record Report(String id, String status, String phase, int done, int total, String message, int shulkers, Map<String, Integer> delivered,
+                  RepairEstimate.Result repair) {
+        Report(String id, String status, String phase, int done, int total, String message, int shulkers, Map<String, Integer> delivered) {
+            this(id, status, phase, done, total, message, shulkers, delivered, null);
+        }
+
         boolean terminal() {
             return !status.equals("in_progress");
         }
     }
 
     private enum Kind { Shulker, Empty, Bin }
+
+    private enum RState { NEW, GATHER, THROW, DONE }
 
     private static final class Unit {
         final Kind kind;
@@ -140,6 +159,20 @@ final class OrderRunner {
         int expands;
         // Expand and Recheck steps in a row (bounded: a sorter that can't start them gets a wait)
         int spins;
+        // Repair of this unit's items (see repairStep)
+        RState rstate = RState.NEW;
+        Kit repairKit;
+        List<Integer> repairPending = new ArrayList<>();
+        List<Integer> repairBatch = new ArrayList<>();
+        // Damage of each pending lot (by lot index), and the keys the lots were asked for with (null until a lot's key changes)
+        Map<Integer, Integer> repairDamage = new HashMap<>();
+        List<String> asked;
+        int repairBegins, repairBottleNeed;
+        // Lots (by index) whose items were gathered for a repair: they are carried, not in the stash any more
+        Set<Integer> carriedLots = new HashSet<>();
+        // Index key of a repaired item (its new key) -> the key the order asked for, for this unit only
+        Map<String, String> repairedAs = new HashMap<>();
+        long repairAt;
         // The name this shulker is to get (null: none), and how naming it went
         String name, unnamedReason;
         boolean nameDone, named;
@@ -181,6 +214,8 @@ final class OrderRunner {
     private static final long PAUSE_TIMEOUT_MS = 10 * 60 * 1000L;
     private static final long REREAD_TIMEOUT_MS = 10 * 60 * 1000L;
     private static final int MAX_FULL_TRIES = 2;
+    /** A repair job the sorter never reports on is given up on after this long. */
+    private static final long REPAIR_LOST_MS = 6 * 60 * 1000L;
     /** Times one shulker asks the delivery storage to grow before the order waits instead. */
     private static final int MAX_EXPANDS = 6;
     private static final int MAX_SPINS = 30;
@@ -211,6 +246,13 @@ final class OrderRunner {
     private String craftFailure;
     // No anvil could be found or placed for this order: later shulkers go unnamed at once
     private boolean anvilNone;
+    // Repairs (REPAIR-CONTRACT.md): the keys wanted for repair, how it went, why it stopped (null: not), and the throwing time used
+    private final Set<String> repairKeys = new HashSet<>();
+    private RepairRun.Tally repairTally = new RepairRun.Tally();
+    private String repairStopped;
+    private int repairTicksUsed, repairRetriesUsed;
+    // The keys of item lines with their own repair toggle (they are always counted); the others are wanted only when damaged
+    private final Set<String> repairExplicit = new HashSet<>();
     private String phase = "starting";
     private boolean cancelRequested, parked;
     private long pausedSince;
@@ -279,6 +321,7 @@ final class OrderRunner {
         anvilNone = false;
         endCrafting("the order was left");
         owner.crafter().release();
+        clearRepair();
         cancelRequested = false;
         parked = false;
         pausedSince = 0;
@@ -288,6 +331,25 @@ final class OrderRunner {
         planned = false;
         state = State.Running;
         epoch++;
+    }
+
+    /** Ticks of throwing used so far by this order's repairs. */
+    int repairTicks() {
+        return repairTicksUsed;
+    }
+
+    /** Retries of the throwing used so far by this order (one is allowed per order). */
+    int repairRetries() {
+        return repairRetriesUsed;
+    }
+
+    private void clearRepair() {
+        repairKeys.clear();
+        repairTally = new RepairRun.Tally();
+        repairStopped = null;
+        repairTicksUsed = 0;
+        repairRetriesUsed = 0;
+        repairExplicit.clear();
     }
 
     Box deliveryBox() {
@@ -323,6 +385,15 @@ final class OrderRunner {
         craftedTotal = 0;
         craftFailure = null;
         anvilNone = false;
+        clearRepair();
+        for (Order.Line l : o.lines) {
+            if (!Order.ITEM.equals(l.type())) continue;
+            if (l.repair()) {
+                repairExplicit.add(l.key());
+                repairKeys.add(l.key());
+            }
+            else if (o.repairAll) repairKeys.add(l.key());
+        }
         cancelRequested = false;
         parked = false;
         pausedSince = 0;
@@ -375,6 +446,12 @@ final class OrderRunner {
                 restored.named = p.named;
                 restored.unnamedReason = p.nameFailure == null || p.nameFailure.isEmpty() ? null : p.nameFailure;
                 restored.namedKey = p.namedKey == null || p.namedKey.isEmpty() ? null : p.namedKey;
+                // Lots repaired before a restart carry their new key; the key the order asked for is kept to count the delivery
+                if (!p.lotAsked.isEmpty() && p.lotAsked.size() == p.lotKeys.size()) {
+                    restored.asked = new ArrayList<>(p.lotAsked);
+                    for (int i = 0; i < p.lotKeys.size(); i++) if (!p.lotKeys.get(i).equals(p.lotAsked.get(i))) restored.repairedAs.put(p.lotKeys.get(i), p.lotAsked.get(i));
+                }
+                restored.carriedLots.addAll(p.lotCarried);
                 plan.add(restored);
             }
             start = Math.min(saved.done, plan.size());
@@ -384,6 +461,7 @@ final class OrderRunner {
             unnamed = saved.unnamed;
             unnamedReasons.addAll(saved.unnamedReasons);
             craftedTotal = saved.crafted;
+            loadRepair(saved);
         }
         else {
             String why = planFresh(stash, o, plan, notes);
@@ -467,6 +545,7 @@ final class OrderRunner {
 
             // Shulkers can't go in shulkers: an item line for a shulker box is empty shulkers, delivered as they are
             if (Utils.isShulker(sample.getItem())) {
+                if (repairExplicit.contains(l.key())) repairTally.skip(l.key(), RepairEstimate.NOT_SINGLE, l.count());
                 int have = emptiesByKey.getOrDefault(l.key(), 0);
                 int take = Math.min(l.count(), have);
                 emptiesByKey.put(l.key(), have - take);
@@ -724,7 +803,8 @@ final class OrderRunner {
             case Cancelled -> "cancelled";
         };
         String shown = state == State.Running && owner.rereading() ? "re-reading containers" : phase;
-        return new Report(order.id, status, shown, Math.min(index, units.size()), units.size(), message, shulkersDelivered, new LinkedHashMap<>(delivered));
+        return new Report(order.id, status, shown, Math.min(index, units.size()), units.size(), message, shulkersDelivered, new LinkedHashMap<>(delivered),
+            state == State.Running ? null : repairTally.result());
     }
 
     /** What the server asked for, per line key. */
@@ -1076,6 +1156,9 @@ final class OrderRunner {
                     skip("lost a finished shulker");
                     continue;
                 }
+                // Items wanted for repair are repaired before the shulker is built (never fails the order)
+                Intent repair = repairStep(u);
+                if (repair != null) return repair;
                 if (!kits.active()) {
                     // No empty shulker to build in: one is crafted, when crafting is on
                     if (owner.craftingOn() && owner.crafter().craftedBase() < 0 && kits.emptyShulkers().isEmpty()) {
@@ -1265,8 +1348,18 @@ final class OrderRunner {
         int n = 0;
         Map<String, Integer> dropped = new LinkedHashMap<>();
         Map<String, Integer> missing = new LinkedHashMap<>();
-        for (Order.Lot lot : u.lots) {
+        Set<Integer> carriedUsed = new HashSet<>();
+        for (int li = 0; li < u.lots.size(); li++) {
+            Order.Lot lot = u.lots.get(li);
             int want = lot.count();
+            // An item gathered for a repair is carried (repaired or not, it is no longer in the stash)
+            if (u.carriedLots.contains(li)) {
+                ItemStack carried = carriedStack(lot.key(), carriedUsed);
+                if (carried != null && n < Kit.SLOTS) {
+                    stacks[n++] = carried.copyWithCount(Math.max(1, Math.min(want, carried.getCount())));
+                    continue;
+                }
+            }
             List<Variant> variants = survey.variants().getOrDefault(lot.key(), List.of());
             while (want > 0) {
                 Variant best = bestFit(variants, used, want);
@@ -1314,6 +1407,313 @@ final class OrderRunner {
         return m == n && cut.isEmpty() ? probe : new Kit(probe.name, trimmed, true);
     }
 
+    // ---- Repair (REPAIR-CONTRACT.md)
+
+    /** The carried stack with this index key in a carry slot not in {@code used} (its slot is added), or null. */
+    private ItemStack carriedStack(String key, Set<Integer> used) {
+        if (mc.player == null) return null;
+        for (int slot : owner.carry()) {
+            if (used.contains(slot)) continue;
+            ItemStack s = mc.player.getInventory().getItem(slot);
+            if (!s.isEmpty() && key.equals(StashIndex.keyOf(s))) {
+                used.add(slot);
+                return s;
+            }
+        }
+        return null;
+    }
+
+    private int carriedBottles() {
+        int n = 0;
+        if (mc.player == null) return 0;
+        for (int slot : owner.carry()) {
+            ItemStack s = mc.player.getInventory().getItem(slot);
+            if (s.is(net.minecraft.world.item.Items.EXPERIENCE_BOTTLE)) n += s.getCount();
+        }
+        return n;
+    }
+
+    private String askedKey(Unit u, int lot) {
+        return u.asked == null ? u.lots.get(lot).key() : u.asked.get(lot);
+    }
+
+    /**
+     * The repair step of a shulker that is still to be built: null when there is nothing (more) to repair for it and the build goes
+     * on. It takes the unit's damaged Mending items and bottles out of the stash with the kit builder (no shulker), has the sorter
+     * throw the bottles ({@link Repair}), and swaps the repaired items' keys into the unit's lots. Repair never fails the order:
+     * whatever goes wrong the items are delivered as they are, and the reason is noted.
+     */
+    private Intent repairStep(Unit u) {
+        if (u.rstate == RState.DONE || order == null) return null;
+        if (!order.wantsRepair()) {
+            u.rstate = RState.DONE;
+            return null;
+        }
+        if (u.rstate == RState.NEW) {
+            if (u.repairPending.isEmpty() && !prepareRepair(u)) {
+                u.rstate = RState.DONE;
+                return null;
+            }
+            if (!startBatch(u)) {
+                u.rstate = RState.DONE;
+                return null;
+            }
+        }
+        if (u.rstate == RState.GATHER) {
+            // Another kit is let go of and this one begun in the same call, so what is carried is never without a kit
+            if (kits.active() && kits.kit() != u.repairKit) kits.dropOrderKit();
+            if (!kits.active() && (++u.repairBegins > 3 || !kits.beginGather(u.repairKit))) {
+                abandonBatch(u, RepairEstimate.INTERRUPTED);
+                return null;
+            }
+            phase = "fetching repair items " + (index + 1) + "/" + units.size();
+            KitBuilder.Intent step = kits.next();
+            if (step instanceof KitBuilder.Done) {
+                // The kit stays active (so the sorter does not put what it gathered back) until the repair is over
+                List<String> keys = new ArrayList<>();
+                for (int i : u.repairBatch) keys.add(u.lots.get(i).key());
+                u.carriedLots.addAll(u.repairBatch);
+                u.rstate = RState.THROW;
+                u.repairAt = System.currentTimeMillis();
+                phase = "repairing items " + (index + 1) + "/" + units.size();
+                saveLots(u);
+                epoch++;
+                return new Repair(keys);
+            }
+            if (step instanceof KitBuilder.Abort abort) {
+                kits.suspend(abort.reason());
+                com.porter.qwerte.QwerteAddon.LOG.info("orders: repair: couldn't gather the items and bottles: {}", abort.reason());
+                abandonBatch(u, bottlesShort(u) ? RepairEstimate.NO_BOTTLES : RepairEstimate.INTERRUPTED);
+                return null;
+            }
+            return new Build(step);
+        }
+        if (u.rstate == RState.THROW) {
+            // The sorter is on it and tells repairEnded; one that never does is given up on after a while
+            if (System.currentTimeMillis() - u.repairAt > REPAIR_LOST_MS) {
+                owner.stopRepair();
+                repairEnded(new RepairRun.Outcome(0, List.of(), repairTicksUsed));
+                return null;
+            }
+            phase = "repairing items " + (index + 1) + "/" + units.size();
+            return new Idle();
+        }
+        return null;
+    }
+
+    /** Whether the stash and the inventory together hold fewer bottles than the batch was to have. */
+    private boolean bottlesShort(Unit u) {
+        Stash stash = owner.stash();
+        long have = carriedBottles();
+        if (stash != null) have += survey(stash, Set.of(RepairEstimate.BOTTLE_KEY)).available().getOrDefault(RepairEstimate.BOTTLE_KEY, 0L);
+        return have < u.repairBottleNeed;
+    }
+
+    /**
+     * Works out which lots of the unit are to be repaired, checking the stack live (the stash's, or a carried one for items already
+     * gathered). Lots with their line's own toggle are always counted, with a reason when they can't be repaired; under the cart-wide
+     * switch only damaged items are wanted. Counts are per item. @return false when none is to be repaired
+     */
+    private boolean prepareRepair(Unit u) {
+        Stash stash = owner.stash();
+        if (stash == null) return false;
+        Set<String> keys = new HashSet<>();
+        for (int i = 0; i < u.lots.size(); i++) {
+            if (repairKeys.contains(askedKey(u, i)) && askedKey(u, i).equals(u.lots.get(i).key())) keys.add(u.lots.get(i).key());
+        }
+        if (keys.isEmpty()) return false;
+        Survey sv = survey(stash, keys);
+        Set<Integer> carriedUsed = new HashSet<>();
+        for (int i = 0; i < u.lots.size(); i++) {
+            String key = u.lots.get(i).key();
+            if (!keys.contains(key)) continue;
+            int count = u.lots.get(i).count();
+            boolean explicit = repairExplicit.contains(askedKey(u, i));
+            ItemStack sample = u.carriedLots.contains(i) ? carriedStack(key, carriedUsed) : null;
+            if (sample == null) sample = sv.samples().get(key);
+            if (sample == null) sample = carriedStack(key, carriedUsed);
+            if (sample == null) {
+                if (explicit) repairTally.skip(key, RepairEstimate.INTERRUPTED, count);
+                continue;
+            }
+            RepairEstimate.Facts facts = new RepairEstimate.Facts(Mending.has(sample), sample.getDamageValue(), sample.getMaxStackSize());
+            // Under the cart-wide switch an item that is not damaged is simply not wanted
+            if (!explicit && facts.damage() <= 0) continue;
+            String reason = RepairEstimate.reason(key, facts);
+            if (reason == null && repairStopped != null) reason = repairStopped;
+            if (reason != null) {
+                repairTally.skip(key, reason, count);
+                continue;
+            }
+            u.repairPending.add(i);
+            u.repairDamage.put(i, facts.damage());
+        }
+        saveLots(u);
+        return !u.repairPending.isEmpty();
+    }
+
+    /** Picks the next batch from the pending items and builds the gathering kit for it. @return false when nothing is left to do */
+    private boolean startBatch(Unit u) {
+        Stash stash = owner.stash();
+        if (stash == null || u.repairPending.isEmpty()) return false;
+        long stashBottles = survey(stash, Set.of(RepairEstimate.BOTTLE_KEY)).available().getOrDefault(RepairEstimate.BOTTLE_KEY, 0L);
+        List<Integer> needs = new ArrayList<>();
+        for (int i : u.repairPending) needs.add(RepairEstimate.bottlesFor(u.repairDamage.getOrDefault(i, 1)));
+        RepairRun.Batch batch = RepairRun.pickBatch(needs, stashBottles + carriedBottles());
+        if (batch.items() == 0) {
+            for (int i : u.repairPending) repairTally.skip(u.lots.get(i).key(), RepairEstimate.NO_BOTTLES, u.lots.get(i).count());
+            u.repairPending.clear();
+            return false;
+        }
+
+        Set<String> keys = new HashSet<>();
+        for (int k = 0; k < batch.items(); k++) keys.add(u.lots.get(u.repairPending.get(k)).key());
+        Survey sv = survey(stash, keys);
+        Map<Variant, Long> used = new java.util.IdentityHashMap<>();
+        List<ItemStack> stacks = new ArrayList<>();
+        List<Integer> chosen = new ArrayList<>();
+        for (int k = 0; k < batch.items(); k++) {
+            int lot = u.repairPending.get(k);
+            Variant v = bestFit(sv.variants().getOrDefault(u.lots.get(lot).key(), List.of()), used, 1);
+            if (v == null) {
+                repairTally.skip(u.lots.get(lot).key(), RepairEstimate.INTERRUPTED, u.lots.get(lot).count());
+                continue;
+            }
+            used.merge(v, 1L, Long::sum);
+            stacks.add(v.sample.copyWithCount(1));
+            chosen.add(lot);
+        }
+        u.repairPending.subList(0, batch.items()).clear();
+        if (chosen.isEmpty()) return !u.repairPending.isEmpty() && startBatch(u);
+        for (int left = batch.bottles(); left > 0; left -= 64) stacks.add(new ItemStack(net.minecraft.world.item.Items.EXPERIENCE_BOTTLE, Math.min(64, left)));
+        if (stacks.size() > Kit.SLOTS) return false;
+
+        u.repairBatch = chosen;
+        u.repairBottleNeed = batch.bottles();
+        u.repairKit = new Kit("repair " + order.id + " #" + (index + 1), stacks.toArray(new ItemStack[0]), true);
+        u.repairBegins = 0;
+        u.rstate = RState.GATHER;
+        epoch++;
+        return true;
+    }
+
+    /** The batch could not be gathered: its items (and the rest of the unit's) go as they are, and the unit carries on. */
+    private void abandonBatch(Unit u, String reason) {
+        for (int i : u.repairBatch) repairTally.skip(u.lots.get(i).key(), reason, u.lots.get(i).count());
+        // Whatever of the batch was already picked up is carried, so the shulker is built from it
+        u.carriedLots.addAll(u.repairBatch);
+        for (int i : u.repairPending) repairTally.skip(u.lots.get(i).key(), reason, u.lots.get(i).count());
+        u.repairPending.clear();
+        u.repairBatch = new ArrayList<>();
+        u.repairKit = null;
+        kits.dropOrderKit();
+        u.rstate = RState.DONE;
+        saveLots(u);
+        epoch++;
+    }
+
+    /** The sorter's repair job is over: the repaired items' keys go into the unit's lots, and the next batch (if any) is set up. */
+    void repairEnded(RepairRun.Outcome outcome) {
+        if (order == null || index >= units.size()) return;
+        Unit u = units.get(index);
+        if (u.rstate != RState.THROW) return;
+        repairTally.bottles(outcome.bottlesUsed());
+        repairTicksUsed = Math.max(repairTicksUsed, outcome.throwTicks());
+        repairRetriesUsed = Math.max(repairRetriesUsed, outcome.retries());
+        boolean interrupted = false;
+        List<Integer> open = new ArrayList<>(u.repairBatch);
+        for (RepairRun.ItemResult r : outcome.items()) {
+            repairTally.add(r);
+            if (RepairEstimate.INTERRUPTED.equals(r.reason()) && r.status() != RepairRun.Status.FULL) interrupted = true;
+            int lot = -1;
+            for (int i : open) {
+                if (u.lots.get(i).key().equals(r.key())) {
+                    lot = i;
+                    break;
+                }
+            }
+            if (lot < 0) continue;
+            open.remove((Integer) lot);
+            if (r.newKey() != null && !r.newKey().equals(r.key())) {
+                if (u.asked == null) {
+                    u.asked = new ArrayList<>();
+                    for (Order.Lot l : u.lots) u.asked.add(l.key());
+                }
+                String asked = u.asked.get(lot);
+                u.lots.set(lot, new Order.Lot(r.newKey(), u.lots.get(lot).count()));
+                u.repairedAs.put(r.newKey(), asked);
+                u.lotTotals = null;
+            }
+        }
+        // Items the job gave no result for (it was lost) go as they are
+        for (int lot : open) repairTally.skip(u.lots.get(lot).key(), RepairEstimate.INTERRUPTED, u.lots.get(lot).count());
+        u.repairBatch = new ArrayList<>();
+        u.repairKit = null;
+        if (repairTicksUsed >= RepairRun.Guard.CAP_TICKS) interrupted = true;
+        if (interrupted && repairStopped == null) repairStopped = RepairEstimate.INTERRUPTED;
+        if (repairStopped != null) {
+            for (int i : u.repairPending) repairTally.skip(u.lots.get(i).key(), repairStopped, u.lots.get(i).count());
+            u.repairPending.clear();
+        }
+        u.rstate = u.repairPending.isEmpty() ? RState.DONE : RState.NEW;
+        saveLots(u);
+        epoch++;
+    }
+
+    /** Keeps the unit's lot keys (repaired ones changed) and the keys they were asked with in the saved plan, for a resume. */
+    private void saveLots(Unit u) {
+        Stash stash = owner.stash();
+        int i = units.indexOf(u);
+        if (stash == null || order == null || stash.activeOrder == null || !stash.activeOrder.id.equals(order.id) || i < 0 || i >= stash.activeOrder.units.size()) return;
+        Stash.ActiveOrder.UnitPlan p = stash.activeOrder.units.get(i);
+        p.lotKeys.clear();
+        p.lotCounts.clear();
+        for (Order.Lot lot : u.lots) {
+            p.lotKeys.add(lot.key());
+            p.lotCounts.add(lot.count());
+        }
+        p.lotAsked.clear();
+        if (u.asked != null) p.lotAsked.addAll(u.asked);
+        p.lotCarried.clear();
+        p.lotCarried.addAll(u.carriedLots);
+        // The order's repair tally, so a resume goes on counting
+        Stash.ActiveOrder a = stash.activeOrder;
+        RepairEstimate.Result r = repairTally.result();
+        a.repairBottles = r == null ? 0 : r.bottlesUsed();
+        a.repaired = r == null ? 0 : r.repaired();
+        a.repairTicks = repairTicksUsed;
+        a.repairRetries = repairRetriesUsed;
+        a.repairStopped = repairStopped == null ? "" : repairStopped;
+        a.repairReasons.clear();
+        a.repairReasons.addAll(repairTally.reasons());
+        a.repairPartial.clear();
+        a.repairSkipped.clear();
+        if (r != null) {
+            for (RepairEstimate.Partial x : r.partial()) a.repairPartial.add(new String[] { x.key(), String.valueOf(x.damage()), String.valueOf(x.maxDamage()) });
+            for (RepairEstimate.Skipped x : r.skipped()) a.repairSkipped.add(new String[] { x.key(), x.reason(), "" });
+        }
+        stash.markDirty();
+        stash.save();
+    }
+
+    /** Takes the repair tally, the throwing time and the stop reason of a saved order back. */
+    private void loadRepair(Stash.ActiveOrder saved) {
+        List<RepairEstimate.Partial> partial = new ArrayList<>();
+        for (String[] e : saved.repairPartial) {
+            try {
+                partial.add(new RepairEstimate.Partial(e[0], Integer.parseInt(e[1]), Integer.parseInt(e[2])));
+            } catch (NumberFormatException ex) {
+                // a damaged entry is left out
+            }
+        }
+        List<RepairEstimate.Skipped> skipped = new ArrayList<>();
+        for (String[] e : saved.repairSkipped) skipped.add(new RepairEstimate.Skipped(e[0], e[1]));
+        repairTally.load(saved.repairBottles, saved.repaired, partial, skipped, saved.repairReasons);
+        repairTicksUsed = saved.repairTicks;
+        repairRetriesUsed = saved.repairRetries;
+        repairStopped = saved.repairStopped.isEmpty() ? null : saved.repairStopped;
+    }
+
     private void skip(String why) {
         skips++;
         problems.add(why);
@@ -1346,7 +1746,8 @@ final class OrderRunner {
         for (ItemStack s : Kits.inside(stack)) {
             if (s == null || s.isEmpty()) continue;
             String key = StashIndex.keyOf(s);
-            if (key != null) out.merge(key, s.getCount(), Integer::sum);
+            // A repaired item counts for the line that asked for it
+            if (key != null) out.merge(u.repairedAs.getOrDefault(key, key), s.getCount(), Integer::sum);
         }
         return out;
     }
@@ -1517,6 +1918,8 @@ final class OrderRunner {
         endCrafting("the order ended");
         owner.crafter().release();
         if (craftedTotal > 0) text = (text.isEmpty() ? "" : text + "; ") + "crafted " + craftedTotal + " Shulker Box";
+        String repairNote = repairTally.note();
+        if (!repairNote.isEmpty() && !text.contains(repairNote)) text = text.isEmpty() ? repairNote : text + "; " + repairNote;
         String unnamedNote = Order.unnamedNote(unnamed, unnamedReasons);
         if (!unnamedNote.isEmpty() && !text.contains(unnamedNote)) text = text.isEmpty() ? unnamedNote : text + "; " + unnamedNote;
         text = cut(text);

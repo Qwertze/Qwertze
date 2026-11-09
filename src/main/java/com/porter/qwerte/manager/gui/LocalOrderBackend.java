@@ -8,6 +8,7 @@ import com.porter.qwerte.manager.model.NamesDraft;
 import com.porter.qwerte.manager.model.OrderModel;
 import com.porter.qwerte.modules.LocalOrders;
 import com.porter.qwerte.stash.Order;
+import com.porter.qwerte.stash.RepairEstimate;
 import com.porter.qwerte.stash.StashIndex;
 
 import java.nio.charset.StandardCharsets;
@@ -75,6 +76,12 @@ final class LocalOrderBackend implements OrderBackend {
         IndexModel.Item item = index.item(key);
         if (item == null) return 0;
         return item.isShulkerBox() ? index.emptyShulkerAvailable(key) : item.count();
+    }
+
+    @Override
+    public long bottles() {
+        IndexModel.Item item = catalog().item(RepairEstimate.BOTTLE_KEY);
+        return item == null ? 0 : item.count();
     }
 
     @Override
@@ -220,8 +227,13 @@ final class LocalOrderBackend implements OrderBackend {
     // ---------- doing ----------
 
     @Override
-    public void place(List<Order.Line> lines, NamesDraft names, int units, Consumer<PlaceResult> done) {
-        Order order = new Order(orders.newId(), List.copyOf(lines), names.toNames(units));
+    public void place(List<Order.Line> lines, NamesDraft names, int units, boolean repairAll, Consumer<PlaceResult> done) {
+        IndexModel index = catalog();
+        RepairEstimate.Estimate estimate = RepairEstimate.estimate(lines, repairAll, key -> {
+            IndexModel.Item it = index.item(key);
+            return it == null ? null : it.repairFacts();
+        }, bottles());
+        Order order = new Order(orders.newId(), List.copyOf(lines), names.toNames(units), repairAll, estimate);
         String why = orders.start(order);
         history = orders.history();
         done.accept(why == null ? new PlaceResult(true, "Order started on this client. Stay near the stash; Cancel stops it.", -1) : new PlaceResult(false, why, -1));

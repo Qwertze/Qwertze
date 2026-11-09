@@ -4,6 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.porter.qwerte.stash.Order;
+import com.porter.qwerte.stash.RepairEstimate;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -31,7 +32,35 @@ public final class OrderModel {
                         boolean cancelRequested, long cancelRequestedAt, long updatedAt, long createdAt,
                         boolean hasPlacedBy, String placedById, String placedByName, String retriedAs,
                         List<Order.Line> lines, String namesMode, String namesAll, List<String> namesEach,
-                        int shulkers, boolean hasResult) {
+                        int shulkers, boolean hasResult, boolean repairAll, RepairEstimate.Estimate repairEstimate,
+                        RepairEstimate.Result repairResult) {
+
+        /** An order without repair: the fields of before the repair feature. */
+        public Entry(String id, String status, String phase, String message, int done, int total,
+                     boolean cancelRequested, long cancelRequestedAt, long updatedAt, long createdAt,
+                     boolean hasPlacedBy, String placedById, String placedByName, String retriedAs,
+                     List<Order.Line> lines, String namesMode, String namesAll, List<String> namesEach,
+                     int shulkers, boolean hasResult) {
+            this(id, status, phase, message, done, total, cancelRequested, cancelRequestedAt, updatedAt, createdAt, hasPlacedBy, placedById,
+                placedByName, retriedAs, lines, namesMode, namesAll, namesEach, shulkers, hasResult, false, null, null);
+        }
+
+        /** The same order with another message, status and so on kept: used where only the repair part changes. */
+        public Entry withRepair(boolean repairAll, RepairEstimate.Estimate estimate, RepairEstimate.Result result) {
+            return new Entry(id, status, phase, message, done, total, cancelRequested, cancelRequestedAt, updatedAt, createdAt, hasPlacedBy,
+                placedById, placedByName, retriedAs, lines, namesMode, namesAll, namesEach, shulkers, hasResult, repairAll, estimate, result);
+        }
+
+        /** A line is wanted for repair: an item line, and the cart-wide switch or its own toggle. */
+        public boolean wantsRepair(Order.Line line) {
+            return RepairEstimate.wanted(line, repairAll);
+        }
+
+        /** Whether any line is wanted for repair. */
+        public boolean wantsRepair() {
+            for (Order.Line l : lines) if (wantsRepair(l)) return true;
+            return false;
+        }
 
         public boolean open() {
             return OrderModel.isOpen(status);
@@ -43,8 +72,17 @@ public final class OrderModel {
     }
 
     /** The orders (newest first) and what can still be ordered per key. */
-    public record Listing(List<Entry> orders, Map<String, Long> availableItems, Map<String, Long> availableShulkers) {
+    public record Listing(List<Entry> orders, Map<String, Long> availableItems, Map<String, Long> availableShulkers, long availableBottles) {
         public static final Listing EMPTY = new Listing(List.of(), Map.of(), Map.of());
+
+        public Listing(List<Entry> orders, Map<String, Long> availableItems, Map<String, Long> availableShulkers) {
+            this(orders, availableItems, availableShulkers, -1);
+        }
+
+        /** Bottles o' enchanting still free to use for repairs (the server's {@code available.bottles}); -1 when it did not say. */
+        public long bottles() {
+            return availableBottles;
+        }
 
         /** Null when the server did not say (then the index count is the best guess). */
         public Long available(String type, String key) {
@@ -97,8 +135,9 @@ public final class OrderModel {
             }
         }
         JsonObject available = Json.obj(o.get("available"));
+        long bottles = available == null || !available.has("bottles") ? -1 : (long) Math.max(0, Json.num(available, "bottles", 0));
         return new Listing(List.copyOf(orders), numbers(available == null ? null : Json.obj(available.get("items"))),
-            numbers(available == null ? null : Json.obj(available.get("shulkers"))));
+            numbers(available == null ? null : Json.obj(available.get("shulkers"))), bottles);
     }
 
     private static Map<String, Long> numbers(JsonObject o) {
@@ -125,7 +164,7 @@ public final class OrderModel {
             String key = Json.str(l, "key");
             double count = Json.num(l, "count", 0);
             if ((type.equals(Order.ITEM) || type.equals(Order.SHULKER)) && !key.isEmpty() && key.length() <= 256 && count >= 1) {
-                lines.add(new Order.Line(type, key, (int) Math.min(Integer.MAX_VALUE, count)));
+                lines.add(new Order.Line(type, key, (int) Math.min(Integer.MAX_VALUE, count), Json.bool(l, "repair")));
             }
         }
         JsonObject progress = Json.obj(o.get("progress"));
@@ -147,7 +186,9 @@ public final class OrderModel {
             Json.bool(o, "cancelRequested"), Json.lng(o, "cancelRequestedAt", 0), Json.lng(o, "updatedAt", 0), Json.lng(o, "createdAt", 0),
             by != null, by == null ? "" : Json.str(by, "id"), by == null ? "" : Text.sanitize(Json.str(by, "name"), 40),
             Json.str(o, "retriedAs"), List.copyOf(lines), mode, names == null ? "" : Text.sanitize(Json.str(names, "name"), 60),
-            List.copyOf(each), result == null ? 0 : (int) Math.max(0, Json.num(result, "shulkers", 0)), result != null);
+            List.copyOf(each), result == null ? 0 : (int) Math.max(0, Json.num(result, "shulkers", 0)), result != null,
+            Json.bool(o, "repairAll"), RepairEstimate.parseEstimate(o.get("repairEstimate")),
+            result == null ? null : RepairEstimate.parseResult(result.get("repair")));
     }
 
     // ---------- who may do what (the website's canManageOrder and friends) ----------

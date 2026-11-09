@@ -3,6 +3,7 @@ package com.porter.qwerte.manager.model;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.porter.qwerte.stash.RepairEstimate;
 
 import java.text.Collator;
 import java.util.ArrayList;
@@ -46,7 +47,21 @@ public final class IndexModel {
 
     /** One kind of item. {@code hay} is the lower-case text a search looks in. */
     public record Item(String key, String id, String name, String englishName, long count, int maxStack, List<String> details,
-                       boolean enchanted, String tab, int tabOrder, int damage, int maxDamage, String ns, String hay) {
+                       boolean enchanted, String tab, int tabOrder, int damage, int maxDamage, String ns, String hay,
+                       boolean mending, boolean repairable, int repairBottles) {
+
+        /** An item as before the repair feature: Mending is read from the details, repairable and bottles are worked out here. */
+        public Item(String key, String id, String name, String englishName, long count, int maxStack, List<String> details,
+                    boolean enchanted, String tab, int tabOrder, int damage, int maxDamage, String ns, String hay) {
+            this(key, id, name, englishName, count, maxStack, details, enchanted, tab, tabOrder, damage, maxDamage, ns, hay,
+                RepairEstimate.detailsHaveMending(details), RepairEstimate.repairable(RepairEstimate.facts(false, details, damage, maxStack)),
+                RepairEstimate.bottlesPerItem(RepairEstimate.facts(false, details, damage, maxStack)));
+        }
+
+        /** What the repair rules look at. */
+        public RepairEstimate.Facts repairFacts() {
+            return new RepairEstimate.Facts(mending, damage, maxStack);
+        }
 
         /** Remaining durability 0 to 1 of a damaged item, or -1 when it isn't damaged (or the bot doesn't say). */
         public double durabilityLeft() {
@@ -174,9 +189,16 @@ public final class IndexModel {
         StringBuilder hay = new StringBuilder(name).append('\n').append(english).append('\n').append(id);
         for (String line : details) hay.append('\n').append(line);
         String ns = id.indexOf(':') < 0 ? "minecraft" : id.substring(0, id.indexOf(':'));
+        int damage = (int) Math.max(0, Json.num(o, "damage", 0));
+        // The bot's flag, else (an older bot) the details; the server's own repairable and repairBottles when it sent them
+        RepairEstimate.Facts facts = RepairEstimate.facts(Json.bool(o, "mending"), details, damage, maxStack);
+        boolean repairable = o.has("repairable") && o.get("repairable").isJsonPrimitive() && o.get("repairable").getAsJsonPrimitive().isBoolean()
+            ? Json.bool(o, "repairable") : RepairEstimate.repairable(facts);
+        int bottles = o.has("repairBottles") ? (int) Math.max(0, Math.min(Integer.MAX_VALUE, Json.num(o, "repairBottles", 0))) : RepairEstimate.bottlesPerItem(facts);
         return new Item(key, id, name, english, count, maxStack, List.copyOf(details), Json.bool(o, "enchanted"), tab,
-            (int) Json.num(o, "tabOrder", 1_000_000), (int) Math.max(0, Json.num(o, "damage", 0)),
-            (int) Math.max(0, Json.num(o, "maxDamage", 0)), ns.toLowerCase(Locale.ROOT), hay.toString().toLowerCase(Locale.ROOT));
+            (int) Json.num(o, "tabOrder", 1_000_000), damage,
+            (int) Math.max(0, Json.num(o, "maxDamage", 0)), ns.toLowerCase(Locale.ROOT), hay.toString().toLowerCase(Locale.ROOT),
+            facts.mending(), repairable, repairable ? bottles : 0);
     }
 
     private static Shulker parseShulker(JsonObject o, Map<String, Item> items) {

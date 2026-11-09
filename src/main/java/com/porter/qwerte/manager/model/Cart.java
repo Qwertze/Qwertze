@@ -24,6 +24,23 @@ public final class Cart {
     }
 
     private final List<Order.Line> lines = new ArrayList<>();
+    private boolean repairAll;
+
+    /** The cart-wide "Repair all items" switch. */
+    public boolean repairAll() {
+        return repairAll;
+    }
+
+    public void setRepairAll(boolean on) {
+        repairAll = on;
+    }
+
+    /** A line's own "Repair" toggle. */
+    public void setRepair(int line, boolean on) {
+        if (line < 0 || line >= lines.size()) return;
+        Order.Line l = lines.get(line);
+        lines.set(line, new Order.Line(l.type(), l.key(), l.count(), on));
+    }
 
     public List<Order.Line> lines() {
         return Collections.unmodifiableList(new ArrayList<>(lines));
@@ -39,6 +56,7 @@ public final class Cart {
 
     public void clear() {
         lines.clear();
+        repairAll = false;
     }
 
     public void replaceAll(List<Order.Line> next) {
@@ -69,7 +87,7 @@ public final class Cart {
         int at = indexOf(next, type, key);
         long total = (at >= 0 ? next.get(at).count() : 0) + n;
         if (total > Integer.MAX_VALUE) return Result.refused("That is more than an order can hold.");
-        if (at >= 0) next.set(at, new Order.Line(type, key, (int) total));
+        if (at >= 0) next.set(at, next.get(at).withCount((int) total));
         else next.add(new Order.Line(type, key, (int) total));
         long need = CartPlan.shulkersNeeded(next, index);
         if (need > CartPlan.MAX_SHULKERS) return Result.refused(capMessage(need, CartPlan.shulkersNeeded(lines, index)));
@@ -96,7 +114,7 @@ public final class Cart {
         long n = Math.max(1, Math.min(Math.min(maxNow, Integer.MAX_VALUE), wanted));
         if (n == l.count()) return new Result(true, 0, "");
         List<Order.Line> next = new ArrayList<>(lines);
-        next.set(line, new Order.Line(l.type(), l.key(), (int) n));
+        next.set(line, l.withCount((int) n));
         long need = CartPlan.shulkersNeeded(next, index);
         if (need > CartPlan.MAX_SHULKERS && n > l.count()) return Result.refused(capMessage(need, CartPlan.shulkersNeeded(lines, index)));
         lines.clear();
@@ -114,7 +132,7 @@ public final class Cart {
         if (at < 0) return;
         long left = lines.get(at).count() - n;
         if (left < 1) lines.remove(at);
-        else lines.set(at, new Order.Line(type, key, (int) left));
+        else lines.set(at, lines.get(at).withCount((int) left));
     }
 
     private static int indexOf(List<Order.Line> list, String type, String key) {

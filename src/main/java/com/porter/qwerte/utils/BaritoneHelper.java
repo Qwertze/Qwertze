@@ -16,6 +16,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Predicate;
 
 /**
  * Thin wrapper around dekrom's Baritone fork (https://github.com/dekrom/baritone).
@@ -193,13 +194,29 @@ public final class BaritoneHelper {
         return goal;
     }
 
+    /**
+     * Like {@link #moveInReach(Collection, double)}, but never ends on a feet cell for which {@code badFeet} is true (the
+     * cell the player's feet would be in), nor on one whose head cell (one above) is. The predicate is called from
+     * Baritone's path finding threads: it must be thread-safe and quick, and must not touch the world.
+     */
+    public static Goal moveInReach(Collection<BlockPos> parts, double reach, Predicate<BlockPos> badFeet) {
+        Goal goal = new GoalReach(List.copyOf(parts), reach, badFeet);
+        baritone().getCustomGoalProcess().setGoalAndPath(goal);
+        return goal;
+    }
+
     /** Feet positions whose eyes are within reach of a block's centre; see {@link #moveInReach}. */
-    private record GoalReach(List<BlockPos> parts, double reach) implements Goal {
+    private record GoalReach(List<BlockPos> parts, double reach, Predicate<BlockPos> badFeet) implements Goal {
         // Standing eye height, and a little less reach than the setting so the arrival check never misses by a hair
         private static final double EYES = 1.62, MARGIN = 0.25;
 
+        GoalReach(List<BlockPos> parts, double reach) {
+            this(parts, reach, null);
+        }
+
         @Override
         public boolean isInGoal(int x, int y, int z) {
+            if (badFeet != null && (badFeet.test(new BlockPos(x, y, z)) || badFeet.test(new BlockPos(x, y + 1, z)))) return false;
             double r = Math.max(1, reach - MARGIN);
             for (BlockPos p : parts) {
                 double dx = x + 0.5 - (p.getX() + 0.5), dy = y + EYES - (p.getY() + 0.5), dz = z + 0.5 - (p.getZ() + 0.5);

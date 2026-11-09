@@ -76,7 +76,7 @@ public sealed interface ViewerEvent {
 
     /** Numbers the bot did not send are NaN. {@code held} is -1 when unknown. Slot lists have 9 and 4 entries; entries may be null. */
     record Hud(double hp, double food, double sat, double xp, double xpP, double armor, int held, List<Slot> hotbar, List<Slot> armorSlots,
-               Slot offhand) {
+               Slot offhand, List<Slot> inv) {
     }
 
     /** {@code kind}: public, whisper, system or death. */

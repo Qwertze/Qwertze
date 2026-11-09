@@ -60,7 +60,17 @@ public interface OrderBackend {
     boolean canClear();
 
     /** Places the cart's lines; {@code units} is the number of planned shulkers (for the names). */
-    void place(List<Order.Line> lines, NamesDraft names, int units, Consumer<PlaceResult> done);
+    void place(List<Order.Line> lines, NamesDraft names, int units, boolean repairAll, Consumer<PlaceResult> done);
+
+    /** Changes whenever what can still be ordered per item changed (so a picker is refilled only then). */
+    default long availabilityVersion() {
+        return 0;
+    }
+
+    /** Bottles o' Enchanting still free for repairs (the stash count, minus what open orders reserve); -1 when not known. */
+    default long bottles() {
+        return -1;
+    }
 
     void cancel(OrderModel.Entry e, Consumer<String> done);
 

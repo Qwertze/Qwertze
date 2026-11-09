@@ -193,13 +193,14 @@ public final class LocalOrderStore {
 
     public static Entry withRetried(Entry e, String newId) {
         return new Entry(e.id(), e.status(), e.phase(), e.message(), e.done(), e.total(), e.cancelRequested(), e.cancelRequestedAt(), e.updatedAt(), e.createdAt(),
-            e.hasPlacedBy(), e.placedById(), e.placedByName(), newId, e.lines(), e.namesMode(), e.namesAll(), e.namesEach(), e.shulkers(), e.hasResult());
+            e.hasPlacedBy(), e.placedById(), e.placedByName(), newId, e.lines(), e.namesMode(), e.namesAll(), e.namesEach(), e.shulkers(), e.hasResult(),
+            e.repairAll(), e.repairEstimate(), e.repairResult());
     }
 
     public static Entry withEnd(Entry e, String status, String message, long now) {
         return new Entry(e.id(), status, status, message, e.done(), e.total(), e.cancelRequested(), e.cancelRequestedAt(), now, e.createdAt(),
             e.hasPlacedBy(), e.placedById(), e.placedByName(), e.retriedAs(), e.lines(), e.namesMode(), e.namesAll(), e.namesEach(),
-            e.shulkers(), e.hasResult());
+            e.shulkers(), e.hasResult(), e.repairAll(), e.repairEstimate(), e.repairResult());
     }
 
     // ---------- writing ----------
@@ -348,9 +349,14 @@ public final class LocalOrderStore {
                 lo.addProperty("type", l.type());
                 lo.addProperty("key", l.key());
                 lo.addProperty("count", l.count());
+                if (l.repair()) lo.addProperty("repair", true);
                 lines.add(lo);
             }
             o.add("lines", lines);
+            // Same names as the server's order JSON, so decode hands them to the same reader
+            if (e.repairAll()) o.addProperty("repairAll", true);
+            if (e.repairEstimate() != null) o.add("repairEstimate", e.repairEstimate().toJson());
+            if (e.repairResult() != null) o.add("repairResult", e.repairResult().toJson());
             array.add(o);
         }
         root.add("orders", array);
@@ -375,6 +381,7 @@ public final class LocalOrderStore {
                 if (o.has("hasResult") && o.get("hasResult").getAsBoolean()) {
                     JsonObject result = new JsonObject();
                     result.addProperty("shulkers", num(o, "shulkers"));
+                    if (o.has("repairResult") && o.get("repairResult").isJsonObject()) result.add("repair", o.get("repairResult"));
                     asServer.add("result", result);
                 }
                 String mode = o.has("namesMode") ? o.get("namesMode").getAsString() : "";

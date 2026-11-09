@@ -232,6 +232,7 @@ public class StashWindow extends Module {
     // Read from the HTTP threads' callbacks only through the client thread, but cheap to make safe
     private volatile Session session;
     private volatile SmClient client;
+    private volatile SmClient backgroundClient;
     private volatile Runnable sessionListener;
     private String lastUser = "";
     private String lastStash;
@@ -396,15 +397,51 @@ public class StashWindow extends Module {
         return client;
     }
 
+    /**
+     * A second client for work the window does not own (the Printer's stash orders): it shares the address, the connect setting
+     * and the session of {@link #client()}, but closing the window does not drop its answers. It never asks for a password.
+     * Client thread only. It is kept in step by {@link #syncClient()}, {@link #dropSession} and every call of this method.
+     */
+    public SmClient backgroundClient() {
+        if (backgroundClient == null) {
+            SmClient created = new SmClient(mc::execute);
+            created.onUnauthorized(() -> dropSession("401"));
+            created.setAllowed(u -> !insecureRefused(u));
+            backgroundClient = created;
+        }
+        syncBackground();
+        return backgroundClient;
+    }
+
+    /**
+     * Brings the background client in line with the connect setting, the address and the session. Each change that bumps its
+     * generation (and so drops answers on the way) is made only when the value really differs.
+     */
+    private void syncBackground() {
+        SmClient c = backgroundClient;
+        if (c == null) return;
+        boolean on = connect.get();
+        if (c.enabled() != on) c.setEnabled(on);
+        ServerUrl url = on ? url() : null;
+        ServerUrl current = c.base();
+        boolean same = url == null ? current == null : current != null && current.origin().equals(url.origin());
+        if (!same) c.setBase(url);
+        Session s = on ? session() : null;
+        if (s != null) c.setToken(s.token(), s.origin());
+        else c.setToken(null, null);
+    }
+
     /** Brings the client in line with the connect setting and the session. */
     private void syncClient() {
         SmClient c = client;
-        if (c == null) return;
-        boolean on = connect.get();
-        c.setEnabled(on);
-        Session s = session;
-        if (on && s != null) c.setToken(s.token(), s.origin());
-        else c.setToken(null, null);
+        if (c != null) {
+            boolean on = connect.get();
+            c.setEnabled(on);
+            Session s = session;
+            if (on && s != null) c.setToken(s.token(), s.origin());
+            else c.setToken(null, null);
+        }
+        if (backgroundClient != null) syncBackground();
     }
 
     /**
@@ -438,6 +475,11 @@ public class StashWindow extends Module {
         if (c != null) {
             c.setToken(null, null);
             c.bumpGeneration();
+        }
+        SmClient bg = backgroundClient;
+        if (bg != null) {
+            bg.setToken(null, null);
+            bg.bumpGeneration();
         }
         viewerIds.clear();
         // Whatever the account saw must not linger in the icon cache

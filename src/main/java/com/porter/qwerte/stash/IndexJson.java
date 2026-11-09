@@ -17,7 +17,11 @@ final class IndexJson {
     private IndexJson() {}
 
     /** What is worked out once per kind of stack (item plus components, container contents ignored). */
-    record Info(String key, String id, String name, String englishName, int maxStack, List<String> details, boolean enchanted, String tab, int tabOrder, int damage, int maxDamage) {}
+    record Info(String key, String id, String name, String englishName, int maxStack, List<String> details, boolean enchanted, String tab, int tabOrder, int damage, int maxDamage, boolean mending) {
+        public Info(String key, String id, String name, String englishName, int maxStack, List<String> details, boolean enchanted, String tab, int tabOrder, int damage, int maxDamage) {
+            this(key, id, name, englishName, maxStack, details, enchanted, tab, tabOrder, damage, maxDamage, false);
+        }
+    }
 
     /** One kind of stack and how many of it there are. */
     static final class Agg {
@@ -64,6 +68,8 @@ final class IndexJson {
             o.addProperty("enchanted", i.enchanted());
             o.addProperty("tab", i.tab());
             o.addProperty("tabOrder", i.tabOrder());
+            // Only a stack with the Mending enchantment (by registry key) carries the flag
+            if (i.mending()) o.addProperty("mending", true);
             // Only a damaged, damageable item has them (a damaged stack has a key of its own, so one entry has one damage value)
             if (i.damage() > 0) {
                 o.addProperty("damage", i.damage());

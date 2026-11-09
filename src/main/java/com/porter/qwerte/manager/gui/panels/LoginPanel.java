@@ -24,7 +24,7 @@ public final class LoginPanel extends PasswordPanel {
         this.theme = theme;
         this.onLogin = onLogin;
         parent.add(theme.label("Log in to the Stash Manager", true));
-        parent.add(theme.label("Server: " + serverText));
+        parent.add(com.porter.qwerte.manager.gui.style.Ui.wrap(theme, "Server: " + serverText, Math.min(theme.scale(420), com.porter.qwerte.manager.gui.style.PageRoom.width(parent, 0))));
         user = plain(parent, "User name (empty for the owner)", lastUser == null ? "" : lastUser);
         password = secret(parent, "Password");
         WButton go = parent.add(theme.button("Log in")).widget();

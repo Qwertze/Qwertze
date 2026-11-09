@@ -225,4 +225,24 @@ class LocalOrderStoreTest {
         s.load("b.example.com");
         assertEquals(List.of("L-2"), s.list("stash").stream().map(Entry::id).toList());
     }
+
+    @Test
+    void repairFieldsSurviveAnEncodeDecode() {
+        var estimate = com.porter.qwerte.stash.RepairEstimate.estimate(List.of(new Order.Line("item", "k", 1, true)), false,
+            key -> new com.porter.qwerte.stash.RepairEstimate.Facts(true, 28, 1), 1);
+        var result = new com.porter.qwerte.stash.RepairEstimate.Result(4, 1, List.of(new com.porter.qwerte.stash.RepairEstimate.Partial("k", 3, 100)), List.of());
+        Entry e = new Entry("L-9", "delivered", "delivered", "m", 1, 1, false, 0, 5, 5, false, "", "", "",
+            List.of(new Order.Line("item", "k", 1, true)), "", "", List.of(), 1, true, true, estimate, result);
+        List<LocalOrderStore.Item> back = LocalOrderStore.decode(LocalOrderStore.encode(List.of(new LocalOrderStore.Item("st", e))));
+        Entry r = back.get(0).entry();
+        assertTrue(r.repairAll());
+        assertTrue(r.lines().get(0).repair());
+        assertEquals(estimate, r.repairEstimate());
+        assertEquals(result, r.repairResult());
+        // An order saved before the feature reads back with none of it
+        Entry plain = LocalOrderStore.decode(LocalOrderStore.encode(List.of(new LocalOrderStore.Item("st", entry("L-1", "delivered", 1))))).get(0).entry();
+        assertFalse(plain.repairAll());
+        assertNull(plain.repairEstimate());
+        assertNull(plain.repairResult());
+    }
 }
