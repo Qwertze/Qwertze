@@ -36,7 +36,6 @@ import net.minecraft.world.level.block.ComposterBlock;
 import net.minecraft.world.level.block.CropBlock;
 import net.minecraft.world.level.block.DaylightDetectorBlock;
 import net.minecraft.world.level.block.DecoratedPotBlock;
-import net.minecraft.world.level.block.DirtPathBlock;
 import net.minecraft.world.level.block.DispenserBlock;
 import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.DoublePlantBlock;
@@ -47,7 +46,6 @@ import net.minecraft.world.level.block.EndRodBlock;
 import net.minecraft.world.level.block.EnderChestBlock;
 import net.minecraft.world.level.block.FaceAttachedHorizontalDirectionalBlock;
 import net.minecraft.world.level.block.FallingBlock;
-import net.minecraft.world.level.block.FarmBlock;
 import net.minecraft.world.level.block.FenceGateBlock;
 import net.minecraft.world.level.block.FlowerBlock;
 import net.minecraft.world.level.block.FungusBlock;
@@ -148,7 +146,6 @@ public final class StateClassifier {
         if (b instanceof ComposterBlock) return "composters are not supported";
         if (b instanceof RespawnAnchorBlock) return "respawn anchor charges are not supported";
         if (b instanceof CakeBlock) return null; // bites are handled by PropertyRules
-        if (b instanceof FarmBlock || b instanceof DirtPathBlock) return "farmland and dirt paths are made by tools, not placed";
         if (b instanceof CommandBlock || b instanceof StructureBlock || b instanceof JigsawBlock) return "creative-only blocks are not supported";
         if (b instanceof PistonHeadBlock || b instanceof MovingPistonBlock) return "piston heads and moving pistons belong to an extended piston";
         if (b instanceof CeilingHangingSignBlock) return "hanging signs that hang from a ceiling are not supported";

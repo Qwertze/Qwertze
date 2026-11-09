@@ -9,11 +9,15 @@ import java.util.List;
  * surface or directly above it (y up to waterTop + 1). It has to stay OPEN for a pearl to stay in stasis, and closing it
  * is what pulls the pearl. The COVER trapdoors are everything above it; they only keep people out and may be closed.
  * A shaft with a single high trapdoor has a cover and no stasis trapdoor (a plain water column).
+ * With none at the water, the lowest is taken for the stasis trapdoor only when it is at most {@value #STASIS_REACH} blocks above
+ * the water top (where a stasis trapdoor sits) and there are two or more; otherwise every trapdoor is a cover.
  */
 public final class TrapRoles {
     public enum Role { STASIS, COVER, NONE }
 
     public static final int NO_STASIS = Integer.MIN_VALUE;
+    /** How far above the water top the lowest of several trapdoors can be and still be the stasis one. */
+    public static final int STASIS_REACH = 2;
 
     private final int stasisY;
     private final List<Integer> coverYs;
@@ -57,6 +61,31 @@ public final class TrapRoles {
         return plan;
     }
 
+    /**
+     * Like {@link #coverPlan(Collection)}, but a trapdoor is also kept open when it is at or below the block above the
+     * pearl's block (the pearl is resting there: shutting it would pull the pearl). {@code pearlBlockY} is null when no pearl is known.
+     */
+    public List<Integer> coverPlan(Collection<Integer> openedYs, Integer pearlBlockY) {
+        List<Integer> plan = new ArrayList<>();
+        for (int y : coverPlan(openedYs)) {
+            if (pearlBlockY != null && y <= pearlBlockY + 1) continue;
+            plan.add(y);
+        }
+        return plan;
+    }
+
+    /**
+     * Of the trapdoors that were opened, those the cover plan deliberately leaves open (the pearl rests at or below
+     * them). Lowest first. Empty when the plan closes them all.
+     */
+    public List<Integer> leftOpen(Collection<Integer> openedYs, Integer pearlBlockY) {
+        List<Integer> plan = coverPlan(openedYs, pearlBlockY);
+        List<Integer> left = new ArrayList<>();
+        for (int y : openedYs) if (error == null && coverYs.contains(y) && !plan.contains(y) && !left.contains(y)) left.add(y);
+        left.sort(null);
+        return left;
+    }
+
     public static TrapRoles classify(int waterTop, List<Integer> trapYs) {
         List<Integer> sorted = new ArrayList<>(trapYs);
         sorted.sort(null);
@@ -65,6 +94,11 @@ public final class TrapRoles {
         if (low.size() > 1) {
             return new TrapRoles(NO_STASIS, List.of(), "two trapdoors are at the water (y " + low.get(0) + " and " + low.get(1)
                 + "), so it is not clear which one keeps the pearl");
+        }
+        // None at the water but two or more: the lowest is the stasis one only when it sits where a stasis trapdoor does
+        // (just above the water top). Higher up, two plain covers over a water column must both be closable.
+        if (low.isEmpty() && high.size() >= 2 && high.get(0) <= waterTop + STASIS_REACH) {
+            return new TrapRoles(high.get(0), high.subList(1, high.size()), null);
         }
         return new TrapRoles(low.isEmpty() ? NO_STASIS : low.get(0), high, null);
     }

@@ -12,6 +12,10 @@ public final class LayerCache {
         last = f;
     }
 
+    public boolean has() {
+        return last != null;
+    }
+
     public LayerFilter fallback() {
         return last == null ? LayerFilter.ALL : last;
     }

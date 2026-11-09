@@ -1,0 +1,2 @@
+# Shared byte-for-byte with the plugin and server (KIT-CONTRACT): never convert line endings
+src/main/resources/kit-items.json -text

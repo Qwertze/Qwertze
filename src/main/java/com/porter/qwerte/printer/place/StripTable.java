@@ -18,6 +18,11 @@ public final class StripTable extends AxeItem {
 
     private static Map<Block, Block> reverse;
 
+    /** Every unstripped block to its stripped block. */
+    public static Map<Block, Block> all() {
+        return STRIPPABLES;
+    }
+
     /** The block an axe turns {@code raw} into, or null. */
     public static Block stripped(Block raw) {
         return STRIPPABLES.get(raw);

@@ -18,6 +18,7 @@ import java.util.TreeMap;
  *       their count.</li>
  *   <li>The upper half of a door or double plant and the head of a bed are PART cells: placed by their base cell, they
  *       cost nothing.</li>
+ *   <li>A potted plant costs an empty flower pot and the plant (the cost's {@code extra}).</li>
  *   <li>A state the printer skips, and a block that has no item, cost nothing and are counted as skipped with the reason.</li>
  *   <li>The shortfall is what is needed minus what is carried; it is taken from the sources in the order they were given.</li>
  * </ul>
@@ -35,8 +36,18 @@ public final class MaterialPlanner {
      * @param item  the item id, or null when nothing is needed
      * @param count how many of it, 0 for a PART cell and for a cell that is skipped
      * @param skip  why the cell is not built, or null
+     * @param extra a second item the cell uses up (the plant that goes into a flower pot), or null
      */
-    public record Cost(String item, int count, String skip) {
+    public record Cost(String item, int count, String skip, String extra, int extraCount) {
+        public Cost(String item, int count, String skip) {
+            this(item, count, skip, null, 0);
+        }
+
+        /** The same cost plus {@code n} of another item. */
+        public Cost withExtra(String extraItem, int n) {
+            return new Cost(item, count, skip, extraItem, n);
+        }
+
         public boolean skipped() {
             return skip != null;
         }
@@ -88,16 +99,25 @@ public final class MaterialPlanner {
         /** Counts a cell whose cost is already known. */
         public Cost add(Cost c) {
             if (c.skipped()) skipped.merge(c.skip(), 1, Integer::sum);
-            else if (c.count() > 0) need.merge(c.item(), (long) c.count(), Long::sum);
+            else {
+                if (c.count() > 0) need.merge(c.item(), (long) c.count(), Long::sum);
+                if (c.extra() != null && c.extraCount() > 0) need.merge(c.extra(), (long) c.extraCount(), Long::sum);
+            }
             return c;
         }
 
         /** A cell left the build (placed, skipped, failed): its cost is no longer needed. */
         public void remove(Cost c) {
-            if (c == null || c.skipped() || c.count() <= 0 || c.item() == null) return;
-            long left = need.getOrDefault(c.item(), 0L) - c.count();
-            if (left <= 0) need.remove(c.item());
-            else need.put(c.item(), left);
+            if (c == null || c.skipped()) return;
+            take(c.item(), c.count());
+            take(c.extra(), c.extraCount());
+        }
+
+        private void take(String item, int n) {
+            if (item == null || n <= 0) return;
+            long left = need.getOrDefault(item, 0L) - n;
+            if (left <= 0) need.remove(item);
+            else need.put(item, left);
         }
 
         /** Item id to how many are still needed, sorted by id. */

@@ -1,5 +1,7 @@
 package com.porter.qwerte.printer.loop;
 
+import com.porter.qwerte.printer.place.LayerCursor;
+import java.util.Arrays;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -7,7 +9,13 @@ import java.util.concurrent.ConcurrentHashMap;
  * Baritone's path finding threads (to keep the player's feet out of unbuilt cells): the section map is concurrent and a
  * section's words are plain longs, so a read sees an old or a new value of a bit, never a broken one. Pure.
  */
-public final class TargetBits {
+public final class TargetBits implements LayerCursor.Counts {
+    private static final int Y_OFFSET = 2048, Y_RANGE = 4096;
+    /** Open cells per y, kept in add and remove: O(1) each. A y outside the world's range is not counted per layer. */
+    private final int[] perY = new int[Y_RANGE];
+    private int lo = Integer.MAX_VALUE, hi = Integer.MIN_VALUE;
+    private boolean bounds = true;
+
     private final ConcurrentHashMap<Long, long[]> sections = new ConcurrentHashMap<>();
     private int count;
 
@@ -34,6 +42,12 @@ public final class TargetBits {
         if ((s[b >> 6] & m) != 0) return false;
         s[b >> 6] |= m;
         count++;
+        int yi = y + Y_OFFSET;
+        if (yi >= 0 && yi < Y_RANGE) {
+            perY[yi]++;
+            if (y < lo) lo = y;
+            if (y > hi) hi = y;
+        }
         return true;
     }
 
@@ -47,6 +61,8 @@ public final class TargetBits {
         if ((s[b >> 6] & m) == 0) return false;
         s[b >> 6] &= ~m;
         count--;
+        int yi = y + Y_OFFSET;
+        if (yi >= 0 && yi < Y_RANGE && --perY[yi] == 0 && (y == lo || y == hi)) bounds = false;
         return true;
     }
 
@@ -57,5 +73,48 @@ public final class TargetBits {
     public void clear() {
         sections.clear();
         count = 0;
+        Arrays.fill(perY, 0);
+        lo = Integer.MAX_VALUE;
+        hi = Integer.MIN_VALUE;
+        bounds = true;
+    }
+
+    /** Open cells at this y. */
+    @Override
+    public int open(int y) {
+        int yi = y + Y_OFFSET;
+        return yi >= 0 && yi < Y_RANGE ? perY[yi] : 0;
+    }
+
+    @Override
+    public int total() {
+        return count;
+    }
+
+    /** The lowest y with an open cell (greater than {@link #high()} when there is none). */
+    @Override
+    public int low() {
+        fixBounds();
+        return lo;
+    }
+
+    @Override
+    public int high() {
+        fixBounds();
+        return hi;
+    }
+
+    /** After a layer emptied at an end of the range: found again by one pass over the counts (only when asked). */
+    private void fixBounds() {
+        if (bounds) return;
+        int l = Integer.MAX_VALUE, h = Integer.MIN_VALUE;
+        for (int i = 0; i < Y_RANGE; i++) {
+            if (perY[i] == 0) continue;
+            if (l == Integer.MAX_VALUE) l = i - Y_OFFSET;
+            h = i - Y_OFFSET;
+        }
+        lo = l;
+        hi = h;
+        bounds = true;
     }
 }

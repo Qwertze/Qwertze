@@ -162,6 +162,15 @@ public final class LitematicaBridge {
         return partials == 1 ? partial : null;
     }
 
+    /** Why {@link #byName} finds nothing for this name: no placement matches, or several partly match. Null when it finds one. */
+    public static String byNameProblem(String name) {
+        if (byName(name) != null) return null;
+        String q = LitematicReader.clean(name == null ? "" : name, 40).trim().toLowerCase(Locale.ROOT);
+        int partials = 0;
+        for (Placement p : placements()) if (!q.isEmpty() && p.name().toLowerCase(Locale.ROOT).contains(q)) partials++;
+        return partials > 1 ? "several Litematica placements match that name; use the exact name" : "no Litematica placement has that name";
+    }
+
     public static List<Placement> placements() {
         List<Placement> out = new ArrayList<>();
         if (!available()) return out;
@@ -281,6 +290,11 @@ public final class LitematicaBridge {
             }
             return layerCache.fallback();
         }
+    }
+
+    /** At least one render-layer read has worked, so a reported "no filter" is real and not a failure. */
+    public static synchronized boolean layerWorks() {
+        return layerOk && layerCache.has();
     }
 
     // ---------- the in-memory schematic ----------

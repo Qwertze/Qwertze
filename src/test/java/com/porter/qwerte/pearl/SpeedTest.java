@@ -120,7 +120,8 @@ class SpeedTest {
     void theCoverClosesOnlyOncePearlIsBelowItsTrapdoor() {
         assertFalse(Hang.pearlBelow(63.1, 63));
         assertFalse(Hang.pearlBelow(62.9, 63));
-        assertTrue(Hang.pearlBelow(62.7, 63));
+        assertFalse(Hang.pearlBelow(62.7, 63)); // the margin is 0.3 now: a pearl is 0.25 high
+        assertTrue(Hang.pearlBelow(62.6, 63));
         // The lowest cover that was opened is the one that matters, and the stasis trapdoor is never in the plan
         TrapRoles r = TrapRoles.classify(57, List.of(58, 63, 64));
         assertEquals(List.of(63, 64), r.coverPlan(Set.of(64, 58, 63)));

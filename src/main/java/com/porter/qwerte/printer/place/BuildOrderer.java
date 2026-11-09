@@ -3,8 +3,12 @@ package com.porter.qwerte.printer.place;
 import com.porter.qwerte.printer.place.PlaceRecipe.Dir;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Collection;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Predicate;
@@ -23,6 +27,10 @@ import java.util.function.Predicate;
  *   <li>Cells live in 16x16x16 section buckets, each with 16 layer lists (no sorting anywhere: the comparator is a total
  *       order, so insertion order never shows); a pick only visits sections within reach of the player.</li>
  * </ul>
+ * <p>Active layer: with {@link #setActiveLayer} set, only the cells of that y are offered and every other section is skipped
+ * without being read. Scaffold cells ({@link #addUngated}) are the exception: they are prerequisites of the active layer,
+ * wherever they are, and come first.
+ *
  * Ties: layer (y ascending when bottom-up), then distance (in half-block steps), then look compatibility with the
  * previous pick, then position (y, x, z), so there is always one answer.
  */
@@ -78,6 +86,9 @@ public final class BuildOrderer {
     private final Set<Long> placedSolid = new HashSet<>();
     private int pending;
     private long clock;
+    private Integer gate;
+    private final Set<Long> ungatedKeys = new HashSet<>();
+    private final Map<Long, Cell> ungated = new LinkedHashMap<>();
     private int idleTicks;
     private int workCap = Integer.MAX_VALUE;
     private boolean truncated;
@@ -114,6 +125,43 @@ public final class BuildOrderer {
         return pending;
     }
 
+    /** Only the cells of this y are offered (null: every layer). */
+    public void setActiveLayer(Integer y) {
+        if (Objects.equals(gate, y)) return;
+        gate = y;
+        for (Section s : sorted.values()) s.idleUntil = 0;
+    }
+
+    public Integer activeLayer() {
+        return gate;
+    }
+
+    /**
+     * Adds a cell that is offered whatever the active layer is, and before the cells of the layer (a scaffold block). Later
+     * {@link #add}, {@link #remove} and {@link #placed} calls for the same position act on it. Not counted by {@link #pending}.
+     */
+    public boolean addUngated(Cell c) {
+        long k = pos(c.x, c.y, c.z);
+        if (!ungatedKeys.add(k)) return false;
+        ungated.put(k, c);
+        return true;
+    }
+
+    /** The position is no longer a scaffold cell: it leaves the queue and the registration. */
+    public void releaseUngated(int x, int y, int z) {
+        long k = pos(x, y, z);
+        ungatedKeys.remove(k);
+        ungated.remove(k);
+    }
+
+    public boolean isUngated(int x, int y, int z) {
+        return ungatedKeys.contains(pos(x, y, z));
+    }
+
+    public int ungatedQueued() {
+        return ungated.size();
+    }
+
     /** Advances the clock the idle cache counts in (one call per game tick). */
     public void advance() {
         clock++;
@@ -139,6 +187,8 @@ public final class BuildOrderer {
 
     /** Adds a cell; a second cell at the same position is ignored. Returns whether it was added. */
     public boolean add(Cell c) {
+        long uk = pos(c.x, c.y, c.z);
+        if (ungatedKeys.contains(uk)) return ungated.put(uk, c) == null;
         long key = sectionKey(c.x >> 4, c.y >> 4, c.z >> 4);
         Section s = sorted.get(key);
         int b = Section.bit(c.x, c.y, c.z);
@@ -192,6 +242,8 @@ public final class BuildOrderer {
     }
 
     private boolean drop(Cell c) {
+        long uk = pos(c.x, c.y, c.z);
+        if (ungatedKeys.contains(uk)) return ungated.remove(uk) != null;
         long key = sectionKey(c.x >> 4, c.y >> 4, c.z >> 4);
         Section s = sorted.get(key);
         if (s == null) return false;
@@ -238,21 +290,49 @@ public final class BuildOrderer {
      * caller's test for what the orderer can't see, such as materials). Null accepts every cell.
      */
     public List<Cell> top(int n, double px, double py, double pz, double reach, Box box, World world, LookWindow prev, Predicate<Cell> accept) {
-        List<Cell> best = new ArrayList<>(Math.max(1, n) + 1);
         truncated = false;
-        if (n <= 0 || pending == 0) return best;
+        List<Cell> best = new ArrayList<>(Math.max(1, n) + 1);
+        if (n <= 0 || pending == 0 && ungated.isEmpty()) return best;
+        if (!ungated.isEmpty()) {
+            // Scaffold cells first: the layer's cells may be waiting for them
+            Comparator<Cell> cmp = comparator(px, py, pz, prev);
+            double reach2 = reach * reach;
+            for (Cell c : ungated.values()) {
+                if (reach != Double.POSITIVE_INFINITY) {
+                    double dx = c.x + 0.5 - px, dy = c.y + 0.5 - py, dz = c.z + 0.5 - pz;
+                    if (dx * dx + dy * dy + dz * dz > reach2) continue;
+                }
+                if (!world.loaded(c.x, c.y, c.z) || !ready(c, box, world)) continue;
+                if (accept != null && !accept.test(c)) continue;
+                insert(best, c, n, cmp);
+            }
+            if (best.size() >= n) return best;
+        }
+        if (pending == 0) return best;
+        best.addAll(layered(n - best.size(), px, py, pz, reach, box, world, prev, accept));
+        return best;
+    }
+
+    private List<Cell> layered(int n, double px, double py, double pz, double reach, Box box, World world, LookWindow prev, Predicate<Cell> accept) {
+        List<Cell> best = new ArrayList<>(Math.max(1, n) + 1);
         Comparator<Cell> cmp = comparator(px, py, pz, prev);
         double reach2 = reach * reach;
         boolean limited = reach != Double.POSITIVE_INFINITY;
         boolean layerFirst = mode != Mode.DISTANCE;
+        Integer g = gate;
         int work = 0;
-        for (Section s : sorted.values()) {
+        Collection<Section> visit = g == null ? sorted.values()
+            : sorted.subMap(sectionKey(-2097152, g >> 4, -2097152), true, sectionKey(2097151, g >> 4, 2097151), true).values();
+        for (Section s : visit) {
             if (limited && sectionDist2(s, px, py, pz) > reach2) continue;
             if (!limited && s.idleUntil > clock) continue;
             if (!world.loaded(s.sx << 4, s.sy << 4, s.sz << 4)) continue;
-            boolean complete = true, found = false;
+            // A section looked at through the gate was not looked at completely: it is never cached as idle
+            boolean complete = g == null, found = false;
             for (int k = 0; k < 16; k++) {
-                List<Cell> slice = s.slices[bottomUp ? k : 15 - k];
+                int idx = bottomUp ? k : 15 - k;
+                if (g != null && idx != (g & 15)) continue;
+                List<Cell> slice = s.slices[idx];
                 if (slice == null || slice.isEmpty()) continue;
                 if (layerFirst && best.size() >= n && layerKey(slice.get(0).y) > layerKey(best.get(best.size() - 1).y)) {
                     complete = false;
@@ -279,6 +359,51 @@ public final class BuildOrderer {
             if (!found && complete && !limited && idleTicks > 0) s.idleUntil = clock + idleTicks;
         }
         return best;
+    }
+
+    private Collection<Section> layerSections(int y) {
+        return sorted.subMap(sectionKey(-2097152, y >> 4, -2097152), true, sectionKey(2097151, y >> 4, 2097151), true).values();
+    }
+
+    /**
+     * Up to {@code max} cells of one layer that can't be placed yet because nothing solid is next to them (air-placing is off):
+     * the cells that scaffolding could help. Solid cells only, free in the world, nearest to the point first. Looks at no more
+     * than {@code cap} cells.
+     */
+    public List<Cell> stranded(int y, int max, int cap, double px, double py, double pz, Box box, World world) {
+        List<Cell> out = new ArrayList<>();
+        if (airplace || max <= 0) return out;
+        int work = 0;
+        Comparator<Cell> near = Comparator.<Cell>comparingDouble(c -> dist2(c, px, py, pz)).thenComparing(POSITION);
+        for (Section sec : layerSections(y)) {
+            List<Cell> slice = sec.slices[y & 15];
+            if (slice == null) continue;
+            for (Cell c : slice) {
+                if (++work > cap) return out;
+                if (c.role != Role.SOLID || !world.loaded(c.x, c.y, c.z) || !world.free(c.x, c.y, c.z) || ready(c, null, world)) continue;
+                insert(out, c, max, near);
+            }
+        }
+        return out;
+    }
+
+    private static double dist2(Cell c, double px, double py, double pz) {
+        double dx = c.x + 0.5 - px, dy = c.y + 0.5 - py, dz = c.z + 0.5 - pz;
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    /** How many cells of this layer are ready now (looks at no more than {@code cap} of them). */
+    public int readyCount(int y, int cap, Box box, World world) {
+        int n = 0, work = 0;
+        for (Section sec : layerSections(y)) {
+            List<Cell> slice = sec.slices[y & 15];
+            if (slice == null || !world.loaded(sec.sx << 4, sec.sy << 4, sec.sz << 4)) continue;
+            for (Cell c : slice) {
+                if (++work > cap) return n;
+                if (ready(c, box, world)) n++;
+            }
+        }
+        return n;
     }
 
     private void insert(List<Cell> best, Cell c, int n, Comparator<Cell> cmp) {

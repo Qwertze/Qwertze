@@ -1,7 +1,7 @@
 # Qwerte
 A Meteor Addon For 2b2t Dedicated to Regrowing &amp; Creating Farmland
 
-Qwerte adds nine modules to [Meteor Client](https://meteorclient.com):
+Qwerte adds ten modules to [Meteor Client](https://meteorclient.com):
 
 - **Auto Till** turns nearby dirt and grass into farmland, digs and fills water holes so the farmland stays hydrated,
   plants and bone meals crops, and restocks its own seeds. With [Baritone](https://github.com/dekrom/baritone)
@@ -18,6 +18,7 @@ Qwerte adds nine modules to [Meteor Client](https://meteorclient.com):
   on your network: a small website that shows the stash and takes orders for the bot to fill.
 - **Reset Pearl** climbs out of a saved stasis chamber after you're pulled through it, throws a fresh pearl into the water
   and closes the cover again.
+- **Messenger** shows your whispers in a small chat window, with a history per player, emoji, and sending from the window.
 - **Stash Window** is a window to search your stash in game, and with a Stash Manager server, the server's pages too.
 - **Container Tweaks** shows what is inside a shulker box when you hover it, and draws its most common item on it. With
   Smart Shulker or Smart Echest turned on, right-clicking a shulker box or ender chest places it, opens it and picks it up again.
@@ -35,7 +36,7 @@ Qwerte adds nine modules to [Meteor Client](https://meteorclient.com):
 
 ## Features
 
-All nine modules are in Meteor's **Qwerte** category. Every feature can be
+All ten modules are in Meteor's **Qwerte** category. Every feature can be
 switched on and off on its own.
 
 ### Auto Till
@@ -376,8 +377,48 @@ New in 0.4.0-dev and still being tested.
 - `pearl-wait` (20 seconds by default): when you're pulled without a pearl, it waits this long for one. 0 gives up at once.
 - `elytra-handling` (Auto by default) takes an elytra off for the climb and puts it back afterwards.
 - It stops with a chat message on a timeout, damage, a nearby player or hostile mob, an open screen, or a dimension change.
+- It closes only the covers, never the stasis trapdoor at the water. In a shaft with no trapdoor at the water, the lowest
+  trapdoor is taken for the stasis one (never closed) only when it is at most 2 blocks above the water top, where a stasis
+  trapdoor sits; higher up, two or more plain covers over a water column are all covers and all get closed. A trapdoor at or below the block above the pearl stays
+  open (closing it would pull the pearl): the module says so once in chat ("Left open on purpose ...") and in the debug
+  log, so that run does not look like a full success. The pearl margin is 0.3. Nothing is closed until the pearl is
+  resting: slower than 0.2 blocks per tick, or, for a pearl held in an upward bubble column, whose height stays within
+  0.05 blocks for 3 ticks.
 - `debug` logs every decision to the client log with a `reset-pearl:` prefix. `experimental-sprint-swim` and
   `experimental-climb-throw` are off by default.
+
+### Messenger
+New in 0.4.0-dev.16. Not tested in game yet.
+
+Messenger reads your whispers into a small chat window with a history per player, and sends from the window. Turn it on
+with the **Messenger** module (category Qwerte).
+
+- **The window.** Drawn over the game while you play (`show-overlay`, on; `window-opacity`, 75 by default, from 20 to 100).
+  It takes the keyboard and mouse only when you focus it: with `focus-key` (none by default), or by clicking it while the
+  chat is open. Esc always lets go. The window has its own input line; a draft in the chat is not carried into it.
+  `notification-sound` (on) plays a quiet sound when a whisper arrives that you are not reading.
+- **Whispers.** Found by the game's own translation key (vanilla), and by the text patterns `pattern-vanilla` ("X whispers
+  to you: ..."), `pattern-2b2t` ("X whispers: ..." and "to X: ..."), `pattern-essentials` ("[X -> me] ...") and
+  `pattern-from-to` ("From X: ..." and "To X: ..."), all on by default. A pattern must match the whole chat line. A decorated
+  name ("[Mod] Steve") is resolved from the display name's own insertion; otherwise from the one online player named in the
+  text, else its last word.
+- **Your own patterns.** `extra-patterns`, one per line: `in:` (a message to you, the default) or `out:` (a message you sent),
+  then a regular expression for the whole chat line, with `(?<name>...)` for the other player and `(?<msg>...)` for the text.
+  Example: `in:\[(?<name>\w{3,16}) whispers\] (?<msg>.*)`. An invalid pattern is refused with a chat message; one that is
+  too slow is switched off.
+- **Sending.** `command-template` must be exactly `/<command> {name} {text}`: one command word (letters, digits, `_`, `:`,
+  `.` or `-`, up to 32 characters), then `{name}`, then `{text}`, with nothing before `{name}` or after `{text}`, so what you
+  type can only be the message. The default is `/msg {name} {text}`; on 2b2t use `/w {name} {text}`. Anything else is
+  refused with a warning. Nothing is sent unless you press Enter or Send. Messages go out at least `send-interval-ms` apart
+  (1500 by default, from 500 to 10000); three may wait, and more are refused.
+- **Emoji.** Drawn as pictures in messages and in the emoji picker (see [Third-party](#third-party)).
+- **History.** Kept in memory for each server (its address, or `local` for singleplayer and LAN). `max-history` is the most
+  messages kept per player (200 by default, from 10 to 500). `save-history` (off by default) writes the history to
+  `meteor-client/qwerte/messenger-history.json` (version 2: the conversations of each server), at most every 20 seconds,
+  when you leave a world and when the module is turned off. A version 1 file's conversations go to the server you are on
+  when it is loaded. A corrupt file is moved aside (`messenger-history.json.corrupt`); one that is too big or can't be
+  read is left alone and not saved until the module is turned on again. "Clear history" forgets every conversation and
+  deletes the file. Nothing is sent anywhere.
 
 ### Stash Manager
 New in 0.4.0-dev and still being tested.
@@ -501,6 +542,15 @@ what is missing, leaves the blocks that are already right alone, and lists what 
     `mirror`.
 - Litematica is optional. Qwerte reads it by reflection, so it is not a dependency. Without it, or when a placement's own
   file can't be read, the file named in `file-name` is read with the settings above.
+- **Schematic queue** (`queue-enabled`, off by default, and `queue`): build several schematics one after the other. Each
+  `queue` entry is a Litematica placement name (exact name first, else the one placement whose name contains it) or
+  `file:<name>` for a `.litematic` in the schematics folder; `file:<name>@x,y,z` gives that file its own origin, otherwise
+  `origin-x/y/z` are used (`rotation` and `mirror` always apply to file entries). `file:` names are checked like the File
+  source: no `..`, no absolute or drive paths. A missing, ambiguous or unreadable entry is skipped with a warning and the
+  queue moves on. When one schematic is done (the report and finish sound play) the next starts without the Printer
+  turning off; after the last, "Queue done: N schematic(s) built". Cancelling or leaving the world stops the queue, and
+  turning the Printer on again starts from the first entry. The info line shows "Queue 2/5: name". With the queue on, `source` and
+  `file-name` are not used. At most 50 entries are used. New in 0.4.0-dev.16, not tested in game yet.
 - `chat-messages` (off by default; in the General group): lets the Printer write to the chat. Off, it sends no chat line at
   all (progress, warnings, errors, the stash order lines, Meteor's "toggled" line); everything is still written to the
   game log.
@@ -540,16 +590,29 @@ what is missing, leaves the blocks that are already right alone, and lists what 
 - Set by the game from its neighbours or redstone, so not set by the printer: stair shape, fence, wall, pane and bar
   connections, redstone wire connections and power, powered, lit and triggered states, leaf distance, crop age and the
   like. A rail whose shape doesn't match after placing is listed.
-- **Stripped logs** (stripped logs, woods, stems, hyphae and bamboo blocks: any block that an axe makes from another). If you
-  carry the stripped item, it is placed as it is. Otherwise the unstripped block is placed with the wanted axis and an
-  axe is used on it right after, on the face toward you (the axe is moved into the hotbar by the same helper as the
-  building blocks, which never moves weapons, food or shulker boxes; with a shield in the off hand the game only strips
-  while you sneak, so the Printer sneaks for it). Without an axe the unstripped block is still placed, you get one
-  warning, and the log stays on a pending list: it is stripped as soon as you carry an axe and are in reach (the Printer
-  walks there with Baritone when nothing else is left). The Printer stays on for them only while an axe is carried and the log is loaded and within a time limit; otherwise the run
-  ends and the report lists the unstripped logs. An unstripped log
-  with the wanted axis is "right block, needs strip", never a wrong block. The table is vanilla's own
-  (`AxeItem.STRIPPABLES`).
+- **Tool actions** (new in 0.4.0-dev.16, not tested in game yet). A block that a tool finishes is placed in its raw form and the tool is used on it right after, on a face
+  chosen for the tool (toward you, never the bottom for a shovel or hoe). If you carry the finished item (a stripped log,
+  waxed copper, a carved pumpkin) it is placed as it is. The tool is moved into the hotbar by the same helper as the
+  building blocks, which never moves weapons, food or shulker boxes. Without the tool the raw block is still placed
+  (except unwaxed copper, which would age), you get one warning per tool, and the block stays on a pending list: it is
+  finished as soon as you carry the tool and are in reach (the Printer walks there with Baritone when nothing else is
+  left). The Printer stays on for pending blocks only while the tool is carried, the block is loaded and a time limit has
+  not passed; otherwise the run ends and the report lists them. A raw block that the tool turns into the wanted one is
+  "right block, needs its tool", never a wrong block. The game's own tables are used where they exist.
+  | Wanted | Placed | Tool |
+  | --- | --- | --- |
+  | Stripped log, wood, stem, hyphae, bamboo block | the unstripped block, same axis | axe (`AxeItem.STRIPPABLES`); with a shield in the off hand the game only strips while you sneak, so the Printer sneaks for it |
+  | Dirt path | dirt (or grass block, podzol, coarse dirt, mycelium, rooted dirt) | shovel (`ShovelItem.FLATTENABLES`), air above |
+  | Campfire wanted out (`lit=false`) | campfire (placed lit) | shovel, to douse it |
+  | Farmland | dirt | hoe, air above; farmland counts as dirt in the materials |
+  | Waxed copper | the unwaxed block, only when the waxed item is not carried | honeycomb (`HoneycombItem.WAXABLES`); not placed without honeycomb |
+  | Carved pumpkin | pumpkin | shears; the side clicked gives the facing |
+  | Lit candle | the candle | flint and steel; never on a waterlogged candle |
+  | Potted plant (`potted_*`) | an empty flower pot | the plant item, right-clicked on the pot (not while sneaking); the materials count the pot and the plant |
+
+  The hoe and shovel need air above the block, and farmland under a solid block turns back to dirt, so while a hoe or
+  shovel is carried nothing is placed above a block that waits for it (crops included). A pot holding the wrong plant is a
+  wrong block (see **Wrong blocks**). Farmland in a dry place can dry back into dirt later and is tilled again.
 - **Waterlogged blocks.** `waterlog` (on): a block the schematic wants waterlogged is placed, then a water bucket from your
   hotbar or inventory is used on it. The bucket is emptied by that. Without a bucket, or with `waterlog` off, the block is
   placed dry and you get one warning for the run (and the count at the end). `refill-water-bucket` (off, shown with
@@ -557,8 +620,7 @@ what is missing, leaves the blocks that are already right alone, and lists what 
   the next block. It does not walk to water. Only a real water source block is used: never a waterlogged block, nor a cell
   the schematic builds in. With `rotation-mode` None, waterlog and refill are skipped with one warning (a bucket needs a look).
 - Skipped and listed, never placed: fluids; fire; portals; bubble columns; vines, glow lichen and
-  sculk veins; pointed dripstone; cauldrons; composters; respawn anchor charges; cake with bites; farmland and
-  dirt paths; command, structure and jigsaw blocks; piston heads and extended pistons; hanging signs that hang from a
+  sculk veins; pointed dripstone; cauldrons; composters; respawn anchor charges; cake with bites; command, structure and jigsaw blocks; piston heads and extended pistons; hanging signs that hang from a
   ceiling; lily pads; double
   chest halves; end portal frame eyes; unknown blocks and properties. Block-entity data is not copied (signs are placed
   blank, chests and shulker boxes empty), and entities are not placed.
@@ -589,13 +651,94 @@ what is missing, leaves the blocks that are already right alone, and lists what 
 - `sneak-ticks` (2 by default, 1 to 6): ticks the sneak key is held before a click that needs it (a chest or door would
   otherwise open).
 - `action-delay` (3 ticks by default, 0 to 20): the wait between steps when fetching materials.
-- `order`: **LayerThenDistance** (the default), **Distance** or **Layer**. `bottom-up` (on) builds from the lowest layer up.
+- `order`: **LayerThenDistance** (the default), **Distance** or **Layer**. With `layer-order` on it ranks the blocks inside
+  the active layer. `bottom-up` (on) builds from the lowest layer up; it is only used (and only shown) when `layer-order`
+  is Off.
+
+#### Layer building and scaffolding
+New in 0.4.0-dev.16. Not tested in game yet.
+
+- `layer-order` (Order group): **BottomToTop** (the default), **TopToBottom**, **MostEfficient** or **Off**. The Printer
+  builds one y level at a time. Blocks above (or below) the active level are left alone until that level has no open block
+  left, then it moves to the next level, and so on until the whole schematic is done. A level is open while it has a block
+  that is queued, being checked, waiting to be tried again, or a wrong block in the way. Tool and water jobs never hold a
+  level back. The run only ends when every level is done. **MostEfficient** picks the level with the most blocks ready to
+  place right now (then the nearest in height to you, then the lower one) each time a level is finished. **Off** keeps the
+  old behaviour: all levels at once, ranked by `order` and `bottom-up`. Changing it applies to the next run (or a reload).
+- A level that can't be built yet is carried over: a lantern or vine hanging under a block of a later level when building
+  bottom-up, sand with nothing below it when building top-down, a block with nothing to be placed against. When nothing in
+  the active level can be placed, walked to, fetched or waited for for 1 second, the Printer carries that level over and
+  moves on. When only carried levels are left, they are tried again (the levels they were waiting for are built by then).
+  If a whole round gets nowhere, the layer rule is dropped and the Printer builds whatever it can, anywhere, until a block
+  gets built; it never locks up on a level. It says "Layer Y=...: N blocks" when the active level changes (chat with
+  `chat-messages`, and the game log).
+- Wrong blocks are only dealt with in the active level and in levels already passed.
+- Litematica's render layers still work and come first: they decide which blocks exist for the Printer, and `layer-order`
+  then works inside them (blocks outside the render layer are not counted in any level).
+- `scaffold` (on; shown when `layer-order` is on): when the nearest blocks of the active level have nothing to be placed
+  against (`airplace` off), the Printer builds a short chain of spare blocks from a block that exists up to a face of the
+  block, places the block, and breaks the chain when nothing needs it any more. It walks to the chain's base with Baritone
+  when it is out of reach, also outside your normal range. A spare block is any block you carry that the schematic does not
+  use, a plain full cube that does not fall, open or hold items, and that the hotbar helper does not protect (no weapons,
+  food or shulker boxes). It never breaks printed blocks to get access. With no spare block it warns once ("no spare blocks
+  for scaffolding: carry some blocks the schematic doesn't use") and carries the block over.
+- `scaffold-max` (64, 1 to 512): most scaffold blocks standing at once.
+- Scaffold limits: only plain solid blocks are helped (a torch, a lantern or a falling block loses its support when the
+  scaffold goes, so those wait for their real support); a chain is at most 6 blocks, the shortest one, never inside a cell
+  the schematic wants a block in, and within 6 blocks of the schematic's area; it is not used with `airplace` on; the
+  Printer does not build stairs to stand on, so a spot out of reach that Baritone can't walk to is not made reachable. If
+  you stop the Printer in the middle, the scaffold blocks that stand are listed in the report and left in the world.
+
+#### Moving to tall and many-layer builds
+New in 0.4.0-dev.16. Not tested in game yet. All of it needs `walk` on; `walk` stays the master switch for any automatic
+movement (off: only what is in reach is built).
+
+- `movement` (Baritone group): **StandOnBuild** (the default), **Fly** or **StandThenFly**. Flying is never used unless you
+  pick Fly or StandThenFly.
+- **StandOnBuild.** Baritone walks to the blocks and climbs onto the blocks already printed. While it walks it may place
+  your spare blocks (the same definition as scaffold: carried blocks the schematic does not use, plain full cubes that do not
+  fall, open or hold items, not protected by the hotbar helper) to pillar up and bridge, and it is only allowed those items
+  (`acceptableThrowawayItems`). It never breaks anything (`allowBreak` stays off), and the cells still to be built are never
+  chosen as the place to stand. The Printer sets these Baritone settings for the walk only and gives your own values back
+  afterwards. Trips for containers and shulker boxes walk without placing. With no spare block carried it warns once
+  ("No spare blocks to climb with") and walks only.
+- Blocks Baritone placed outside the schematic are noted (a spare block that shows up where there was air next to your feet)
+  and broken again once nothing needs them, like scaffold (`remove-stand-blocks`, on). A block it places inside a cell the
+  schematic wants is ours: it is broken and the cell built, whatever `wrong-blocks` says (the container and fluid rules still
+  apply). Stand blocks are never broken while a walk is going or while you are on or beside them (within 2 blocks sideways
+  and at or below your feet); they come down from the top, and at the very end you are walked away from the last ones
+  first. A stand block still standing after 3 failed walks away from it is left in place and listed. Stand blocks do not
+  count toward `scaffold-max`.
+- **Fly.** The Printer flies with a flight module that moves you with the movement keys, Meteor's Flight by default
+  (`flight-modules`: the first one already on is used, otherwise the first in the list is switched on and, afterwards, off
+  again, only if the Printer switched it on). It chooses a hover point within reach of the next blocks, above or beside the
+  active layer and never in a block or a cell still to be built, and holds forward, back, left, right, jump or sneak to get
+  there. It does not turn the camera, so placing and the module's own look handling are untouched. It stops moving while it
+  places, lets go of the keys when you turn the Printer off, leave the world, open a screen, or after losing more than 3
+  health in one tick (then it holds still for 2 seconds). The module is not switched off in the air: if you would fall more
+  than 3 blocks it is left on, with a message. Solid ground or water below counts as safe to land on; lava or another fluid
+  does not.
+- **StandThenFly.** Walks as in StandOnBuild; flies when there has been no progress toward the target for 5 seconds, or two
+  searches in a row found no path. It walks again only after flying at least 3 seconds, standing on the ground for 1 second
+  and a back-off (10 seconds, doubled after each failed try, at most 1 minute).
+- Path searches that fail are not repeated for 1 second, so a failing walk does not ask Baritone every tick (new in
+  0.4.0-dev.16, not tested in game yet).
+- **Flight can get you kicked or banned on servers that do not allow it (for example 2b2t's anticheat).** The default never
+  flies.
+- Limits: Baritone's path search picks the cheapest standing spot, it does not prefer printed blocks beyond that; Baritone with
+  `safe-walk` cannot climb down more than one block, so after pillaring up, trips to containers (resupply, shulker boxes) from
+  the top of a tall build can find no path (flying there is not done: stock up before, or let the build bring you down by
+  breaking the stand blocks at the end); the stand blocks are broken from the top down, so you fall one block at a time
+  while they go; flight modules that do not use the movement keys are not supported.
 
 #### Wrong blocks
 `wrong-blocks` says what to do with a block that is where the schematic wants another one:
 - **SkipAndList** (the default): leaves it and lists it at the end.
-- **BreakAndReplace**: breaks it and builds the right block. The drops are not collected. It skips blocks next to a fluid,
-  a falling block, a hazard or anything it can't break. With `never-break-containers` on (the default, shown only with
+- **BreakAndReplace**: breaks it and builds the right block. The drops are not collected. It skips blocks next to a fluid
+  block (water or lava), a falling block, a hazard or anything it can't break. A block next to a waterlogged block (slab,
+  stair, kelp, seagrass) or itself waterlogged is only broken when its replacement can be placed straight after (the
+  item is carried, the wanted block is not air and a placement reaches the cell from where you stand); otherwise it is
+  skipped as "next to water". With `never-break-containers` on (the default, shown only with
   this mode), a block that has contents is skipped too.
 - **Pause**: stops until the block is gone, then carries on by itself.
 
@@ -636,7 +779,10 @@ what is missing, leaves the blocks that are already right alone, and lists what 
   chest. The count is right and nothing is lost.
 - The Stash Window's local index is no longer a source (`use-stash-index` was removed). For stock from the stash, use
   `order-from-stash` below.
-- A full inventory pauses the printer with a message until a slot is free.
+- A full inventory pauses the printer with a message until a slot is free, when there is a source to fetch from.
+- Before a materials, shulker or ender chest trip, a flying player lands first: a flight module the Printer switched on is
+  switched off on the ground. With no solid ground or water below, the trip is skipped with a message. New in 0.4.0-dev.16,
+  not tested in game yet.
 
 #### Stash orders
 Off by default. With `order-from-stash` on, the printer orders what it is running low on from the Stash Manager server,
@@ -680,7 +826,9 @@ Out of materials:
 #### Baritone
 - `walk` (on) lets Baritone walk to blocks that are out of reach and to containers. It needs
   [dekrom's Baritone fork](https://github.com/dekrom/baritone/releases). Off: only what is in reach is built.
-- Once it starts walking, Baritone may not break or place blocks until the run ends, and `safe-walk` (on) keeps the walk
+- While Baritone walks it never breaks blocks. It places only your spare blocks, and only on the building walk with
+  `movement` StandOnBuild (see Moving to tall and many-layer builds above); trips for containers and shulker boxes walk
+  without placing. `safe-walk` (on) keeps the walk
   away from parkour, diagonal drops and falls of more than one block. Everything is given back when the run ends.
 - The printer never stands in a block it has yet to build.
 - It pauses while Baritone is busy with something else, and while you press a movement key (`pause-on-input`, on).
@@ -692,6 +840,25 @@ Out of materials:
   the module off.
 - When the run ends, the chat says how many blocks were placed, already there, failed, skipped as wrong, not buildable
   and left unbuilt, and lists them.
+- At the end it also reports, per tool, how many blocks were finished and which were left (Unstripped, Not flattened or
+  doused, Not tilled, Not waxed, Not carved, Not lit, Pots without plant).
+- Finished cells are looked at again later (about 5 seconds after, then every 10 seconds while they are within reach, at
+  most three looks per run; new in 0.4.0-dev.16, not tested in game yet): one that
+  became wrong, empty or dry goes back in the queue, and a log, candle or farmland block that needs its tool again gets it.
+- Sounds (own group, new in 0.4.0-dev.16, not tested in game yet): `finish-sound` and `error-sound` (both on; with
+  `finish-sound-event`, `error-sound-event` and `sound-volume`) play when the run finishes, when it stops, and when it pauses
+  because it needs you (stuck, no materials source, a failed fetch). At most one sound every 1.5 seconds.
+- Blocks can be placed from the off hand (new in 0.4.0-dev.16, not tested in game yet).
+- Changing `wrong-blocks` in the middle of a run looks again at the cells that were skipped as wrong (new in 0.4.0-dev.16,
+  not tested in game yet).
+- The Litematica layer mode is logged when it is read and when it changes.
+- A pause or a resume is announced only once it has held for 1 second, so a flapping condition says nothing. "Stuck",
+  "Layer done" and "could not get the materials" are announced at once. A pause that must stop walking (inventory full,
+  Baritone busy, walking off) stops it at once; only its message waits. Work that goes on again shows as building at once
+  (new in 0.4.0-dev.16, not tested in game yet).
+- "Your inventory is full" is only said when there is a source to fetch from (new in 0.4.0-dev.16, not tested in game yet).
+- A warning is given once per run when another printer, kill aura or crystal aura is on, since they fight over your look and hotbar (new in 0.4.0-dev.16, not tested in game yet).
+- The Printer's rotations go out at priority 100 with the look set on your client too, so another module that rotates in the same tick does not take the look from a click (waterlogging with a bucket failed that way). New in 0.4.0-dev.16, not tested in game yet.
 - A shulker box that couldn't be picked up is listed as **Left behind** with its coordinates when you next enter that
   world. The entry goes away once the box and its drop are gone. An ender chest that was left in the world is listed the
   same way.
@@ -701,8 +868,8 @@ Out of materials:
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) for Minecraft **1.21.11** or **1.21.4**.
 2. Put [Meteor Client](https://meteorclient.com) for the same Minecraft version in your `mods` folder.
 3. Download the `qwerte-addon` jar for your Minecraft version from the
-   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.4.0-dev.14`, see
-   [Dev builds](#dev-builds)): `qwerte-addon-0.4.0-dev.14+1.21.11.jar` or `qwerte-addon-0.4.0-dev.14+1.21.4.jar`. Put it
+   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.4.0-dev.16`, see
+   [Dev builds](#dev-builds)): `qwerte-addon-0.4.0-dev.16+1.21.11.jar` or `qwerte-addon-0.4.0-dev.16+1.21.4.jar`. Put it
    in your `mods` folder.
 4. *(Optional, for auto-walk and refilling)* Download `baritone-api-fabric-1.3.0-<minecraft>.jar` for your version from
    [dekrom's Baritone releases](https://github.com/dekrom/baritone/releases) (for example
@@ -988,20 +1155,22 @@ there; add its jar to `run/mods` if you want to try the automation. Litematica i
 
 ```
 src/main/java/com/porter/qwerte/
-├── QwerteAddon.java          Addon entrypoint: the Qwerte category, the nine modules and the stash-window command
+├── QwerteAddon.java          Addon entrypoint: the Qwerte category, the ten modules and the stash-window command
 ├── commands/
 │   └── StashWindowCommand.java  The .stash-window (and .stash) command
-├── modules/                  The Meteor modules, and the helpers they use (the nine modules are registered in QwerteAddon)
+├── modules/                  The Meteor modules, and the helpers they use (the ten modules are registered in QwerteAddon)
 │   ├── AutoTill.java         The auto-till module: tilling, watering, planting, automation
 │   ├── AutoDirt.java         The auto-dirt module: covering ground with dirt
 │   ├── StashSorter.java      The stash-sorter module: sorting, kits, bot mode, picking, search
 │   ├── StashOverlay.java     The stash-overlay module: an icon of each container's main item
 │   ├── StashManager.java     The stash-manager module: sends the index and the kit report to the Stash Manager server, takes its orders and kit settings
 │   ├── ResetPearl.java       The reset-pearl module: climbs out of a stasis chamber and re-arms it
+│   ├── Messenger.java        The messenger module: the whisper window, its patterns, sending and history
 │   ├── StashWindow.java      The stash-window module: the in-game Stash Window and its local index
 │   ├── ContainerTweaks.java  The container-tweaks module: shulker previews and icons, Smart Shulker and Smart Echest
 │   ├── Printer.java          The printer module: builds a schematic block by block, fetching or ordering its materials
 │   ├── PrinterActions.java   The printer's clicks: placing, breaking, sneaking, checking blocks and quick-moves out of containers
+│   ├── FlyController.java    The printer's flight: flies with a flight module to a hover point, and lands before trips (a helper, not a module)
 │   ├── SmartPlaceSession.java  The shulker box session (place, open, take, mine, pick up), shared by Container Tweaks and Printer
 │   ├── OrderRunner.java      Carries out a server order for stash-sorter: plans, builds and delivers the shulkers
 │   ├── LocalOrders.java      Carries out the window's own orders with this client as the bot (no server)
@@ -1046,20 +1215,26 @@ src/main/java/com/porter/qwerte/
 ├── manager/                  The Stash Window: gui/ (the screen, tabs such as KitsTab, and widgets), model/ (its data and rules, such as KitsModel),
 │                             net/ (the connection to the Stash Manager server), local/ (the local index and orders),
 │                             map/ (the live map)
-├── pearl/                    Reset Pearl's parts: the chamber, the shaft scan, the trapdoor clicks and the sequence
+├── pearl/                    Reset Pearl's parts: the chamber, the shaft scan, the trapdoor clicks, the sequence and the pearl's rest check (PearlRest)
+├── messenger/                The Messenger's parts: whisper patterns and chat lines (DmFormat, DmParser, ChatLines, UserPatterns), conversations
+│                             and their history (ConversationStore, ServerStores, HistoryJson), sending (SendText, Outbox), emoji (EmojiSet,
+│                             EmojiSegmenter, EmojiPixels, ImageScale), and the window's layout and text (MessengerCore, MessengerUi, TextLayout).
+│                             The window itself is in src/<minecraft>/java/com/porter/qwerte/messenger/; tests are in src/test/java/com/porter/qwerte/messenger/
 ├── tweaks/                   Container Tweaks' parts: the preview grid and its cache, the spot search and the Smart Shulker/Echest steps
 │   └── Orphans.java          The list of shulker boxes left behind (its format and checks), shared with the printer
 ├── printer/                  The printer's parts: pure logic (unit-tested) and the game-facing steps
 │   ├── schematic/            Reading .litematic files: the format, the reader and its limits, file names and transforms
 │   ├── source/               Where the schematic comes from: Litematica (by reflection, LitematicaBridge), files, block states,
-│                             and the render-layer filter (LayerFilter; LayerCache keeps the last range read)
+│                             and the render-layer filter (LayerFilter; LayerCache keeps the last range read), and the schematic queue (BuildQueue)
 │   ├── place/                How each block is placed: placement rules (PlacementMapper, PropertyRules, StateClassifier), stripped
-│                             logs (StripRules, StripTable), waterlogging (WaterlogRules), look windows, build order, batching,
+│                             logs and other tool finishes (ToolRules, ToolTables, Tool, ToolAction, HandTables, ShovelTable), wrong-block breaks
+│                             (BreakRules), layer order (LayerCursor), scaffold chains (ScaffoldPlanner), waterlogging (WaterlogRules), look windows, build order, batching,
 │                             the packet budget, the area watch (AreaWatch) and the jobs that hold the end of a run (JobHold)
 │   ├── materials/            What the build needs, and where it is fetched from (inventory, shulkers, containers, ender chest),
 │                             and what happens when an item runs out (MaterialPolicy)
+│   ├── move/                 Getting to blocks out of reach: MovePolicy (walk or fly), HoverPoint and FlySteer (flying), StandShield (stand blocks), SpareItems (spare blocks)
 │   ├── stash/                Stash orders: the low-stock rule, the stash picker, order batches, the order ledger and the chat text
-│   └── loop/                 The printer's state machine: what to do next on each tick, and why it pauses (PrintLoop)
+│   └── loop/                 The printer's state machine: what to do next on each tick, and why it pauses (PrintLoop), and the slow re-check of finished cells (RecheckQueue)
 ├── craft/                    Crafting for stash-sorter: the recipes, the planner, and the table and anvil finders
 └── utils/
     ├── AutoHotbar.java       Keeps the items a module works with in the hotbar
@@ -1093,6 +1268,8 @@ ZenithProxy plugin uses). The little that differs between Minecraft versions is 
 folder for the version being built is compiled. The addon version, Fabric Loader and Loom versions live in
 `gradle/libs.versions.toml`.
 
+The Messenger window (`messenger/` in each `src/<minecraft>/java`) and the emoji pictures (`src/main/resources/assets/qwerte/textures/emoji`, Twemoji, see [Third-party](#third-party)) follow the same rule: the pictures are shared, and the window's version-specific classes are in each build's folder.
+
 The 1.21.11 build also has `ClientPacketListenerMixin` in `src/1.21.11/java/com/porter/qwerte/mixin/` (listed in
 `src/1.21.11/resources/qwerte.mixins.json`). It works around a game crash when a name-only player head is looked up while
 chests are read on a busy server. Container Tweaks adds its own mixins for drawing the shulker previews and icons:
@@ -1101,6 +1278,11 @@ its own slot mixin and tooltip mixin, listed in its `qwerte.mixins.json`.
 
 To add another Minecraft version, add a `versions/<minecraft>.properties` and a `src/<minecraft>/java` folder with the
 compat classes (copy the eleven in `src/1.21.4/java/com/porter/qwerte/compat/` and adapt them), then build with `-Pmc=<minecraft>`.
+
+## Third-party
+
+### Twemoji
+The emoji pictures bundled in assets/qwerte/textures/emoji are Twemoji 17.0.3 (https://github.com/jdecked/twemoji), 181 emoji at 72x72. Copyright 2019 Twitter, Inc and other contributors (graphics), continued by the jdecked/twemoji project. Licensed under CC-BY 4.0 (https://creativecommons.org/licenses/by/4.0/). Used unmodified; shrunk to 36x36 in memory when drawn. The licence text and notice are in the same folder.
 
 ## License
 

@@ -150,7 +150,7 @@ public final class PropertyRules {
                 return value.equals("0") ? derived("whole cake") : skip("cake bites cannot be built");
             case "powered", "triggered", "enabled", "lit", "power", "distance", "persistent", "snowy", "age", "attached", "in_wall",
                 "instrument", "occupied", "locked", "has_book", "has_record", "honey_level", "signal_fire", "cracked", "hatch",
-                "bottom", "unstable", "stage", "berries", "phase", "bloom", "can_summon", "shrieking", "open", "disarmed":
+                "bottom", "unstable", "stage", "berries", "phase", "bloom", "can_summon", "shrieking", "open", "disarmed", "moisture":
                 return derived(prop + " follows the world or redstone");
             case "north", "east", "south", "west", "up", "down":
                 if (kind == StateKind.FULL || kind == StateKind.SUPPORTED_FLOOR) return derived("connections follow the neighbours");

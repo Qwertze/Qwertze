@@ -10,6 +10,7 @@ import baritone.api.process.IBaritoneProcess;
 import baritone.api.process.ICustomGoalProcess;
 import com.porter.qwerte.compat.BaritoneFluids;
 import net.minecraft.core.BlockPos;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.level.block.Block;
 
 import java.util.ArrayList;
@@ -134,6 +135,7 @@ public final class BaritoneHelper {
 
     /**
      * Keeps Baritone from breaking and placing blocks at all, remembering the user's own settings for {@link #unconfine()}.
+     * Placing can be let back in with {@link #allowPlacing(Collection)}; breaking never is.
      */
     public static void confine(boolean safe) {
         Settings settings = BaritoneAPI.getSettings();
@@ -150,6 +152,74 @@ public final class BaritoneHelper {
         confineOne(settings.allowWaterBucketFall, false);
         confineOne(settings.allowJumpAt256, false);
         confineOne(settings.maxFallHeightNoWater, 1);
+    }
+
+    /**
+     * While confined: lets Baritone place blocks (to pillar up and bridge), but only the {@code throwaway} items, and still
+     * never break anything. Stays within the confinement: {@link #unconfine()} gives the user's values back. Does nothing
+     * when the settings are not confined or the list is empty (then placing stays off).
+     */
+    public static void allowPlacing(Collection<Item> throwaway) {
+        if (confined.isEmpty()) return;
+        if (throwaway.isEmpty()) {
+            forbidPlacing();
+            return;
+        }
+        Settings settings = BaritoneAPI.getSettings();
+        retarget(settings.acceptableThrowawayItems, List.copyOf(throwaway));
+        retarget(settings.allowPlace, true);
+    }
+
+    /**
+     * Back to the walk-only confinement: placing off, and the user's list of throwaway items back.
+     */
+    public static void forbidPlacing() {
+        if (confined.isEmpty()) return;
+        Settings settings = BaritoneAPI.getSettings();
+        retarget(settings.allowPlace, false);
+        release(settings.acceptableThrowawayItems);
+    }
+
+    /**
+     * True while Baritone may place blocks under our confinement.
+     */
+    public static boolean placingAllowed() {
+        if (confined.isEmpty()) return false;
+        for (Object[] saved : confined) {
+            if (saved[0] == BaritoneAPI.getSettings().allowPlace) return Boolean.TRUE.equals(saved[2]);
+        }
+        return false;
+    }
+
+    /**
+     * Changes the value we hold a setting at, remembering the user's value from before the first change.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void retarget(Settings.Setting setting, Object ours) {
+        for (Object[] saved : confined) {
+            if (saved[0] != setting) continue;
+            // The user changed it behind our back: theirs stands, we keep our hands off it
+            if (!Objects.equals(setting.value, saved[2])) return;
+            saved[2] = ours;
+            setting.value = ours;
+            return;
+        }
+        confined.add(new Object[] { setting, setting.value, ours });
+        setting.value = ours;
+    }
+
+    /**
+     * Gives one setting back to the user's value and drops it from the confinement.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void release(Settings.Setting setting) {
+        for (int i = 0; i < confined.size(); i++) {
+            Object[] saved = confined.get(i);
+            if (saved[0] != setting) continue;
+            if (Objects.equals(setting.value, saved[2])) setting.value = saved[1];
+            confined.remove(i);
+            return;
+        }
     }
 
     /**

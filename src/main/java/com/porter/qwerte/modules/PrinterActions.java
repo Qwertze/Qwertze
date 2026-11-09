@@ -100,20 +100,23 @@ final class PrinterActions {
         BlockState at = mc.level.getBlockState(c.target());
         if (!(at.isAir() || at.canBeReplaced())) return Outcome.CELL_TAKEN;
         if (!c.airplace() && mc.level.getBlockState(c.hit().getBlockPos()).isAir()) return Outcome.SUPPORT_GONE;
-        if (c.slot() < 0 || c.slot() > 8) return Outcome.ITEM_GONE;
-        ItemStack held = mc.player.getInventory().getItem(c.slot());
+        // Slot 40 is the off hand: the block is placed from it without touching the hotbar
+        boolean off = c.slot() == 40;
+        if (!off && (c.slot() < 0 || c.slot() > 8)) return Outcome.ITEM_GONE;
+        ItemStack held = off ? mc.player.getOffhandItem() : mc.player.getInventory().getItem(c.slot());
         if (!held.is(c.item()) || held.getCount() < c.cost()) return Outcome.ITEM_GONE;
 
-        if (Players.selectedSlot() != c.slot()) InvUtils.swap(c.slot(), false);
-        InteractionResult result = mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, c.hit());
+        InteractionHand hand = off ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND;
+        if (!off && Players.selectedSlot() != c.slot()) InvUtils.swap(c.slot(), false);
+        InteractionResult result = mc.gameMode.useItemOn(mc.player, hand, c.hit());
         if (result.consumesAction()) swing(swing);
 
         if (c.extraPlaces() > 0) {
             Vec3 centre = Vec3.atCenterOf(c.target());
             BlockHitResult self = new BlockHitResult(new Vec3(centre.x, c.target().getY() + 0.5, centre.z), Direction.UP, c.target(), false);
             for (int i = 0; i < c.extraPlaces(); i++) {
-                if (mc.player.getInventory().getItem(c.slot()).isEmpty()) break;
-                if (mc.gameMode.useItemOn(mc.player, InteractionHand.MAIN_HAND, self).consumesAction()) swing(swing);
+                if ((off ? mc.player.getOffhandItem() : mc.player.getInventory().getItem(c.slot())).isEmpty()) break;
+                if (mc.gameMode.useItemOn(mc.player, hand, self).consumesAction()) swing(swing);
             }
         }
         if (c.useClicks() > 0 && !c.sneak()) useClicks(c.target(), c.useClicks(), swing);

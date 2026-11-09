@@ -13,6 +13,7 @@ import com.porter.qwerte.pearl.OwnThrow;
 import com.porter.qwerte.pearl.Hang;
 import com.porter.qwerte.pearl.InvQueue;
 import com.porter.qwerte.pearl.Pending;
+import com.porter.qwerte.pearl.PearlRest;
 import com.porter.qwerte.pearl.PhaseTimer;
 import com.porter.qwerte.pearl.PullDetector;
 import com.porter.qwerte.pearl.SlotWatch;
@@ -317,6 +318,9 @@ public class ResetPearl extends Module {
     private int coverShiftWaits;
     private final TreeSet<BlockPos> opened = new TreeSet<>(Comparator.<BlockPos>comparingInt(BlockPos::getY).thenComparingInt(BlockPos::getX).thenComparingInt(BlockPos::getZ));
     private int coverWait;
+    private final PearlRest pearlRest = new PearlRest();
+    /** The covers left open on purpose were already reported this run. */
+    private boolean leftOpenReported;
     private int throwUnfit;
     private long throwAt;
     private int rethrows, waitTicks;
@@ -886,6 +890,8 @@ public class ResetPearl extends Module {
         attempts.clear();
         opened.clear();
         coverWait = 0;
+        pearlRest.reset();
+        leftOpenReported = false;
         throwUnfit = 0;
         rethrows = 0;
         waitTicks = 0;
@@ -1594,10 +1600,23 @@ public class ResetPearl extends Module {
 
     private boolean pearlSettled() {
         Entity pearl = findPearl();
-        if (pearl == null) return false;
+        if (pearl == null) {
+            pearlRest.reset();
+            return false;
+        }
+        boolean restingByHeight = pearlRest.update(mc.level.getGameTime(), pearl.getY());
         if (opened.isEmpty()) return pearl.getY() < shaft.waterTop() + 1.5;
         // The lowest trapdoor we opened is the first to close, and only once the pearl is below it
-        return Hang.pearlBelow(pearl.getY(), opened.first().getY());
+        // ... and only once it is resting, not while it still falls past the trapdoor
+        // In an upward bubble column the speed never gets small, so a pearl that holds its height counts as resting too
+        boolean resting = pearl.getDeltaMovement().lengthSqr() < 0.04 || restingByHeight;
+        return resting && Hang.pearlBelow(pearl.getY(), opened.first().getY());
+    }
+
+    /** The block y of the pearl in the shaft, or null when there is none. */
+    private Integer pearlBlockY() {
+        Entity pearl = findPearl();
+        return pearl == null ? null : (int) Math.floor(pearl.getY());
     }
 
     /** Closes the lowest open trapdoor of ours, one per few ticks. Returns true when all of ours are closed. */
@@ -1611,13 +1630,17 @@ public class ResetPearl extends Module {
             partialFinish("a trapdoor will not close");
             return false;
         }
-        for (int y : roles.coverPlan(openedYs)) {
+        for (int y : roles.coverPlan(openedYs, pearlBlockY())) {
             BlockPos at = new BlockPos(shaft.x(), y, shaft.z());
             if (await && trapClicks.isPending(at.asLong())) continue;
             if (kindAt(shaft.x(), y, shaft.z()) == Kind.TRAPDOOR_OPEN) targets.add(at);
         }
         // Closed on our side but not confirmed yet: wait for the server before calling the cover done
-        if (targets.isEmpty()) return !(await && trapClicks.anyPending());
+        if (targets.isEmpty()) {
+            boolean done = !(await && trapClicks.anyPending());
+            if (done) reportLeftOpen(openedYs);
+            return done;
+        }
         if (coverWait < sp().coverWait()) {
             coverWait++;
             return false;
@@ -1640,6 +1663,18 @@ public class ResetPearl extends Module {
         }
         actionCooldown = sp().coverCooldown();
         return false;
+    }
+
+    /** Says once, in the log, in debug and in chat, which covers were left open on purpose, so the run does not look like a full success. */
+    private void reportLeftOpen(List<Integer> openedYs) {
+        if (leftOpenReported) return;
+        List<Integer> left = roles.leftOpen(openedYs, pearlBlockY());
+        if (left.isEmpty()) return;
+        leftOpenReported = true;
+        String ys = left.toString();
+        QwerteAddon.LOG.info("reset-pearl: trapdoors left open on purpose (the pearl rests at or below them): y {}", ys);
+        dbg("trapdoors left open on purpose at y %s: the pearl rests at or below them", ys);
+        warn("Left open on purpose: the trapdoor(s) at y %s (the pearl rests at or below them, closing would pull it).", ys);
     }
 
     // Helpers for the sequence
@@ -2167,7 +2202,7 @@ public class ResetPearl extends Module {
             List<Integer> ys = new ArrayList<>();
             for (BlockPos t : opened) ys.add(t.getY());
             boolean all = true;
-            for (int y : roles.coverPlan(ys)) {
+            for (int y : roles.coverPlan(ys, pearlBlockY())) {
                 BlockPos at = new BlockPos(shaft.x(), y, shaft.z());
                 if (kindAt(at.getX(), at.getY(), at.getZ()) != Kind.TRAPDOOR_OPEN) continue;
                 if (!inReach(at) || !clickTrapdoor(at, false, TrapRoles.Role.COVER)) all = false;

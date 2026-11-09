@@ -381,4 +381,152 @@ class BuildOrdererTest {
         StateSpec sand = StateSpec.of("minecraft:sand", StateKind.FULL, java.util.Map.of(), true);
         assertEquals(Role.GRAVITY, Cell.of(0, 0, 0, sand, null).role());
     }
+
+    // The active layer gate
+
+    @Test
+    void onlyTheActiveLayerIsOffered() {
+        Flat w = new Flat();
+        BuildOrderer o = orderer(Mode.LAYER_THEN_DISTANCE, true, true, solid(0, 0, 0), solid(1, 1, 0), solid(2, 2, 0), solid(3, 1, 0));
+        o.setActiveLayer(1);
+        List<Cell> top = o.top(10, 0, 0, 0, 20, NONE, w, null);
+        assertEquals(2, top.size());
+        assertTrue(top.stream().allMatch(c -> c.y() == 1));
+        o.setActiveLayer(2);
+        assertEquals(List.of(solid(2, 2, 0)), o.top(10, 0, 0, 0, 20, NONE, w, null));
+        o.setActiveLayer(null);
+        assertEquals(4, o.top(10, 0, 0, 0, 20, NONE, w, null).size());
+    }
+
+    @Test
+    void aLayerIsFinishedBeforeTheNextOneIsOffered() {
+        Flat w = new Flat();
+        BuildOrderer o = orderer(Mode.LAYER_THEN_DISTANCE, true, false, solid(0, 0, 0), solid(1, 0, 0), solid(0, 1, 0), solid(1, 1, 0), solid(0, 2, 0));
+        List<Cell> order = new ArrayList<>();
+        for (int y = 0; y <= 2; y++) {
+            o.setActiveLayer(y);
+            Cell c;
+            while ((c = o.pick(0, 0, 0, 20, NONE, w, null)) != null) {
+                order.add(c);
+                o.placed(c);
+                w.put(c.x(), c.y(), c.z());
+            }
+        }
+        assertEquals(5, order.size());
+        for (int i = 1; i < order.size(); i++) assertTrue(order.get(i).y() >= order.get(i - 1).y());
+        assertEquals(0, o.pending());
+    }
+
+    @Test
+    void theGateAlsoNarrowsTheFarSearch() {
+        Flat w = new Flat();
+        BuildOrderer o = orderer(Mode.LAYER_THEN_DISTANCE, true, true, solid(0, 0, 0), solid(90, 5, 90));
+        o.setActiveLayer(5);
+        assertEquals(solid(90, 5, 90), o.nearest(0, 0, 0, NONE, w, null));
+        o.setActiveLayer(3);
+        assertNull(o.nearest(0, 0, 0, NONE, w, null));
+    }
+
+    @Test
+    void theGateSeparatesLayersAcrossSectionBordersAndNegativeY() {
+        World open = new World() {
+            @Override public boolean solid(int x, int y, int z) { return false; }
+            @Override public boolean free(int x, int y, int z) { return true; }
+        };
+        BuildOrderer o = orderer(Mode.LAYER_THEN_DISTANCE, true, true, solid(0, 15, 0), solid(0, 16, 0), solid(5, -1, 5), solid(5, -16, 5), solid(5, -17, 5));
+        o.setActiveLayer(16);
+        assertEquals(List.of(solid(0, 16, 0)), o.top(9, 0, 16, 0, 50, NONE, open, null));
+        o.setActiveLayer(15);
+        assertEquals(List.of(solid(0, 15, 0)), o.top(9, 0, 15, 0, 50, NONE, open, null));
+        o.setActiveLayer(-1);
+        assertEquals(List.of(solid(5, -1, 5)), o.top(9, 0, 0, 0, 50, NONE, open, null));
+        o.setActiveLayer(-16);
+        assertEquals(List.of(solid(5, -16, 5)), o.top(9, 0, -16, 0, 50, NONE, open, null));
+        o.setActiveLayer(-17);
+        assertEquals(List.of(solid(5, -17, 5)), o.top(9, 0, -17, 0, 50, NONE, open, null));
+    }
+
+    @Test
+    void aGatedSearchIsNotCachedAsIdleForTheNextLayer() {
+        Flat w = new Flat();
+        BuildOrderer o = orderer(Mode.LAYER_THEN_DISTANCE, true, true, solid(0, 3, 0));
+        o.setIdleCache(100);
+        o.setActiveLayer(7);
+        assertNull(o.nearest(0, 0, 0, NONE, w, null));
+        o.setActiveLayer(3);
+        assertEquals(solid(0, 3, 0), o.nearest(0, 0, 0, NONE, w, null));
+    }
+
+    @Test
+    void scaffoldCellsAreOfferedWhateverTheLayerAndComeFirst() {
+        Flat w = new Flat();
+        BuildOrderer o = orderer(Mode.LAYER_THEN_DISTANCE, true, false, solid(0, 5, 0));
+        Cell scaffold = solid(0, 0, 0); // on the ground, far below the active layer
+        assertTrue(o.addUngated(scaffold));
+        assertFalse(o.addUngated(scaffold));
+        o.setActiveLayer(5);
+        assertEquals(0, o.pending() - 1);
+        List<Cell> top = o.top(5, 0, 0, 0, 20, NONE, w, null);
+        assertEquals(List.of(scaffold), top); // the layer's own cell has no support yet
+        o.placed(scaffold);
+        w.put(0, 0, 0);
+        assertEquals(1, o.pending());
+        assertTrue(o.isUngated(0, 0, 0));
+        o.releaseUngated(0, 0, 0);
+        assertFalse(o.isUngated(0, 0, 0));
+        assertEquals(0, o.ungatedQueued());
+    }
+
+    @Test
+    void scaffoldCellsPlacedInOrderEachOnTheLast() {
+        Flat w = new Flat();
+        BuildOrderer o = orderer(Mode.LAYER_THEN_DISTANCE, true, false);
+        for (int y = 0; y < 3; y++) o.addUngated(solid(0, y, 0));
+        o.setActiveLayer(9);
+        for (int y = 0; y < 3; y++) {
+            Cell c = o.pick(0, 0, 0, 20, NONE, w, null);
+            assertEquals(solid(0, y, 0), c);
+            o.placed(c);
+            // the placed block counts as a support at once, before the world shows it
+        }
+        assertNull(o.pick(0, 0, 0, 20, NONE, w, null));
+    }
+
+    @Test
+    void removeAndAddKeepActingOnAScaffoldCell() {
+        Flat w = new Flat();
+        BuildOrderer o = orderer(Mode.LAYER_THEN_DISTANCE, true, false);
+        Cell c = solid(0, 0, 0);
+        o.addUngated(c);
+        assertTrue(o.remove(c));
+        assertNull(o.pick(0, 0, 0, 20, NONE, w, null));
+        Cell withLook = c.withLook(LookWindow.any());
+        assertTrue(o.add(withLook));
+        assertEquals(withLook, o.pick(0, 0, 0, 20, NONE, w, null));
+        assertEquals(0, o.pending());
+    }
+
+    @Test
+    void strandedCellsAreTheOnesWithNothingToBePlacedAgainst() {
+        Flat w = new Flat();
+        Cell onGround = solid(0, 0, 0);
+        Cell floating = solid(4, 3, 4);
+        Cell floating2 = solid(9, 3, 9);
+        BuildOrderer o = orderer(Mode.LAYER_THEN_DISTANCE, true, false, onGround, floating, floating2, attach(1, 3, 1, Dir.UP));
+        o.setActiveLayer(3);
+        assertEquals(List.of(floating, floating2), o.stranded(3, 5, 100, 0, 3, 0, NONE, w)); // nearest first, solid cells only
+        assertEquals(List.of(floating), o.stranded(3, 1, 100, 0, 3, 0, NONE, w));
+        assertTrue(o.stranded(0, 5, 100, 0, 0, 0, NONE, w).isEmpty(), "the ground cell is ready");
+        BuildOrderer air = orderer(Mode.LAYER_THEN_DISTANCE, true, true, floating);
+        assertTrue(air.stranded(3, 5, 100, 0, 0, 0, NONE, w).isEmpty(), "air-placing needs no scaffold");
+    }
+
+    @Test
+    void readyCountsPerLayer() {
+        Flat w = new Flat();
+        BuildOrderer o = orderer(Mode.LAYER_THEN_DISTANCE, true, false, solid(0, 0, 0), solid(1, 0, 0), solid(5, 4, 5));
+        assertEquals(2, o.readyCount(0, 100, NONE, w));
+        assertEquals(0, o.readyCount(4, 100, NONE, w));
+        assertEquals(1, o.readyCount(0, 1, NONE, w), "stops at the cap");
+    }
 }

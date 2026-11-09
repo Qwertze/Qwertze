@@ -26,6 +26,8 @@ class PrintLoopTest {
         boolean worldChanged, cancelled, loaded = true, scanDone = true, breaking, placeable, walkTarget, lacking, resupplyActive, sessionActive,
             inventoryFull, baritoneBusy, supplyPossible = true, canWalk = true, waiting, disableWhenOut;
         String layerHold;
+        int scaffoldLeft;
+        boolean scaffoldRemovable, layerMoving;
         String loadError, wrongInfo, lackingInfo, resupplyFailed, orderWait, orderProblem;
         int pending = 10, wrongPending;
         Wrong wrongMode = Wrong.SKIP_AND_LIST;
@@ -45,7 +47,7 @@ class PrintLoopTest {
 
         Obs build() {
             return new Obs(worldChanged, cancelled, loaded, loadError, scanDone, pending, wrongPending, wrongInfo, breaking, wrongMode, placeable,
-                walkTarget, lacking, lackingInfo, supplyPossible, resupplyActive, resupplyFailed, sessionActive, inventoryFull, baritoneBusy, canWalk, waiting, orderWait, orderProblem, disableWhenOut, layerHold);
+                walkTarget, lacking, lackingInfo, supplyPossible, resupplyActive, resupplyFailed, sessionActive, inventoryFull, baritoneBusy, canWalk, waiting, orderWait, orderProblem, disableWhenOut, layerHold, scaffoldLeft, scaffoldRemovable, layerMoving);
         }
     }
 
@@ -395,6 +397,103 @@ class PrintLoopTest {
         assertEquals(Phase.BUILDING, layer.phase());
     }
 
+    private static PrintLoop smoothed() {
+        PrintLoop loop = new PrintLoop(4, 2, 20);
+        loop.tick(Obs.idle());
+        loop.tick(obs(b -> b));
+        loop.tick(obs(b -> b));
+        return loop;
+    }
+
+    @Test
+    void aFlappingShortageSaysNothingAndASteadyOneIsAnnouncedOnceAfterTheHysteresis() {
+        PrintLoop loop = smoothed();
+        for (int i = 0; i < 100; i++) {
+            Step s = loop.tick(i % 5 < 3 ? obs(b -> b.lack().noSupply()) : obs(B::place));
+            assertNull(s.msg(), "tick " + i);
+        }
+        assertEquals(Phase.BUILDING, loop.phase());
+        int messages = 0;
+        for (int i = 0; i < 60; i++) if (loop.tick(obs(b -> b.lack().noSupply())).msg() != null) messages++;
+        assertEquals(1, messages);
+        assertEquals(Phase.PAUSED, loop.phase());
+    }
+
+    @Test
+    void workIsBuildingAtOnceAndOnlyTheResumedLineWaitsForTheHysteresis() {
+        PrintLoop loop = smoothed();
+        for (int i = 0; i < 25; i++) loop.tick(obs(b -> b.lack().noSupply()));
+        assertEquals(Phase.PAUSED, loop.phase());
+        assertTrue(loop.errorPause());
+        int resumes = 0;
+        for (int i = 0; i < 10; i++) {
+            Step s = loop.tick(obs(B::place));
+            assertEquals(Act.PLACE, s.act());
+            assertEquals(Phase.BUILDING, loop.phase(), "tick " + i);
+            assertFalse(loop.errorPause(), "tick " + i);
+            if (s.msg() != null) resumes++;
+        }
+        assertEquals(0, resumes);
+        // a gap restarts the count of the message
+        loop.tick(obs(b -> b.lack().noSupply()));
+        for (int i = 0; i < 10; i++) assertNull(loop.tick(obs(B::place)).msg());
+        int lines = 0;
+        for (int i = 0; i < 25; i++) if (loop.tick(obs(B::place)).msg() != null) lines++;
+        assertEquals(1, lines);
+        assertEquals(Phase.BUILDING, loop.phase());
+    }
+
+    @Test
+    void pausesThatMustStopMovementStopItAtOnceAndOnlyTheLineWaits() {
+        for (int kind = 0; kind < 3; kind++) {
+            final int k = kind;
+            PrintLoop loop = smoothed();
+            for (int i = 0; i <= PrintLoop.HYSTERESIS; i++) {
+                Step s = loop.tick(obs(b -> {
+                    if (k == 0) b.walk().busy();
+                    if (k == 1) { b.walk(); b.canWalk = false; }
+                    if (k == 2) b.lack().full();
+                    return b;
+                }));
+                assertEquals(Act.STOP_WALK, s.act(), "kind " + k + " tick " + i);
+                if (i < PrintLoop.HYSTERESIS) assertNull(s.msg(), "kind " + k + " tick " + i);
+                else assertNotNull(s.msg(), "kind " + k + " announced at tick " + i);
+            }
+            assertEquals(Phase.PAUSED, loop.phase(), "kind " + k);
+        }
+    }
+
+    @Test
+    void aPauseThatComesBackBeforeTheResumeLineIsNotAnnouncedTwice() {
+        PrintLoop loop = smoothed();
+        int lines = 0;
+        for (int i = 0; i < 25; i++) if (loop.tick(obs(b -> b.lack().noSupply())).msg() != null) lines++;
+        for (int i = 0; i < 5; i++) loop.tick(obs(B::place));
+        for (int i = 0; i < 40; i++) if (loop.tick(obs(b -> b.lack().noSupply())).msg() != null) lines++;
+        assertEquals(1, lines);
+    }
+
+    @Test
+    void aFullInventoryOnlyPausesAsFullWhenThereIsASourceToFetchFrom() {
+        PrintLoop with = building();
+        Step s = with.tick(obs(b -> b.lack().full()));
+        assertTrue(s.msg().contains("inventory is full"));
+        PrintLoop without = building();
+        Step n = without.tick(obs(b -> b.lack().full().noSupply()));
+        assertFalse(n.msg().contains("inventory is full"));
+        assertTrue(n.msg().contains("no materials source"));
+    }
+
+    @Test
+    void errorPausesAreMarkedForTheSound() {
+        PrintLoop loop = building();
+        loop.tick(obs(b -> b.lack().noSupply()));
+        assertTrue(loop.errorPause());
+        PrintLoop wrong = building();
+        wrong.tick(obs(b -> b.wrong(Wrong.PAUSE)));
+        assertFalse(wrong.errorPause());
+    }
+
     @Test
     void onlyEverythingBuiltEndsTheRun() {
         PrintLoop loop = building();
@@ -600,5 +699,70 @@ class PrintLoopTest {
         Step s = ordered.tick(obs(b -> { b.disableWhenOut = true; b.lacking = true; b.resupplyFailed = "no source holds stone."; b.orderWait = "the order from stash Main"; return b; }));
         assertFalse(s.ends());
         assertEquals(Phase.PAUSED, ordered.phase());
+    }
+
+    @Test
+    void theRunDoesNotFinishWhileLayersAreStillOpen() {
+        PrintLoop loop = building();
+        // Cells remain (in a later layer): nothing is ready, but the run is not over
+        for (int i = 0; i < 10; i++) assertFalse(loop.tick(obs(b -> { b.layerMoving = true; return b.pending(40); })).ends());
+        // The last layer is done
+        Step s = loop.tick(obs(b -> b.pending(0)));
+        assertEquals(Act.FINISH, s.act());
+    }
+
+    @Test
+    void aMovingLayerCursorKeepsTheStuckPauseAwayAndTheStuckPauseComesWhenItStops() {
+        PrintLoop loop = building();
+        for (int i = 0; i < PrintLoop.STUCK_TICKS * 3; i++) {
+            Step s = loop.tick(obs(b -> { b.layerMoving = true; return b.pending(5); }));
+            assertEquals(Act.NONE, s.act());
+            assertFalse(loop.paused());
+        }
+        // The cursor gave up (open gate) and still nothing can be built: the old stuck pause
+        boolean paused = false;
+        for (int i = 0; i < PrintLoop.STUCK_TICKS + 2 && !paused; i++) paused = loop.tick(obs(b -> b.pending(5))).msg() != null;
+        assertTrue(paused);
+        assertTrue(loop.errorPause());
+    }
+
+    @Test
+    void scaffoldBlocksAreRemovedBeforeTheRunFinishes() {
+        PrintLoop loop = building();
+        // Everything built, three scaffold blocks stand, none needed: take them down, do not finish
+        Step s = loop.tick(obs(b -> { b.scaffoldLeft = 3; b.scaffoldRemovable = true; return b.pending(0); }));
+        assertEquals(Act.REMOVE_SCAFFOLD, s.act());
+        assertFalse(loop.ended());
+        assertEquals(Act.REMOVE_SCAFFOLD, loop.tick(obs(b -> { b.scaffoldLeft = 1; b.scaffoldRemovable = true; return b.pending(0); })).act());
+        assertFalse(loop.ended());
+        // The last one is gone
+        assertEquals(Act.FINISH, loop.tick(obs(b -> b.pending(0))).act());
+    }
+
+    @Test
+    void finishWaitsForScaffoldThatIsNotRemovableYet() {
+        PrintLoop loop = building();
+        for (int i = 0; i < 5; i++) assertFalse(loop.tick(obs(b -> { b.scaffoldLeft = 2; return b.pending(0); })).ends());
+        assertEquals(Act.FINISH, loop.tick(obs(b -> b.pending(0))).act());
+    }
+
+    @Test
+    void placingComesBeforeRemovingScaffold() {
+        PrintLoop loop = building();
+        assertEquals(Act.PLACE, loop.tick(obs(b -> { b.scaffoldLeft = 2; b.scaffoldRemovable = true; return b.place(); })).act());
+        assertEquals(Act.REMOVE_SCAFFOLD, loop.tick(obs(b -> { b.scaffoldLeft = 2; b.scaffoldRemovable = true; return b; })).act());
+    }
+
+    @Test
+    void aOneTickResupplyFailureIsNotSwallowedByTheHysteresis() {
+        PrintLoop loop = smoothed();
+        Step s = loop.tick(obs(b -> { b.resupplyFailed = "no source"; return b.lack(); }));
+        assertNotNull(s.msg());
+        assertTrue(s.msg().contains("Could not get the materials"));
+        assertEquals(Phase.PAUSED, loop.phase());
+        assertTrue(loop.errorPause());
+        // the next tick no longer carries the failure; the pause stays
+        loop.tick(obs(b -> b.lack()));
+        assertTrue(loop.errorPause());
     }
 }

@@ -38,9 +38,9 @@ public final class Hang {
         return (px - cx) * dx + (pz - cz) * dz >= CLEAR_OF_SHAFT;
     }
 
-    /** A trapdoor may be closed once the pearl, falling, is below it. */
+    /** A trapdoor may be closed once the pearl is below it: its top (a pearl is 0.25 high) clear of the trapdoor with a margin. */
     public static boolean pearlBelow(double pearlY, int trapY) {
-        return pearlY + 0.2 < trapY;
+        return pearlY + 0.3 < trapY;
     }
 
     /** Standard deviation of the sideways speed a thrown pearl gets from the game's random spread, per tick. */

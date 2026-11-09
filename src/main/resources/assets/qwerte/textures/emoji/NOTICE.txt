@@ -1,0 +1,8 @@
+Emoji images in this folder: Twemoji 17.0.3, 72x72 PNG, a subset of 181 emoji.
+
+Copyright 2019 Twitter, Inc and other contributors (graphics), continued by the jdecked/twemoji project.
+Graphics licensed under CC-BY 4.0 (https://creativecommons.org/licenses/by/4.0/); the full text is in LICENSE-GRAPHICS.txt.
+Source: https://github.com/jdecked/twemoji (assets/72x72), fetched from
+https://cdn.jsdelivr.net/gh/jdecked/twemoji@17.0.3/assets/72x72/<codepoints>.png
+Changes: none; the files are used unmodified. Their names are the emoji's codepoints in lowercase hex joined by "-".
+Used by the Qwerte addon's Messenger window to show emoji in messages.

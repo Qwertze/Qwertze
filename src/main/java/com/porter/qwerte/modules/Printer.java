@@ -3,14 +3,22 @@ package com.porter.qwerte.modules;
 import com.porter.qwerte.QwerteAddon;
 import com.porter.qwerte.compat.Players;
 import com.porter.qwerte.printer.loop.PrintLoop;
+import com.porter.qwerte.printer.loop.RecheckQueue;
 import com.porter.qwerte.printer.loop.TargetBits;
 import com.porter.qwerte.printer.materials.MaterialPlanner;
 import com.porter.qwerte.printer.materials.EchestReturn;
 import com.porter.qwerte.printer.materials.TakeRules;
+import com.porter.qwerte.printer.move.HoverPoint;
+import com.porter.qwerte.printer.move.MovePolicy;
+import com.porter.qwerte.printer.move.SpareItems;
+import com.porter.qwerte.printer.move.StandShield;
 import com.porter.qwerte.printer.source.StateResolver;
 import com.porter.qwerte.printer.place.AreaWatch;
+import com.porter.qwerte.printer.place.BreakRules;
 import com.porter.qwerte.printer.place.BuildOrderer;
 import com.porter.qwerte.printer.place.JobHold;
+import com.porter.qwerte.printer.place.LayerCursor;
+import com.porter.qwerte.printer.place.ScaffoldPlanner;
 import com.porter.qwerte.printer.place.LookWindow;
 import com.porter.qwerte.printer.place.PacketBudget;
 import com.porter.qwerte.printer.place.PlaceRecipe;
@@ -20,14 +28,18 @@ import com.porter.qwerte.printer.place.PlacementMapper;
 import com.porter.qwerte.printer.place.StateClassifier;
 import com.porter.qwerte.printer.place.StateKind;
 import com.porter.qwerte.printer.place.StateSpec;
-import com.porter.qwerte.printer.place.StripRules;
-import com.porter.qwerte.printer.place.StripTable;
+import com.porter.qwerte.printer.place.HandTables;
+import com.porter.qwerte.printer.place.Tool;
+import com.porter.qwerte.printer.place.ToolAction;
+import com.porter.qwerte.printer.place.ToolRules;
+import com.porter.qwerte.printer.place.ToolTables;
 import com.porter.qwerte.printer.place.TickBatcher;
 import com.porter.qwerte.printer.place.WaterlogRules;
 import com.porter.qwerte.printer.stash.StashOrders;
 import com.porter.qwerte.printer.schematic.LitematicReader;
 import com.porter.qwerte.printer.schematic.SchematicFile;
 import com.porter.qwerte.printer.schematic.Transform;
+import com.porter.qwerte.printer.source.BuildQueue;
 import com.porter.qwerte.printer.source.BuildSource;
 import com.porter.qwerte.printer.source.LayerFilter;
 import com.porter.qwerte.printer.source.LitematicaBridge;
@@ -45,11 +57,15 @@ import meteordevelopment.meteorclient.settings.DoubleSetting;
 import meteordevelopment.meteorclient.settings.EnumSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
 import meteordevelopment.meteorclient.settings.KeybindSetting;
+import meteordevelopment.meteorclient.settings.ModuleListSetting;
 import meteordevelopment.meteorclient.settings.Setting;
+import meteordevelopment.meteorclient.settings.SoundEventListSetting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.settings.StringListSetting;
 import meteordevelopment.meteorclient.settings.StringSetting;
 import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.systems.modules.Modules;
+import meteordevelopment.meteorclient.systems.modules.movement.Flight;
 import meteordevelopment.meteorclient.utils.Utils;
 import meteordevelopment.meteorclient.utils.misc.Keybind;
 import meteordevelopment.meteorclient.utils.misc.input.Input;
@@ -60,6 +76,9 @@ import meteordevelopment.meteorclient.utils.world.BlockUtils;
 import meteordevelopment.orbit.EventHandler;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.multiplayer.ServerData;
+import net.minecraft.client.resources.sounds.SimpleSoundInstance;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundEvents;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -75,9 +94,12 @@ import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.EntityBlock;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.FallingBlock;
+import net.minecraft.world.level.block.FlowerPotBlock;
 import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.entity.BarrelBlockEntity;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -97,14 +119,19 @@ import net.minecraft.world.phys.Vec3;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.IdentityHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.function.Predicate;
 
@@ -132,6 +159,7 @@ public class Printer extends Module {
     private final SettingGroup sgMaterials = settings.createGroup("Materials");
     private final SettingGroup sgStash = settings.createGroup("Stash Orders");
     private final SettingGroup sgBaritone = settings.createGroup("Baritone");
+    private final SettingGroup sgSounds = settings.createGroup("Sounds");
 
     public enum Source {
         LitematicaLatest(SourcePicker.Mode.LITEMATICA_LATEST), LitematicaByName(SourcePicker.Mode.LITEMATICA_BY_NAME), File(SourcePicker.Mode.FILE);
@@ -145,12 +173,33 @@ public class Printer extends Module {
 
     public enum RotationMode { Smart, Snap, None }
 
+    public enum Movement {
+        StandOnBuild(MovePolicy.Mode.STAND), Fly(MovePolicy.Mode.FLY), StandThenFly(MovePolicy.Mode.STAND_THEN_FLY);
+
+        final MovePolicy.Mode mode;
+
+        Movement(MovePolicy.Mode mode) {
+            this.mode = mode;
+        }
+    }
+
     public enum Order {
         LayerThenDistance(BuildOrderer.Mode.LAYER_THEN_DISTANCE), Distance(BuildOrderer.Mode.DISTANCE), Layer(BuildOrderer.Mode.LAYER);
 
         final BuildOrderer.Mode mode;
 
         Order(BuildOrderer.Mode mode) {
+            this.mode = mode;
+        }
+    }
+
+    /** Which y level is printed: one at a time, in this order; Off keeps the old behaviour (every layer at once, ranked by order and bottom-up). */
+    public enum LayerOrder {
+        Off(LayerCursor.Mode.OFF), BottomToTop(LayerCursor.Mode.BOTTOM_TO_TOP), TopToBottom(LayerCursor.Mode.TOP_TO_BOTTOM), MostEfficient(LayerCursor.Mode.MOST_EFFICIENT);
+
+        final LayerCursor.Mode mode;
+
+        LayerOrder(LayerCursor.Mode mode) {
             this.mode = mode;
         }
     }
@@ -227,6 +276,21 @@ public class Printer extends Module {
         .name("mirror")
         .description("How the file is mirrored, for a file placed with this module's own position.")
         .defaultValue(Transform.Mir.NONE)
+        .build()
+    );
+
+    private final Setting<Boolean> queueEnabled = sgSource.add(new BoolSetting.Builder()
+        .name("queue-enabled")
+        .description("Builds the schematics of the queue below one after the other instead of the single source above: when one is done the Printer goes on with the next without turning off. The source and file-name settings are not used then (the origin, rotation and mirror still are, for file entries).")
+        .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<List<String>> queueList = sgSource.add(new StringListSetting.Builder()
+        .name("queue")
+        .description("The schematics in build order, one per entry: a Litematica placement name (exact name first, else the one placement whose name contains it), or file:<name> for a .litematic in the schematics folder (file:<name>@x,y,z gives that file its own origin). A missing, ambiguous or unreadable entry is skipped with a warning. The queue starts from the top each time the Printer is turned on.")
+        .defaultValue(new ArrayList<>())
+        .visible(queueEnabled::get)
         .build()
     );
 
@@ -363,17 +427,43 @@ public class Printer extends Module {
 
     // Order
 
+    private final Setting<LayerOrder> layerOrder = sgOrder.add(new EnumSetting.Builder<LayerOrder>()
+        .name("layer-order")
+        .description("Builds one y level at a time: blocks above it are left alone until it is complete, then the printer moves to the next. BottomToTop: lowest first. TopToBottom: highest first. MostEfficient: the layer with the most blocks ready now, then the nearest in height. A layer that can't be built yet (a hanging block under a later layer) is carried over and tried again. Off: no layers, blocks are ranked by order and bottom-up.")
+        .defaultValue(LayerOrder.BottomToTop)
+        .build()
+    );
+
     private final Setting<Order> order = sgOrder.add(new EnumSetting.Builder<Order>()
         .name("order")
-        .description("LayerThenDistance: a layer at a time, nearest block first. Distance: always the nearest block. Layer: a layer at a time, in a fixed order.")
+        .description("LayerThenDistance: a layer at a time, nearest block first. Distance: always the nearest block. Layer: a layer at a time, in a fixed order. With layer-order on, this ranks the blocks inside the active layer.")
         .defaultValue(Order.LayerThenDistance)
         .build()
     );
 
     private final Setting<Boolean> bottomUp = sgOrder.add(new BoolSetting.Builder()
         .name("bottom-up")
-        .description("Build from the lowest layer up. Off builds from the top down.")
+        .description("Build from the lowest layer up. Off builds from the top down. Only used when layer-order is Off.")
         .defaultValue(true)
+        .visible(() -> layerOrder.get() == LayerOrder.Off)
+        .build()
+    );
+
+    private final Setting<Boolean> scaffold = sgOrder.add(new BoolSetting.Builder()
+        .name("scaffold")
+        .description("When a block of the active layer has nothing to be placed against, build a short chain of spare blocks (blocks in your inventory that the schematic doesn't use) up to it, and break them again when nothing needs them. Never breaks printed blocks. Needs layer-order and air-place off.")
+        .defaultValue(true)
+        .visible(() -> layerOrder.get() != LayerOrder.Off)
+        .build()
+    );
+
+    private final Setting<Integer> scaffoldMax = sgOrder.add(new IntSetting.Builder()
+        .name("scaffold-max")
+        .description("Most scaffold blocks standing at once.")
+        .defaultValue(64)
+        .range(1, 512)
+        .sliderRange(1, 128)
+        .visible(() -> layerOrder.get() != LayerOrder.Off && scaffold.get())
         .build()
     );
 
@@ -524,9 +614,34 @@ public class Printer extends Module {
 
     private final Setting<Boolean> safeWalk = sgBaritone.add(new BoolSetting.Builder()
         .name("safe-walk")
-        .description("While walking: no parkour, no diagonal drops, no falls beyond one block, and no breaking or placing blocks.")
+        .description("While walking: no parkour, no diagonal drops, no falls beyond one block, and never breaking blocks. Placing blocks is only what movement StandOnBuild allows.")
         .defaultValue(true)
         .visible(walk::get)
+        .build()
+    );
+
+    private final Setting<Movement> movement = sgBaritone.add(new EnumSetting.Builder<Movement>()
+        .name("movement")
+        .description("How the Printer gets to blocks that are out of reach. StandOnBuild (default): Baritone walks and climbs onto the blocks already printed, placing your spare blocks (carried blocks the schematic does not use) to pillar up, and never breaking anything. Fly: flies with a flight module and never walks. StandThenFly: stands on the build, and flies when walking gets nowhere. Flying can get you kicked on servers that don't allow it (for example 2b2t's anticheat); it is off unless you pick Fly or StandThenFly.")
+        .defaultValue(Movement.StandOnBuild)
+        .visible(walk::get)
+        .onChanged(m -> this.movePolicy.setMode(m.mode))
+        .build()
+    );
+
+    private final Setting<List<Module>> flightModules = sgBaritone.add(new ModuleListSetting.Builder()
+        .name("flight-modules")
+        .description("The modules to fly with for Fly and StandThenFly: the first one that is already on is used, otherwise the first in the list is switched on while flying and off again afterwards (only if the Printer switched it on). It must move you with the movement keys, as Meteor's Flight does. Flight can get you kicked on servers that don't allow it.")
+        .defaultValue(Flight.class)
+        .visible(() -> walk.get() && movement.get() != Movement.StandOnBuild)
+        .build()
+    );
+
+    private final Setting<Boolean> removeStandBlocks = sgBaritone.add(new BoolSetting.Builder()
+        .name("remove-stand-blocks")
+        .description("Breaks the blocks Baritone placed to climb (outside the schematic) once nothing needs them, like scaffold. Off: they are left standing.")
+        .defaultValue(true)
+        .visible(() -> walk.get() && movement.get() != Movement.Fly)
         .build()
     );
 
@@ -535,6 +650,48 @@ public class Printer extends Module {
         .description("Stops walking while you press a movement key yourself.")
         .defaultValue(true)
         .visible(walk::get)
+        .build()
+    );
+
+    // Sounds
+
+    private final Setting<Boolean> finishSound = sgSounds.add(new BoolSetting.Builder()
+        .name("finish-sound")
+        .description("Plays a sound when the Printer finishes everything it can build.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<List<SoundEvent>> finishSoundEvent = sgSounds.add(new SoundEventListSetting.Builder()
+        .name("finish-sound-event")
+        .description("The sound for finishing (the first one in the list is played).")
+        .defaultValue(SoundEvents.PLAYER_LEVELUP)
+        .visible(finishSound::get)
+        .build()
+    );
+
+    private final Setting<Boolean> errorSound = sgSounds.add(new BoolSetting.Builder()
+        .name("error-sound")
+        .description("Plays a sound when the Printer stops, or pauses because it needs you (stuck, no materials source, a failed fetch).")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<List<SoundEvent>> errorSoundEvent = sgSounds.add(new SoundEventListSetting.Builder()
+        .name("error-sound-event")
+        .description("The sound for a stop or an error pause (the first one in the list is played).")
+        .defaultValue(SoundEvents.ANVIL_LAND)
+        .visible(errorSound::get)
+        .build()
+    );
+
+    private final Setting<Double> soundVolume = sgSounds.add(new DoubleSetting.Builder()
+        .name("sound-volume")
+        .description("How loud the sounds are. At most one sound every 1.5 seconds.")
+        .defaultValue(1.0)
+        .min(0)
+        .sliderRange(0, 2)
+        .visible(() -> finishSound.get() || errorSound.get())
         .build()
     );
 
@@ -556,6 +713,8 @@ public class Printer extends Module {
     private static final int STORED_LIST = 400;
     private static final int DEFER_TICKS = 20, DEFER_TRIES = 3;
     private static final int WALK_GIVE_UP = 20 * 120;
+    /** Ticks a hovering player may take to come down before a materials trip is skipped. */
+    private static final int LAND_GIVE_UP = 20 * 20;
     private static final int RECIPE_CACHE_MAX = 4096;
     private static final int ORPHAN_CHECK = 40;
     private static final int MAX_UNPACKS = 6;
@@ -585,12 +744,35 @@ public class Printer extends Module {
         Block block = blocksById.get(blockId);
         Item item = block == null ? Items.AIR : block.asItem();
         String id = item == Items.AIR ? null : BuiltInRegistries.ITEM.getKey(item).toString();
+        // Farmland and dirt paths are made from dirt; a potted plant is an empty pot (its plant is the cell's extra cost)
+        if (HandTables.PLACED_FROM.containsKey(blockId)) id = HandTables.PLACED_FROM.get(blockId);
+        else if (block instanceof FlowerPotBlock) id = HandTables.FLOWER_POT;
         ITEM_OF_BLOCK.put(blockId, id);
         return id;
     };
 
-    /** {@code rawItem}: for a block that is the strip result of another (stripped logs), the item of that other block; else null. */
-    private record Info(StateSpec spec, MaterialPlanner.Cost cost, Item item, Item rawItem) {}
+    /**
+     * A block that a tool finishes. {@code action}: the tool and the raw block (for a property such as a lit candle, the
+     * block itself). {@code rawItem}: the item of the raw block, null when the wanted block is placed as it is and only a
+     * property is set. {@code only}: the wanted block has no item (farmland, a potted plant), so the raw one is always what
+     * is placed. {@code plant}: the item a flower pot is filled with. {@code rawState}/{@code rawSpec}: how the raw block is
+     * placed, when that differs from the wanted block (dirt for farmland, a pumpkin for a carved one); else null.
+     */
+    private record ToolSource(ToolAction action, Item rawItem, boolean only, Item plant, BlockState rawState, StateSpec rawSpec) {
+        Tool tool() {
+            return action.tool();
+        }
+
+        boolean property() {
+            return rawItem == null;
+        }
+    }
+
+    /** {@code toolSource}: set for a block a tool finishes (stripped logs, farmland, waxed copper, potted plants, ...); else null. */
+    private record Info(StateSpec spec, MaterialPlanner.Cost cost, Item item, ToolSource toolSource) {}
+
+    /** What is placed with the click: the cell's own item, or the raw one when {@code raw}. */
+    private record Use(Item item, int count, boolean raw) {}
 
     /** {@code use}/{@code useCount}: what is placed with the click. The cell's own item, or the unstripped one when {@code raw}. */
     private record Prep(BuildOrderer.Cell cell, Info info, PlaceRecipe recipe, BlockHitResult hit, int slot, Item use, int useCount, boolean raw) {}
@@ -598,10 +780,10 @@ public class Printer extends Module {
     private record Awaiting(BuildOrderer.Cell cell, Info info, PlaceRecipe recipe, int tickPlaced, boolean raw) {}
 
     /** What the world shows at a cell next to what the schematic wants. */
-    private enum Seen { BUILT, NEEDS_STRIP, NO }
+    private enum Seen { BUILT, NEEDS_TOOL, NO }
 
-    /** {@code wantId}: the stripped block the schematic wants here; the axe is only used on its unstripped partner. */
-    private record StripJob(BlockPos pos, int tries, int lastTick, int since, String wantId) {}
+    /** A block that waits for its tool; {@code info} says what the schematic wants here (the tool is only used on a raw block of it). */
+    private record ToolJob(BlockPos pos, Info info, Tool tool, int tries, int lastTick, int since) {}
 
     private record WaterJob(BlockPos pos, int since, int giveUp, int tries, int lastTick) {}
 
@@ -610,6 +792,27 @@ public class Printer extends Module {
     private record RecipeKey(BlockState want, int mask, boolean air) {}
 
     private record UseJob(BlockPos pos, int clicks, int giveUpTick) {}
+
+    /** A scaffold block: planned (in the queue), placed (click sent) and, once the world shows it, built. */
+    private static final class Scaf {
+        final BlockPos pos;
+        final Item item;
+        final BlockState state;
+        final Info info;
+        final int since;
+        boolean placed, built;
+        /** Adopted: a spare block Baritone climbed with, not planned by the Printer (it does not count toward scaffold-max). */
+        boolean stand;
+        int breakTicks;
+
+        Scaf(BlockPos pos, Item item, BlockState state, Info info, int since) {
+            this.pos = pos;
+            this.item = item;
+            this.state = state;
+            this.info = info;
+            this.since = since;
+        }
+    }
 
     private enum Fin { PLACED, PRESENT, DROPPED, SKIPPED, FAILED }
 
@@ -628,6 +831,9 @@ public class Printer extends Module {
     private int runId;
     private Object runLevel;
     private int tick;
+
+    /** The schematic queue of this activation (null when queue-enabled is off). Its position survives runs, not activations. */
+    private BuildQueue queue;
 
     private BuildSource built;
     private Future<?> loadFuture;
@@ -688,16 +894,78 @@ public class Printer extends Module {
     private Object walkGoal;
     private boolean usedConfine, usedProtect, walkWarned;
     private int lastWalk;
+    // Movement: stand on the build or fly. Baritone path failures are counted over the run for the policy
+    private final MovePolicy movePolicy = new MovePolicy(MovePolicy.Mode.STAND);
+    private final FlyController fly = new FlyController(() -> flightModules.get(), () -> sneak.holding() || this.toolSneak);
+    private int pathFailures, retryWalkAt;
+    private HoverPoint.Point hover;
+    private int hoverAt = -1000;
+    private MovePolicy.Way lastWay = MovePolicy.Way.WALK;
+    private boolean standNoSpareWarned, flyNoModuleWarned;
+    /** Cells seen empty near the feet while Baritone may place: one that turns into a spare block later was placed by Baritone. */
+    private final Set<Long> airSeen = new HashSet<>();
+    private static final int PATH_RETRY = 20, HOVER_EVERY = 10, AIR_SEEN_MAX = 4096;
+    /** The spare blocks Baritone may place while it walks (empty: walking only), and how long its placing is watched for. */
+    private List<Item> standItems = List.of();
+    private int standTrackUntil = -1, standPlaced;
 
-    // Stripping (logs placed unstripped, waiting for an axe click), waterlogging, the layer range, the schematic area
-    private static final int STRIP_TRIES = 4, STRIP_WAIT = 5, WATER_TRIES = 4, WATER_WAIT = 5, WATER_GIVE_UP = 20 * 60, WATER_GIVE_UP_PRESENT = 20 * 300, STRIP_GIVE_UP = 20 * 120, LAYER_EVERY = 5;
+    // Tool jobs (logs placed unstripped waiting for an axe click, farmland for a hoe, ...), waterlogging, the layer range, the schematic area
+    private static final int TOOL_TRIES = 4, TOOL_WAIT = 5, WATER_TRIES = 4, WATER_WAIT = 5, WATER_GIVE_UP = 20 * 60, WATER_GIVE_UP_PRESENT = 20 * 300, TOOL_GIVE_UP = 20 * 120, LAYER_EVERY = 5;
     private static final long LAYER_BUDGET_NANOS = 1_000_000L;
     private static final int OFFHAND = 40;
-    private final Map<Long, StripJob> stripPending = new LinkedHashMap<>();
+    /** Above the combat modules, so their rotations don't take the look this tick (Meteor sets the client look for the first one queued). */
+    private static final int ROTATION_PRIORITY = 100;
+    private static final ToolRules.Table TOOLS = ToolTables.INSTANCE;
+    private final Map<Long, ToolJob> toolJobs = new LinkedHashMap<>();
     private final Map<Long, WaterJob> waterJobs = new LinkedHashMap<>();
-    private boolean warnedNoAxe, warnedDry, stripSneak;
-    private int stripBlockedUntil, waterBlockedUntil, waterLeft, stripDone, waterDone, dryCount;
+    private final Set<Tool> warnedTools = EnumSet.noneOf(Tool.class);
+    private final Map<Tool, Integer> toolDone = new EnumMap<>(Tool.class);
+    private final int[] toolBlockedUntil = new int[Tool.values().length];
+    /** The plant item the hotbar need looks for while a flower pot is being filled. */
+    private Item plantWanted;
+    /** Set once a shovel or hoe block is seen: the cells above it wait (see {@link #heldByTool}). */
+    private boolean airAboveWork;
+    /** hasToolAnywhere: asked once per tick per tool; a tool found missing stays missing for {@link #TOOL_MISSING_TICKS} ticks. */
+    private final Map<Object, Boolean> toolHasCache = new HashMap<>();
+    private final Map<Object, Integer> toolMissingUntil = new HashMap<>();
+    private int toolHasTick = -1;
+    private static final int TOOL_MISSING_TICKS = 20;
+    private boolean warnedDry, toolSneak;
+    private int waterBlockedUntil, waterLeft, waterDone, dryCount;
     private final List<String> dryLines = new ArrayList<>();
+    private final RecheckQueue rechecks = new RecheckQueue();
+    private static final int RECHECK_DELAY = 100, RECHECK_INTERVAL = 200;
+    private final List<int[]> skippedWrong = new ArrayList<>();
+    private WrongBlocks wrongSigMode;
+    private boolean wrongSigNever;
+    private long lastSoundMs;
+    private double aimYaw, aimPitch;
+    private boolean layerLogged;
+    private LayerFilter.Mode layerModeLogged;
+    // Layer building and scaffolding
+    private LayerCursor layers;
+    private Integer shownLayer;
+    private boolean lastStalled;
+    private final Map<Long, Scaf> scaffolds = new ConcurrentHashMap<>();
+    private final Map<Item, Info> scaffoldInfos = new HashMap<>();
+    private final Map<Long, Integer> scaffoldFail = new HashMap<>();
+    private final Set<Integer> scaffoldWarned = new HashSet<>();
+    private List<BlockPos> scaffoldRemovable = List.of();
+    /** Stand blocks nobody needs but that the player is on or beside: kept until the player has moved off. */
+    private List<BlockPos> standShielded = List.of();
+    /** Cells where Baritone put a spare block that the schematic wants something else in: ours, broken whatever wrong-blocks says. */
+    private final Set<Long> ownWrong = new HashSet<>();
+    private final Map<Long, Integer> scaffoldBudgetHits = new HashMap<>();
+    /** The walk goal is a walk to take stand blocks down (walk only, ending away from them). */
+    private boolean removalWalk, walkNoPlace;
+    private int removalSince, removalFails, removalRetryAt;
+    private static final int REMOVAL_WALK_MAX = 20 * 20;
+    private List<ScaffoldPlanner.Box> scaffoldAreas = List.of();
+    private boolean scaffoldNoSpareWarned, scaffoldPlannedNow;
+    private int scaffoldTry = -1000, scaffoldCheck = -1000, scaffoldPlacedTotal, scaffoldRemovedTotal;
+    private static final int SCAFFOLD_EVERY = 10, SCAFFOLD_CHECK = 5, SCAFFOLD_PLANNED_TTL = 300, SCAFFOLD_FAIL_TTL = 200, SCAFFOLD_BREAK_TRIES = 200;
+    /** The most one planning pass may take in all, however many cells ran out of their own time. */
+    private static final long SCAFFOLD_TOTAL_NANOS = 4_000_000L;
     private BlockPos refillSource;
     private int refillScanTick = -1000;
     private LayerFilter layer = LayerFilter.ALL;
@@ -729,13 +997,28 @@ public class Printer extends Module {
     private final SmartPlaceSession session = new SmartPlaceSession(new SessionHost());
     private final AutoHotbar.Need need = new AutoHotbar.Need("build blocks", s -> currentItem != null && s.is(currentItem) && s.getCount() >= currentCost && !loadedShulker(s), () -> 0, false, () -> currentItem != null);
     // The tools follow the same hotbar rules as the blocks: weapons, food and shulker boxes are never moved out of the way
-    private final AutoHotbar.Need axeNeed = new AutoHotbar.Need("axe", this::usableAxe, () -> 0, false, () -> !stripPending.isEmpty());
+    private final Map<Tool, AutoHotbar.Need> toolNeeds = makeToolNeeds();
     private final AutoHotbar.Need waterNeed = new AutoHotbar.Need("water bucket", s -> s.is(Items.WATER_BUCKET), () -> 0, false, () -> !waterJobs.isEmpty())
         .sharing(s -> s.is(Items.BUCKET));
     private final AutoHotbar.Need emptyBucketNeed = new AutoHotbar.Need("bucket", s -> s.is(Items.BUCKET), () -> 0, false, () -> waterlog.get() && refillWaterBucket.get() && waterWorkAhead())
         .sharing(s -> s.is(Items.WATER_BUCKET));
     private final AutoHotbar hotbar = new AutoHotbar(() -> true, s -> keepForeign.get() && !s.isEmpty() && !isBuildItem(s),
-        m -> warning("%s", m), m -> info("%s", m), List.of(need, axeNeed, waterNeed, emptyBucketNeed));
+        m -> warning("%s", m), m -> info("%s", m), allNeeds());
+
+    private Map<Tool, AutoHotbar.Need> makeToolNeeds() {
+        Map<Tool, AutoHotbar.Need> m = new EnumMap<>(Tool.class);
+        for (Tool t : Tool.values()) m.put(t, new AutoHotbar.Need(t.label(), s -> usableTool(t, s, plantWanted), () -> 0, false, () -> hasJobFor(t)));
+        return m;
+    }
+
+    private List<AutoHotbar.Need> allNeeds() {
+        List<AutoHotbar.Need> all = new ArrayList<>();
+        all.add(need);
+        all.addAll(toolNeeds.values());
+        all.add(waterNeed);
+        all.add(emptyBucketNeed);
+        return all;
+    }
 
     // Orphans
     private Object orphanLevel;
@@ -827,12 +1110,28 @@ public class Printer extends Module {
         }
         // Turning the module on is a new build for the order limits (a reload is not)
         buildKey = "";
+        queue = null;
+        if (queueEnabled.get()) {
+            BuildQueue.Parsed parsed = BuildQueue.parse(queueList.get());
+            for (String problem : parsed.errors()) warning("Queue: %s", problem);
+            if (parsed.entries().isEmpty()) {
+                error("The queue has no usable entry: add schematics to queue, or turn queue-enabled off.");
+                toggle();
+                return;
+            }
+            queue = new BuildQueue(parsed.entries());
+        }
         startRun();
     }
 
     @Override
     public void onDeactivate() {
         session.shutdown();
+        // Switched off in the middle of a run: say how far it got
+        if (loop != null && !reported && built != null) {
+            reported = true;
+            report(false);
+        }
         stopRun();
     }
 
@@ -853,24 +1152,39 @@ public class Printer extends Module {
         stopRun();
         runId++;
         runLevel = mc.level;
-        tick = 0;
+        // tick keeps counting across runs: a timer left from an earlier run can never look recent
         int ping = pingTicks();
-        loop = new PrintLoop(Math.max(PrintLoop.VERIFY_TICKS, ping + 2), PrintLoop.RETRIES);
+        loop = new PrintLoop(Math.max(PrintLoop.VERIFY_TICKS, ping + 2), PrintLoop.RETRIES, PrintLoop.HYSTERESIS);
         budget = new PacketBudget(packetBudget.get());
+        markWrongSig();
         registries();
         StateResolver.prepare();
-        orderer = new BuildOrderer(order.get().mode, bottomUp.get(), airplace.get());
+        orderer = new BuildOrderer(order.get().mode, layerOrder.get() == LayerOrder.Off ? bottomUp.get() : layerOrder.get() != LayerOrder.TopToBottom, airplace.get());
         orderer.setIdleCache(20);
+        movePolicy.setMode(movement.get().mode);
+        movePolicy.reset();
+        lastWay = MovePolicy.Way.WALK;
+        pathFailures = retryWalkAt = 0;
+        layers = layerOrder.get() == LayerOrder.Off ? null : new LayerCursor(layerOrder.get().mode);
         partBits = new TargetBits();
         stashOrders.reset();
         String key = source.get() + "|" + fileName.get() + "|" + originX.get() + "," + originY.get() + "," + originZ.get() + "|" + rotation.get() + "|" + mirror.get();
+        boolean queueEmpty = false;
+        if (queue != null) {
+            // each queue entry is its own build for the order limits
+            queueEmpty = !queue.seek(this::queueProblem, this::queueSkipped);
+            key = queueEmpty ? "queue|end" : "queue|" + queue.index() + "|" + queue.current().raw() + "|" + rotation.get() + "|" + mirror.get() + "|"
+                + originX.get() + "," + originY.get() + "," + originZ.get();
+        }
         if (!key.equals(buildKey)) {
             buildKey = key;
             stashOrders.newBuild();
         }
+        if (queueEmpty) loadError = "No schematic of the queue can be built.";
         reported = false;
         layer = LayerFilter.ALL;
         layerRead = false;
+        warnOtherModules();
         QwerteAddon.LOG.info("printer: started ({}, blocks-per-tick {}, packet-budget {})", source.get(), blocksPerTick.get(), packetBudget.get());
     }
 
@@ -910,6 +1224,23 @@ public class Printer extends Module {
         resolved = scanDone = false;
         cursor = null;
         orderer = null;
+        layers = null;
+        shownLayer = null;
+        lastStalled = false;
+        scaffolds.clear();
+        scaffoldFail.clear();
+        scaffoldWarned.clear();
+        scaffoldRemovable = List.of();
+        scaffoldAreas = List.of();
+        standShielded = List.of();
+        ownWrong.clear();
+        scaffoldBudgetHits.clear();
+        removalWalk = walkNoPlace = false;
+        removalFails = removalRetryAt = 0;
+        scaffoldNoSpareWarned = scaffoldPlannedNow = false;
+        scaffoldTry = scaffoldCheck = -1000;
+        scaffoldPlacedTotal = scaffoldRemovedTotal = 0;
+        scaffoldFailures = 0;
         targets.clear();
         sweep.clear();
         sweepAt = 0;
@@ -917,6 +1248,9 @@ public class Printer extends Module {
         tally = new MaterialPlanner.Tally();
         buildItems.clear();
         infos.clear();
+        airAboveWork = false;
+        toolHasCache.clear();
+        toolMissingUntil.clear();
         recipes.clear();
         wrongQueue.clear();
         wrongKeys.clear();
@@ -934,15 +1268,28 @@ public class Printer extends Module {
         lastMenuTick = -1000;
         loadedCache.clear();
         lastClicked.clear();
+        lastFar = lastFarInfinite = -1000;
+        lastClickTick = -1000;
+        releasedAt = -1000;
+        loadedCacheTick = 0;
+        openedInstead = 0;
+        rechecks.clear();
+        skippedWrong.clear();
+        layerLogged = false;
+        layerModeLogged = null;
         plan = null;
         prevLook = null;
         placeDelay = 0;
         walkSince = -1;
-        stripPending.clear();
+        toolJobs.clear();
         waterJobs.clear();
-        warnedNoAxe = warnedDry = stripSneak = false;
-        stripBlockedUntil = waterBlockedUntil = 0;
-        waterLeft = stripDone = waterDone = dryCount = 0;
+        warnedTools.clear();
+        toolDone.clear();
+        Arrays.fill(toolBlockedUntil, 0);
+        plantWanted = null;
+        warnedDry = toolSneak = false;
+        waterBlockedUntil = 0;
+        waterLeft = waterDone = dryCount = 0;
         refillSource = null;
         refillScanTick = -1000;
         dryLines.clear();
@@ -974,6 +1321,15 @@ public class Printer extends Module {
         session.tick();
         if (loop == null) return;
         tick++;
+        try {
+            tickBody();
+        } finally {
+            // Keys nobody drove this tick go up, whatever way the tick ended
+            fly.endTick(tick);
+        }
+    }
+
+    private void tickBody() {
         if (orderer != null) orderer.advance();
 
         if (built != null && (!layerRead || tick % LAYER_EVERY == 0)) readLayer();
@@ -981,6 +1337,8 @@ public class Printer extends Module {
         PrintLoop.Step step = loop.tick(obs);
         if (step.msg() != null) tell(step.level(), step.msg());
         if (step.msg() != null && step.msg().startsWith(PrintLoop.STUCK_PREFIX)) reportStuck();
+        if (step.msg() != null && step.act() == PrintLoop.Act.STOP_WALK && loop != null && loop.errorPause()) playSound(true);
+        if (wrongBlocks.get() != wrongSigMode || neverBreakContainers.get() != wrongSigNever) requeueSkippedWrong();
 
         // Checks that run whatever the loop does
         recoverOpened();
@@ -990,11 +1348,11 @@ public class Printer extends Module {
 
         if (loop == null) return;
         if (orderFromStash.get() && scanDone) stashOrders.tick(System.currentTimeMillis(), ordersView);
-        // Stripping and waterlogging are clicks on blocks that were just placed: done before the player can walk out of reach
-        stripSneak = false;
+        // Tool clicks and waterlogging are clicks on blocks that were just placed: done before the player can walk out of reach
+        toolSneak = false;
         boolean acted = false;
         if (scanDone && step.act() != PrintLoop.Act.FINISH && step.act() != PrintLoop.Act.ABORT && step.act() != PrintLoop.Act.RESUPPLY) {
-            acted = stripTick() || waterTick();
+            acted = toolTick() || waterTick();
         }
         switch (step.act()) {
             case LOAD -> startLoad();
@@ -1009,15 +1367,19 @@ public class Printer extends Module {
             case RESUPPLY -> resupply.start();
             case SKIP_WRONG -> skipWrong();
             case BREAK_WRONG -> breakTick();
+            case REMOVE_SCAFFOLD -> removeScaffoldTick();
             case FINISH, ABORT -> {
                 finishRun(step.act() == PrintLoop.Act.FINISH);
                 return;
             }
             default -> {}
         }
-        if (step.act() != PrintLoop.Act.PLACE && sneak.holding() && !stripSneak) sneak.release();
+        if (step.act() != PrintLoop.Act.PLACE && sneak.holding() && !toolSneak) sneak.release();
+        // Baritone's placing is watched for a few ticks after it was last allowed
+        if (tick <= standTrackUntil) trackStandBlocks();
         if (loop != null && loop.phase() != PrintLoop.Phase.IDLE && scanDone) {
             sweepStep();
+            recheckStep();
             layerPass();
             holdScan();
         }
@@ -1030,6 +1392,12 @@ public class Printer extends Module {
         boolean building = loaded && scanDone && loop.phase() != PrintLoop.Phase.LOADING && loop.phase() != PrintLoop.Phase.SCANNING && !worldChanged;
 
         plan = null;
+        if (building) {
+            layerTick();
+            scaffoldMaintain();
+        } else if (orderer != null) {
+            orderer.setActiveLayer(null);
+        }
         boolean otherSession = SmartPlaceSession.busy() && !session.active();
         if (building && !session.active() && !resupply.running() && !otherSession) {
             // While the placing delay runs the last plan is still good: nothing can be placed this tick anyway
@@ -1051,14 +1419,59 @@ public class Printer extends Module {
         // Our own goal was only just let go of: Baritone may need a tick or two to say so
         boolean barBusy = userMoving || SmartPlaceSession.BARITONE && walk.get() && tick - releasedAt >= 2
             && BaritoneHelper.controlledByOther((baritone.api.pathing.goals.Goal) walkGoal);
-        boolean canWalk = canWalkNow();
+        boolean canWalk = canMoveNow();
 
-        BuildOrderer.Cell firstWrong = wrongQueue.peekFirst();
-        return new PrintLoop.Obs(worldChanged, cancelled, loaded, loadError, scanDone, targets.size(), wrongQueue.size(),
-            firstWrong == null ? null : describeWrong(firstWrong), breaking != null, wrongBlocks.get().mode, placeable, walkTarget, lacking,
+        // With layers on, a wrong block in a layer the cursor has not reached is left alone
+        BuildOrderer.Cell firstWrong = firstWrong();
+        boolean waitingFlag = otherSession || !useJobs.isEmpty() || plan != null && plan.waiting || jobsCanProgress() || layerDirty || holdScanning();
+        lastStalled = building && plan != null && !placeable && !walkTarget && !lacking && !plan.waiting && !waitingFlag && loop.verifying() == 0
+            && firstWrong == null && breaking == null && scaffoldIdle() && !deferredWaiting();
+        return new PrintLoop.Obs(worldChanged, cancelled, loaded, loadError, scanDone, targets.size(), firstWrong == null ? 0 : wrongQueue.size(),
+            firstWrong == null ? null : describeWrong(firstWrong), breaking != null, wrongModeFor(firstWrong), placeable, walkTarget, lacking,
             lackingInfo, !lacking || supplyPossible(lackingId), resupply.running(), resupply.takeFailure(), session.active(), full, barBusy, canWalk,
-            otherSession || !useJobs.isEmpty() || plan != null && plan.waiting || jobsCanProgress() || layerDirty || holdScanning(),
-            orderWait, orderProblem, disableWhenOut.get(), layerHold());
+            waitingFlag, orderWait, orderProblem, disableWhenOut.get(), layerHold(), scaffoldLeft(), scaffoldRemovableNow(),
+            layers != null && layers.working());
+    }
+
+    /** What the loop does with the first wrong block: the setting, except that blocks of ours are always broken. */
+    private PrintLoop.Wrong wrongModeFor(BuildOrderer.Cell first) {
+        return first != null && ownWrong.contains(key(first)) ? PrintLoop.Wrong.BREAK_AND_REPLACE : wrongBlocks.get().mode;
+    }
+
+    private BuildOrderer.Cell firstWrong() {
+        // Spare blocks Baritone put into the build are ours: they go first
+        if (!ownWrong.isEmpty()) {
+            for (BuildOrderer.Cell c : wrongQueue) if (ownWrong.contains(key(c)) && (layers == null || layers.eligible(c.y()))) return c;
+        }
+        if (layers == null) return wrongQueue.peekFirst();
+        for (BuildOrderer.Cell c : wrongQueue) if (layers.eligible(c.y())) return c;
+        return null;
+    }
+
+    /** Moves the layer cursor and tells the orderer which y it may offer. */
+    private void layerTick() {
+        if (orderer == null) return;
+        if (layers == null) {
+            orderer.setActiveLayer(null);
+            return;
+        }
+        Integer a = layers.update(targets, mc.player.getBlockY(), y -> orderer.readyCount(y, 512, box(), worldView), lastStalled);
+        orderer.setActiveLayer(a);
+        if (java.util.Objects.equals(a, shownLayer)) return;
+        shownLayer = a;
+        // The searches and the plan of the layer before are no good for this one
+        lastFar = -1000;
+        lastPlan = null;
+        farCells = List.of();
+        unloadedHint = cycleHint = null;
+        walkSince = -1;
+        if (a != null) {
+            QwerteAddon.LOG.info("printer: layer Y={}: {} block(s), {} carried over", a, targets.open(a), layers.carriedCount());
+            info("Layer Y=%d: %d blocks", a, targets.open(a));
+        } else if (layers.free()) {
+            QwerteAddon.LOG.info("printer: no layer can be built on its own; building whatever is possible anywhere");
+            info("No layer can be built on its own right now: building whatever is possible, anywhere.");
+        }
     }
 
     // ---------------------------------------------------------------------------------------------------------------
@@ -1073,16 +1486,38 @@ public class Printer extends Module {
             loadError = "The game folder could not be found.";
             return;
         }
-        String name = fileName.get();
-        if (source.get() != Source.LitematicaLatest && name.isBlank()) {
-            loadError = "Set file-name first.";
-            return;
+        SourcePicker.Config cfg;
+        if (queue != null) {
+            BuildQueue.Entry e = queue.current();
+            if (e == null) {
+                loadError = "No schematic of the queue is left.";
+                return;
+            }
+            // a file entry is placed by its own origin when it has one, else by the origin settings; rotation and mirror are the settings'
+            int[] o = e.origin();
+            cfg = new SourcePicker.Config(e.kind() == BuildQueue.Kind.FILE ? SourcePicker.Mode.FILE : SourcePicker.Mode.LITEMATICA_BY_NAME, e.name(), e.name(),
+                o != null ? o[0] : originX.get(), o != null ? o[1] : originY.get(), o != null ? o[2] : originZ.get(), rotation.get(), mirror.get(), root,
+                SchematicFile.DEFAULT_TIMEOUT);
+            info("Loading %s...", queue.label());
+        } else {
+            String name = fileName.get();
+            if (source.get() != Source.LitematicaLatest && name.isBlank()) {
+                loadError = "Set file-name first.";
+                return;
+            }
+            cfg = new SourcePicker.Config(source.get().mode, name, name, originX.get(), originY.get(), originZ.get(), rotation.get(),
+                mirror.get(), root, SchematicFile.DEFAULT_TIMEOUT);
+            info("Loading the schematic...");
         }
-        SourcePicker.Config cfg = new SourcePicker.Config(source.get().mode, name, name, originX.get(), originY.get(), originZ.get(), rotation.get(),
-            mirror.get(), root, SchematicFile.DEFAULT_TIMEOUT);
-        info("Loading the schematic...");
         Future<?> f = SourcePicker.pick(cfg, picked -> {
             if (id != runId || loop == null) return;
+            if (!picked.ok() && queue != null) {
+                // an entry that fails to load is skipped like a missing one
+                queueSkipped(queue.current(), LitematicReader.clean(picked.error(), 160));
+                queue.skip();
+                startRun();
+                return;
+            }
             if (!picked.ok()) {
                 loadError = LitematicReader.clean(picked.error(), 240);
                 return;
@@ -1108,7 +1543,10 @@ public class Printer extends Module {
     private void onCell(int x, int y, int z, BlockState want) {
         Info in = infoOf(want);
         if (in.item() != null) buildItems.add(in.item());
-        if (in.rawItem() != null) buildItems.add(in.rawItem());
+        if (in.toolSource() != null) {
+            if (in.toolSource().rawItem() != null) buildItems.add(in.toolSource().rawItem());
+            if (in.toolSource().plant() != null) buildItems.add(in.toolSource().plant());
+        }
         if (in.cost().skipped() || in.spec().part()) {
             MaterialPlanner.Cost c = tally.add(in.cost());
             if (c.skipped()) noteSkipped(c.skip(), x, y, z);
@@ -1130,7 +1568,7 @@ public class Printer extends Module {
             if (seen != Seen.NO) {
                 tally.remove(c);
                 presentCount++;
-                if (seen == Seen.NEEDS_STRIP) addStrip(x, y, z, in);
+                if (seen == Seen.NEEDS_TOOL) addTool(x, y, z, in);
                 else queueWater(in, st, scratch.immutable(), true);
                 return;
             }
@@ -1212,20 +1650,43 @@ public class Printer extends Module {
         if (in == null) {
             StateSpec spec = StateClassifier.classify(want);
             MaterialPlanner.Cost cost = MaterialPlanner.cost(spec, ITEMS);
-            in = new Info(spec, cost, cost.item() == null ? null : itemsById.get(cost.item()), rawItemOf(spec));
+            ToolSource ts = null;
+            if (!spec.skipped() && !cost.skipped()) {
+                if (want.getBlock() instanceof FlowerPotBlock pot && pot.getPotted() != Blocks.AIR) {
+                    // A potted plant: an empty pot, then the plant on it. Both are materials.
+                    Item plant = ToolTables.plantOf(want.getBlock());
+                    if (plant == null) {
+                        cost = new MaterialPlanner.Cost(null, 0, spec.blockId() + " has no plant item to fill the pot with");
+                    } else {
+                        cost = cost.withExtra(BuiltInRegistries.ITEM.getKey(plant).toString(), 1);
+                        BlockState pot0 = Blocks.FLOWER_POT.defaultBlockState();
+                        ts = new ToolSource(new ToolAction(Tool.PLANT, HandTables.FLOWER_POT), Items.FLOWER_POT, true, plant, pot0, StateClassifier.classify(pot0));
+                    }
+                } else {
+                    ts = toolSourceOf(spec);
+                }
+                if (ts != null && ts.action().needsAirAbove()) airAboveWork = true;
+            }
+            in = new Info(spec, cost, cost.item() == null ? null : itemsById.get(cost.item()), ts);
             infos.put(want, in);
         }
         return in;
     }
 
-    /** For a stripped log and the like: the item of the block an axe turns into it (a block with an axis only). */
-    private static Item rawItemOf(StateSpec spec) {
-        if (spec.skipped() || spec.kind() != StateKind.AXIS) return null;
-        Block b = blocksById.get(spec.blockId());
-        Block raw = b == null ? null : StripTable.raw(b);
-        if (raw == null) return null;
-        Item item = raw.asItem();
-        return item == Items.AIR ? null : item;
+    /** For a block a tool finishes (logs, farmland, waxed copper, carved pumpkins, lit candles, ...): the tool and the raw block. */
+    private static ToolSource toolSourceOf(StateSpec spec) {
+        Tool property = ToolRules.propertyTool(spec.blockId(), spec.props());
+        if (property != null) return new ToolSource(new ToolAction(property, spec.blockId()), null, false, null, null, null);
+        List<ToolAction> actions = TOOLS.actionsFor(spec.blockId());
+        if (actions.isEmpty()) return null;
+        ToolAction pref = ToolRules.preferred(actions);
+        Block raw = blocksById.get(pref.rawId());
+        Item rawItem = raw == null ? Items.AIR : raw.asItem();
+        if (rawItem == Items.AIR) return null;
+        boolean only = HandTables.toolOnly(spec.blockId());
+        // Placed differently from the wanted block: dirt for farmland, a pumpkin for a carved one (same class: logs, copper, dirt)
+        BlockState rawState = only || pref.tool() == Tool.SHEARS ? raw.defaultBlockState() : null;
+        return new ToolSource(pref, rawItem, only, null, rawState, rawState == null ? null : StateClassifier.classify(rawState));
     }
 
     private static long key(int x, int y, int z) {
@@ -1244,7 +1705,7 @@ public class Printer extends Module {
     private void evaluate(BuildOrderer.Cell cell, Info in, BlockState st) {
         Seen seen = seen(in, st);
         if (seen != Seen.NO) {
-            if (seen == Seen.NEEDS_STRIP) addStrip(cell.x(), cell.y(), cell.z(), in);
+            if (seen == Seen.NEEDS_TOOL) addTool(cell.x(), cell.y(), cell.z(), in);
             else queueWater(in, st, posOf(cell), true);
             finish(cell, in, Fin.PRESENT, null);
             return;
@@ -1262,6 +1723,7 @@ public class Printer extends Module {
         orderer.remove(cell);
         orderer.unplaced(cell.x(), cell.y(), cell.z());
         if (wrongKeys.remove(k)) wrongQueue.removeIf(c -> key(c) == k);
+        ownWrong.remove(k);
         awaiting.remove(k);
         deferred.remove(k);
         forceSneak.remove(k);
@@ -1272,10 +1734,17 @@ public class Printer extends Module {
         String where = cell.x() + " " + cell.y() + " " + cell.z();
         String what = in == null ? "?" : in.spec().describe();
         switch (how) {
-            case PLACED -> builtCount++;
-            case PRESENT -> presentCount++;
+            case PLACED -> {
+                builtCount++;
+                rechecks.add(cell.x(), cell.y(), cell.z(), tick, RECHECK_DELAY);
+            }
+            case PRESENT -> {
+                presentCount++;
+                rechecks.add(cell.x(), cell.y(), cell.z(), tick, RECHECK_DELAY);
+            }
             case DROPPED -> {}
             case SKIPPED -> {
+                if (skippedWrong.size() < 20000) skippedWrong.add(new int[] { cell.x(), cell.y(), cell.z() });
                 if (wrongLines.size() < STORED_LIST) wrongLines.add(why + " at " + where + " (wanted " + what + ")");
             }
             case FAILED -> {
@@ -1317,6 +1786,8 @@ public class Printer extends Module {
             if (awaiting.containsKey(k) || waiting != null && waiting.dueTick() != Integer.MAX_VALUE || wrongKeys.contains(k)) continue;
             scratch.set(c.x(), c.y(), c.z());
             if (!mc.level.isLoaded(scratch)) {
+                // With a layer active only its cells are worth walking to
+                if (orderer.activeLayer() != null && c.y() != orderer.activeLayer()) continue;
                 if (cycleHint == null || nearer(c, cycleHint)) cycleHint = c;
                 // Known at once, not only when the sweep wraps: it is where to walk when nothing else is in reach
                 if (unloadedHint == null || nearer(c, unloadedHint)) unloadedHint = c;
@@ -1357,23 +1828,34 @@ public class Printer extends Module {
         int n = Math.max(8, Math.min(65, blocksPerTick.get() * 2));
         Map<Item, Integer> have = inventoryCounts();
         Item[] lack = { null };
+        Map<Object, Boolean> carried = new HashMap<>();
         // A ready cell whose materials are not carried must not take one of the places: the ones behind it may be placeable
         // (A cell outside Litematica's render layers is never offered; that is not a missing item.)
         Predicate<BuildOrderer.Cell> usable = c -> {
+            Scaf sc0 = scaffolds.get(key(c));
+            if (sc0 != null) return have.getOrDefault(sc0.item, 0) >= 1;
             if (!layer.contains(c.x(), c.y(), c.z())) return false;
             BlockState w = built.stateAt(scratch2.set(c.x(), c.y(), c.z()));
             if (w == null || w.isAir()) return true;
             Info in = infoOf(w);
             if (in.item() == null) return true;
+            // Farmland is tilled before anything is placed above it (the hoe needs air above; a solid block turns it to dirt)
+            if (airAboveWork && heldByTool(c, carried)) return false;
             if (have.getOrDefault(in.item(), 0) < in.cost().count()) {
-                // The unstripped block does too (an axe strips it after the placement)
-                if (in.rawItem() != null && have.getOrDefault(in.rawItem(), 0) >= 1) return true;
-                if (lack[0] == null) lack[0] = in.item();
+                // The raw block does too (the tool finishes it after the placement)
+                if (canUseRaw(in, have, carried)) return true;
+                if (lack[0] == null) lack[0] = lackNamed(in, have);
+                return false;
+            }
+            // A potted plant needs the plant as well as the pot: the missing plant is what the message names
+            ToolSource pts = in.toolSource();
+            if (pts != null && pts.plant() != null && in.cost().extra() != null
+                && have.getOrDefault(pts.plant(), 0) < Math.max(1, in.cost().extraCount())) {
+                if (lack[0] == null) lack[0] = pts.plant();
                 return false;
             }
             return true;
         };
-        Boolean[] axe = { null };
         orderer.setWorkCap(0);
         List<BuildOrderer.Cell> near = orderer.top(n, eye.x, eye.y, eye.z, reach, box, worldView, prevLook, usable);
         double yaw = mc.player.getYRot(), pitch = mc.player.getXRot();
@@ -1382,19 +1864,26 @@ public class Printer extends Module {
             BuildOrderer.Cell c = c0;
             scratch.set(c.x(), c.y(), c.z());
             BlockPos pos = scratch.immutable();
-            BlockState want = built.stateAt(pos);
-            if (want == null || want.isAir()) {
+            Scaf sc = scaffolds.get(key(c));
+            BlockState want = sc != null ? sc.state : built.stateAt(pos);
+            if (sc == null && (want == null || want.isAir())) {
                 finish(c, null, Fin.DROPPED, null);
                 continue;
             }
-            Info in = infoOf(want);
+            Info in = sc != null ? sc.info : infoOf(want);
             if (in.item() == null) {
                 finish(c, in, Fin.FAILED, "no item to place it with");
                 continue;
             }
-            PlaceSimulator.Confirmed conf = recipeFor(c, want, in, pos);
+            // The item itself when it is carried (preferred); else the raw block, which gets its tool after it is placed
+            Use use = useFor(in, have, carried);
+            ToolSource ts = in.toolSource();
+            BlockState simWant = use.raw() && ts.rawState() != null ? ts.rawState() : want;
+            StateSpec simSpec = use.raw() && ts.rawSpec() != null ? ts.rawSpec() : in.spec();
+            PlaceSimulator.Confirmed conf = recipeFor(c, simWant, simSpec, pos);
             if (conf == null) {
-                defer(c, in, "no way to place it from here: " + in.spec().describe());
+                if (sc != null) dropScaffold(sc);
+                else defer(c, in, "no way to place it from here: " + in.spec().describe());
                 continue;
             }
             PlaceRecipe r = conf.recipe();
@@ -1413,19 +1902,7 @@ public class Printer extends Module {
             if (requireLineOfSight.get() && !visible(eye, hitVec, clicked, r.airplace())) continue;
             if (rotationMode.get() == RotationMode.None && !r.look().contains(yaw, pitch)) continue;
             BlockHitResult hit = new BlockHitResult(hitVec, DIRECTIONS[r.face().ordinal()], clicked, false);
-            // The item itself when it is carried (preferred); else the unstripped block, which gets an axe click after it is placed
-            Item use = in.item();
-            int useCount = in.cost().count();
-            boolean raw = false;
-            if (in.rawItem() != null) {
-                StripRules.Choice choice = StripRules.choose(have.getOrDefault(in.item(), 0) >= useCount, have.getOrDefault(in.rawItem(), 0) >= 1, axe[0] == null ? (axe[0] = hasAxeAnywhere()) : axe[0]);
-                if (choice == StripRules.Choice.RAW_THEN_STRIP || choice == StripRules.Choice.RAW_NO_AXE) {
-                    use = in.rawItem();
-                    useCount = 1;
-                    raw = true;
-                }
-            }
-            p.preps.add(new Prep(c, in, r, hit, hotbarSlot(use, useCount), use, useCount, raw));
+            p.preps.add(new Prep(c, in, r, hit, hotbarSlot(use.item(), use.count()), use.item(), use.count(), use.raw()));
         }
         p.placeable = !p.preps.isEmpty();
         if (p.placeable) return p;
@@ -1442,10 +1919,10 @@ public class Printer extends Module {
             orderer.setWorkCap(0);
         }
         for (BuildOrderer.Cell c : farCells) {
-            if (!targets.contains(c.x(), c.y(), c.z())) continue;
+            if (!targets.contains(c.x(), c.y(), c.z()) && !scaffolds.containsKey(key(c))) continue;
             p.walkParts.add(new BlockPos(c.x(), c.y(), c.z()));
         }
-        if (p.walkParts.isEmpty() && unloadedHint != null) {
+        if (p.walkParts.isEmpty() && unloadedHint != null && (orderer.activeLayer() == null || unloadedHint.y() == orderer.activeLayer())) {
             scratch.set(unloadedHint.x(), unloadedHint.y(), unloadedHint.z());
             if (!mc.level.isLoaded(scratch)) p.walkParts.add(scratch.immutable());
             else unloadedHint = null;
@@ -1457,24 +1934,22 @@ public class Printer extends Module {
             // A search that was cut short has not said there is nothing: the run must not count that as being stuck
             p.waiting = farTruncated && !p.lacking;
         }
-        if (!p.walkTarget && !p.lacking && (!stripPending.isEmpty() || !waterJobs.isEmpty())) {
-            // Logs waiting for the axe and blocks waiting for water that are out of reach: go to them (only the ones that can progress)
-            int toStrip = 0;
-            if (hasAxeAnywhere()) {
-                for (StripJob j : stripPending.values()) {
-                    if (!mc.level.isLoaded(j.pos()) || tick - j.since() > STRIP_GIVE_UP || eye.distanceTo(Vec3.atCenterOf(j.pos())) <= reach) continue;
-                    p.walkParts.add(j.pos());
-                    if (++toStrip >= 8) break;
-                }
+        if (!p.walkTarget && !p.lacking && (!toolJobs.isEmpty() || !waterJobs.isEmpty())) {
+            // Blocks waiting for a tool or for water that are out of reach: go to them (only the ones that can progress)
+            int toJobs = 0;
+            for (ToolJob j : toolJobs.values()) {
+                if (!mc.level.isLoaded(j.pos()) || tick - j.since() > TOOL_GIVE_UP || !toolCarried(j, carried) || blockedAbove(j) || eye.distanceTo(Vec3.atCenterOf(j.pos())) <= reach) continue;
+                p.walkParts.add(j.pos());
+                if (++toJobs >= 8) break;
             }
-            if (toStrip < 8 && waterCanProgress()) {
+            if (toJobs < 8 && waterCanProgress()) {
                 for (WaterJob j : waterJobs.values()) {
                     if (!mc.level.isLoaded(j.pos()) || tick > j.giveUp() || eye.distanceTo(Vec3.atCenterOf(j.pos())) <= reach) continue;
                     p.walkParts.add(j.pos());
-                    if (++toStrip >= 8) break;
+                    if (++toJobs >= 8) break;
                 }
             }
-            if (toStrip > 0) {
+            if (toJobs > 0) {
                 p.walkTarget = true;
                 p.waiting = false;
             }
@@ -1482,11 +1957,17 @@ public class Printer extends Module {
         if (!p.walkTarget && !p.lacking) {
             // Standing in a cell that is still to be built keeps it from being placed: step out of it
             BlockPos feet = mc.player.blockPosition();
-            if (targets.contains(feet.getX(), feet.getY(), feet.getZ()) || targets.contains(feet.getX(), feet.getY() + 1, feet.getZ())) {
+            if (targets.contains(feet.getX(), feet.getY(), feet.getZ()) || targets.contains(feet.getX(), feet.getY() + 1, feet.getZ())
+                || scaffoldUnplacedAt(feet.getX(), feet.getY(), feet.getZ()) || scaffoldUnplacedAt(feet.getX(), feet.getY() + 1, feet.getZ())) {
                 p.walkParts.add(feet);
                 p.walkTarget = true;
                 p.waiting = false;
             }
+        }
+        if (!p.walkTarget && !p.lacking && !p.waiting) {
+            // Nothing to do in this layer: a cell with nothing to be placed against may be helped by a scaffold chain
+            if (scaffoldInProgress()) p.waiting = true;
+            else if (scaffoldPlan(eye, box, have)) p.waiting = true;
         }
         return p;
     }
@@ -1521,7 +2002,7 @@ public class Printer extends Module {
     }
 
     /** The recipe for a cell: from the cache, or proposed by the mapper and confirmed by the game's own placement code. */
-    private PlaceSimulator.Confirmed recipeFor(BuildOrderer.Cell c, BlockState want, Info in, BlockPos pos) {
+    private PlaceSimulator.Confirmed recipeFor(BuildOrderer.Cell c, BlockState want, StateSpec spec, BlockPos pos) {
         int mask = 0;
         boolean[] clickable = new boolean[6], interactive = new boolean[6];
         Dir[] dirs = Dir.values();
@@ -1534,11 +2015,14 @@ public class Printer extends Module {
                 scratch.set(nx, ny, nz);
                 BlockState ns = mc.level.getBlockState(scratch);
                 interactive[i] = BlockUtils.isClickable(ns.getBlock()) || mc.level.getBlockEntity(scratch) != null;
+                // A neighbour of the same block (a bottom slab next to a slab): a click on it can merge instead of placing,
+                // so a recipe worked out without one must not be reused with one
+                if (ns.getBlock() == want.getBlock()) mask |= 1 << (12 + i);
             }
             if (clickable[i]) mask |= 1 << i;
             if (interactive[i]) mask |= 1 << (6 + i);
         }
-        boolean cacheable = CACHEABLE.contains(in.spec().kind());
+        boolean cacheable = CACHEABLE.contains(spec.kind());
         RecipeKey rk = new RecipeKey(want, mask, airplace.get());
         if (cacheable) {
             PlaceSimulator.Confirmed hit = recipes.get(rk);
@@ -1555,9 +2039,9 @@ public class Printer extends Module {
                 return interactive[d.ordinal()];
             }
         };
-        List<PlaceRecipe> proposed = PlacementMapper.recipes(in.spec(), view, airplace.get());
+        List<PlaceRecipe> proposed = PlacementMapper.recipes(spec, view, airplace.get());
         if (proposed.isEmpty()) return null;
-        PlaceSimulator.Confirmed conf = PlaceSimulator.confirm(mc.level, mc.player, want, pos, in.spec(), proposed);
+        PlaceSimulator.Confirmed conf = PlaceSimulator.confirm(mc.level, mc.player, want, pos, spec, proposed);
         if (conf != null && cacheable) {
             if (recipes.size() >= RECIPE_CACHE_MAX) recipes.clear();
             recipes.put(rk, conf);
@@ -1625,7 +2109,7 @@ public class Printer extends Module {
             double[] look = look(batch.window(), lead.hit().getLocation());
             Runnable action = () -> execute(chosen);
             if (rotationMode.get() == RotationMode.None) action.run();
-            else Rotations.rotate(look[0], look[1], action);
+            else Rotations.rotate(look[0], look[1], ROTATION_PRIORITY, true, action);
 
             prevLook = batch.window();
             blocksLeft -= chosen.size();
@@ -1657,15 +2141,17 @@ public class Printer extends Module {
             if (o != PrinterActions.Outcome.SENT) continue;
             if (lastClickTick != tick) lastClicked.clear();
             long k = key(c);
+            Scaf scaf = scaffolds.get(k);
+            if (scaf != null && !scaf.placed) {
+                scaf.placed = true;
+                scaffoldPlacedTotal++;
+            }
             orderer.placed(c);
             awaiting.put(k, new Awaiting(c, p.info(), r, tick, p.raw()));
             loop.placed(k);
             if (p.raw()) {
-                addStrip(c.x(), c.y(), c.z(), p.info());
-                if (!hasAxeAnywhere() && !warnedNoAxe) {
-                    warnedNoAxe = true;
-                    warning("No axe in your inventory: logs are placed unstripped and are stripped when you carry an axe and are within reach of them.");
-                }
+                addTool(c.x(), c.y(), c.z(), p.info());
+                warnNoTool(p.info().toolSource().tool(), p.info().toolSource().plant());
             }
             queueWater(p.info(), null, posOf(c), false);
             lastClicked.add(posOf(c));
@@ -1722,10 +2208,15 @@ public class Printer extends Module {
             BuildOrderer.Cell c = a.cell();
             scratch.set(c.x(), c.y(), c.z());
             BlockState st = mc.level.getBlockState(scratch);
-            // A block that only waits for the axe is placed
+            Scaf sc = scaffolds.get(k);
+            if (sc != null) {
+                scaffoldVerdict(sc, k, c, PrinterActions.built(a.info().spec(), st));
+                continue;
+            }
+            // A block that only waits for its tool is placed
             Seen seen = seen(a.info(), st);
             boolean ok = seen != Seen.NO;
-            if (seen == Seen.NEEDS_STRIP) addStrip(c.x(), c.y(), c.z(), a.info());
+            if (seen == Seen.NEEDS_TOOL) addTool(c.x(), c.y(), c.z(), a.info());
             switch (loop.verdict(k, ok)) {
                 case OK -> {
                     PlaceRecipe r = a.recipe();
@@ -1769,41 +2260,146 @@ public class Printer extends Module {
     }
 
     // ---------------------------------------------------------------------------------------------------------------
-    // Stripping logs, waterlogging blocks, the layer range, the schematic area
+    // Tool jobs (stripping logs, tilling farmland, ...), waterlogging blocks, the layer range, the schematic area
 
-    private String rawIdOf(String strippedId) {
-        Block b = blocksById.get(strippedId);
-        Block raw = b == null ? null : StripTable.raw(b);
-        return raw == null ? null : StateClassifier.idOf(raw);
-    }
-
-    /** What the world shows at a cell next to what the schematic wants: built; "right block, needs strip" (the unstripped block with the wanted axis); or neither. */
+    /** What the world shows at a cell next to what the schematic wants: built; "right block, needs its tool"; or neither. */
     private Seen seen(Info in, BlockState st) {
-        if (PrinterActions.built(in.spec(), st)) return Seen.BUILT;
-        if (in.rawItem() == null || st.isAir()) return Seen.NO;
-        String haveAxis = st.hasProperty(BlockStateProperties.AXIS) ? st.getValue(BlockStateProperties.AXIS).getSerializedName() : null;
-        return StripRules.classify(in.spec().blockId(), in.spec().props().get("axis"), StateClassifier.idOf(st.getBlock()), haveAxis, this::rawIdOf)
-            == StripRules.WorldState.NEEDS_STRIP ? Seen.NEEDS_STRIP : Seen.NO;
+        ToolSource ts = in.toolSource();
+        if (PrinterActions.built(in.spec(), st)) {
+            // A candle that is there but not lit, a campfire that burns when it should be out: the block is right, the property is not
+            if (ts != null && ts.property() && neededAction(in, st) != null) return Seen.NEEDS_TOOL;
+            return Seen.BUILT;
+        }
+        if (ts == null || ts.property() || st.isAir()) return Seen.NO;
+        return neededAction(in, st) != null ? Seen.NEEDS_TOOL : Seen.NO;
     }
 
-    private void addStrip(int x, int y, int z, Info in) {
-        stripPending.putIfAbsent(key(x, y, z), new StripJob(new BlockPos(x, y, z), 0, -1000, tick, in.spec().blockId()));
+    /** The tool action that turns the world block into what the schematic wants here, or null (built, or not a raw block of it). */
+    private ToolAction neededAction(Info in, BlockState st) {
+        if (in.toolSource() == null || st.isAir()) return null;
+        ToolRules.Verdict v = ToolRules.classify(in.spec(), StateClassifier.idOf(st.getBlock()), StateClassifier.props(st), TOOLS);
+        return v.needsTool() ? v.action() : null;
     }
 
-    /** The axe turns this world block into the block the schematic wants here (its unstripped partner), and nothing else. */
-    private static boolean stripsInto(BlockState st, String wantId) {
-        Block result = StripTable.stripped(st.getBlock());
-        return result != null && (wantId == null || StateClassifier.idOf(result).equals(wantId));
+    private void addTool(int x, int y, int z, Info in) {
+        ToolSource ts = in.toolSource();
+        if (ts == null) return;
+        toolJobs.putIfAbsent(key(x, y, z), new ToolJob(new BlockPos(x, y, z), in, ts.tool(), 0, -1000, tick));
     }
 
-    private boolean usableAxe(ItemStack s) {
-        return !s.isEmpty() && s.is(ItemTags.AXES) && (!s.isDamageableItem() || s.getMaxDamage() - s.getDamageValue() > 1);
+    private boolean hasJobFor(Tool t) {
+        for (ToolJob j : toolJobs.values()) if (j.tool() == t) return true;
+        return false;
     }
 
-    private boolean hasAxeAnywhere() {
+    private static Item plantOf(Info in) {
+        return in.toolSource() == null ? null : in.toolSource().plant();
+    }
+
+    /** The tool in this stack will do: it is the right kind and has a use left (a pot takes the one plant it is wanted with). */
+    private boolean usableTool(Tool t, ItemStack s, Item plant) {
+        if (s.isEmpty()) return false;
+        boolean durable = !s.isDamageableItem() || s.getMaxDamage() - s.getDamageValue() > 1;
+        return switch (t) {
+            case AXE -> s.is(ItemTags.AXES) && durable;
+            case SHOVEL -> s.is(ItemTags.SHOVELS) && durable;
+            case HOE -> s.is(ItemTags.HOES) && durable;
+            case SHEARS -> s.is(Items.SHEARS) && durable;
+            case FLINT_AND_STEEL -> s.is(Items.FLINT_AND_STEEL) && durable;
+            case HONEYCOMB -> s.is(Items.HONEYCOMB);
+            case PLANT -> plant != null && s.is(plant);
+        };
+    }
+
+    private boolean hasToolAnywhere(Tool t, Item plant) {
         if (mc.player == null) return false;
-        for (int i = 0; i < 36; i++) if (usableAxe(mc.player.getInventory().getItem(i))) return true;
-        return usableAxe(mc.player.getOffhandItem());
+        if (toolHasTick != tick) {
+            toolHasCache.clear();
+            toolHasTick = tick;
+        }
+        Object k = t == Tool.PLANT ? plant : t;
+        Boolean known = toolHasCache.get(k);
+        if (known != null) return known;
+        Integer until = toolMissingUntil.get(k);
+        boolean has = false;
+        if (until == null || tick >= until) {
+            for (int i = 0; i < 36 && !has; i++) has = usableTool(t, mc.player.getInventory().getItem(i), plant);
+            has = has || usableTool(t, mc.player.getOffhandItem(), plant);
+            if (has) toolMissingUntil.remove(k);
+            else toolMissingUntil.put(k, tick + TOOL_MISSING_TICKS);
+        }
+        toolHasCache.put(k, has);
+        return has;
+    }
+
+    /** A hoe or shovel job under a solid block: the tool needs air above, so it can't progress until that is gone. */
+    private boolean blockedAbove(ToolJob j) {
+        ToolSource ts = j.info().toolSource();
+        if (ts == null || !ts.action().needsAirAbove()) return false;
+        BlockPos above = j.pos().above();
+        return mc.level.isLoaded(above) && !mc.level.getBlockState(above).isAir();
+    }
+
+    /** Whether the tool for this source is carried; {@code cache} (per planning pass) keeps it to one look at the inventory per tool. */
+    private boolean toolCarried(ToolSource ts, Map<Object, Boolean> cache) {
+        Object k = ts.tool() == Tool.PLANT ? ts.plant() : ts.tool();
+        return cache.computeIfAbsent(k, x -> hasToolAnywhere(ts.tool(), ts.plant()));
+    }
+
+    private boolean toolCarried(ToolJob j, Map<Object, Boolean> cache) {
+        ToolSource ts = j.info().toolSource();
+        return ts != null && toolCarried(ts, cache);
+    }
+
+    /** The item a missing-materials message names for a cell: its own, but the honeycomb when only that is missing. */
+    private Item lackNamed(Info in, Map<Item, Integer> have) {
+        ToolSource ts = in.toolSource();
+        if (ts != null && ts.tool() == Tool.HONEYCOMB && ts.rawItem() != null && have.getOrDefault(ts.rawItem(), 0) >= 1) return Items.HONEYCOMB;
+        return in.item();
+    }
+
+    /** The raw block's item is carried and may be placed now (honeycomb waits for the honeycomb: unwaxed copper ages). */
+    private boolean canUseRaw(Info in, Map<Item, Integer> have, Map<Object, Boolean> cache) {
+        ToolSource ts = in.toolSource();
+        if (ts == null || ts.property() || ts.only() || have.getOrDefault(ts.rawItem(), 0) < 1) return false;
+        return ToolRules.placeWithoutTool(ts.tool()) || toolCarried(ts, cache);
+    }
+
+    /** What to place for a cell: its own item when carried, else the raw block's (then the tool finishes it). */
+    private Use useFor(Info in, Map<Item, Integer> have, Map<Object, Boolean> cache) {
+        ToolSource ts = in.toolSource();
+        int count = in.cost().count();
+        if (ts == null || ts.property()) return new Use(in.item(), count, false);
+        // No item of its own (farmland, a potted plant): the raw block is always what is placed
+        if (ts.only()) return new Use(in.item(), count, true);
+        ToolRules.Choice choice = ToolRules.choose(have.getOrDefault(in.item(), 0) >= count, canUseRaw(in, have, cache), toolCarried(ts, cache));
+        if (choice == ToolRules.Choice.RAW_THEN_TOOL || choice == ToolRules.Choice.RAW_NO_TOOL) return new Use(ts.rawItem(), 1, true);
+        return new Use(in.item(), count, false);
+    }
+
+    /**
+     * A block that waits for a hoe or a shovel holds back the cell above it: the tool needs air above, and farmland under a
+     * solid block turns back to dirt. Applies while the tool is carried, so a missing tool never starves the cells above.
+     */
+    private boolean heldByTool(BuildOrderer.Cell c, Map<Object, Boolean> cache) {
+        int bx = c.x(), by = c.y() - 1, bz = c.z();
+        Info below = null;
+        ToolJob j = toolJobs.get(key(bx, by, bz));
+        if (j != null) below = j.info();
+        else if (targets.contains(bx, by, bz)) {
+            BlockState w = built.stateAt(scratch2.set(bx, by, bz));
+            if (w != null && !w.isAir()) below = infoOf(w);
+        }
+        ToolSource ts = below == null ? null : below.toolSource();
+        return ts != null && ToolRules.holdsAbove(ts.action(), toolCarried(ts, cache));
+    }
+
+    /** Said once per tool: the blocks are placed anyway and finished when the tool is carried. */
+    private void warnNoTool(Tool tool, Item plant) {
+        if (warnedTools.contains(tool) || hasToolAnywhere(tool, plant)) return;
+        warnedTools.add(tool);
+        String what = tool == Tool.PLANT && plant != null ? itemName(plant) : tool.label();
+        warning("No %s in your inventory: blocks that need it are placed first and finished when you carry it and are within reach of them.", what);
     }
 
     /** The slot of the first matching item: 0 to 8 in the hotbar, {@link #OFFHAND}, -2 in the main inventory only, -1 not carried. */
@@ -1814,10 +2410,6 @@ public class Printer extends Module {
         return -1;
     }
 
-    private int axeSlot() {
-        return slotOf(this::usableAxe);
-    }
-
     private int waterBucketSlot() {
         return slotOf(s -> s.is(Items.WATER_BUCKET));
     }
@@ -1826,95 +2418,135 @@ public class Printer extends Module {
         return slotOf(s -> s.is(Items.BUCKET));
     }
 
+    /** Traces along the look the action asked for (aimYaw, aimPitch), not along whatever the player's rotation is at that moment. */
     private BlockHitResult traceLook(ClipContext.Fluid fluid) {
         Vec3 eye = mc.player.getEyePosition();
-        Vec3 end = eye.add(mc.player.getViewVector(1f).scale(mc.player.blockInteractionRange()));
+        double y = Math.toRadians(aimYaw), p = Math.toRadians(aimPitch);
+        Vec3 dir = new Vec3(-Math.sin(y) * Math.cos(p), -Math.sin(p), Math.cos(y) * Math.cos(p));
+        Vec3 end = eye.add(dir.scale(mc.player.blockInteractionRange()));
         return mc.level.clip(new ClipContext(eye, end, ClipContext.Block.OUTLINE, fluid, mc.player));
     }
 
     /** Runs the click with the look it needs (right away when rotation-mode is None). */
     private void lookAndDo(Vec3 aim, Runnable action) {
-        if (rotationMode.get() == RotationMode.None) action.run();
-        else Rotations.rotate(Rotations.getYaw(aim), Rotations.getPitch(aim), action);
+        if (rotationMode.get() == RotationMode.None) {
+            aimYaw = mc.player.getYRot();
+            aimPitch = mc.player.getXRot();
+            action.run();
+            return;
+        }
+        aimYaw = Rotations.getYaw(aim);
+        aimPitch = Rotations.getPitch(aim);
+        Rotations.rotate(aimYaw, aimPitch, ROTATION_PRIORITY, true, action);
     }
 
     /** Moves a tool into the hotbar (one move); false when it could not be, with a pause before the next try. */
-    private boolean pullIntoHotbar(AutoHotbar.Need what, boolean axeSide) {
+    private boolean pullIntoHotbar(AutoHotbar.Need what, Tool tool) {
         long now = System.currentTimeMillis();
         if (budget.canSend(now, 1) && hotbar.ensure(what)) {
             budget.record(now, 1);
             return true;
         }
-        if (axeSide) stripBlockedUntil = tick + 40;
+        if (tool != null) toolBlockedUntil[tool.ordinal()] = tick + 40;
         else waterBlockedUntil = tick + 40;
         return false;
     }
 
     /**
-     * Uses an axe on a log that was placed unstripped (or found so). Returns true when it spent this tick on it, so the
-     * placing waits one tick. Nothing here moves a weapon, food or a shulker box: the axe is pulled in by the same hotbar
-     * helper as the building blocks.
+     * Uses the tool of a block that was placed in its raw form (or found so): an axe on a log, a hoe on dirt, the plant on a
+     * pot. Returns true when it spent this tick on it, so the placing waits one tick. Nothing here moves a weapon, food or a
+     * shulker box: the tool is pulled in by the same hotbar helper as the building blocks.
      */
-    private boolean stripTick() {
-        if (stripPending.isEmpty() || mc.player == null || mc.level == null || mc.screen != null || session.active() || resupply.running()) return false;
+    private boolean toolTick() {
+        if (toolJobs.isEmpty() || mc.player == null || mc.level == null || mc.screen != null || session.active() || resupply.running()) return false;
         Vec3 eye = mc.player.getEyePosition();
         double reach = reach();
-        StripJob pick = null;
+        ToolJob pick = null;
+        ToolAction pickAction = null;
         long pickKey = 0;
-        for (Iterator<Map.Entry<Long, StripJob>> it = stripPending.entrySet().iterator(); it.hasNext(); ) {
-            Map.Entry<Long, StripJob> e = it.next();
-            StripJob j = e.getValue();
+        ToolJob missing = null;
+        boolean sweepAll = tick % 20 == 0;
+        for (Iterator<Map.Entry<Long, ToolJob>> it = toolJobs.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<Long, ToolJob> e = it.next();
+            ToolJob j = e.getValue();
+            boolean inReach = eye.distanceTo(Vec3.atCenterOf(j.pos())) <= reach;
+            // The tool is not carried anywhere: its jobs wait (looked up once per tick per tool, a miss is kept for a second)
+            if (!hasToolAnywhere(j.tool(), plantOf(j.info()))) {
+                if (inReach && missing == null) missing = j;
+                continue;
+            }
+            // Looking at a job costs a state classification: the ones in reach are looked at every tick (until one is picked),
+            // the others once a second (to drop what was finished by hand)
+            if (!inReach && !sweepAll || pick != null && !sweepAll) continue;
             if (!mc.level.isLoaded(j.pos())) continue;
             BlockState st = mc.level.getBlockState(j.pos());
-            if (!stripsInto(st, j.wantId())) {
-                // Stripped (by us or by hand), gone, or not the unstripped partner of the wanted block: nothing to do here
-                if (j.tries() > 0 && !st.isAir()) stripDone++;
+            ToolAction action = neededAction(j.info(), st);
+            if (action == null) {
+                // Done (by us or by hand), gone, or not a raw block of the wanted one: nothing to do here
+                if (j.tries() > 0 && seen(j.info(), st) == Seen.BUILT) toolDone.merge(j.tool(), 1, Integer::sum);
                 it.remove();
                 continue;
             }
-            if (j.tries() >= STRIP_TRIES && tick - j.lastTick() >= STRIP_WAIT) {
-                if (failedLines.size() < STORED_LIST) failedLines.add(StateClassifier.idOf(st.getBlock()) + " at " + j.pos().getX() + " " + j.pos().getY() + " " + j.pos().getZ() + ": could not be stripped");
+            if (j.tries() >= TOOL_TRIES && tick - j.lastTick() >= TOOL_WAIT) {
+                if (failedLines.size() < STORED_LIST) failedLines.add(StateClassifier.idOf(st.getBlock()) + " at " + j.pos().getX() + " " + j.pos().getY() + " " + j.pos().getZ() + ": the " + j.tool().label() + " did not work on it");
                 it.remove();
                 continue;
             }
-            if (tick - j.lastTick() < STRIP_WAIT) continue;
-            if (pick == null && eye.distanceTo(Vec3.atCenterOf(j.pos())) <= reach) {
+            if (tick - j.lastTick() < TOOL_WAIT || !inReach) continue;
+            // A shovel and a hoe need air above (vanilla ShovelItem, HoeItem.onlyIfAirAbove)
+            if (action.needsAirAbove() && !mc.level.getBlockState(j.pos().above()).isAir()) continue;
+            if (!hasToolAnywhere(action.tool(), plantOf(j.info()))) {
+                if (missing == null) missing = j;
+                continue;
+            }
+            if (pick == null) {
                 pick = j;
+                pickAction = action;
                 pickKey = e.getKey();
             }
         }
-        if (pick == null) return false;
-        int slot = axeSlot();
-        if (slot == -1) {
-            if (!warnedNoAxe) {
-                warnedNoAxe = true;
-                warning("No axe in your inventory: logs are placed unstripped and are stripped when you carry an axe and are within reach of them.");
-            }
+        if (pick == null) {
+            if (missing != null) warnNoTool(missing.tool(), plantOf(missing.info()));
             return false;
         }
-        if (slot == -2) return tick >= stripBlockedUntil && pullIntoHotbar(axeNeed, true);
+        Tool tool = pickAction.tool();
+        Item plant = plantOf(pick.info());
+        int slot = slotOf(s -> usableTool(tool, s, plant));
+        if (slot == -1) return false;
+        if (slot == -2) {
+            plantWanted = plant;
+            return tick >= toolBlockedUntil[tool.ordinal()] && pullIntoHotbar(toolNeeds.get(tool), tool);
+        }
 
         long now = System.currentTimeMillis();
-        // Axe in the main hand with a shield in the off hand: the game only strips while sneaking
-        if (slot != OFFHAND && Players.blocksWithoutSneak(mc.player.getOffhandItem())) {
+        if (tool.needsNoSneak()) {
+            // The pot and the pumpkin do their part in the block's own right-click code, which sneaking skips
+            if (sneak.holding()) {
+                sneak.release();
+                return true;
+            }
+            if (mc.player.isShiftKeyDown()) return false;
+        } else if (tool == Tool.AXE && slot != OFFHAND && Players.blocksWithoutSneak(mc.player.getOffhandItem())) {
+            // Axe in the main hand with a shield in the off hand: the game only strips while sneaking (AxeItem; the shovel and hoe have no such rule)
             if (!sneak.holding()) budget.record(now, 1);
             sneak.press();
-            stripSneak = true;
+            toolSneak = true;
             if (!sneak.ready(sneakTicks.get())) return true;
         }
         if (!budget.trySpend(now, 3 + (swing.get() ? 1 : 0))) return false;
         if (savedSlot < 0) savedSlot = Players.selectedSlot();
 
         BlockPos pos = pick.pos();
-        Direction dir = DIRECTIONS[StripRules.faceToward(eye.x, eye.y, eye.z, pos.getX(), pos.getY(), pos.getZ()).ordinal()];
+        Dir face = ToolRules.clickFace(pickAction, pick.info().spec().facing(), eye.x, eye.y, eye.z, pos.getX(), pos.getY(), pos.getZ());
+        Direction dir = DIRECTIONS[face.ordinal()];
         Vec3 hitVec = new Vec3(pos.getX() + 0.5 + dir.getStepX() * 0.5, pos.getY() + 0.5 + dir.getStepY() * 0.5, pos.getZ() + 0.5 + dir.getStepZ() * 0.5);
         BlockHitResult hit = new BlockHitResult(hitVec, dir, pos, false);
-        stripPending.put(pickKey, new StripJob(pos, pick.tries() + 1, tick, pick.since(), pick.wantId()));
-        String wantId = pick.wantId();
+        Info info = pick.info();
+        toolJobs.put(pickKey, new ToolJob(pos, info, pick.tool(), pick.tries() + 1, tick, pick.since()));
         lookAndDo(hitVec, () -> {
             if (mc.player == null || mc.level == null || mc.gameMode == null) return;
-            if (!stripsInto(mc.level.getBlockState(pos), wantId)) return;
-            int use = axeSlot();
+            if (neededAction(info, mc.level.getBlockState(pos)) == null) return;
+            int use = slotOf(s -> usableTool(tool, s, plant));
             if (use < 0) return;
             InteractionHand hand = InteractionHand.MAIN_HAND;
             if (use == OFFHAND) hand = InteractionHand.OFF_HAND;
@@ -1954,6 +2586,7 @@ public class Printer extends Module {
             return;
         }
         // A block that was already there is walked to if need be, so it is given longer
+        QwerteAddon.LOG.debug("printer: water job queued at {} ({})", pos, present ? "already there" : "just placed");
         waterJobs.putIfAbsent(key(pos.getX(), pos.getY(), pos.getZ()), new WaterJob(pos, tick, tick + (present ? WATER_GIVE_UP_PRESENT : WATER_GIVE_UP), 0, -1000));
     }
 
@@ -1987,6 +2620,7 @@ public class Printer extends Module {
                 continue;
             }
             if (st.getValue(BlockStateProperties.WATERLOGGED)) {
+                QwerteAddon.LOG.debug("printer: water job at {} done after {} tries", pos, j.tries());
                 if (j.tries() > 0) waterDone++;
                 it.remove();
                 continue;
@@ -2014,13 +2648,14 @@ public class Printer extends Module {
                 noteDry("no water bucket", pos);
                 continue;
             }
-            if (slot == -2) return pullIntoHotbar(waterNeed, false);
+            if (slot == -2) return pullIntoHotbar(waterNeed, null);
             Vec3 aim = waterAim(eye, pos, st, reach);
             if (aim == null) continue;
             long now = System.currentTimeMillis();
             if (!budget.trySpend(now, 3 + (swing.get() ? 1 : 0))) return false;
             if (savedSlot < 0) savedSlot = Players.selectedSlot();
             e.setValue(new WaterJob(pos, j.since(), j.giveUp(), j.tries() + 1, tick));
+            QwerteAddon.LOG.debug("printer: water job at {} try {}", pos, j.tries() + 1);
             lookAndDo(aim, () -> useBucket(Items.WATER_BUCKET, ClipContext.Fluid.NONE, p -> p.equals(pos)));
             return true;
         }
@@ -2031,9 +2666,13 @@ public class Printer extends Module {
     private void useBucket(Item bucket, ClipContext.Fluid fluid, Predicate<BlockPos> wanted) {
         if (mc.player == null || mc.level == null || mc.gameMode == null) return;
         BlockHitResult tr = traceLook(fluid);
-        if (tr.getType() != HitResult.Type.BLOCK || !wanted.test(tr.getBlockPos())) return;
+        if (tr.getType() != HitResult.Type.BLOCK || !wanted.test(tr.getBlockPos())) {
+            QwerteAddon.LOG.debug("printer: bucket trace missed (yaw {}, pitch {}): {} {}", aimYaw, aimPitch, tr.getType(), tr.getType() == HitResult.Type.BLOCK ? tr.getBlockPos() : "");
+            return;
+        }
         int use = slotOf(s -> s.is(bucket));
         if (use < 0) return;
+        QwerteAddon.LOG.debug("printer: bucket used on {} (yaw {}, pitch {})", tr.getBlockPos(), aimYaw, aimPitch);
         InteractionHand hand = InteractionHand.MAIN_HAND;
         if (use == OFFHAND) hand = InteractionHand.OFF_HAND;
         else if (Players.selectedSlot() != use) InvUtils.swap(use, false);
@@ -2090,7 +2729,7 @@ public class Printer extends Module {
         BlockPos src = refillSource;
         boolean inReach = src != null && isWaterSource(src);
         if (!WaterlogRules.shouldRefill(true, true, false, true, inReach)) return false;
-        if (empty == -2) return pullIntoHotbar(emptyBucketNeed, false);
+        if (empty == -2) return pullIntoHotbar(emptyBucketNeed, null);
         Vec3 aim = sourceAim(eye, src, reach);
         if (aim == null) {
             refillSource = null;
@@ -2134,20 +2773,92 @@ public class Printer extends Module {
         return eye.distanceTo(hit.getLocation()) <= reach ? hit.getLocation() : null;
     }
 
+    // Rechecking finished cells, wrong-block mode changes, sounds, other modules
+
+    /** A slow look at finished cells in reach: one that became wrong, empty or dry goes back on the right queue. */
+    private void recheckStep() {
+        if (built == null || mc.level == null || rechecks.size() == 0 || session.active() || resupply.running()) return;
+        Vec3 eye = mc.player.getEyePosition();
+        double r = reach();
+        for (RecheckQueue.Cell c : rechecks.poll(tick, 24, 2, cell -> eye.distanceToSqr(cell.x() + 0.5, cell.y() + 0.5, cell.z() + 0.5) <= r * r)) {
+            scratch.set(c.x(), c.y(), c.z());
+            if (!mc.level.isLoaded(scratch) || targets.contains(c.x(), c.y(), c.z()) || !layer.contains(c.x(), c.y(), c.z())) continue;
+            BlockState want = built.stateAt(scratch);
+            if (want == null || want.isAir()) continue;
+            Info in = infoOf(want);
+            BlockState st = mc.level.getBlockState(scratch);
+            Seen seen = seen(in, st);
+            if (seen == Seen.BUILT) {
+                queueWater(in, st, scratch.immutable(), true);
+                rechecks.again(c, tick, RECHECK_INTERVAL);
+            } else if (seen == Seen.NEEDS_TOOL) {
+                addTool(c.x(), c.y(), c.z(), in);
+                rechecks.again(c, tick, RECHECK_INTERVAL);
+            } else {
+                QwerteAddon.LOG.debug("printer: finished cell at {} {} {} is no longer right, queued again", c.x(), c.y(), c.z());
+                onCell(c.x(), c.y(), c.z(), want);
+            }
+        }
+    }
+
+    /** Remembers the wrong-block settings as they are now (compared field by field, no string is built per tick). */
+    private void markWrongSig() {
+        wrongSigMode = wrongBlocks.get();
+        wrongSigNever = neverBreakContainers.get();
+    }
+
+    /** The wrong-blocks setting changed in the middle of a run: the cells that were skipped as wrong are looked at again. */
+    private void requeueSkippedWrong() {
+        markWrongSig();
+        if (built == null || mc.level == null || skippedWrong.isEmpty()) return;
+        List<int[]> cells = new ArrayList<>(skippedWrong);
+        skippedWrong.clear();
+        wrongLines.clear();
+        for (int[] p : cells) {
+            BlockState want = built.stateAt(scratch.set(p[0], p[1], p[2]));
+            if (want == null || want.isAir() || targets.contains(p[0], p[1], p[2])) continue;
+            onCell(p[0], p[1], p[2], want);
+        }
+        QwerteAddon.LOG.info("printer: wrong-blocks setting changed, {} skipped cell(s) looked at again", cells.size());
+    }
+
+    private void playSound(boolean error) {
+        if (mc.player == null || !(error ? errorSound : finishSound).get()) return;
+        List<SoundEvent> list = (error ? errorSoundEvent : finishSoundEvent).get();
+        long now = System.currentTimeMillis();
+        if (list.isEmpty() || now - lastSoundMs < 1500) return;
+        lastSoundMs = now;
+        mc.getSoundManager().play(SimpleSoundInstance.forUI(list.get(0), 1.0f, soundVolume.get().floatValue()));
+    }
+
+    /** Another module that places blocks or aims can fight the Printer for the look and the hotbar. Said once per run. */
+    private void warnOtherModules() {
+        List<String> names = new ArrayList<>();
+        for (Module m : Modules.get().getAll()) {
+            if (m == this || !m.isActive()) continue;
+            String n = (m.name + m.title).toLowerCase(Locale.ROOT).replaceAll("[-_ ]", "");
+            if (n.contains("printer") || n.contains("killaura") || n.contains("crystalaura")) names.add(m.title);
+        }
+        if (!names.isEmpty()) logWarn("These modules are on and can fight the Printer for your look and hotbar: " + String.join(", ", names) + ".");
+    }
+
     private boolean waterCanProgress() {
         return waterlog.get() && rotationMode.get() != RotationMode.None && (waterBucketSlot() != -1 || refillWaterBucket.get() && emptyBucketSlot() != -1);
     }
 
     /**
-     * A strip or water job holds the end of the run only while it can progress now: the axe or bucket is carried, its block is
-     * loaded and its give-up time has not passed. Jobs that cannot (no axe, unloaded chunk) never keep the Printer on; the
+     * A tool or water job holds the end of the run only while it can progress now: the tool or bucket is carried, its block is
+     * loaded and its give-up time has not passed. Jobs that cannot (no tool, unloaded chunk) never keep the Printer on; the
      * report lists them.
      */
     private boolean jobsCanProgress() {
-        if (mc.player == null || mc.level == null || stripPending.isEmpty() && waterJobs.isEmpty()) return false;
-        if (!stripPending.isEmpty() && hasAxeAnywhere()) {
-            for (StripJob j : stripPending.values()) {
-                if (JobHold.canProgress(true, mc.level.isLoaded(j.pos()), tick - j.since() > STRIP_GIVE_UP || j.tries() >= STRIP_TRIES)) return true;
+        if (mc.player == null || mc.level == null || toolJobs.isEmpty() && waterJobs.isEmpty()) return false;
+        if (!toolJobs.isEmpty()) {
+            Map<Object, Boolean> carried = new HashMap<>();
+            for (ToolJob j : toolJobs.values()) {
+                if (!toolCarried(j, carried)) continue;
+                if (blockedAbove(j)) continue;
+                if (JobHold.canProgress(true, mc.level.isLoaded(j.pos()), tick - j.since() > TOOL_GIVE_UP || j.tries() >= TOOL_TRIES)) return true;
             }
         }
         if (!waterJobs.isEmpty() && waterCanProgress()) {
@@ -2180,7 +2891,13 @@ public class Printer extends Module {
     /** Re-reads Litematica's render layers; a change marks the build to be sorted again (blocks outside leave, blocks inside come back). */
     private void readLayer() {
         layerRead = true;
-        LayerFilter now = built != null && built.mode().startsWith("litematica") ? LitematicaBridge.layer() : LayerFilter.ALL;
+        boolean fromLitematica = built != null && built.mode().startsWith("litematica");
+        LayerFilter now = fromLitematica ? LitematicaBridge.layer() : LayerFilter.ALL;
+        if (fromLitematica && LitematicaBridge.layerWorks() && (!layerLogged || now.mode() != layerModeLogged)) {
+            layerLogged = true;
+            layerModeLogged = now.mode();
+            QwerteAddon.LOG.info("printer: Litematica render layer mode is {}{}", now.mode(), now.active() ? " (axis " + now.axis() + ", " + now + ")" : " (everything is built)");
+        }
         if (now.equals(layer)) return;
         layer = now;
         layerDirty = true;
@@ -2294,16 +3011,459 @@ public class Printer extends Module {
     }
 
     // ---------------------------------------------------------------------------------------------------------------
+    // Scaffolding: spare blocks that give a cell something to be placed against, taken down when nothing needs them
+
+    private final ScaffoldPlanner.World scaffoldWorld = new ScaffoldPlanner.World() {
+        private final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+
+        @Override
+        public boolean air(int x, int y, int z) {
+            return mc.level.isLoaded(pos.set(x, y, z)) && mc.level.getBlockState(pos).isAir() && !scaffolds.containsKey(key(x, y, z));
+        }
+
+        @Override
+        public boolean solid(int x, int y, int z) {
+            return orderer != null && orderer.isPlacedSolid(x, y, z) || worldView.solid(x, y, z);
+        }
+
+        @Override
+        public boolean wanted(int x, int y, int z) {
+            if (built == null) return false;
+            BlockState w = built.stateAt(pos.set(x, y, z));
+            return w != null && !w.isAir();
+        }
+
+        @Override
+        public BuildOrderer.Cell open(int x, int y, int z) {
+            if (built == null || !targets.contains(x, y, z)) return null;
+            BlockState w = built.stateAt(pos.set(x, y, z));
+            return w == null || w.isAir() ? null : BuildOrderer.Cell.of(x, y, z, infoOf(w).spec(), null);
+        }
+    };
+
+    private int scaffoldFailures;
+
+    private boolean scaffoldEnabled() {
+        return layers != null && layers.active() != null && scaffold.get() && !airplace.get() && scaffoldFailures < 3;
+    }
+
+    private boolean scaffoldUnplacedAt(int x, int y, int z) {
+        Scaf sc = scaffolds.get(key(x, y, z));
+        return sc != null && !sc.placed;
+    }
+
+    /** Cells that failed to place and are waiting to be tried again. */
+    private boolean deferredWaiting() {
+        for (Deferred d : deferred.values()) if (d.dueTick() != Integer.MAX_VALUE) return true;
+        return false;
+    }
+
+    /** A chain is being placed: some scaffold block is not standing yet. */
+    private boolean scaffoldInProgress() {
+        for (Scaf sc : scaffolds.values()) if (!sc.built) return true;
+        return false;
+    }
+
+    private boolean scaffoldIdle() {
+        return !scaffoldInProgress();
+    }
+
+    /** Scaffold blocks that stand or may stand (a click was sent): they must be gone before the run can end. */
+    private int scaffoldLeft() {
+        int n = 0;
+        for (Scaf sc : scaffolds.values()) if (sc.placed) n++;
+        return n;
+    }
+
+    /**
+     * Some scaffold is not needed any more and the loop may take it down: in reach, or nothing else is left to do. A stand
+     * block (one Baritone climbed with) only counts while no walk is going and the player is not on or beside it
+     * ({@link StandShield}); at the very end the player is walked away from the last ones first.
+     */
+    private boolean scaffoldRemovableNow() {
+        if (mc.player == null || scaffoldRemovable.isEmpty() && standShielded.isEmpty()) return false;
+        boolean end = targets.size() == 0;
+        // Our own walk away from the stand blocks is going on: the loop keeps coming back to it
+        if (removalWalk && walkGoal != null) return true;
+        Vec3 eye = mc.player.getEyePosition();
+        BlockPos feet = mc.player.blockPosition();
+        double r = reach();
+        for (BlockPos p : scaffoldRemovable) {
+            Scaf sc = scaffolds.get(key(p.getX(), p.getY(), p.getZ()));
+            if (sc != null && sc.stand) {
+                if (StandShield.shielded(p.getX(), p.getY(), p.getZ(), feet.getX(), feet.getY(), feet.getZ())) continue;
+                if (walkGoal != null && !end) continue;
+            }
+            if (end || eye.distanceToSqr(Vec3.atCenterOf(p)) <= r * r) return true;
+        }
+        return end && !standShielded.isEmpty();
+    }
+
+    /** Every few ticks: scaffold nobody needs is listed for removal (or just dropped when it was never placed); stale plans expire. */
+    private void scaffoldMaintain() {
+        if (scaffolds.isEmpty()) {
+            if (!scaffoldRemovable.isEmpty()) scaffoldRemovable = List.of();
+            if (!standShielded.isEmpty()) standShielded = List.of();
+            return;
+        }
+        if (tick - scaffoldCheck < SCAFFOLD_CHECK) return;
+        scaffoldCheck = tick;
+        for (Scaf sc : new ArrayList<>(scaffolds.values())) {
+            if (!sc.placed && tick - sc.since > SCAFFOLD_PLANNED_TTL) {
+                dropScaffold(sc);
+            } else if (sc.built && mc.level.isLoaded(sc.pos) && !mc.level.getBlockState(sc.pos).is(sc.state.getBlock())) {
+                // The world showed it once and it is gone now (broken by someone, or replaced): it is no support any more
+                QwerteAddon.LOG.debug("printer: scaffold block at {} is gone, dropped", sc.pos);
+                dropScaffold(sc);
+            }
+        }
+        List<int[]> all = new ArrayList<>();
+        for (Scaf sc : scaffolds.values()) all.add(new int[] { sc.pos.getX(), sc.pos.getY(), sc.pos.getZ() });
+        List<BlockPos> remove = new ArrayList<>(), shielded = new ArrayList<>();
+        BlockPos feet = mc.player == null ? null : mc.player.blockPosition();
+        for (int[] p : ScaffoldPlanner.removable(scaffoldWorld, all, airplace.get())) {
+            long k = key(p[0], p[1], p[2]);
+            Scaf sc = scaffolds.get(k);
+            if (sc == null) continue;
+            if (!sc.placed) {
+                dropScaffold(sc); // never placed: it only leaves the queue
+                continue;
+            }
+            if (awaiting.containsKey(k)) continue;
+            // A stand block the player is on or beside stays until they have moved off it
+            if (sc.stand && feet != null && StandShield.shielded(p[0], p[1], p[2], feet.getX(), feet.getY(), feet.getZ())) {
+                shielded.add(sc.pos);
+                continue;
+            }
+            remove.add(sc.pos);
+        }
+        scaffoldRemovable = remove;
+        standShielded = shielded;
+    }
+
+    /** A scaffold block leaves the books (it was removed, never placed, or could not be placed). */
+    private void dropScaffold(Scaf sc) {
+        long k = key(sc.pos.getX(), sc.pos.getY(), sc.pos.getZ());
+        scaffolds.remove(k);
+        awaiting.remove(k);
+        if (orderer != null) {
+            orderer.releaseUngated(sc.pos.getX(), sc.pos.getY(), sc.pos.getZ());
+            orderer.unplaced(sc.pos.getX(), sc.pos.getY(), sc.pos.getZ());
+            orderer.wake(sc.pos.getX(), sc.pos.getY(), sc.pos.getZ());
+        }
+        if (loop != null) loop.forget(k);
+        if (!scaffoldRemovable.isEmpty()) scaffoldRemovable = scaffoldRemovable.stream().filter(p -> !p.equals(sc.pos)).toList();
+    }
+
+    /** The check of a scaffold block that was placed. */
+    private void scaffoldVerdict(Scaf sc, long k, BuildOrderer.Cell c, boolean ok) {
+        switch (loop.verdict(k, ok)) {
+            case OK -> {
+                sc.built = true;
+                awaiting.remove(k);
+                orderer.unplaced(c.x(), c.y(), c.z()); // the world shows it now
+                orderer.wake(c.x(), c.y(), c.z());
+            }
+            case RETRY -> {
+                awaiting.remove(k);
+                orderer.unplaced(c.x(), c.y(), c.z());
+                orderer.add(c);
+            }
+            case FAILED -> {
+                scaffoldFailures++;
+                dropScaffold(sc);
+                if (scaffoldFailures == 3) warning("Scaffold blocks keep not appearing; scaffolding is off for this run.");
+            }
+        }
+    }
+
+    private Info scaffoldInfoOf(Item item) {
+        return scaffoldInfos.computeIfAbsent(item, i -> {
+            StateSpec spec = StateClassifier.classify(((BlockItem) i).getBlock().defaultBlockState());
+            return new Info(spec, MaterialPlanner.cost(spec, ITEMS), i, null);
+        });
+    }
+
+    /** A block that makes good scaffold: a plain full cube, nothing that falls, opens, holds items or hurts. */
+    private boolean spareBlock(Block b) {
+        if (b instanceof FallingBlock || b instanceof EntityBlock || b instanceof LiquidBlock || b instanceof net.minecraft.world.level.block.piston.PistonBaseBlock
+            || b instanceof net.minecraft.world.level.block.ObserverBlock || b == Blocks.TNT || b == Blocks.MAGMA_BLOCK || BlockUtils.isClickable(b)) return false;
+        BlockState s = b.defaultBlockState();
+        if (s.getDestroySpeed(mc.level, BlockPos.ZERO) < 0 || !s.isCollisionShapeFullBlock(mc.level, BlockPos.ZERO)) return false;
+        StateSpec spec = StateClassifier.classify(s);
+        return !spec.skipped() && spec.kind() == StateKind.FULL;
+    }
+
+    /** The spare items: carried, not a schematic material, not one the hotbar protects, a spare block. The most plentiful first. */
+    private List<Item> spareList(Map<Item, Integer> have) {
+        return SpareItems.pick(have, buildItems::contains, it -> AutoHotbar.isProtected(it.getDefaultInstance()),
+            it -> it instanceof BlockItem bi && spareBlock(bi.getBlock()), it -> BuiltInRegistries.ITEM.getKey(it).toString());
+    }
+
+    /** The item to scaffold with: the most plentiful spare item. */
+    private Item spareItem(Map<Item, Integer> have) {
+        List<Item> spare = spareList(have);
+        return spare.isEmpty() ? null : spare.get(0);
+    }
+
+    private List<ScaffoldPlanner.Box> scaffoldBoxes() {
+        if (scaffoldAreas.isEmpty() && !areaBoxes.isEmpty()) {
+            List<ScaffoldPlanner.Box> l = new ArrayList<>();
+            for (int[] b : areaBoxes) l.add(new ScaffoldPlanner.Box(b[0], b[1], b[2], b[3], b[4], b[5]));
+            scaffoldAreas = l;
+        }
+        return scaffoldAreas;
+    }
+
+    /**
+     * Nothing in the active layer can be placed: for the nearest cells with nothing next to them, looks for a chain of spare
+     * blocks from an existing block to one of their faces (a nanosecond budget; a refused cell is not tried again for a
+     * while) and queues it. Returns true when a chain was queued.
+     */
+    private boolean scaffoldPlan(Vec3 eye, BuildOrderer.Box box, Map<Item, Integer> have) {
+        if (!scaffoldEnabled() || scaffoldInProgress() || tick - scaffoldTry < SCAFFOLD_EVERY) return false;
+        scaffoldTry = tick;
+        int layerY = layers.active();
+        List<BuildOrderer.Cell> stranded = orderer.stranded(layerY, 6, 4000, eye.x, eye.y, eye.z, box, worldView);
+        if (stranded.isEmpty()) return false;
+        Item item = spareItem(have);
+        if (item == null) {
+            if (!scaffoldNoSpareWarned) {
+                scaffoldNoSpareWarned = true;
+                warning("no spare blocks for scaffolding: carry some blocks the schematic doesn't use");
+            }
+            return false;
+        }
+        List<ScaffoldPlanner.Box> areas = scaffoldBoxes();
+        if (areas.isEmpty()) return false;
+        // Only planned blocks count toward scaffold-max; the stand blocks Baritone climbed with are not the Printer's to limit
+        int planned = 0;
+        for (Scaf s : scaffolds.values()) if (!s.stand) planned++;
+        int room = Math.min(scaffoldMax.get() - planned, have.getOrDefault(item, 0));
+        long started = System.nanoTime();
+        boolean timedOut = false;
+        for (BuildOrderer.Cell c : stranded) {
+            Integer until = scaffoldFail.get(key(c));
+            if (until != null && tick < until) continue;
+            // Each cell has its own time; a cell whose search ran out of it before gets more next time (up to 2 ms)
+            if (System.nanoTime() - started > SCAFFOLD_TOTAL_NANOS) {
+                timedOut = true;
+                break;
+            }
+            int hits = scaffoldBudgetHits.getOrDefault(key(c), 0);
+            long deadline = System.nanoTime() + ScaffoldPlanner.budgetNanos(hits);
+            ScaffoldPlanner.Result r = ScaffoldPlanner.plan(scaffoldWorld, areas, c.x(), c.y(), c.z(), ScaffoldPlanner.MAX_CHAIN, eye.x, eye.y, eye.z, deadline);
+            if (r.budgetHit()) {
+                // Out of time: remembered for this cell only, the others are still looked at
+                if (scaffoldBudgetHits.size() > 4096) scaffoldBudgetHits.clear();
+                scaffoldBudgetHits.merge(key(c), 1, Integer::sum);
+                timedOut = true;
+                continue;
+            }
+            scaffoldBudgetHits.remove(key(c));
+            if (r.chain() == null || r.chain().size() > room) {
+                if (scaffoldFail.size() > 4096) scaffoldFail.clear();
+                scaffoldFail.put(key(c), tick + SCAFFOLD_FAIL_TTL);
+                continue;
+            }
+            Info info = scaffoldInfoOf(item);
+            BlockState state = ((BlockItem) item).getBlock().defaultBlockState();
+            for (int[] b : r.chain().blocks()) {
+                BlockPos bp = new BlockPos(b[0], b[1], b[2]);
+                BuildOrderer.Cell cell = BuildOrderer.Cell.of(b[0], b[1], b[2], info.spec(), null);
+                Scaf sc = new Scaf(bp, item, state, info, tick);
+                if (scaffolds.putIfAbsent(key(cell), sc) == null) orderer.addUngated(cell);
+            }
+            lastFar = -1000;
+            lastPlan = null;
+            QwerteAddon.LOG.info("printer: scaffold of {} block(s) for the cell at {} {} {}", r.chain().size(), c.x(), c.y(), c.z());
+            return true;
+        }
+        if (!timedOut && scaffoldWarned.add(layerY) && scaffoldWarned.size() <= 5) {
+            BuildOrderer.Cell c = stranded.get(0);
+            warning("No scaffold can reach the cell at %d %d %d (layer Y=%d): no chain of up to %d spare blocks from a block that exists gets to it. The layer is carried over and tried again later.",
+                c.x(), c.y(), c.z(), layerY, ScaffoldPlanner.MAX_CHAIN);
+        }
+        return false;
+    }
+
+    /**
+     * Takes down scaffold nobody needs, breaking it like a wrong block. Planned scaffold goes nearest first (walking to it
+     * when it is out of reach, walk only). Stand blocks (the spare blocks Baritone climbed with) only when no walk is going,
+     * highest first, and never the ones the player is on or beside; at the very end the player is walked away from the last
+     * ones first.
+     */
+    private void removeScaffoldTick() {
+        if (mc.player == null || mc.level == null) return;
+        if (scaffoldRemovable.isEmpty() && standShielded.isEmpty()) return;
+        Vec3 eye = mc.player.getEyePosition();
+        BlockPos feet = mc.player.blockPosition();
+        BlockPos best = null;
+        double bestD = Double.MAX_VALUE;
+        List<BlockPos> free = new ArrayList<>();
+        for (BlockPos p : scaffoldRemovable) {
+            Scaf s = scaffolds.get(key(p.getX(), p.getY(), p.getZ()));
+            if (s != null && s.stand) {
+                if (!StandShield.shielded(p.getX(), p.getY(), p.getZ(), feet.getX(), feet.getY(), feet.getZ())) free.add(p);
+                continue;
+            }
+            double d = eye.distanceToSqr(Vec3.atCenterOf(p));
+            if (d < bestD) {
+                best = p;
+                bestD = d;
+            }
+        }
+        if (best == null) {
+            removeStandTick(eye, feet, free);
+            return;
+        }
+        Scaf sc = scaffolds.get(key(best.getX(), best.getY(), best.getZ()));
+        if (sc == null) {
+            BlockPos gone = best;
+            scaffoldRemovable = scaffoldRemovable.stream().filter(p -> !p.equals(gone)).toList();
+            return;
+        }
+        breakScaffold(sc, best, eye);
+    }
+
+    /** Stand blocks: one walk at a time, highest first, the player is walked off them at the end. */
+    private void removeStandTick(Vec3 eye, BlockPos feet, List<BlockPos> free) {
+        boolean end = targets.size() == 0;
+        if (walkGoal != null) {
+            if (!removalWalk) {
+                if (!end) return; // a building walk is going: the stand blocks wait for it
+                releaseWalk(); // nothing is left to build: the walk to nowhere ends
+            } else if (SmartPlaceSession.BARITONE && BaritoneHelper.goalIs((baritone.api.pathing.goals.Goal) walkGoal) && tick - removalSince < REMOVAL_WALK_MAX) {
+                return; // our own walk away from the blocks is going on
+            } else {
+                // The walk ended (no path, lost goal or timeout): it failed if the feet are still next to a stand block
+                int[][] left = new int[standShielded.size()][];
+                for (int i = 0; i < left.length; i++) left[i] = new int[] { standShielded.get(i).getX(), standShielded.get(i).getY(), standShielded.get(i).getZ() };
+                if (StandShield.walkFailed(feet.getX(), feet.getY(), feet.getZ(), left)) {
+                    removalFails++;
+                    removalRetryAt = tick + StandShield.RETRY_TICKS;
+                }
+                releaseWalk();
+                scaffoldCheck = -1000; // where the player stands now decides which blocks may go: the lists are made again first
+                return;
+            }
+        }
+        if (removalFails >= StandShield.MAX_FAILS) {
+            for (Scaf s : new ArrayList<>(scaffolds.values())) {
+                if (!s.stand) continue;
+                if (failedLines.size() < STORED_LIST) failedLines.add("stand block left standing at " + s.pos.getX() + " " + s.pos.getY() + " " + s.pos.getZ());
+                giveUpScaffold(s, "the Printer could not walk away from it");
+            }
+            removalFails = 0;
+            return;
+        }
+        if (!free.isEmpty()) {
+            int[][] arr = new int[free.size()][];
+            for (int i = 0; i < arr.length; i++) arr[i] = new int[] { free.get(i).getX(), free.get(i).getY(), free.get(i).getZ() };
+            BlockPos best = free.get(StandShield.topDown(arr, eye.x, eye.y, eye.z));
+            Scaf sc = scaffolds.get(key(best.getX(), best.getY(), best.getZ()));
+            if (sc == null) {
+                BlockPos gone = best;
+                scaffoldRemovable = scaffoldRemovable.stream().filter(p -> !p.equals(gone)).toList();
+                return;
+            }
+            breakScaffold(sc, best, eye);
+            return;
+        }
+        if (end && !standShielded.isEmpty()) startRemovalWalk(standShielded);
+    }
+
+    /** Walks (walk only) to where the eyes reach one of the blocks but the feet are not on or beside any stand block. */
+    private void startRemovalWalk(List<BlockPos> parts) {
+        if (tick < removalRetryAt) return;
+        if (!canWalkNow() || !confineBaritone()) {
+            removalFails = StandShield.MAX_FAILS;
+            return;
+        }
+        walkOnly();
+        List<int[]> shield = new ArrayList<>();
+        for (BlockPos p : parts) shield.add(new int[] { p.getX(), p.getY(), p.getZ() });
+        for (BlockPos p : scaffoldRemovable) {
+            Scaf s = scaffolds.get(key(p.getX(), p.getY(), p.getZ()));
+            if (s != null && s.stand) shield.add(new int[] { p.getX(), p.getY(), p.getZ() });
+        }
+        final int[][] snapshot = shield.toArray(new int[0][]);
+        walkGoal = BaritoneHelper.moveInReach(parts, Math.max(1.0, reach() - 0.25),
+            p -> targets.contains(p.getX(), p.getY(), p.getZ()) || partBits.contains(p.getX(), p.getY(), p.getZ())
+                || StandShield.badFeet(p.getX(), p.getY(), p.getZ(), snapshot));
+        removalWalk = true;
+        removalSince = lastWalk = tick;
+    }
+
+    /** Breaks one scaffold block, walking to it first if it is out of reach. */
+    private void breakScaffold(Scaf sc, BlockPos best, Vec3 eye) {
+        if (!mc.level.isLoaded(best)) {
+            if (++sc.breakTicks > SCAFFOLD_BREAK_TRIES) giveUpScaffold(sc, "its chunk is not loaded");
+            else if (canMoveNow()) walkToOnly(List.of(best));
+            return;
+        }
+        BlockState st = mc.level.getBlockState(best);
+        if (!st.is(sc.state.getBlock())) {
+            // Gone (taken down, or never appeared) or replaced by something else: nothing left to break
+            if (sc.built && st.isAir()) scaffoldRemovedTotal++;
+            dropScaffold(sc);
+            return;
+        }
+        if (st.getDestroySpeed(mc.level, best) < 0) {
+            giveUpScaffold(sc, "it cannot be broken");
+            return;
+        }
+        if (eye.distanceTo(Vec3.atCenterOf(best)) > reach()) {
+            if (++sc.breakTicks > SCAFFOLD_BREAK_TRIES) giveUpScaffold(sc, "it is out of reach and the Printer can't walk there");
+            else if (sc.stand) startRemovalWalk(List.of(best));
+            else if (canMoveNow()) walkToOnly(List.of(best));
+            return;
+        }
+        if (sc.stand) {
+            // The player may have moved since the list was made: never break a block they are on or beside
+            BlockPos feet = mc.player.blockPosition();
+            if (walkGoal != null || StandShield.shielded(best.getX(), best.getY(), best.getZ(), feet.getX(), feet.getY(), feet.getZ())) return;
+        }
+        releaseWalk();
+        if (++sc.breakTicks > SCAFFOLD_BREAK_TRIES) {
+            giveUpScaffold(sc, "it could not be broken");
+            return;
+        }
+        if (!budget.trySpend(System.currentTimeMillis(), 2)) return;
+        if (savedSlot < 0) savedSlot = Players.selectedSlot();
+        FindItemResult tool = InvUtils.findFastestTool(st);
+        if (tool.found() && tool.slot() != Players.selectedSlot()) InvUtils.swap(tool.slot(), false);
+        PrinterActions.breakBlock(best, rotationMode.get() != RotationMode.None, swing.get());
+    }
+
+    /** A walk that never places a block, whatever the building walk allowed. */
+    private void walkToOnly(List<BlockPos> parts) {
+        walkOnly();
+        walkNoPlace = true;
+        try {
+            walkTo(parts);
+        } finally {
+            walkNoPlace = false;
+        }
+    }
+
+    private void giveUpScaffold(Scaf sc, String why) {
+        warning("Scaffold block left standing at %d %d %d: %s.", sc.pos.getX(), sc.pos.getY(), sc.pos.getZ(), why);
+        dropScaffold(sc);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
     // Wrong blocks
 
     private void skipWrong() {
-        for (int i = 0; i < 32 && !wrongQueue.isEmpty(); i++) {
-            BuildOrderer.Cell c = wrongQueue.peekFirst();
+        for (int i = 0; i < 32; i++) {
+            BuildOrderer.Cell c = firstWrong();
+            if (c == null) break;
             scratch.set(c.x(), c.y(), c.z());
             BlockState want = built.stateAt(scratch);
             Info in = want == null ? null : infoOf(want);
             String existing = StateClassifier.idOf(mc.level.getBlockState(scratch).getBlock());
-            wrongQueue.pollFirst();
+            wrongQueue.remove(c);
             wrongKeys.remove(key(c));
             if (PrinterActions.free(mc.level.getBlockState(scratch))) {
                 // It went away by itself: build here again
@@ -2315,7 +3475,7 @@ public class Printer extends Module {
     }
 
     private void breakTick() {
-        BuildOrderer.Cell c = breaking != null ? breaking : wrongQueue.peekFirst();
+        BuildOrderer.Cell c = breaking != null ? breaking : firstWrong();
         if (c == null) {
             breaking = null;
             return;
@@ -2328,6 +3488,7 @@ public class Printer extends Module {
             // Broken (or gone): the cell is built again
             wrongQueue.removeIf(w -> key(w) == k);
             wrongKeys.remove(k);
+            ownWrong.remove(k);
             if (breaking != null && key(breaking) == k) brokenCount++;
             breaking = null;
             breakTicks = 0;
@@ -2341,8 +3502,9 @@ public class Printer extends Module {
             finish(c, in, Fin.SKIPPED, "wrong block " + existing + " (has contents, never-break-containers)");
             return;
         }
-        if (breakRisky(pos, st)) {
-            finish(c, in, Fin.SKIPPED, "wrong block " + existing + " (next to a fluid, a hazard or a falling block)");
+        String risk = breakRisk(pos, st, c, want, in);
+        if (risk != null) {
+            finish(c, in, Fin.SKIPPED, "wrong block " + existing + " (" + risk + ")");
             return;
         }
         if (st.getDestroySpeed(mc.level, pos) < 0) {
@@ -2352,7 +3514,7 @@ public class Printer extends Module {
         Vec3 eye = mc.player.getEyePosition();
         if (eye.distanceTo(Vec3.atCenterOf(pos)) > reach()) {
             breaking = null;
-            if (!canWalkNow()) {
+            if (!canMoveNow()) {
                 finish(c, in, Fin.SKIPPED, "wrong block " + existing + " (out of reach, walking is off)");
                 return;
             }
@@ -2373,14 +3535,70 @@ public class Printer extends Module {
         PrinterActions.breakBlock(pos, rotationMode.get() != RotationMode.None, swing.get());
     }
 
-    /** Breaking it could let a fluid flow, drop a column of sand, or put us next to lava or fire. */
-    private boolean breakRisky(BlockPos pos, BlockState st) {
-        if (st.getBlock() instanceof FallingBlock || mc.level.getBlockState(pos.above()).getBlock() instanceof FallingBlock) return true;
-        if (GroundCollector.hazardous(pos)) return true;
+    /**
+     * Why breaking it is risky (a short phrase), or null when it is not: it could let a fluid flow, drop a column of sand, or
+     * put us next to lava or fire. A real liquid block next to the cell always counts. Waterlogged neighbours (slabs, stairs,
+     * kelp) are water sources too: the block is then only broken when its replacement can be placed straight after
+     * ({@link BreakRules}).
+     */
+    private String breakRisk(BlockPos pos, BlockState st, BuildOrderer.Cell c, BlockState want, Info in) {
+        final String generic = "next to a fluid, a hazard or a falling block";
+        if (st.getBlock() instanceof FallingBlock || mc.level.getBlockState(pos.above()).getBlock() instanceof FallingBlock) return generic;
+        if (GroundCollector.hazardous(pos)) return generic;
+        boolean liquid = false, wet = !(st.getBlock() instanceof LiquidBlock) && !st.getFluidState().isEmpty();
         for (Direction d : DIRECTIONS) {
             BlockPos n = pos.relative(d);
-            if (!mc.level.isLoaded(n)) return true;
-            if (!mc.level.getBlockState(n).getFluidState().isEmpty()) return true;
+            if (!mc.level.isLoaded(n)) return generic;
+            BlockState ns = mc.level.getBlockState(n);
+            if (ns.getBlock() instanceof LiquidBlock) liquid = true;
+            else if (!ns.getFluidState().isEmpty()) wet = true;
+        }
+        boolean wantedAir = want == null || want.isAir();
+        boolean follows = wet && !liquid && !wantedAir && replacementFollows(c, want, in, pos);
+        BreakRules.Verdict v = BreakRules.fluidVerdict(liquid, wet, wantedAir, follows, follows);
+        return switch (v) {
+            case OK -> null;
+            case FLUID -> generic;
+            case NEXT_TO_WATER -> "next to water";
+        };
+    }
+
+    /** The wanted block (or its raw block) is carried and a placement recipe reaches the cell from where the player stands. */
+    private boolean replacementFollows(BuildOrderer.Cell c, BlockState want, Info in, BlockPos pos) {
+        if (in == null || in.item() == null) return false;
+        Map<Item, Integer> have = inventoryCounts();
+        Use use = useFor(in, have, new HashMap<>());
+        if (have.getOrDefault(use.item(), 0) < use.count()) return false;
+        ToolSource ts = in.toolSource();
+        StateSpec spec = use.raw() && ts != null && ts.rawSpec() != null ? ts.rawSpec() : in.spec();
+        boolean[] clickable = new boolean[6], interactive = new boolean[6];
+        Dir[] dirs = Dir.values();
+        for (int i = 0; i < 6; i++) {
+            Dir d = dirs[i];
+            int nx = c.x() + d.dx, ny = c.y() + d.dy, nz = c.z() + d.dz;
+            clickable[i] = orderer.isPlacedSolid(nx, ny, nz) || worldView.solid(nx, ny, nz);
+            if (clickable[i]) {
+                scratch2.set(nx, ny, nz);
+                BlockState ns = mc.level.getBlockState(scratch2);
+                interactive[i] = BlockUtils.isClickable(ns.getBlock()) || mc.level.getBlockEntity(scratch2) != null;
+            }
+        }
+        PlacementMapper.NeighbourView view = new PlacementMapper.NeighbourView() {
+            @Override
+            public boolean clickable(Dir d) {
+                return clickable[d.ordinal()];
+            }
+
+            @Override
+            public boolean interactive(Dir d) {
+                return interactive[d.ordinal()];
+            }
+        };
+        Vec3 eye = mc.player.getEyePosition();
+        double reach = reach();
+        for (PlaceRecipe r : PlacementMapper.recipes(spec, view, airplace.get())) {
+            double[] h = r.hitAt(pos.getX(), pos.getY(), pos.getZ());
+            if (eye.distanceTo(new Vec3(h[0], h[1], h[2])) <= reach) return true;
         }
         return false;
     }
@@ -2396,6 +3614,13 @@ public class Printer extends Module {
     /** Walking is on, Baritone is there, and nobody else has confined it (or we have). */
     private boolean canWalkNow() {
         return walk.get() && SmartPlaceSession.BARITONE && (usedConfine || !confinedByOther());
+    }
+
+    /** Any way of moving works: walking, or flying when that is chosen and a flight module is there. */
+    private boolean canMoveNow() {
+        if (!walk.get()) return false;
+        if (movement.get() != Movement.StandOnBuild && fly.available()) return true;
+        return canWalkNow();
     }
 
     private static boolean confinedByOther() {
@@ -2416,6 +3641,11 @@ public class Printer extends Module {
         BaritoneHelper.confine(safeWalk.get());
         usedConfine = true;
         return true;
+    }
+
+    /** Trips for containers and shulkers walk only: no placing, whatever the building walk allowed. */
+    private void walkOnly() {
+        if (SmartPlaceSession.BARITONE && usedConfine && BaritoneHelper.placingAllowed()) BaritoneHelper.forbidPlacing();
     }
 
     private void walkTick() {
@@ -2443,18 +3673,215 @@ public class Printer extends Module {
         return null;
     }
 
+    /** Moves toward cells that are out of reach: by walking with Baritone or by flying, as the movement setting and the policy say. */
     private void walkTo(List<BlockPos> parts) {
-        if (!SmartPlaceSession.BARITONE || !walk.get() || parts.isEmpty()) return;
-        if (walk.get() && pauseOnInput.get() && movementKeyDown()) {
+        if (parts.isEmpty() || !walk.get() || mc.player == null) return;
+        if (pauseOnInput.get() && movementKeyDown()) {
             releaseWalk();
             return;
         }
+        MovePolicy.Way way = pickWay(parts);
+        if (way != lastWay) switchWay(way);
+        if (way == MovePolicy.Way.FLY) flyTo(parts);
+        else standTo(parts);
+    }
+
+    private double nearestDistance(List<BlockPos> parts) {
+        Vec3 pos = mc.player.position();
+        double best = Double.MAX_VALUE;
+        for (BlockPos b : parts) best = Math.min(best, pos.distanceTo(Vec3.atCenterOf(b)));
+        return best;
+    }
+
+    private MovePolicy.Way pickWay(List<BlockPos> parts) {
+        movePolicy.setMode(movement.get().mode);
+        boolean flightOk = movement.get() != Movement.StandOnBuild && fly.available();
+        if (movement.get() != Movement.StandOnBuild && !flightOk && !flyNoModuleWarned) {
+            flyNoModuleWarned = true;
+            warning("movement %s needs a flight module: add one to flight-modules. Walking instead.", movement.get());
+        }
+        MovePolicy.Way way = movePolicy.update(new MovePolicy.Obs(tick, nearestDistance(parts), pathFailures, flightOk, mc.player.onGround()));
+        // Walking needs Baritone and nobody else confining it: with flight there, it is flown
+        if (way == MovePolicy.Way.WALK && flightOk && !canWalkNow()) return MovePolicy.Way.FLY;
+        return way;
+    }
+
+    private void switchWay(MovePolicy.Way way) {
+        lastWay = way;
+        if (way == MovePolicy.Way.FLY) {
+            if (walkGoal != null) releaseWalk();
+            QwerteAddon.LOG.info("printer: flying to the next blocks ({})", fly.sourceName());
+            if (movement.get() == Movement.StandThenFly) info("Walking got nowhere: flying (%s).", fly.sourceName());
+        } else {
+            fly.shutdown();
+            flyNotice();
+            hover = null;
+        hoverFor = null;
+            QwerteAddon.LOG.info("printer: walking to the next blocks");
+            if (movement.get() == Movement.StandThenFly) info("Trying to walk again.");
+        }
+    }
+
+    private void flyNotice() {
+        String n = fly.takeNotice();
+        if (n != null) warning("%s", n);
+    }
+
+    // Flying
+
+    private final BlockPos.MutableBlockPos flyPos = new BlockPos.MutableBlockPos();
+    private BlockPos hoverFor;
+
+    private void flyTo(List<BlockPos> parts) {
+        // Baritone and the flight module must not both steer
+        if (walkGoal != null) releaseWalk();
+        BlockPos first = parts.get(0);
+        if (hover == null && tick - hoverAt >= HOVER_EVERY || hover != null && (!hoverOk(parts) || !first.equals(hoverFor) && tick - hoverAt >= HOVER_EVERY)) {
+            hover = chooseHover(parts);
+            hoverFor = first;
+            hoverAt = tick;
+            if (hover == null) QwerteAddon.LOG.info("printer: no free spot to hover in reach of {} {} {}", first.getX(), first.getY(), first.getZ());
+        }
+        if (hover == null) {
+            fly.hold();
+            return;
+        }
+        fly.drive(tick, hover.x() + 0.5, hover.y(), hover.z() + 0.5);
+        flyNotice();
+    }
+
+    private double hoverReach() {
+        return Math.max(1.0, reach() - 0.75);
+    }
+
+    /** The spot is still free and still in reach of one of the targets. */
+    private boolean hoverOk(List<BlockPos> parts) {
+        if (flyBlocked(hover.x(), hover.y(), hover.z()) || flyBlocked(hover.x(), hover.y() + 1, hover.z())) return false;
+        for (BlockPos b : parts) {
+            if (HoverPoint.within(hover.x(), hover.y(), hover.z(), new int[] { b.getX(), b.getY(), b.getZ() }, hoverReach())) return true;
+        }
+        return false;
+    }
+
+    private HoverPoint.Point chooseHover(List<BlockPos> parts) {
+        List<int[]> targetCells = new ArrayList<>();
+        for (BlockPos b : parts) {
+            targetCells.add(new int[] { b.getX(), b.getY(), b.getZ() });
+            if (targetCells.size() >= 8) break;
+        }
+        Vec3 pos = mc.player.position();
+        return HoverPoint.choose(targetCells, pos.x, pos.y, pos.z, hoverReach(), this::flyBlocked, this::flyDiscouraged);
+    }
+
+    /** A cell the body can't be in: solid, fluid, unloaded, or a block of the layer being built that is still to be placed. */
+    private boolean flyBlocked(int x, int y, int z) {
+        flyPos.set(x, y, z);
+        if (!mc.level.isLoaded(flyPos)) return true;
+        BlockState st = mc.level.getBlockState(flyPos);
+        if (!st.getCollisionShape(mc.level, flyPos).isEmpty() || !st.getFluidState().isEmpty()) return true;
+        Integer active = orderer == null ? null : orderer.activeLayer();
+        if (targets.contains(x, y, z) && (active == null || y <= active)) return true;
+        return partBits.contains(x, y, z) || scaffolds.containsKey(key(x, y, z));
+    }
+
+    /** A cell of the schematic that is not built yet (a later layer): hovering there is allowed but not liked. */
+    private boolean flyDiscouraged(int x, int y, int z) {
+        if (targets.contains(x, y, z)) return true;
+        if (built == null) return false;
+        BlockState w = built.stateAt(flyPos.set(x, y, z));
+        return w != null && !w.isAir();
+    }
+
+    // Standing on the build
+
+    private void standTo(List<BlockPos> parts) {
+        if (!SmartPlaceSession.BARITONE) return;
         if (!confineBaritone()) return;
+        if (BaritoneHelper.placingAllowed()) standTrackUntil = tick + 10;
         boolean going = BaritoneHelper.goalIs((baritone.api.pathing.goals.Goal) walkGoal);
+        if (walkGoal != null && !going) {
+            // Baritone let go of it by itself: it got there, or found no path. Still out of reach means it found none
+            walkGoal = null;
+            if (nearestEyeDistance(parts) > reach()) {
+                pathFailures++;
+                retryWalkAt = tick + PATH_RETRY;
+            }
+        }
         if (going && tick - lastWalk < 60) return;
+        if (tick < retryWalkAt) return;
         if (walkGoal != null) BaritoneHelper.releaseOurs((baritone.api.pathing.goals.Goal) walkGoal);
-        walkGoal = BaritoneHelper.moveInReach(parts, Math.max(1.0, reach() - 0.25), p -> targets.contains(p.getX(), p.getY(), p.getZ()) || partBits.contains(p.getX(), p.getY(), p.getZ()));
+        if (walkNoPlace) walkOnly();
+        else placeWhileWalking();
+        walkGoal = BaritoneHelper.moveInReach(parts, Math.max(1.0, reach() - 0.25), p -> targets.contains(p.getX(), p.getY(), p.getZ()) || partBits.contains(p.getX(), p.getY(), p.getZ()) || scaffolds.containsKey(key(p.getX(), p.getY(), p.getZ())));
         lastWalk = tick;
+    }
+
+    private double nearestEyeDistance(List<BlockPos> parts) {
+        Vec3 eye = mc.player.getEyePosition();
+        double best = Double.MAX_VALUE;
+        for (BlockPos b : parts) best = Math.min(best, eye.distanceTo(Vec3.atCenterOf(b)));
+        return best;
+    }
+
+    /** Lets Baritone place the spare blocks it climbs with (never anything else, never breaking); none carried means walking only. */
+    private void placeWhileWalking() {
+        standItems = spareList(inventoryCounts());
+        if (standItems.isEmpty()) {
+            BaritoneHelper.forbidPlacing();
+            if (!standNoSpareWarned) {
+                standNoSpareWarned = true;
+                warning("No spare blocks to climb with: carry blocks the schematic doesn't use (cobblestone, dirt) so Baritone can pillar up. Walking only.");
+            }
+            return;
+        }
+        BaritoneHelper.allowPlacing(standItems);
+        standTrackUntil = tick + 10;
+    }
+
+    /**
+     * Baritone is placing the spare blocks it climbs with: a spare block that appears where there was air next to the feet,
+     * outside the schematic, is listed with the scaffold so it is broken again once nothing needs it. A block it placed inside
+     * a cell the schematic wants is a wrong block, and the wrong-block rules deal with it.
+     */
+    private void trackStandBlocks() {
+        if (built == null || standItems.isEmpty() || mc.player == null) return;
+        BlockPos f = mc.player.blockPosition();
+        for (int dy = -2; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    int x = f.getX() + dx, y = f.getY() + dy, z = f.getZ() + dz;
+                    scratch.set(x, y, z);
+                    if (!mc.level.isLoaded(scratch)) continue;
+                    long k = key(x, y, z);
+                    BlockState st = mc.level.getBlockState(scratch);
+                    if (st.isAir()) {
+                        if (airSeen.size() >= AIR_SEEN_MAX) airSeen.clear();
+                        airSeen.add(k);
+                        continue;
+                    }
+                    if (!airSeen.remove(k)) continue;
+                    Item item = st.getBlock().asItem();
+                    if (!(item instanceof BlockItem) || !standItems.contains(item) || scaffolds.containsKey(k)) continue;
+                    if (partBits.contains(x, y, z)) continue;
+                    BlockState want = built.stateAt(scratch);
+                    if (targets.contains(x, y, z) && want != null && !want.isAir()) {
+                        // Baritone put a spare block in a cell the schematic still wants: it is ours, so it is broken and the
+                        // cell built, whatever wrong-blocks says (the break still goes through the container and fluid rules)
+                        Info wanted = infoOf(want);
+                        ownWrong.add(k);
+                        evaluate(BuildOrderer.Cell.of(x, y, z, wanted.spec(), null), wanted, st);
+                        continue;
+                    }
+                    if (targets.contains(x, y, z) || want != null && !want.isAir()) continue;
+                    if (!removeStandBlocks.get()) continue;
+                    Scaf sc = new Scaf(new BlockPos(x, y, z), item, st, scaffoldInfoOf(item), tick);
+                    sc.stand = true;
+                    sc.placed = sc.built = true;
+                    scaffolds.put(k, sc);
+                    standPlaced++;
+                }
+            }
+        }
     }
 
     /** Lets go of our own goal only. */
@@ -2464,11 +3891,36 @@ public class Printer extends Module {
             releasedAt = tick;
         }
         walkGoal = null;
+        removalWalk = false;
+        // Standing still to place: the keys go up (the flight module stays on, the player hovers) and Baritone may not place
+        fly.hold();
+        walkOnly();
     }
 
-    /** Gives Baritone back everything this run took. */
+    /** Gives Baritone back everything this run took, and lets go of the flight module and the keys. */
     private void releaseBaritone() {
         releaseWalk();
+        try {
+            fly.shutdown();
+        } finally {
+            try {
+                flyNotice();
+            } finally {
+                releaseBaritoneRest();
+            }
+        }
+    }
+
+    private void releaseBaritoneRest() {
+        hover = null;
+        hoverFor = null;
+        movePolicy.reset();
+        lastWay = MovePolicy.Way.WALK;
+        pathFailures = retryWalkAt = 0;
+        standItems = List.of();
+        standTrackUntil = -1;
+        airSeen.clear();
+        standNoSpareWarned = flyNoModuleWarned = false;
         if (SmartPlaceSession.BARITONE) {
             if (usedConfine) BaritoneHelper.unconfine();
             if (usedProtect) BaritoneHelper.unprotect();
@@ -2513,6 +3965,8 @@ public class Printer extends Module {
             if (s.isEmpty() || loadedShulker(s)) continue;
             out.merge(s.getItem(), s.getCount(), Integer::sum);
         }
+        ItemStack off = mc.player.getOffhandItem();
+        if (!off.isEmpty() && !loadedShulker(off)) out.merge(off.getItem(), off.getCount(), Integer::sum);
         return out;
     }
 
@@ -2527,6 +3981,9 @@ public class Printer extends Module {
             ItemStack s = mc.player.getInventory().getItem(i);
             if (s.is(item) && s.getCount() >= count && !loadedShulker(s)) return i;
         }
+        // The off hand counts too (AutoHotbar sees it as present); the block is placed from it with the off hand
+        ItemStack off = mc.player.getOffhandItem();
+        if (off.is(item) && off.getCount() >= count && !loadedShulker(off)) return OFFHAND;
         return -1;
     }
 
@@ -2658,7 +4115,7 @@ public class Printer extends Module {
 
     /** The resupply flow: pick a source, walk to it, open it, take what is needed, close it, or unpack a shulker box. */
     private final class Resupply {
-        private enum Stage { PICK, WALK, OPEN, TAKE, CLOSE, UNPACK, ECHEST_TAKE, ECHEST_RETURN }
+        private enum Stage { LAND, PICK, WALK, OPEN, TAKE, CLOSE, UNPACK, ECHEST_TAKE, ECHEST_RETURN }
 
         private boolean running, screenOpen;
         private Stage stage = Stage.PICK;
@@ -2669,6 +4126,7 @@ public class Printer extends Module {
         private int[] target;
         private Object goal;
         private int ticks, openTries, wait, unpacks, unpackSlot = -1;
+        private int landTicks;
         private SmartPlaceSession.Result unpackResult;
         private final Map<Integer, Integer> slotTries = new HashMap<>();
         private boolean roomBlocked, fullSeen;
@@ -2709,6 +4167,9 @@ public class Printer extends Module {
             returnTried = false;
             echestResult = null;
             endMessage = null;
+            // A trip on foot starts on the ground: a hovering player comes down first (a module we switched on is switched off)
+            landTicks = 0;
+            stage = fly.airborne() ? Stage.LAND : Stage.PICK;
             haveAtStart = wantedHave();
             QwerteAddon.LOG.info("printer: fetching materials");
         }
@@ -2765,6 +4226,7 @@ public class Printer extends Module {
                 return;
             }
             switch (stage) {
+                case LAND -> landStep();
                 case PICK -> pick();
                 case WALK -> walkStep();
                 case OPEN -> openStep();
@@ -2790,6 +4252,27 @@ public class Printer extends Module {
                 case UNPACK -> unpacked();
                 case ECHEST_TAKE -> echestTaken();
                 case ECHEST_RETURN -> echestReturned();
+            }
+        }
+
+        /**
+         * Flying: the trip is not made from the air. The player descends (holding the descend key only); if there is no safe
+         * ground to come down to, or it takes too long, the trip is skipped with a message (a hovering player is never sent
+         * walking, and a flight module is never switched off in mid-air).
+         */
+        private void landStep() {
+            FlyController.Landing l = fly.land(tick);
+            flyNotice();
+            if (l == FlyController.Landing.LANDED) {
+                hover = null;
+                hoverFor = null;
+                landTicks = 0;
+                stage = Stage.PICK;
+                return;
+            }
+            if (l == FlyController.Landing.STUCK || ++landTicks > LAND_GIVE_UP) {
+                fly.hold();
+                end("you are flying and could not land safely (no ground or water below, a screen open, or it took too long).");
             }
         }
 
@@ -3246,12 +4729,47 @@ public class Printer extends Module {
     // Ending
 
     private void finishRun(boolean finished) {
+        playSound(!finished);
         if (!reported) {
             reported = true;
             report(finished);
         }
+        if (queue != null && queue.hasCurrent()) {
+            if (finished) {
+                info("%s done.", queue.label());
+                // FINISH needs the scaffold gone, and startRun gives back everything else, so the next entry starts clean
+                queue.complete();
+                if (queue.seek(this::queueProblem, this::queueSkipped)) {
+                    info("Next: %s", queue.label());
+                    startRun();
+                    return;
+                }
+                info("Queue done: %d schematic(s) built%s.", queue.completed(), queue.skipped() > 0 ? ", " + queue.skipped() + " skipped" : "");
+            } else {
+                info("Queue stopped at %s (%d done, %d skipped).", queue.label(), queue.completed(), queue.skipped());
+            }
+        }
         stopRun();
         if (isActive()) toggle();
+    }
+
+    /** Whether a queue entry can be built: null when it can, else why not. Client thread. */
+    private String queueProblem(BuildQueue.Entry e) {
+        Path root;
+        try {
+            root = FabricLoader.getInstance().getGameDir().resolve("schematics");
+        } catch (RuntimeException ex) {
+            return "the game folder could not be found";
+        }
+        if (e.kind() == BuildQueue.Kind.PLACEMENT && LitematicaBridge.available()) return LitematicaBridge.byNameProblem(e.name());
+        SchematicFile.Resolved r = SchematicFile.resolve(root, e.name());
+        if (r.ok()) return null;
+        return e.kind() == BuildQueue.Kind.PLACEMENT ? "Litematica is not available and no file has that name (" + r.error() + ")" : r.error();
+    }
+
+    private void queueSkipped(BuildQueue.Entry e, String why) {
+        warning("Queue: skipped %s: %s", LitematicReader.clean(e == null ? "?" : e.raw(), 60), why);
+        QwerteAddon.LOG.warn("printer: queue entry skipped: {} ({})", e == null ? "?" : e.raw(), why);
     }
 
     private void report(boolean finished) {
@@ -3262,12 +4780,16 @@ public class Printer extends Module {
         sendList("Failed", failedLines);
         sendList("Wrong blocks skipped", wrongLines);
         if (brokenCount > 0) info("Broke %d wrong block(s); their drops were not collected.", brokenCount);
-        if (stripDone > 0) info("Stripped %d log(s) with an axe.", stripDone);
-        if (!stripPending.isEmpty()) {
-            info("%d log(s) were left unstripped (no axe, out of reach or not loaded).", stripPending.size());
-            List<String> logs = new ArrayList<>();
-            for (StripJob j : stripPending.values()) logs.add(j.pos().getX() + " " + j.pos().getY() + " " + j.pos().getZ());
-            sendList("Unstripped", logs);
+        for (Tool t : Tool.values()) {
+            int done = toolDone.getOrDefault(t, 0);
+            if (done > 0) info("%s %d block(s) with the %s.", t.doneLabel(), done, t.label());
+            List<String> left = new ArrayList<>();
+            for (ToolJob j : toolJobs.values()) {
+                if (j.tool() == t) left.add(j.pos().getX() + " " + j.pos().getY() + " " + j.pos().getZ());
+            }
+            if (left.isEmpty()) continue;
+            info("%d block(s) were left without the %s (not carried, out of reach or not loaded).", left.size(), t.label());
+            sendList(t.leftTitle(), left);
         }
         if (waterDone > 0) info("Waterlogged %d block(s).", waterDone);
         if (dryCount > 0) {
@@ -3280,6 +4802,10 @@ public class Printer extends Module {
             sendList("Waiting for water", wet);
         }
         if (dormantN > 0) info("%d block(s) outside Litematica's render layers were left out.", dormantN);
+        if (scaffoldPlacedTotal > 0) info("Scaffold: %d block(s) placed, %d removed.", scaffoldPlacedTotal, scaffoldRemovedTotal);
+        List<String> scaffoldStanding = new ArrayList<>();
+        for (Scaf sc : scaffolds.values()) if (sc.placed) scaffoldStanding.add(sc.pos.getX() + " " + sc.pos.getY() + " " + sc.pos.getZ());
+        if (!scaffoldStanding.isEmpty()) sendList("Scaffold blocks still standing", scaffoldStanding);
         if (targets.size() > 0 && built != null) {
             List<String> left = new ArrayList<>();
             for (BuildOrderer.Cell c : sweep) {
@@ -3388,7 +4914,7 @@ public class Printer extends Module {
     @Override
     public String getInfoString() {
         if (loop == null) return null;
-        return targets.size() + " left" + (stripPending.isEmpty() ? "" : ", " + stripPending.size() + " to strip");
+        return (queue != null && queue.hasCurrent() ? queue.label() + ", " : "") + targets.size() + " left" + (toolJobs.isEmpty() ? "" : ", " + toolJobs.size() + " to finish with a tool");
     }
 
     /** What the shulker box session needs from this module. */

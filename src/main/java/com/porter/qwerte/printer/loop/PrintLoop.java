@@ -47,6 +47,8 @@ public final class PrintLoop {
         SKIP_WRONG,
         /** Break the wrong block so its cell can be built. */
         BREAK_WRONG,
+        /** Break a scaffold block that no open cell needs any more. */
+        REMOVE_SCAFFOLD,
         /** Everything that can be built is built. Ends the run. */
         FINISH,
         /** Stopped (cancelled, world change, error). Ends the run. */
@@ -89,6 +91,9 @@ public final class PrintLoop {
      * @param orderProblem     why stash orders can't help right now (not logged in, not allowed, nothing to order from), or null
      * @param layerHold        non-null when nothing is left to build inside Litematica's render layers but blocks remain outside them:
      *                         the message to pause with (the run does not end; it resumes when the layers change)
+     * @param scaffoldLeft     scaffold blocks that stand (or may stand: a click is awaiting its check) and must be removed before the run ends
+     * @param scaffoldRemovable some of them are not needed any more and can be broken now
+     * @param layerMoving      the layer cursor is still going to move on (carry a layer over, try carried ones again): nothing is stuck yet
      * @param disableWhenOut   the setting {@code disable-when-out-of-materials}: when nothing can supply a missing item, turn the module
      *                         off instead of pausing until the item turns up
      */
@@ -96,7 +101,18 @@ public final class PrintLoop {
                       int wrongPending, String wrongInfo, boolean breaking, Wrong wrongMode, boolean placeable, boolean walkTarget,
                       boolean lacking, String lackingInfo, boolean supplyPossible, boolean resupplyActive, String resupplyFailed,
                       boolean sessionActive, boolean inventoryFull, boolean baritoneBusy, boolean canWalk, boolean waiting, String orderWait, String orderProblem,
-                      boolean disableWhenOut, String layerHold) {
+                      boolean disableWhenOut, String layerHold, int scaffoldLeft, boolean scaffoldRemovable, boolean layerMoving) {
+
+        /** Without scaffolding or a layer cursor. */
+        public Obs(boolean worldChanged, boolean cancelled, boolean loaded, String loadError, boolean scanDone, int pending,
+                   int wrongPending, String wrongInfo, boolean breaking, Wrong wrongMode, boolean placeable, boolean walkTarget,
+                   boolean lacking, String lackingInfo, boolean supplyPossible, boolean resupplyActive, String resupplyFailed,
+                   boolean sessionActive, boolean inventoryFull, boolean baritoneBusy, boolean canWalk, boolean waiting, String orderWait, String orderProblem,
+                   boolean disableWhenOut, String layerHold) {
+            this(worldChanged, cancelled, loaded, loadError, scanDone, pending, wrongPending, wrongInfo, breaking, wrongMode, placeable, walkTarget,
+                lacking, lackingInfo, supplyPossible, resupplyActive, resupplyFailed, sessionActive, inventoryFull, baritoneBusy, canWalk, waiting,
+                orderWait, orderProblem, disableWhenOut, layerHold, 0, false, false);
+        }
 
         /** A quiet observation to build tests and the first tick from. */
         public static Obs idle() {
@@ -120,9 +136,16 @@ public final class PrintLoop {
     /** The start of the pause message for blocks that can't be built right now; the module lists the cells when it sees it. */
     public static final String STUCK_PREFIX = "Stuck: ";
 
-    private final int verifyTicks, retries;
+    /** Ticks a pause or a resume must hold before it is announced (a flapping condition says nothing). */
+    public static final int HYSTERESIS = 20;
+
+    private final int verifyTicks, retries, hysteresis;
+    private Pause candidate = Pause.NONE;
+    private long candidateSince, candidateLast, resumeSince, resumeLast;
     private Phase phase = Phase.IDLE;
     private Pause pause = Pause.NONE;
+    /** The pause the player was told about and has not been told is over. */
+    private Pause announced = Pause.NONE;
     private long now;
     private int stuck;
     private long retryAt;
@@ -137,8 +160,18 @@ public final class PrintLoop {
     }
 
     public PrintLoop(int verifyTicks, int retries) {
+        this(verifyTicks, retries, 0);
+    }
+
+    public PrintLoop(int verifyTicks, int retries, int hysteresis) {
         this.verifyTicks = Math.max(1, verifyTicks);
         this.retries = Math.max(0, retries);
+        this.hysteresis = Math.max(0, hysteresis);
+    }
+
+    /** Paused for a reason that needs the player or a fix: stuck, no materials source, a failed fetch. (For the error sound.) */
+    public boolean errorPause() {
+        return phase == Phase.PAUSED && (pause == Pause.STUCK || pause == Pause.NO_SOURCE || pause == Pause.RESUPPLY_FAILED);
     }
 
     public Phase phase() {
@@ -248,7 +281,9 @@ public final class PrintLoop {
                 && o.layerHold() != null) {
             return pause(Pause.LAYER, o.layerHold());
         }
-        if (o.pending() == 0 && o.wrongPending() == 0 && !o.breaking() && waiting.isEmpty() && !o.sessionActive() && !o.resupplyActive() && !o.waiting()) {
+        // Finished only when every layer is done and the scaffold is gone
+        if (o.pending() == 0 && o.wrongPending() == 0 && !o.breaking() && waiting.isEmpty() && !o.sessionActive() && !o.resupplyActive() && !o.waiting()
+                && o.scaffoldLeft() == 0) {
             return end(Phase.DONE, Act.FINISH, Level.INFO, "Finished: everything that can be built is built.");
         }
 
@@ -299,6 +334,13 @@ public final class PrintLoop {
             return resumed(wasPaused, new Step(Act.PLACE, Level.INFO, null));
         }
 
+        // Scaffold nobody needs is taken down once the placing is done (and before the run can end)
+        if (o.scaffoldRemovable()) {
+            stuck = 0;
+            retryAt = 0;
+            return resumed(wasPaused, new Step(Act.REMOVE_SCAFFOLD, Level.INFO, null));
+        }
+
         if (o.walkTarget()) {
             stuck = 0;
             retryAt = 0;
@@ -315,7 +357,8 @@ public final class PrintLoop {
         if (o.lacking()) {
             stuck = 0;
             String what = o.lackingInfo() == null ? "materials" : o.lackingInfo();
-            if (o.inventoryFull()) {
+            // A full inventory only matters when there is a source to fetch from
+            if (o.inventoryFull() && o.supplyPossible()) {
                 return pause(Pause.FULL, "Your inventory is full, so " + what + " can't be fetched. Free a slot. Printing resumes by itself.");
             }
             if (o.supplyPossible()) {
@@ -340,7 +383,8 @@ public final class PrintLoop {
         }
 
         // Nothing ready, nothing to fetch. Placed blocks may still turn up, so wait for those
-        if (!waiting.isEmpty() || o.waiting()) {
+        // (The layer cursor carries stalled layers over before this counts as being stuck.)
+        if (!waiting.isEmpty() || o.waiting() || o.layerMoving()) {
             stuck = 0;
             return resumed(wasPaused, none());
         }
@@ -358,21 +402,68 @@ public final class PrintLoop {
         return none();
     }
 
-    private Step resumed(boolean wasPaused, Step step) {
-        if (!wasPaused && pause == Pause.NONE) return step;
-        phase = Phase.BUILDING;
-        pause = Pause.NONE;
-        if (step.msg() != null) return step;
-        // Only when work actually starts; leaving a pause because something else is going on says nothing
-        boolean work = step.act() == Act.PLACE || step.act() == Act.WALK || step.act() == Act.RESUPPLY || step.act() == Act.SKIP_WRONG || step.act() == Act.BREAK_WRONG;
-        return work ? new Step(step.act(), Level.INFO, "Printing resumed.") : step;
+    private static boolean isWork(Act act) {
+        return act == Act.PLACE || act == Act.WALK || act == Act.RESUPPLY || act == Act.SKIP_WRONG || act == Act.BREAK_WRONG || act == Act.REMOVE_SCAFFOLD;
     }
 
+    /**
+     * Work starts (or goes on). The phase is BUILDING at once, so nothing about the loop says "paused" while it works;
+     * only the "Printing resumed." line waits until the work has held for the hysteresis (a flapping condition says nothing).
+     */
+    private Step resumed(boolean wasPaused, Step step) {
+        boolean work = isWork(step.act());
+        if (!work) {
+            // Leaving a pause because something else is going on says nothing now; the line comes with the next work
+            if (wasPaused || pause != Pause.NONE) {
+                phase = Phase.BUILDING;
+                pause = Pause.NONE;
+            }
+            return step;
+        }
+        if (wasPaused || pause != Pause.NONE) {
+            phase = Phase.BUILDING;
+            pause = Pause.NONE;
+        }
+        if (announced == Pause.NONE) return step;
+        if (hysteresis > 0) {
+            if (now - resumeLast > 1) resumeSince = now;
+            resumeLast = now;
+            if (now - resumeSince < hysteresis) return step;
+        }
+        announced = Pause.NONE;
+        if (step.msg() != null) return step;
+        return new Step(step.act(), Level.INFO, "Printing resumed.");
+    }
+
+    /**
+     * A condition that stops the build. Pauses that must stop the walking ({@link #stopsMovement}) send STOP_WALK at once;
+     * only the announcement waits for the hysteresis. A pause the player was told about and that comes back before the
+     * resume was announced is not announced again.
+     */
     private Step pause(Pause why, String msg) {
-        if (phase == Phase.PAUSED && pause == why) return none();
+        if (phase == Phase.PAUSED && pause == why) {
+            candidate = Pause.NONE;
+            return none();
+        }
+        if (hysteresis > 0 && why != Pause.STUCK && why != Pause.LAYER && why != Pause.RESUPPLY_FAILED) {
+            // The condition must hold for a while before it is announced; a flapping one says nothing
+            if (candidate != why || now - candidateLast > 1) {
+                candidate = why;
+                candidateSince = now;
+            }
+            candidateLast = now;
+            if (now - candidateSince < hysteresis) return stopsMovement(why) ? new Step(Act.STOP_WALK, Level.INFO, null) : none();
+        }
+        candidate = Pause.NONE;
         phase = Phase.PAUSED;
         pause = why;
-        return new Step(Act.STOP_WALK, Level.WARN, msg);
+        String shown = announced == why ? null : msg;
+        announced = why;
+        return new Step(Act.STOP_WALK, Level.WARN, shown);
+    }
+
+    private static boolean stopsMovement(Pause why) {
+        return why == Pause.FULL || why == Pause.BARITONE || why == Pause.WALK_OFF;
     }
 
     private Step none() {
