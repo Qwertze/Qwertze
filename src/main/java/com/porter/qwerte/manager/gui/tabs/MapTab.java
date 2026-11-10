@@ -93,6 +93,28 @@ public final class MapTab {
         this.host = host;
     }
 
+    // ---------- the stash area on the map (AA5) ----------
+
+    private AreaTab area;
+    private boolean editArea;
+    private boolean builtEditable;
+
+    /** The Area page whose draft a drag on the map sets. */
+    public void attachArea(AreaTab area) {
+        this.area = area;
+    }
+
+    private String shownPlayer() {
+        BotList.Bot b = host.bots().selectedBot();
+        return b == null ? "" : b.player();
+    }
+
+    /** The map shows the bot of the selected stash, and the account may change its area. */
+    private boolean areaEditable() {
+        // Coordinates relative to the bot (a viewer that hides where it is) or another dimension than the stash's: the picture is not this area's
+        return area != null && state != null && !state.relative() && state.world() != null && area.mapEditable(shownPlayer(), state.world().dim());
+    }
+
     private void ensureState() {
         if (atlas == null) {
             atlas = new MapAtlas(MapPalette.argb());
@@ -214,6 +236,12 @@ public final class MapTab {
     /** Called every frame while the tab is shown (before the widgets are drawn, on the client thread). */
     public void tick(long now) {
         if (!shown || host.closed()) return;
+        if (area != null && area.mapCandidate(shownPlayer())) {
+            area.tick(now, false);
+            if (areaEditable() != builtEditable) host.later(host::rebuild);
+        } else if (builtEditable) {
+            host.later(host::rebuild);
+        }
         host.bots().tick(now, true);
         if (host.bots().takeChanged()) {
             String sig = botsSignature();
@@ -410,11 +438,30 @@ public final class MapTab {
         again.pill = true;
         again.tooltip = "Open the live stream again now.";
         again.action = this::reconnect;
+        builtEditable = areaEditable();
+        if (!builtEditable) editArea = false;
+        if (builtEditable) {
+            SmButton edit = (SmButton) buttons.add(theme.button(editArea ? "Done editing" : "Edit area")).widget();
+            edit.pill = true;
+            edit.primary = editArea;
+            edit.tooltip = editArea ? "Stop drawing the area: dragging pans the map again." : "Drag a rectangle on the map to set the X and Z of this stash's area draft (the Area tab has Save).";
+            edit.action = () -> {
+                editArea = !editArea;
+                host.later(host::rebuild);
+            };
+        }
 
         noteLabel = left.add(Ui.muted(theme, "", mainW - theme.scale(16))).expandX().widget();
         noteLabel.color(Ui.warn(theme));
         WMapView map = left.add(new WMapView(view, atlas, state, () -> texture, () -> host.policy().hideNames(), this::mapHint)).centerX().widget();
         map.maxWidth = Math.max(theme.scale(120), mainW - theme.scale(16));
+        if (builtEditable) {
+            map.storedArea = area::mapStored;
+            map.draftArea = area::mapDraft;
+            map.areaMode = editArea;
+            map.onAreaDrag = area::mapDrag;
+            map.onAreaRefused = host::notice;
+        }
 
         // The bot's inventory and hotbar, centred under the map
         WVerticalList inv = new WVerticalList();

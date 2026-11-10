@@ -149,7 +149,7 @@ class PlanModelTest {
         assertEquals(List.of("a", "b", "c"), o.withExcluded("c", true).exclude());
         JsonObject body = new JsonObject();
         o.withRound("shulker").addTo(body);
-        assertEquals("{\"multiplier\":64,\"exclude\":[\"a\",\"b\"],\"fluids\":true,\"containerItems\":false,\"round\":\"shulker\"}", body.toString());
+        assertEquals("{\"multiplier\":64,\"exclude\":[\"a\",\"b\"],\"fluids\":true,\"containerItems\":false,\"round\":\"shulker\",\"craft\":false}", body.toString());
     }
 
     @Test

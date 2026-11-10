@@ -5,13 +5,19 @@ import com.porter.qwerte.mixin.ChatScreenAccessor;
 import com.porter.qwerte.messenger.ChatClicks;
 import com.porter.qwerte.messenger.ChatKeyRoute;
 import com.porter.qwerte.messenger.ChatLines;
+import com.porter.qwerte.messenger.ChatReplace;
+import com.porter.qwerte.messenger.ChatText;
+import com.porter.qwerte.messenger.ComponentText;
 import com.porter.qwerte.messenger.ConversationStore;
 import com.porter.qwerte.messenger.DmFormat;
 import com.porter.qwerte.messenger.DmParser;
 import com.porter.qwerte.messenger.DmPattern;
 import com.porter.qwerte.messenger.Geometry;
 import com.porter.qwerte.messenger.HistoryJson;
+import com.porter.qwerte.messenger.LineKind;
 import com.porter.qwerte.messenger.MessengerCore;
+import com.porter.qwerte.messenger.MessengerTheme;
+import com.porter.qwerte.messenger.ThemeColor;
 import com.porter.qwerte.messenger.MessengerScreen;
 import com.porter.qwerte.messenger.MessengerUi;
 import com.porter.qwerte.messenger.OnlineNames;
@@ -27,10 +33,15 @@ import meteordevelopment.meteorclient.events.game.ReceiveMessageEvent;
 import meteordevelopment.meteorclient.events.render.Render2DEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.gui.GuiTheme;
+import meteordevelopment.meteorclient.gui.GuiThemes;
+import meteordevelopment.meteorclient.gui.WidgetScreen;
+import meteordevelopment.meteorclient.gui.themes.meteor.MeteorGuiTheme;
 import meteordevelopment.meteorclient.gui.widgets.WWidget;
 import meteordevelopment.meteorclient.gui.widgets.containers.WHorizontalList;
 import meteordevelopment.meteorclient.gui.widgets.pressable.WButton;
 import meteordevelopment.meteorclient.settings.BoolSetting;
+import meteordevelopment.meteorclient.settings.ColorSetting;
+import meteordevelopment.meteorclient.settings.DoubleSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
 import meteordevelopment.meteorclient.settings.KeybindSetting;
 import meteordevelopment.meteorclient.settings.Setting;
@@ -42,6 +53,7 @@ import meteordevelopment.meteorclient.systems.modules.Module;
 import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.utils.Utils;
 import meteordevelopment.meteorclient.utils.misc.Keybind;
+import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.meteorclient.systems.config.Config;
 import meteordevelopment.orbit.EventHandler;
 import meteordevelopment.orbit.EventPriority;
@@ -55,7 +67,9 @@ import net.minecraft.sounds.SoundEvents;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.EnumSet;
+import java.util.Map;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -78,6 +92,7 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
  * ({@code meteor-client/qwerte/messenger-history.json}); it is never sent anywhere.
  */
 public class Messenger extends Module {
+    private static final org.slf4j.Logger LOG = com.mojang.logging.LogUtils.getLogger();
     private static final String GEOMETRY_KEY = "qwerteMessengerWindow";
     /** Changed whispers are written after this long; the public chat alone only after the longer one (or on leaving). */
     private static final long SAVE_EVERY_MS = 20_000;
@@ -87,6 +102,15 @@ public class Messenger extends Module {
     private final SettingGroup sgSending = settings.createGroup("Sending");
     private final SettingGroup sgHistory = settings.createGroup("History");
     private final SettingGroup sgWindow = settings.createGroup("Window");
+    private final SettingGroup sgTheme = settings.createGroup("Theme");
+    private final SettingGroup sgDebug = settings.createGroup("Debug");
+
+    private final Setting<Boolean> debugLines = sgDebug.add(new BoolSetting.Builder()
+        .name("debug-lines")
+        .description("Writes every public chat line to latest.log with how it was read: the component tree (content types, translation keys, arguments, siblings, fonts, at most 2 KB), the text the game gives, the text shown (each cut at 512 characters), the sender found and whether the repeat check dropped it. For troubleshooting only: leave it off otherwise. Lines that start with [Meteor] or [Baritone] are left out, but every other chat line is written, including a whisper the patterns did not recognise and a line from another module of yours, so latest.log can then hold private text. Off: nothing is logged.")
+        .defaultValue(false)
+        .build()
+    );
 
     // ---------- patterns ----------
 
@@ -196,7 +220,7 @@ public class Messenger extends Module {
     private final Setting<Keybind> focusKey = sgWindow.add(new KeybindSetting.Builder()
         .name("focus-key")
         .description("Takes the keyboard and mouse for the Messenger window, and lets go again (a key that is not a letter or digit; Esc always lets go).")
-        .defaultValue(Keybind.none())
+        .defaultValue(Keybind.fromKey(org.lwjgl.glfw.GLFW.GLFW_KEY_RIGHT_CONTROL))
         .action(this::keybindAction)
         .build()
     );
@@ -205,6 +229,21 @@ public class Messenger extends Module {
         .name("take-chat-key")
         .description("Take priority over the chat key: it opens the Messenger on Global instead of the normal chat. The command key (/) still opens the normal chat with a slash. Only a chat opened with empty text is taken, so on 1.21.11 a saved vanilla chat draft still opens vanilla chat, and another mod that opens an empty chat screen is taken too. Off: the normal chat is untouched.")
         .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<Boolean> replaceChat = sgWindow.add(new BoolSetting.Builder()
+        .name("replace-chat")
+        .description("The Messenger replaces the game's chat: the normal chat list (new and fading lines in the bottom left, and the history above the input line) is not drawn at all, and the Messenger window is the only chat display, with Global shown in the overlay. The chat key opens the Messenger (like take-chat-key); the command key (/) still opens the normal input line, with its suggestions. The hidden lines can not be clicked or hovered either. Messages are still received, logged and seen by other mods. Alerts that normally appear in the vanilla chat (kicks, module warnings, server notices) show only in the Messenger while this is on, so keep show-overlay on. Off: the normal chat is back.")
+        .defaultValue(false)
+        .onChanged(v -> ChatReplace.hidden(isActive() && v))
+        .build()
+    );
+
+    private final Setting<Boolean> showHeads = sgWindow.add(new BoolSetting.Builder()
+        .name("show-player-heads")
+        .description("Draws the player's head (from the tab list skin) in front of a public chat line written <Name> text. A player who left the tab list gets the default skin.")
+        .defaultValue(true)
         .build()
     );
 
@@ -231,12 +270,63 @@ public class Messenger extends Module {
         .build()
     );
 
+    private final Setting<Boolean> autoFontScale = sgWindow.add(new BoolSetting.Builder()
+        .name("auto-font-scale")
+        .description("The text, rows, badges and emoji grow and shrink with the window: its size against the default size (330 x 190), from 0.75x to 2x. Off: font-scale is used.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Double> fontScale = sgWindow.add(new DoubleSetting.Builder()
+        .name("font-scale")
+        .description("The scale of the whole window when auto-font-scale is off.")
+        .defaultValue(1.0)
+        .range(0.75, 2.0)
+        .sliderRange(0.75, 2.0)
+        .visible(() -> !autoFontScale.get())
+        .build()
+    );
+
+    private final Setting<Integer> consoleOpacity = sgWindow.add(new IntSetting.Builder()
+        .name("system-message-opacity")
+        .description("How opaque the console lines are drawn in Global, in percent: server messages, deaths, joins and leaves, and notices from Meteor and its addons (like \"[Meteor] Toggled ...\"). Player chat is always at full opacity.")
+        .defaultValue(55)
+        .range(10, 100)
+        .sliderRange(10, 100)
+        .build()
+    );
+
     private final Setting<Boolean> sound = sgWindow.add(new BoolSetting.Builder()
         .name("notification-sound")
         .description("A quiet sound when a whisper arrives (not when you are reading that conversation).")
         .defaultValue(true)
         .build()
     );
+
+    // ---------- theme ----------
+
+    private final Setting<Boolean> followMeteorTheme = sgTheme.add(new BoolSetting.Builder()
+        .name("follow-meteor-theme")
+        .description("Uses the colours of Meteor's current GUI theme all the time (checked twice a second) instead of the colours below, which are left as they are. The Sync button copies them once instead.")
+        .defaultValue(false)
+        .build()
+    );
+
+    /** One colour setting per {@link ThemeColor}, in the Theme group. The defaults are the look from before theming. */
+    private final Map<ThemeColor, Setting<SettingColor>> themeColors = new EnumMap<>(ThemeColor.class);
+    private int[] followed;
+    private long followedAt;
+
+    {
+        for (ThemeColor c : ThemeColor.values()) {
+            int rgb = c.defaultRgb();
+            themeColors.put(c, sgTheme.add(new ColorSetting.Builder()
+                .name(c.settingName())
+                .description(c.description())
+                .defaultValue(new SettingColor((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, 255))
+                .build()));
+        }
+    }
 
     private final MessengerCore core = new MessengerCore(new ServerStores(200));
     private final MessengerUi ui = new MessengerUi(new MessengerUi.Host() {
@@ -291,7 +381,7 @@ public class Messenger extends Module {
 
         @Override
         public boolean overlayGlobal() {
-            return overlayGlobalChat.get();
+            return overlayGlobalChat.get() || replaceChat.get();
         }
 
         @Override
@@ -300,11 +390,53 @@ public class Messenger extends Module {
         }
 
         @Override
+        public int color(ThemeColor color) {
+            return themeColor(color);
+        }
+
+        @Override
+        public boolean showHeads() {
+            return showHeads.get();
+        }
+
+        @Override
+        public boolean autoFontScale() {
+            return autoFontScale.get();
+        }
+
+        @Override
+        public float fontScale() {
+            return fontScale.get().floatValue();
+        }
+
+        @Override
+        public float consoleOpacity() {
+            return consoleOpacity.get() / 100f;
+        }
+
+        @Override
         public String hint() {
             Keybind key = focusKey.get();
-            return key.isSet() ? "Press " + key + " to type" : "Set the focus-key, or click here with the chat open";
+            if (key.isSet()) return "Press " + key + " to type";
+            refreshChatKeyName();
+            return (takeChatKey.get() || replaceChat.get()) ? "Press the chat key (" + chatKeyName + ") to type" : "Open chat (" + chatKeyName + ") and click here, or enable take-chat-key";
         }
     });
+    private String chatKeyName = "T";
+    private long chatKeyAt;
+
+    /** The name of the game's chat key, looked up at most every 500 ms. */
+    private void refreshChatKeyName() {
+        long now = System.currentTimeMillis();
+        if (now - chatKeyAt < 500) return;
+        chatKeyAt = now;
+        try {
+            chatKeyName = mc.options.keyChat.getTranslatedKeyMessage().getString();
+        } catch (RuntimeException ignored) {
+            // keep the last name
+        }
+    }
+
     private final ChatClicks clicks = new ChatClicks(this::onChatClick);
 
     private volatile DmParser parser = new DmParser(EnumSet.allOf(DmFormat.class), List.of());
@@ -362,6 +494,7 @@ public class Messenger extends Module {
         core.switchServer(serverKey());
         ui.reset();
         saveBlocked = false;
+        ChatReplace.hidden(replaceChat.get());
         rebuildParser();
         checkTemplate(template.get());
         if (saveHistory.get()) loadHistory();
@@ -371,6 +504,7 @@ public class Messenger extends Module {
 
     @Override
     public void onDeactivate() {
+        ChatReplace.hidden(false);
         MeteorClient.EVENT_BUS.unsubscribe(clicks);
         core.cancelQueued();
         if (mc.screen instanceof MessengerScreen) mc.setScreen(null);
@@ -428,7 +562,20 @@ public class Messenger extends Module {
         boolean whisper = lastWasWhisper;
         lastWasWhisper = false;
         if (whisper || event.isCancelled() || event.getMessage() == null) return;
-        core.receiveGlobal(event.getMessage().getString(), System.currentTimeMillis());
+        boolean console = ChatLines.isConsole(event.getMessage(), event.getIndicator(), LineKind.NOTICE_PREFIXES);
+        String shown = ComponentText.plain(event.getMessage()); // no "[Name head]" text of an inline head
+        boolean added = core.receiveGlobal(shown, System.currentTimeMillis(), console);
+        if (debugLines.get()) debugLine(event, shown, console, added);
+    }
+
+    /** debug-lines: one line per public chat line in latest.log. Only called when the setting is on. */
+    private void debugLine(ReceiveMessageEvent event, String shown, boolean console, boolean added) {
+        String display = ChatText.message(shown);
+        if (LineKind.isNotice(display, LineKind.NOTICE_PREFIXES)) return; // made by the client itself (Meteor, addons): not logged
+        String tag = event.getIndicator() == null ? "none" : ComponentText.escape(String.valueOf(event.getIndicator().logTag()), 32);
+        LOG.info("[messenger-debug] source=ReceiveMessageEvent tag={} modified={} console={} getString=\"{}\" display=\"{}\" sender={} dedupeDropped={} component={}",
+            tag, event.isModified(), console, ComponentText.escape(event.getMessage().getString(), 512), ComponentText.escape(display, 512),
+            LineKind.sender(display), !added, ComponentText.structure(event.getMessage(), 2048));
     }
 
     // ---------- sending and saving ----------
@@ -511,7 +658,7 @@ public class Messenger extends Module {
      */
     @EventHandler
     private void onOpenScreen(OpenScreenEvent event) {
-        if (!takeChatKey.get() || event.screen == null || event.screen.getClass() != ChatScreen.class) return;
+        if (!(takeChatKey.get() || replaceChat.get()) || event.screen == null || event.screen.getClass() != ChatScreen.class) return;
         boolean available = isActive() && mc.player != null && mc.level != null && mc.screen == null;
         String initial = ((ChatScreenAccessor) event.screen).qwerte$getInitial();
         if (ChatKeyRoute.route(true, initial, available) != ChatKeyRoute.Route.MESSENGER) return;
@@ -617,6 +764,56 @@ public class Messenger extends Module {
         });
     }
 
+    // ---------- theme colours ----------
+
+    /** A colour of the window, 0xAARRGGBB: from Meteor's theme when following it, else from the Theme settings. */
+    private int themeColor(ThemeColor c) {
+        if (followMeteorTheme.get()) {
+            long now = System.currentTimeMillis();
+            if (followed == null || now - followedAt > 500) {
+                followedAt = now;
+                int[] next = new int[ThemeColor.values().length];
+                for (var e : MessengerTheme.fromMeteor(meteorPalette()).entrySet()) next[e.getKey().ordinal()] = e.getValue();
+                followed = next;
+            }
+            return followed[c.ordinal()];
+        }
+        SettingColor s = themeColors.get(c).get();
+        return (s.a << 24) | (s.r << 16) | (s.g << 8) | s.b;
+    }
+
+    private static int pack(SettingColor c) {
+        return (c.a << 24) | (c.r << 16) | (c.g << 8) | c.b;
+    }
+
+    /** Meteor's current GUI theme as a palette. A theme other than Meteor's own only gives its text colours; the rest are Meteor's defaults. */
+    private static MessengerTheme.Palette meteorPalette() {
+        GuiTheme t = GuiThemes.get();
+        MessengerTheme.Palette d = MessengerTheme.Palette.meteorDefault();
+        if (t instanceof MeteorGuiTheme m) {
+            return new MessengerTheme.Palette(pack(m.accentColor.get()), pack(m.textColor.get()), pack(m.textSecondaryColor.get()),
+                pack(m.favoriteColor.get()), pack(m.loggedInColor.get()), pack(m.plusColor.get()), pack(m.minusColor.get()),
+                pack(m.backgroundColor.get(false, false, true)), pack(m.backgroundColor.get(false, true, true)),
+                pack(m.backgroundColor.get(true, true, true)), pack(m.moduleBackground.get()));
+        }
+        if (t == null) return d;
+        return new MessengerTheme.Palette(d.accent(), 0xFF000000 | t.textColor().getPacked(), 0xFF000000 | t.textSecondaryColor().getPacked(), d.favorite(),
+            d.loggedIn(), d.plus(), d.minus(), d.background(), d.backgroundHover(), d.backgroundPressed(), d.moduleBackground());
+    }
+
+    /** Copies the colours of Meteor's current GUI theme into the Theme settings (once). */
+    public void syncWithMeteorTheme() {
+        for (var e : MessengerTheme.fromMeteor(meteorPalette()).entrySet()) {
+            int argb = e.getValue();
+            themeColors.get(e.getKey()).set(new SettingColor((argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF, 255));
+        }
+    }
+
+    /** Puts every Theme colour back to its default. */
+    public void resetTheme() {
+        for (Setting<SettingColor> s : themeColors.values()) s.reset();
+    }
+
     // ---------- saved data and settings screen ----------
 
     @Override
@@ -650,6 +847,18 @@ public class Messenger extends Module {
         WButton clear = list.add(theme.button("Clear history")).widget();
         clear.tooltip = "Forgets every conversation and deletes the history file.";
         clear.action = this::clearHistory;
+        WButton sync = list.add(theme.button("Sync theme with Meteor")).widget();
+        sync.tooltip = "Copies the colours of Meteor's current GUI theme into the Theme settings.";
+        sync.action = () -> {
+            syncWithMeteorTheme();
+            if (mc.screen instanceof WidgetScreen ws) ws.reload(); // so the colour boxes show the new colours
+        };
+        WButton reset = list.add(theme.button("Reset theme")).widget();
+        reset.tooltip = "Puts every Theme colour back to its default.";
+        reset.action = () -> {
+            resetTheme();
+            if (mc.screen instanceof WidgetScreen ws) ws.reload();
+        };
         return list;
     }
 }

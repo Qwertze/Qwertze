@@ -1596,6 +1596,38 @@ public class StashSorter extends Module {
             if (repairer.active()) repairer.abortNow();
             if (job == Job.Repair) job = null;
         }
+
+        @Override
+        public int freeCarryCount() {
+            return StashSorter.this.freeCarryCount();
+        }
+
+        @Override
+        public boolean craftBusy() {
+            return tableSession || placingTable;
+        }
+
+        @Override
+        public int craftMaxFills() {
+            StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+            return manager == null ? 2048 : manager.craftOrderMaxFills();
+        }
+
+        @Override
+        public int craftMaxPerHour() {
+            StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+            return manager == null ? 4096 : manager.craftOrderMaxPerHour();
+        }
+
+        @Override
+        public String craftTableProblem() {
+            return StashSorter.this.craftTableProblem();
+        }
+
+        @Override
+        public void retryTable() {
+            craftHealth.forget();
+        }
     });
     private int collectedSlot = -1;
     private int seenKits;
@@ -1798,6 +1830,9 @@ public class StashSorter extends Module {
 
     private void teardown() {
         setUp = false;
+        // Nothing waiting for an area, nothing awaiting an acknowledgement: they belong to this run
+        areaPending.reset();
+        releaseWebsiteTable();
         // An order stops where it is: its saved plan carries on at the next claim
         // A repair in progress puts the bot's gear back first
         if (repairer.active()) {
@@ -1993,6 +2028,9 @@ public class StashSorter extends Module {
 
     @EventHandler
     private void onTick(TickEvent.Pre event) {
+        // The website's table stands in for ours only while a craft session runs: cleared every tick whatever else happened
+        // The order table (when the user's own is out of the limits) stays in until a table being gathered, crafted or placed for it is done
+        if (swappedStash != null && !crafter.active() && (!swappedSide || (!tableSession && !placingTable && !orderRunner.craftChunkPending()))) releaseWebsiteTable();
         if (stash == null) {
             turnOff();
             return;
@@ -3560,10 +3598,12 @@ public class StashSorter extends Module {
             case OrderRunner.Craft craft -> startOrderCraft(craft);
             case OrderRunner.FindAnvil find -> startFindAnvil();
             case OrderRunner.Repair repair -> startRepair(repair);
+            case OrderRunner.CraftChunk chunk -> startOrderChunk(chunk);
         };
     }
 
     // Crafting (Job.Craft). The table is no Box: it is never read, sorted or indexed
+    private int chunkJobLimit;
     private static final int CRAFT_JOB_TICKS = 20 * 180, CRAFT_OPEN_TICKS = 20 * 15, CRAFT_OPEN_TRIES = 4, CRAFT_OPEN_RETRY = 40;
     private static final int CRAFT_COOLDOWN_TICKS = 20 * 60 * 5;
     // The reasons crafting is refused or given up on, worded as the proxy plugin has them
@@ -3597,6 +3637,8 @@ public class StashSorter extends Module {
     private String craftBlocker() {
         if (stash == null) return TableFinder.NONE;
         if (mc.level == null || mc.player == null) return "no world";
+        // Nothing is shipped: without the fetched (or game-built) recipe table nothing is crafted
+        if (Crafter.recipes() == null) return Crafter.recipesPending() ? Crafter.WAITING_FOR_RECIPES : Crafter.NO_RECIPES;
         if (!stash.dimension.isEmpty() && !stash.dimension.equals(Stash.currentDimension())) return TABLE_OTHER_DIMENSION;
         // A table that is set or remembered and still there: only trouble it caused for this order stops the craft
         if (!tableMissing()) return craftHealth.problem(orderRunner.orderId(), stash.craftingTablePos);
@@ -3618,16 +3660,24 @@ public class StashSorter extends Module {
         return !mc.level.isLoaded(s.craftingTablePos) || isTable(s.craftingTablePos);
     }
 
+    /** For the UI (the outline, the window's setup): the user's own table, never the website's that stands in for it during a craft chunk. */
     BlockPos craftingTablePos() {
         Stash s = ensureStash();
-        return s == null ? null : s.craftingTablePos;
+        return s == null ? null : s.tableSwap.persistedPos(s.craftingTablePos);
+    }
+
+    /** The website's table is standing in for the user's own right now (a craft chunk): changes to the user's table wait. */
+    boolean websiteTableInUse() {
+        return stash != null && stash.tableSwap.engaged();
     }
 
     /** For the heartbeat: where the table in use came from: "set", "found", "placed", "crafted" or "none". */
     String craftingTableSource() {
         Stash s = ensureStash();
-        if (s == null || s.craftingTablePos == null) return "none";
-        return s.craftingTableSource.isEmpty() ? "set" : s.craftingTableSource;
+        BlockPos pos = s == null ? null : s.tableSwap.persistedPos(s.craftingTablePos);
+        if (pos == null) return "none";
+        String source = s.tableSwap.persistedSource(s.craftingTableSource);
+        return source.isEmpty() ? "set" : source;
     }
 
     /**
@@ -3636,6 +3686,8 @@ public class StashSorter extends Module {
      */
     int toggleCraftingTable(BlockPos pos) {
         if (mc.level == null || ensureStash() == null) return -2;
+        // The website's table is standing in for the user's own: a change now would be lost when it is swapped back
+        if (stash.tableSwap.engaged()) return -3;
         if (stash.craftingTablePos != null && stash.craftingTablePos.equals(pos)) {
             stash.craftingTablePos = null;
             stash.craftingTableSource = "";
@@ -3652,11 +3704,318 @@ public class StashSorter extends Module {
 
     /** For stash-manager: no crafting table any more. @return false when there was none or no stash */
     boolean clearCraftingTable() {
-        if (ensureStash() == null || stash.craftingTablePos == null) return false;
+        if (ensureStash() == null || stash.tableSwap.engaged() || stash.craftingTablePos == null) return false;
         stash.craftingTablePos = null;
         stash.craftingTableSource = "";
         stash.save();
         return true;
+    }
+
+    // Craft orders (0.4.0-dev.18, CRAFT-CONTRACT.md): the website's crafting table for this stash, as the server last sent it, and what the
+    // heartbeat says about it. Nothing here moves the bot or clicks: it only reads the world.
+    private BlockPos websiteTableSeen;
+    private long seenScanAt = Long.MIN_VALUE / 2;
+    private List<String> seenCache = List.of();
+    private static final long SEEN_SCAN_MS = 10 * 60_000L, SEEN_RESCAN_EMPTY_MS = 30_000L;
+
+    /** The craft settings cached for the loaded stash, or null when nothing was heard from the server. */
+    com.porter.qwerte.stash.CraftSettings craftSettings() {
+        Stash s = ensureStash();
+        return s == null ? null : com.porter.qwerte.stash.CraftStore.shared().get(StashIndex.clamp(s.server, 256), StashIndex.clamp(s.name, 256));
+    }
+
+    /**
+     * This build can carry out craft orders now: its runner exists ({@link com.porter.qwerte.craft.CraftOrder#EXECUTES}), crafting is on and
+     * a recipe table is held. The heartbeat and the claim say so; otherwise the server never gives this bot a craft order.
+     */
+    boolean craftOrdersCapable() {
+        StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+        if (!craftingOn() || Crafter.recipes() == null) return false;
+        return com.porter.qwerte.craft.CraftCapability.capable(true, manager != null && manager.craftOrdersOn(), true, com.porter.qwerte.craft.CraftAuto.tableOk(autoState()));
+    }
+
+    // Craft chunks (0.4.0-dev.18): the website's table stands in for the stash's own while a chunk is crafted, and is always put back
+
+    private Stash swappedStash, swappedCapStash;
+    private boolean swappedSide;
+    private final com.porter.qwerte.craft.CraftTableCap tableCap = new com.porter.qwerte.craft.CraftTableCap();
+
+    /**
+     * Why the website's crafting table can't be used for a craft chunk now (a CraftOrder reason): none set, outside the stash's dimension or area
+     * margin (checked before the bot walks anywhere), not a crafting table where it is loaded, or trouble reaching it earlier in this order.
+     */
+    private String craftTableProblem() {
+        com.porter.qwerte.stash.CraftSettings cs = craftSettings();
+        com.porter.qwerte.stash.CraftSettings.Table t = cs == null ? null : cs.table();
+        if (t == null) return autoTableProblem();
+        if (ensureStash() == null || mc.level == null || mc.player == null) return com.porter.qwerte.craft.CraftOrder.TABLE_BLOCKED;
+        BlockPos pos = new BlockPos(t.x(), t.y(), t.z());
+        boolean loaded = mc.level.isLoaded(pos);
+        String problem = com.porter.qwerte.craft.CraftTable.problem(t, stash.dimension, craftBounds(), Stash.currentDimension(), loaded, loaded && isTable(pos));
+        if (problem == null && craftHealth.problem(orderRunner.orderId(), pos) != null) problem = com.porter.qwerte.craft.CraftOrder.TABLE_BLOCKED;
+        return problem;
+    }
+
+    /** The stash cannot hold a bot table to limits (a CraftAuto code): no area, no recorded dimension, or the bot is in another dimension. Null when it can. */
+    private String autoConfigCode() {
+        if (ensureStash() == null || mc.level == null || mc.player == null) return com.porter.qwerte.craft.CraftAuto.NO_AREA;
+        if (craftBounds() == null) return com.porter.qwerte.craft.CraftAuto.NO_AREA;
+        if (stash.dimension.isEmpty()) return com.porter.qwerte.craft.CraftAuto.NO_DIMENSION;
+        if (!com.porter.qwerte.stash.CraftBounds.sameDimension(Stash.currentDimension(), stash.dimension)) return com.porter.qwerte.craft.CraftAuto.WRONG_DIMENSION;
+        return null;
+    }
+
+    /** The CraftOrder reason for a failure code of the auto table: a stash that can't hold one is no_table, the rest table_blocked or no_table by what failed. */
+    private static String autoReason(String code) {
+        return switch (code) {
+            case com.porter.qwerte.craft.CraftAuto.NO_AREA, com.porter.qwerte.craft.CraftAuto.NO_DIMENSION, com.porter.qwerte.craft.CraftAuto.NO_MATERIAL -> com.porter.qwerte.craft.CraftOrder.NO_TABLE;
+            default -> com.porter.qwerte.craft.CraftOrder.TABLE_BLOCKED;
+        };
+    }
+
+    /**
+     * Why no table can be had with none set on the website (a CraftOrder reason), or null when one may be found, placed or crafted. A try that
+     * failed a short while ago is not made again at once (the heartbeat says why).
+     */
+    private String autoTableProblem() {
+        if (ensureStash() == null || mc.level == null || mc.player == null) return com.porter.qwerte.craft.CraftOrder.TABLE_BLOCKED;
+        String config = autoConfigCode();
+        if (config != null) return autoReason(config);
+        String recent = currentAutoWhy();
+        return recent == null ? null : autoReason(recent);
+    }
+
+    /** What {@link #autoTable} says to do next. */
+    private static final String AUTO_GATHER = "<gather>", AUTO_PLACING = "<placing>";
+
+    /**
+     * With no website table: a table the bot can use. The user's own table (hand-set) is used for orders when it is within the limits; when it
+     * is out of them, orders use a table of their own (a slot of the stash, persisted) that never overwrites it. A table the bot picked that has
+     * got out of the limits is forgotten, a missing one is found nearby, taken out of the stash and placed, or crafted from planks or logs and
+     * placed ({@link #prepareTable}, the shulker crafting's own), at most one table per order and three an hour.
+     * @return null when a table is ready, {@link #AUTO_GATHER} or {@link #AUTO_PLACING} when a session or a job began, else the failure text
+     */
+    private String autoTable() {
+        String config = autoConfigCode();
+        if (config != null) return com.porter.qwerte.craft.CraftTable.failureText(autoReason(config));
+        tableForChunk = true;
+        if (stash != swappedCapStash) {
+            swappedCapStash = stash;
+            tableCap.load(stash.craftTables);
+        }
+        // A hand-set table out of the limits stays as it is (shulker crafting still uses it); the order table stands in for it for the chunk
+        if (sideMode() && !stash.orderSlotInUse()) {
+            stash.useOrderSlot();
+            swappedStash = stash;
+            swappedSide = true;
+            tableChanged();
+        }
+        if (knownTableOutOfLimits()) {
+            // A table the bot picked earlier that is out of bounds is let go, and the steps are run again
+            stash.craftingTablePos = null;
+            stash.craftingTableSource = "";
+            stash.save();
+            tableChanged();
+        }
+        if (!tableMissing()) {
+            autoWhy.cleared();
+            return null;
+        }
+        // A table is put down only so often (it is a block in the world): once per order, three an hour
+        TableFinder.Decision d = decideTable(true);
+        boolean puts = d.step() == TableFinder.Step.PLACE_FROM_STOCK || d.step() == TableFinder.Step.CRAFT;
+        if (puts && tableItemSlot(false) < 0 && !tableCap.allows(orderRunner.orderId(), System.currentTimeMillis())) {
+            // The cap is its own reason: not a failure of the auto table, so nothing is remembered and the heartbeat's tableWhy stays null
+            com.porter.qwerte.QwerteAddon.LOG.info("orders: table cap reached ({} per order, {} an hour): no table is put down for this order", com.porter.qwerte.craft.CraftTableCap.PER_ORDER, com.porter.qwerte.craft.CraftTableCap.PER_HOUR);
+            return com.porter.qwerte.craft.CraftTable.failureText(com.porter.qwerte.craft.CraftOrder.TABLE_BLOCKED);
+        }
+        return switch (prepareTable(TableResume.Order, true)) {
+            case READY -> {
+                autoWhy.cleared();
+                yield null;
+            }
+            case GATHERING -> AUTO_GATHER;
+            case PLACING -> AUTO_PLACING;
+            default -> {
+                autoFailed(tableCode);
+                yield tableWhy;
+            }
+        };
+    }
+
+    /** @return null when the website's table now stands in for ours, else the crafter's words for why not */
+    private String engageWebsiteTable() {
+        // The order table's slot (or an earlier swap) goes back first: the website's table must never be copied into the order table's slot
+        if (swappedStash != null) releaseWebsiteTable();
+        String problem = craftTableProblem();
+        if (problem != null) return com.porter.qwerte.craft.CraftTable.failureText(problem);
+        com.porter.qwerte.stash.CraftSettings.Table t = craftSettings().table();
+        stash.overrideTable(new BlockPos(t.x(), t.y(), t.z()));
+        swappedStash = stash;
+        tableChanged();
+        return null;
+    }
+
+    /** The user's own table is put back (a no-op when the website's is not in use). Safe to call any time. */
+    private void releaseWebsiteTable() {
+        if (swappedStash == null) return;
+        swappedStash.restoreTable();
+        swappedStash = null;
+        swappedSide = false;
+        tableChanged();
+    }
+
+    /** The order wants a chunk made at the website's table. The table is swapped in for the session and always swapped back out. */
+    private boolean startOrderChunk(OrderRunner.CraftChunk chunk) {
+        try {
+            if (!crafter.active()) {
+                com.porter.qwerte.stash.CraftSettings cs = craftSettings();
+                boolean website = cs != null && cs.table() != null;
+                // A website table has priority; without one the bot's own (found, placed or crafted) is used and kept for next time
+                String bad = website ? engageWebsiteTable() : autoTable();
+                if (AUTO_GATHER.equals(bad)) return runCraft(crafter.next());
+                if (AUTO_PLACING.equals(bad)) return true;
+                if (bad != null) {
+                    orderRunner.craftEnded(new Crafter.Outcome(chunk.key(), 0, bad));
+                    return false;
+                }
+                int chunkFills = 0;
+                for (var step : chunk.plan().steps()) chunkFills += step.crafts();
+                chunkJobLimit = 20 * (120 + 20 * chunkFills);
+                String why = crafter.beginPlan(new Crafter.Request(chunk.key(), chunk.count(), "order " + orderRunner.orderId(), false, 0, java.util.Map::of, java.util.Set::of, false, true),
+                    chunk.plan(), chunk.carried());
+                if (why != null) {
+                    orderRunner.craftEnded(new Crafter.Outcome(chunk.key(), 0, why));
+                    return false;
+                }
+                craftForOrder = true;
+            }
+            return runCraft(crafter.next());
+        } finally {
+            if (!crafter.active() && !swappedSide) releaseWebsiteTable();
+        }
+    }
+
+    /** The stash area as minX, minY, minZ, maxX, maxY, maxZ, or null when it has none (or it was set in another dimension than the stash). */
+    private int[] craftBounds() {
+        if (stash == null || !stash.hasCorners()) return null;
+        if (!stash.areaDimension.isEmpty() && !com.porter.qwerte.stash.CraftBounds.sameDimension(stash.areaDimension, stash.dimension)) return null;
+        BlockPos lo = stash.areaMin(), hi = stash.areaMax();
+        return new int[] { lo.getX(), lo.getY(), lo.getZ(), hi.getX(), hi.getY(), hi.getZ() };
+    }
+
+    /** The website's table is not in the stash's dimension, or is more than 64 blocks outside the stash area: it is never walked to. */
+    boolean craftTableOutOfBounds(com.porter.qwerte.stash.CraftSettings.Table t) {
+        return stash == null || com.porter.qwerte.stash.CraftBounds.outOfBounds(stash.dimension, craftBounds(), t);
+    }
+
+    /**
+     * The table the heartbeat reports (CRAFT-CONTRACT.md + the auto-table addition): the website's table when one is set (unset, ok, unloaded,
+     * ...), else "auto" when the bot can find, place or craft one itself, else "unset". Never a position.
+     */
+    String craftTableStatus() {
+        return com.porter.qwerte.craft.CraftAuto.status(autoState());
+    }
+
+    /** Why the table is not usable (a CraftAuto code), or null when it is. */
+    String craftTableWhy() {
+        return com.porter.qwerte.craft.CraftAuto.why(autoState());
+    }
+
+    /** The bot's own table in use, as "x,y,z" and where it came from (found, placed, crafted), or null. A position: the server hides it from streamers. */
+    String[] botTable() {
+        Stash st = ensureStash();
+        if (st == null || st.tableSwap.engaged() || st.craftingTablePos == null) return null;
+        String source = com.porter.qwerte.craft.CraftAuto.botSource(st.craftingTableSource);
+        return source == null ? null : new String[] { st.craftingTablePos.getX() + "," + st.craftingTablePos.getY() + "," + st.craftingTablePos.getZ(), source };
+    }
+
+    // The auto table: with no website table the bot finds one nearby, takes one out of the stash and places it, or crafts one (TableFinder,
+    // prepareTable), within the same limits as the website's: the stash's dimension, 64 blocks of its area, a height of -64 to 320
+    private final com.porter.qwerte.craft.AutoWhy autoWhy = new com.porter.qwerte.craft.AutoWhy();
+
+    /** The last try at a table on the order path failed for this reason (a CraftAuto code); said in the heartbeat for a while, and not tried again at once. */
+    private void autoFailed(String code) {
+        // Only on the order path: a shulker craft or the chest expansion failing to get a table is not a reason to stop taking craft orders
+        autoWhy.failed(tableForChunk, code, System.currentTimeMillis());
+    }
+
+    private String currentAutoWhy() {
+        return autoWhy.current(System.currentTimeMillis());
+    }
+
+    private boolean outOfLimits(BlockPos p) {
+        return com.porter.qwerte.stash.CraftBounds.outOfBounds(stash.dimension, craftBounds(), new com.porter.qwerte.stash.CraftSettings.Table(p.getX(), p.getY(), p.getZ(), stash.dimension));
+    }
+
+    /** The table in use now (the live fields) is outside the limits of a bot table. */
+    private boolean knownTableOutOfLimits() {
+        return stash != null && stash.craftingTablePos != null && outOfLimits(stash.craftingTablePos);
+    }
+
+    /**
+     * The user's own table was set by hand and is outside the limits: craft orders use a table of their own then (CraftingTableSpot's side mode in the
+     * plugin), and the hand-set one is kept for shulker crafting. A table found, placed or crafted is not the user's: it is simply forgotten.
+     */
+    private boolean sideMode() {
+        if (stash == null) return false;
+        BlockPos pos = stash.tableSwap.persistedPos(stash.craftingTablePos);
+        String source = stash.tableSwap.persistedSource(stash.craftingTableSource);
+        return com.porter.qwerte.craft.CraftSide.decide(pos != null, source, pos != null && outOfLimits(pos)) == com.porter.qwerte.craft.CraftSide.Use.SLOT;
+    }
+
+    /** A table can be had without the website: a known one within the limits, a table found nearby, one in the stash, or planks or logs to craft one. */
+    private boolean autoObtainable() {
+        if (stash == null || mc.level == null) return false;
+        TableFinder.Decision d = orderPreCheck.get(System.currentTimeMillis(), TABLE_PRECHECK_MS, () -> decideTable(true));
+        return d.step() != TableFinder.Step.FAIL;
+    }
+
+    private com.porter.qwerte.craft.CraftAuto.State autoState() {
+        com.porter.qwerte.stash.CraftSettings cs = craftSettings();
+        boolean websiteSet = cs != null && cs.table() != null;
+        if (ensureStash() == null) return new com.porter.qwerte.craft.CraftAuto.State(websiteSet, websiteSet ? websiteTableStatus() : "unset", false, false, false, null);
+        boolean area = craftBounds() != null, dimension = !stash.dimension.isEmpty();
+        return new com.porter.qwerte.craft.CraftAuto.State(websiteSet, websiteSet ? websiteTableStatus() : "unset", area, dimension,
+            area && dimension && autoObtainable(), currentAutoWhy(), sideMode());
+    }
+
+    /** The state of the website's crafting table for the heartbeat (unset, ok, unloaded, ...). Never a position. */
+    String websiteTableStatus() {
+        com.porter.qwerte.stash.CraftSettings cs = craftSettings();
+        com.porter.qwerte.stash.CraftSettings.Table t = cs == null ? null : cs.table();
+        if (t == null) return StashIndex.TABLE_UNSET;
+        if (ensureStash() == null || mc.level == null) return StashIndex.TABLE_UNLOADED;
+        // A table outside the stash's dimension or far from the stash area is never "ok": the bot does not go there
+        if (!stash.dimension.isEmpty() && !com.porter.qwerte.stash.CraftBounds.sameDimension(stash.dimension, t.dimension())) return StashIndex.TABLE_OTHER_DIMENSION;
+        if (craftTableOutOfBounds(t)) return StashIndex.TABLE_UNREACHABLE;
+        if (!com.porter.qwerte.stash.CraftBounds.sameDimension(Stash.currentDimension(), t.dimension())) return StashIndex.TABLE_OTHER_DIMENSION;
+        BlockPos pos = new BlockPos(t.x(), t.y(), t.z());
+        // Once the table was seen standing, leaving its chunk unloaded does not make it unknown again ("unloaded" is only for one never seen)
+        if (!mc.level.isLoaded(pos)) return com.porter.qwerte.stash.CraftBounds.unloadedStatus(pos.equals(websiteTableSeen));
+        if (!isTable(pos)) {
+            websiteTableSeen = null;
+            return StashIndex.TABLE_NOT_TABLE;
+        }
+        websiteTableSeen = pos;
+        return StashIndex.TABLE_OK;
+    }
+
+    /** Crafting tables standing in the stash area, as the last search found them ("x,y,z", at most 8): the website's quick pick. Searched at most every 10 minutes. */
+    List<String> seenTables() {
+        long now = System.currentTimeMillis();
+        // A search that found nothing is repeated sooner (a chunk may not have been loaded yet)
+        if (now - seenScanAt < (seenCache.isEmpty() ? SEEN_RESCAN_EMPTY_MS : SEEN_SCAN_MS) || mc.level == null || mc.player == null || ensureStash() == null) return seenCache;
+        seenScanAt = now;
+        List<String> out = new ArrayList<>();
+        try {
+            for (BlockPos p : scanArea(st -> st.is(Blocks.CRAFTING_TABLE), true)) out.add(p.getX() + "," + p.getY() + "," + p.getZ());
+        } catch (RuntimeException e) {
+            return seenCache;
+        }
+        java.util.Collections.sort(out);
+        seenCache = out.size() > StashIndex.MAX_SEEN ? new ArrayList<>(out.subList(0, StashIndex.MAX_SEEN)) : out;
+        return seenCache;
     }
 
     // Finding a crafting table to craft at (before a craft that needs one). In order: the one picked by hand, a remembered one, a
@@ -3667,24 +4026,29 @@ public class StashSorter extends Module {
     private enum TablePrep { READY, GATHERING, PLACING, FAILED }
 
     private final TableFinder.Throttle tableThrottle = new TableFinder.Throttle();
-    private boolean tableSession, placingTable, tableCrafted;
+    private boolean tableSession, placingTable, tableCrafted, tableForChunk;
     private TableResume tableResume = TableResume.Order;
     // Why the table could not be had, as the failure text ("no crafting table available: <cause>"), and why placing failed
     private String tableWhy = TableFinder.NONE, placeWhy = "";
+    // Why the table could not be had, as a CraftAuto code that travels with the failure text
+    private String tableCode = com.porter.qwerte.craft.CraftAuto.NO_MATERIAL;
     // Slots that held a crafting table before the table session began: never the one placed
     private final Set<Integer> tablePre = new HashSet<>();
     // The pre-check of a craft (can a table be had?) is kept for a few seconds, the world and the stash are not combed on every ask
     private static final long TABLE_PRECHECK_MS = 3000;
     private final TableFinder.Memo<TableFinder.Decision> tablePreCheck = new TableFinder.Memo<>();
+    // The same for craft orders: their table may come only from plain stacks, and from the order slot when the user's own is out of the limits
+    private final TableFinder.Memo<TableFinder.Decision> orderPreCheck = new TableFinder.Memo<>();
     private int tableWaitTicks;
 
     /** The table position, or what it can be had from, changed: the kept answers are dropped. */
     private void tableChanged() {
         tableThrottle.reset();
         tablePreCheck.reset();
+        orderPreCheck.reset();
     }
 
-    private TableFinder.World tableWorld() {
+    private TableFinder.World tableWorld(boolean plain) {
         return new TableFinder.World() {
             @Override
             public boolean isTable(TableFinder.Pos p) {
@@ -3721,22 +4085,37 @@ public class StashSorter extends Module {
 
             @Override
             public boolean stockHasTable() {
-                return orderRunner.craftPool().getOrDefault(TableFinder.TABLE_ID, 0L) > 0;
+                return orderRunner.craftPool(plain).getOrDefault(TableFinder.TABLE_ID, 0L) > 0;
             }
 
             @Override
             public TableFinder.Material craftMaterial() {
                 StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
-                return TableFinder.material(Crafter.recipes(), orderRunner.craftPool(), manager == null ? Set.of() : manager.craftNeverUse());
+                return TableFinder.material(Crafter.recipes(), orderRunner.craftPool(plain), manager == null ? Set.of() : manager.craftNeverUse());
             }
         };
     }
 
     private TableFinder.Decision decideTable() {
-        TableFinder.Memory memory = stash.craftingTablePos == null ? null
-            : new TableFinder.Memory(new TableFinder.Pos(stash.craftingTablePos.getX(), stash.craftingTablePos.getY(), stash.craftingTablePos.getZ()),
-                TableFinder.Source.of(stash.craftingTableSource.isEmpty() ? "set" : stash.craftingTableSource));
-        return TableFinder.decide(memory, tableWorld());
+        return decideTable(false);
+    }
+
+    /**
+     * @param orders the decision is for a craft order's table: plain stacks only, and the order slot when the user's own table is out of the
+     *               limits. The shulker, compaction and chest flows keep the user's table and every stack.
+     */
+    private TableFinder.Decision decideTable(boolean orders) {
+        BlockPos known = stash.craftingTablePos;
+        String knownSource = stash.craftingTableSource;
+        // With the user's hand-set table out of the limits the table of orders is the stash's order slot (when it is not standing in already)
+        if (orders && !stash.tableSwap.engaged() && sideMode()) {
+            known = stash.orderTablePos;
+            knownSource = stash.orderTableSource;
+        }
+        TableFinder.Memory memory = known == null ? null
+            : new TableFinder.Memory(new TableFinder.Pos(known.getX(), known.getY(), known.getZ()),
+                TableFinder.Source.of(knownSource.isEmpty() ? "set" : knownSource));
+        return TableFinder.decide(memory, tableWorld(orders));
     }
 
     /** What is in the inventory window's crafting grid and on its cursor, as text ("" when nothing). */
@@ -3775,14 +4154,20 @@ public class StashSorter extends Module {
      * tells whoever asked.
      */
     private TablePrep prepareTable(TableResume resume) {
+        return prepareTable(resume, false);
+    }
+
+    /** @param chunk the table is for a craft-order chunk (plain stacks only, counted against the table cap, remembered when it fails) */
+    private TablePrep prepareTable(TableResume resume, boolean chunk) {
         if (stash == null || mc.level == null || mc.player == null) return TablePrep.FAILED;
         tableResume = resume;
+        tableForChunk = chunk;
         // A table taken out or crafted earlier and not yet placed (the job was interrupted)
         int held = tableItemSlot(false);
         if (held >= 0) tableCrafted = false;
         if (held >= 0 && startTablePlace(held)) return TablePrep.PLACING;
 
-        TableFinder.Decision decision = decideTable();
+        TableFinder.Decision decision = decideTable(tableForChunk);
         if (decision.forget()) {
             info("The crafting table I knew is gone, looking for another.");
             stash.craftingTablePos = null;
@@ -3805,20 +4190,22 @@ public class StashSorter extends Module {
                 return TablePrep.READY;
             }
             case PLACE_FROM_STOCK -> {
-                String why = crafter.begin(new Crafter.Request(TableFinder.TABLE_ID, 1, "placing", false, 0, orderRunner::craftPool, orderRunner::lotKeys, true));
+                String why = crafter.begin(new Crafter.Request(TableFinder.TABLE_ID, 1, "placing", false, 0, orderRunner::craftPool, orderRunner::lotKeys, true, chunk));
                 if (why != null) {
                     warning("No crafting table to place: %s.", why);
                     tableWhy = TableFinder.failure("couldn't take one from the stash: " + why);
+                    tableCode = com.porter.qwerte.craft.CraftAuto.NO_MATERIAL;
                     return TablePrep.FAILED;
                 }
                 tableCrafted = false;
                 info("No crafting table in the area, taking one out of the stash to place.");
             }
             case CRAFT -> {
-                String why = crafter.begin(new Crafter.Request(TableFinder.TABLE_ID, 1, "placing", false, 0, orderRunner::craftPool, orderRunner::lotKeys, false));
+                String why = crafter.begin(new Crafter.Request(TableFinder.TABLE_ID, 1, "placing", false, 0, orderRunner::craftPool, orderRunner::lotKeys, false, chunk));
                 if (why != null) {
                     warning("No crafting table to craft: %s.", why);
                     tableWhy = TableFinder.failure("couldn't craft one: " + why);
+                    tableCode = com.porter.qwerte.craft.CraftAuto.NO_MATERIAL;
                     return TablePrep.FAILED;
                 }
                 crafter.useInventoryGrid();
@@ -3828,6 +4215,7 @@ public class StashSorter extends Module {
             default -> {
                 warning("%s.", decision.failure());
                 tableWhy = decision.failure();
+                tableCode = com.porter.qwerte.craft.CraftAuto.NO_MATERIAL;
                 return TablePrep.FAILED;
             }
         }
@@ -3842,6 +4230,11 @@ public class StashSorter extends Module {
 
     /** The table is there (or not): whoever asked is told, and carries on. */
     private void tableAcquired(boolean ok) {
+        // Only a table put down for an order is remembered as a failure of the auto table (a shulker craft or the chest expansion are not)
+        if (tableForChunk) {
+            if (ok) autoWhy.cleared();
+            else autoFailed(tableCode);
+        }
         switch (tableResume) {
             case Order -> {
                 if (ok) orderRunner.tableReady();
@@ -3958,6 +4351,9 @@ public class StashSorter extends Module {
     /** The crafting session is over: the order (or the compactor) is told how it went. */
     private void endCraft() {
         Crafter.Outcome outcome = crafter.finish();
+        // The session is over: the user's own crafting table is ours again (the order table stays in while its table is being put down)
+        if (!swappedSide) releaseWebsiteTable();
+        chunkJobLimit = 0;
         if (tableSession) {
             // The crafting table was only gathered or crafted: it is placed now
             tableSession = false;
@@ -3967,6 +4363,7 @@ public class StashSorter extends Module {
                 String cause = outcome.failure() == null ? "the crafting table couldn't be taken" : outcome.failure();
                 warning("No crafting table to place: %s.", cause);
                 tableWhy = TableFinder.failure(cause);
+                tableCode = cause.contains("reach") || cause.contains("open") ? com.porter.qwerte.craft.CraftAuto.PATH_FAILED : com.porter.qwerte.craft.CraftAuto.NO_MATERIAL;
                 tableAcquired(false);
             }
             // What the session held is not looked at again
@@ -4173,12 +4570,14 @@ public class StashSorter extends Module {
         stepTicks++;
         lastOwnAct = ticks;
         if (step == Step.Working) craftJobTicks++;
-        if (craftJobTicks > CRAFT_JOB_TICKS + 400) {
+        // A craft-order chunk gets what its plan needs: 2 minutes and 20 seconds a fill (CRAFT-CONTRACT.md), at least the usual
+        int jobLimit = Math.max(CRAFT_JOB_TICKS, chunkJobLimit);
+        if (craftJobTicks > jobLimit + 400) {
             if (craftFailure == null) craftFailure = "crafting didn't finish";
             craftEnd();
             return;
         }
-        if (craftJobTicks > CRAFT_JOB_TICKS && craftFailure == null) craftFailure = "crafting didn't finish";
+        if (craftJobTicks > jobLimit && craftFailure == null) craftFailure = "crafting didn't finish";
         switch (step) {
             case Walking -> craftWalk();
             case Opening -> craftOpen();
@@ -5370,6 +5769,13 @@ public class StashSorter extends Module {
         if (ok && table) {
             stash.craftingTablePos = anvilSpot.immutable();
             stash.craftingTableSource = tableCrafted ? "crafted" : "placed";
+            // A table actually placed for a craft order counts against its cap (one per order, three an hour); kept with the stash
+            if (tableForChunk) {
+                long stamp = System.currentTimeMillis();
+                tableCap.placed(orderRunner.orderId(), stamp);
+                stash.craftTables.clear();
+                stash.craftTables.addAll(tableCap.export(stamp));
+            }
             stash.save();
             tableChanged();
             info(tableCrafted ? "Crafted a crafting table and placed it, remembered for next time." : "Placed a crafting table to craft at, remembered for next time.");
@@ -5381,7 +5787,10 @@ public class StashSorter extends Module {
             info("Placed an anvil to name shulkers at, remembered for next time.");
         }
         else warning(table ? "Couldn't place a crafting table." : "Couldn't place an anvil.");
-        if (table && !ok) tableWhy = TableFinder.failure(placeWhy.isEmpty() ? "it couldn't be placed" : placeWhy);
+        if (table && !ok) {
+            tableWhy = TableFinder.failure(placeWhy.isEmpty() ? "it couldn't be placed" : placeWhy);
+            tableCode = com.porter.qwerte.craft.CraftAuto.NO_STAND;
+        }
         placingTable = false;
         // An anvil item that was not placed is carried like anything else and put back
         anvilSlot = -1;
@@ -9158,6 +9567,183 @@ public class StashSorter extends Module {
         return true;
     }
 
+
+    // The stash area editor (0.4.0-dev.20, AREA-CONTRACT.md): an area from the website or a local edit waits in areaPending and is applied here, on the
+    // tick, only between tasks; a website area further than 128 blocks away or for another dimension waits; a local edit is reported as "edited" until the
+    // server has it
+
+    private final com.porter.qwerte.stash.AreaPending areaPending = new com.porter.qwerte.stash.AreaPending();
+
+    public com.porter.qwerte.stash.AreaPending areaPending() {
+        return areaPending;
+    }
+
+    /** The set area as a box (min and max corners), or null. */
+    private static int[] boxOf(Stash s) {
+        if (!s.hasCorners()) return null;
+        BlockPos lo = s.areaMin(), hi = s.areaMax();
+        return new int[] { lo.getX(), lo.getY(), lo.getZ(), hi.getX(), hi.getY(), hi.getZ() };
+    }
+
+    /** The set area's dimension as the contract names it ("minecraft:overworld"), or null when it isn't known. */
+    private static String areaDimensionOf(Stash s) {
+        String d = com.porter.qwerte.stash.CraftBounds.fullId(!s.areaDimension.isEmpty() ? s.areaDimension : s.dimension);
+        return d.isEmpty() ? null : d;
+    }
+
+    /** The stash's dimension as the contract names it, or null. */
+    private static String stashDimensionOf(Stash s) {
+        String d = com.porter.qwerte.stash.CraftBounds.fullId(s.dimension);
+        return d.isEmpty() ? null : d;
+    }
+
+    /** A dimension id in the form this addon keeps ({@code ResourceKey[minecraft:dimension / minecraft:overworld]}): the current one's own text when it is that one. */
+    private static String rawDimension(String full) {
+        String current = Stash.currentDimension();
+        if (!current.isEmpty() && com.porter.qwerte.stash.CraftBounds.sameDimension(current, full)) return current;
+        return "ResourceKey[minecraft:dimension / " + full + "]";
+    }
+
+    /** The area fields of the heartbeat, or null with no stash or an area whose dimension is not known. */
+    public StashIndex.AreaReport areaReport() {
+        Stash s = ensureStash();
+        if (s == null) return null;
+        int[] box = boxOf(s);
+        String dimension = null;
+        if (box != null) {
+            dimension = areaDimensionOf(s);
+            if (dimension == null) return null;
+        }
+        List<int[]> blocks = new ArrayList<>();
+        int outside = 0;
+        for (Box b : s.boxes) {
+            if (b.delivery) continue;
+            if (box != null && b.foreign) outside++;
+            if (b.known() && !b.foreign) for (BlockPos p : b.parts) blocks.add(new int[] { p.getX(), p.getY(), p.getZ() });
+        }
+        String key = areaKey();
+        com.porter.qwerte.stash.AreaPending.Request pending = areaPending.get(key);
+        return new StashIndex.AreaReport(com.porter.qwerte.stash.AreaRules.hashOf(box, dimension), box, dimension,
+            box == null ? com.porter.qwerte.stash.AreaRules.derived(blocks) : null, areaPending.edited(key),
+            pending == null ? null : pending.hash(), pending == null ? null : areaPending.why(), outside);
+    }
+
+    /** A cheap signature of what the heartbeat says about the area, so a change sends a heartbeat at once. */
+    public String areaSig() {
+        Stash s = stash;
+        String key = areaKey();
+        com.porter.qwerte.stash.AreaPending.Request p = areaPending.get(key);
+        return (s == null ? "-" : s.corner1 + "/" + s.corner2 + "/" + s.areaDimension) + "|" + (p == null ? "-" : p.hash() + areaPending.why()) + "|" + areaPending.edited(key);
+    }
+
+    /** Queues a local area edit (the window's area card): applied between tasks, then reported as edited. {@code box} null clears. */
+    public String queueLocalArea(int[] box, String dimension) {
+        int[] copy = box == null ? null : box.clone();
+        String dim = dimension != null ? dimension : StashIndex.dimension();
+        if (copy != null) {
+            if (dim.isEmpty()) return "no dimension";
+            Stash s = stash;
+            String own = s == null ? null : stashDimensionOf(s);
+            String refused = com.porter.qwerte.stash.AreaRules.validate(copy, dim, own != null ? own : dim);
+            if (refused != null) return refused;
+        }
+        areaPending.queue(new com.porter.qwerte.stash.AreaPending.Request(copy, copy == null ? null : dim, false), areaKey());
+        return null;
+    }
+
+    /** The key of the stash this module works on (server and name): a queued area or an unacknowledged edit belongs to one stash. */
+    public String areaKey() {
+        return Stash.currentServer() + "/" + stashName.get();
+    }
+
+    /** The area waiting for the current stash, or null. */
+    public com.porter.qwerte.stash.AreaPending.Request pendingArea() {
+        return areaPending.get(areaKey());
+    }
+
+    /** The bot is in the middle of something an area change must not cut short. */
+    private boolean areaBusy(boolean website) {
+        boolean hard = orderRunner.holdsOrder() || orderRunner.resumeId() != null || job != null || handle != null || placed != null || pendingResume != null
+            || crafter.active() || kitBuilder.active() || repairer.active() || compactor.active() || (stash != null && stash.inFlight != null) || !orderHeld.isEmpty()
+            || chestHolding || chestSession || tableSession || placingTable || anvilSession || returning || !activeCarried().isEmpty();
+        // Leftovers with no destination must not hold the area forever: after 10 minutes of nothing else, a change made in game goes through
+        // (the website one still waits, and is reported as busy)
+        return areaPending.held().busy(hard, !stashHeld.isEmpty(), website, System.currentTimeMillis());
+    }
+
+    private String areaWaitingWhy;
+    private long areaWaitingAt;
+
+    /** A waiting area is said in chat when the reason changes and every 10 minutes after, so it never waits without a word. */
+    private void announceAreaWaiting(String why) {
+        long now = System.currentTimeMillis();
+        if (why.equals(areaWaitingWhy) && now - areaWaitingAt < 10 * 60_000L) return;
+        areaWaitingWhy = why;
+        areaWaitingAt = now;
+        String words = switch (why) {
+            case com.porter.qwerte.stash.AreaRules.FAR -> "the bot is more than 128 blocks away";
+            case com.porter.qwerte.stash.AreaRules.DIMENSION -> "the bot is in another dimension than the area";
+            default -> "the bot is busy with a task";
+        };
+        notice("A stash area change is waiting: %s. The stash keeps working with its current area until then.", words);
+    }
+
+    /** Applies the queued area when the bot is between tasks, near enough and in the right dimension. Every tick, client thread. */
+    private void applyPendingArea() {
+        String key = areaKey();
+        // A request or an edit made for another stash (or server) is nothing here
+        areaPending.dropOthers(key);
+        com.porter.qwerte.stash.AreaPending.Request r = areaPending.get(key);
+        if (r == null || mc.player == null || mc.level == null) return;
+        Stash s = ensureStash();
+        if (s == null) return;
+        String current = StashIndex.dimension();
+        // The dimension of a local edit is resolved now: the one it was queued with, else the bot's
+        String dimension = com.porter.qwerte.stash.AreaSync.resolveDimension(r.dimension(), current.isEmpty() ? null : current);
+        if (r.box() != null && dimension == null) {
+            areaPending.setWhy(com.porter.qwerte.stash.AreaRules.BUSY);
+            return;
+        }
+        String why = com.porter.qwerte.stash.AreaRules.pendingWhy(r.box(), dimension, current.isEmpty() ? null : current, r.website(), mc.player.getX(), mc.player.getZ(),
+            areaBusy(r.website()) ? com.porter.qwerte.stash.AreaRules.BUSY : null);
+        areaPending.setWhy(why == null ? com.porter.qwerte.stash.AreaRules.BUSY : why);
+        if (why != null) {
+            announceAreaWaiting(why);
+            return;
+        }
+        areaWaitingWhy = null;
+        if (r.box() != null) {
+            // Checked again against this stash's own dimension, whoever queued it
+            String own = stashDimensionOf(s);
+            // An area from the website is never checked against itself: a stash with no known dimension takes none. A local edit is made
+            // in the dimension the player is in, so it may be the stash's first
+            String refused = r.website() && own == null ? "the stash's dimension isn't known"
+                : com.porter.qwerte.stash.AreaRules.validate(r.box(), dimension, own != null ? own : dimension);
+            if (refused != null) {
+                areaPending.clear(r);
+                warning("The stash area was not applied: %s.", refused);
+                return;
+            }
+        }
+        if (r.box() == null) {
+            s.corner1 = null;
+            s.corner2 = null;
+            s.areaDimension = "";
+        } else {
+            s.corner1 = new BlockPos(r.box()[0], r.box()[1], r.box()[2]);
+            s.corner2 = new BlockPos(r.box()[3], r.box()[4], r.box()[5]);
+            s.areaDimension = rawDimension(dimension);
+        }
+        // Only the request that was applied is removed: one queued meanwhile stays. A change made in game is reported until the server has this area
+        areaPending.clear(r);
+        if (!r.website()) areaPending.markEdited(com.porter.qwerte.stash.AreaRules.hashOf(r.box(), r.box() == null ? null : dimension), key);
+        s.markDirty();
+        s.save();
+        // Only the size in chat: the positions are for the user's own stash area command
+        notice("Stash area %s.", r.box() == null ? "cleared" : "changed (" + com.porter.qwerte.stash.AreaEdit.sizeOf(r.box()) + ")");
+        areaChanged();
+    }
+
     // The stash perimeter
 
     /**
@@ -9168,12 +9754,22 @@ public class StashSorter extends Module {
         // Corners set in another dimension don't go with this one
         String dimension = Stash.currentDimension();
         if (stash.hasCorners() || stash.corner1 != null || stash.corner2 != null) {
-            if (!stash.areaDimension.isEmpty() && !stash.areaDimension.equals(dimension)) {
+            if (!stash.areaDimension.isEmpty() && !com.porter.qwerte.stash.CraftBounds.sameDimension(stash.areaDimension, dimension)) {
                 stash.corner1 = null;
                 stash.corner2 = null;
             }
         }
         BlockPos other = which == 1 ? stash.corner2 : stash.corner1;
+        // A change of ours that is still waiting is the area as it will be: the other corner comes from it, not from the corners applied now
+        com.porter.qwerte.stash.AreaPending.Request waiting = pendingArea();
+        if (waiting != null && !waiting.website()) {
+            int[] wb = waiting.box();
+            if (wb == null) {
+                error("Clearing the stash area is still waiting for the bot to be between tasks: set the corner after it is done.");
+                return;
+            }
+            other = which == 1 ? new BlockPos(wb[3], wb[4], wb[5]) : new BlockPos(wb[0], wb[1], wb[2]);
+        }
         if (other != null && Stash.tooBig(pos, other)) {
             error("That area is %d\u00d7%d\u00d7%d, the largest allowed is %d\u00d7%d\u00d7%d (width \u00d7 height \u00d7 depth).",
                 Math.abs(pos.getX() - other.getX()) + 1, Math.abs(pos.getY() - other.getY()) + 1, Math.abs(pos.getZ() - other.getZ()) + 1,
@@ -9181,6 +9777,19 @@ public class StashSorter extends Module {
             return;
         }
 
+        // The corner that completes an area is a local edit: it waits for the bot to be between tasks (a lone corner changes nothing yet)
+        if (other != null) {
+            int[] box = { Math.min(pos.getX(), other.getX()), Math.min(pos.getY(), other.getY()), Math.min(pos.getZ(), other.getZ()),
+                Math.max(pos.getX(), other.getX()), Math.max(pos.getY(), other.getY()), Math.max(pos.getZ(), other.getZ()) };
+            String full = StashIndex.dimension();
+            String refused = queueLocalArea(box, full);
+            if (refused != null) {
+                error("That area can't be used: %s.", refused);
+                return;
+            }
+            notice("Stash area change queued (%s): it is applied when the bot is between tasks.", com.porter.qwerte.stash.AreaEdit.sizeOf(box));
+            return;
+        }
         if (which == 1) stash.corner1 = pos;
         else stash.corner2 = pos;
         stash.areaDimension = dimension;
@@ -9199,14 +9808,18 @@ public class StashSorter extends Module {
             notice("There is no stash area set.");
             return;
         }
-        boolean applied = stash.hasArea();
+        if (stash.hasCorners()) {
+            // A set area is cleared between tasks, like any local edit
+            queueLocalArea(null, null);
+            notice("Clearing the stash area is queued: it is done when the bot is between tasks.");
+            return;
+        }
         stash.corner1 = null;
         stash.corner2 = null;
         stash.areaDimension = "";
         stash.markDirty();
         stash.save();
         notice("Stash area cleared, finding containers around you again.");
-        if (applied) areaChanged();
     }
 
     /**
@@ -9522,7 +10135,8 @@ public class StashSorter extends Module {
         if (ensureStash() == null || (stash.corner1 == null && stash.corner2 == null)) return "Stash area: none, containers are found around you (radius and height).";
         if (stash.hasCorners() && !stash.hasArea()) return "Stash area: set in another dimension, not used here.";
         if (!stash.hasArea()) return "Stash area: corner " + (stash.corner1 != null ? "1 is set at " + stash.corner1.toShortString() : "2 is set at " + stash.corner2.toShortString()) + ", the other is missing.";
-        return "Stash area: " + stash.areaText() + ".";
+        com.porter.qwerte.stash.AreaPending.Request waiting = pendingArea();
+        return "Stash area: " + stash.areaText() + "." + (waiting == null ? "" : " A change waits to be applied (" + areaPending.why() + ").");
     }
 
     /**
@@ -9591,6 +10205,7 @@ public class StashSorter extends Module {
         private void onGameLeft(GameLeftEvent event) {
             driven = false;
             setUp = false;
+            areaPending.reset();
             // Before anything is forgotten: what is carried and the shulker standing in the world are written down
             if (stash != null) {
                 BlockPos standing = standingShulker();
@@ -9677,6 +10292,7 @@ public class StashSorter extends Module {
             worldTicks++;
             Stash.remember();
             if (mc.level != null) cachedDimension = mc.level.dimension().toString();
+            applyPendingArea();
             pumpAlerts();
             ground.update();
             // Not walking for us: Baritone's settings are the user's own
@@ -9721,6 +10337,7 @@ public class StashSorter extends Module {
                         crafter.clearLastHeld();
                         craftForOrder = false;
                         tableWhy = TableFinder.failure("the player changed (respawn or dimension)");
+                        tableCode = com.porter.qwerte.craft.CraftAuto.PATH_FAILED;
                         tableAcquired(false);
                     }
                     // Another dimension or a new life: nothing was explored there, and the area may not be used at all

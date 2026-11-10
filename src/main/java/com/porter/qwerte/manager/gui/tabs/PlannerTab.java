@@ -10,6 +10,7 @@ import com.porter.qwerte.manager.gui.style.SmGuiTheme;
 import com.porter.qwerte.manager.gui.style.SmTable;
 import com.porter.qwerte.manager.gui.style.Ui;
 import com.porter.qwerte.manager.gui.widgets.WItemIcon;
+import com.porter.qwerte.manager.model.CraftModel;
 import com.porter.qwerte.manager.model.PlanModel;
 import com.porter.qwerte.manager.model.SchematicFiles;
 import com.porter.qwerte.manager.model.StashRef;
@@ -693,6 +694,7 @@ public final class PlannerTab {
         SmCard opts = Ui.card(parent, "Options");
         stashPicker(opts);
         optionsRow(opts, wrap);
+        craftBanners(opts, wrap);
         tiles(parent, wrap);
         tableSection(parent, wrap);
         lists(parent, wrap);
@@ -831,7 +833,8 @@ public final class PlannerTab {
     }
 
     private void tile(SmGrid grid, String name, String value, String sub, boolean danger) {
-        double cellW = (grid.maxWidth - 4 * theme.scale(6)) / 5 - theme.scale(12);
+        int cols = Math.max(1, grid.columns);
+        double cellW = (grid.maxWidth - (cols - 1) * theme.scale(6)) / cols - theme.scale(12);
         SmCard t = grid.add(new SmCard(name, danger ? SmCard.Style.DANGER : SmCard.Style.INSET)).widget();
         t.quietTitle = true;
         t.padding = 6;
@@ -846,16 +849,49 @@ public final class PlannerTab {
         PlanModel.Totals t = p.totals();
         SmCard card = Ui.card(parent, "");
         SmGrid grid = card.add(new SmGrid()).expandX().widget();
-        grid.columns = 5;
+        CraftModel.Info ci = p.craft();
+        boolean craftTile = ci != null && ci.showsColumn();
+        grid.columns = craftTile ? 6 : 5;
         grid.gapX = 6;
         grid.maxWidth = PageRoom.width(card, 16);
         tile(grid, "Needed", Text.grouped(t.need()), p.items().size() + (p.items().size() == 1 ? " kind" : " kinds"), false);
         tile(grid, "Available", Text.grouped(t.available()), "in the stash, after open orders", false);
-        tile(grid, "Missing", Text.grouped(t.missing()), "not in the stash", t.missing() > 0);
-        tile(grid, "To order", Text.grouped(t.want()), t.lines() + (t.lines() == 1 ? " line" : " lines"), false);
+        if (craftTile) tile(grid, "Craftable", ci.available() ? Text.grouped(t.craft() == null ? 0 : t.craft().craftable()) : "...",
+            CraftModel.tileSub(t.craft(), ci), false);
+        tile(grid, "Missing", Text.grouped(t.missingNow()), t.craft() != null ? "after crafting" : "not in the stash", t.missingNow() > 0);
+        tile(grid, "To order", Text.grouped(toOrder()), t.lines() + (t.lines() == 1 ? " line" : " lines"), false);
         tile(grid, "Shulkers", Text.grouped(t.shulkers()), t.parts() + (t.parts() == 1 ? " order" : " orders") + " of up to 54", false);
         if (t.frozen()) card.add(Ui.muted(theme, "The order is fixed: parts are ordered.", wrap)).expandX();
         orderArea(card, wrap);
+    }
+
+    /** What an order would take: the item lines, plus the craftable amounts when the craft box is on and the stash can take craft lines. */
+    private long toOrder() {
+        PlanModel.Totals t = plan.totals();
+        return options.craft() && CraftModel.orderable(plan.craft()) && t.craft() != null ? t.craft().wantWithCraft() : t.want();
+    }
+
+    /** The banner lines of the plan's craft state (see the contract's UI table). */
+    private void craftBanners(WContainer parent, double wrap) {
+        for (CraftModel.Banner b : CraftModel.banners(plan.craft())) {
+            parent.add(Ui.wrap(theme, b.text(), wrap)).expandX().widget().color(b.warn() ? Ui.warn(theme) : Ui.dim(theme));
+        }
+    }
+
+    /** The craft box: on when the stash can take craft orders, else off and unusable, with the reason beside it. */
+    private void craftBox(WHorizontalList checks) {
+        CraftModel.Info ci = plan.craft();
+        if (ci == null || !ci.showsColumn()) return;
+        boolean usable = CraftModel.orderable(ci);
+        WCheckbox box = checks.add(theme.checkbox(usable && options.craft())).widget();
+        if (usable) {
+            box.tooltip = "Order the items the stash can make from what it holds; the bot crafts them at the crafting table";
+            box.action = () -> changed(options.withCraft(box.checked));
+        } else {
+            box.tooltip = ci.building() ? "Recipes are still loading" : CraftModel.cannotOrder(ci);
+            box.action = () -> box.checked = false;
+        }
+        checks.add(theme.label(CraftModel.boxLabel(ci, plan.totals().craft()))).widget().color(Ui.dim(theme));
     }
 
     private static String yesNo(boolean on) {
@@ -866,7 +902,8 @@ public final class PlannerTab {
         if (locked()) {
             parent.add(theme.label("Parts are ordered, so the options are fixed. Copies " + options.multiplier() + " | rounding " + options.round()
                 + " | fluids " + yesNo(options.fluids()) + " | chest contents " + yesNo(options.containerItems()) + " | skipped "
-                + options.exclude().size() + ". Dismiss the list to start over.", wrap)).expandX().widget().color(Ui.dim(theme));
+                + options.exclude().size() + (plan.craft() != null && plan.craft().available() ? " | crafting " + yesNo(options.craft() && CraftModel.orderable(plan.craft())) : "")
+                + ". Dismiss the list to start over.", wrap)).expandX().widget().color(Ui.dim(theme));
             return;
         }
         WHorizontalList row = parent.add(theme.horizontalList()).expandX().widget();
@@ -910,6 +947,7 @@ public final class PlannerTab {
         if (!options.exclude().isEmpty()) {
             checks.add(theme.label(options.exclude().size() + " skipped")).widget().color(Ui.dim(theme));
         }
+        craftBox(checks);
     }
 
     // ---------- ordering ----------
@@ -927,7 +965,7 @@ public final class PlannerTab {
         } else if (!started) {
             String why = s == null || plan.stash() == null ? "Pick a stash first."
                 : !plan.stash().indexed() ? "This stash has no index yet."
-                : plan.totals().want() <= 0 ? "Nothing in this stash is available for the list." : "";
+                : toOrder() <= 0 ? "Nothing in this stash is available for the list." : "";
             SmButton order = (SmButton) parent.add(((SmGuiTheme) theme).primaryButton(ordering ? "Planning..." : "Order build materials now")).widget();
             order.tooltip = why.isEmpty() ? "Plan the order and show the parts before anything is ordered" : why;
             order.action = why.isEmpty() ? this::planOrder : () -> host.notice(why);
@@ -976,6 +1014,16 @@ public final class PlannerTab {
                 table.addRow(theme.label(part.part() + (part.order().isEmpty() ? "" : " (ordered)")), theme.label(Text.grouped(part.lineCount())),
                     theme.label(Text.grouped(part.shulkers())), theme.label(Text.grouped(part.items())));
             }
+        }
+        long craftLines = 0;
+        long craftFills = 0;
+        for (PlanModel.Part part : d.parts()) {
+            craftLines += part.craftLines();
+            craftFills += part.craftFills();
+        }
+        if (craftLines > 0) {
+            parent.add(Ui.wrap(theme, "Crafting: " + craftLines + (craftLines == 1 ? " item" : " items") + " will be made from the stash (" + craftFills
+                + (craftFills == 1 ? " fill" : " fills") + " at the crafting table).", wrap)).expandX().widget().color(Ui.dim(theme));
         }
         if (!d.notAvailable().isEmpty()) {
             StringBuilder sb = new StringBuilder("Not available in this stash, left out: ");
@@ -1072,7 +1120,10 @@ public final class PlannerTab {
     }
 
     private Color needColor(PlanModel.Row r) {
-        return r.excluded() ? Ui.dim(theme) : r.missing() > 0 ? Ui.err(theme) : Ui.ok(theme);
+        if (r.excluded()) return Ui.dim(theme);
+        if (CraftModel.stillMissing(r)) return Ui.err(theme);
+        // craftable: the plain text colour, neither red nor "all there"
+        return r.craft() != null && r.missing() > 0 ? null : Ui.ok(theme);
     }
 
     /** Fills one page of the table in place (the filter box keeps its cursor). */
@@ -1101,9 +1152,17 @@ public final class PlannerTab {
             tableBox.add(Ui.muted(theme, "Nothing matches.")).expandX();
             return;
         }
-        SmTable table = tableBox.add(new SmTable("", "Name", "Need", "In stash", "Available", "Missing")).expandX().widget();
-        table.weights(1, 6, 2, 2, 2, 2);
-        table.rightAlign(2, 3, 4, 5);
+        CraftModel.Info ci = plan.craft();
+        boolean craftCol = ci != null && ci.showsColumn();
+        SmTable table = tableBox.add(craftCol ? new SmTable("", "Name", "Need", "In stash", "Available", "Craft", "Missing")
+            : new SmTable("", "Name", "Need", "In stash", "Available", "Missing")).expandX().widget();
+        if (craftCol) {
+            table.weights(1, 6, 2, 2, 2, 2, 3);
+            table.rightAlign(2, 3, 4, 5, 6);
+        } else {
+            table.weights(1, 6, 2, 2, 2, 2);
+            table.rightAlign(2, 3, 4, 5);
+        }
         table.maxWidth = tableW;
         for (PlanModel.Row r : PlanModel.page(rows, page)) {
             WHorizontalList first = theme.horizontalList();
@@ -1125,9 +1184,21 @@ public final class PlannerTab {
             inStash.color(Ui.dim(theme));
             WLabel avail = theme.label(r.inIndex() ? PlanModel.stacks(r.available(), r.maxStack()) : "-");
             avail.color(Ui.dim(theme));
-            WLabel missing = theme.label(PlanModel.stacks(r.missing(), r.maxStack()));
-            missing.color(needColor(r));
-            table.addRow(first, name, need, inStash, avail, missing);
+            WLabel missing = theme.label(CraftModel.missingCell(r));
+            Color missingColor = needColor(r);
+            if (missingColor != null) missing.color(missingColor);
+            if (!craftCol) {
+                table.addRow(first, name, need, inStash, avail, missing);
+                continue;
+            }
+            WLabel craft = theme.label(CraftModel.craftCell(r, ci));
+            craft.color(Ui.dim(theme));
+            String tip = CraftModel.tooltip(r);
+            if (!tip.isEmpty()) {
+                craft.tooltip = tip;
+                missing.tooltip = tip;
+            }
+            table.addRow(first, name, need, inStash, avail, craft, missing);
         }
     }
 

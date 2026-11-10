@@ -15,7 +15,10 @@ import com.porter.qwerte.manager.gui.panels.LoginPanel;
 import com.porter.qwerte.manager.gui.tabs.ActivityTab;
 import com.porter.qwerte.manager.gui.tabs.AppearanceCard;
 import com.porter.qwerte.manager.gui.tabs.BotsTab;
+import com.porter.qwerte.manager.gui.tabs.AreaTab;
 import com.porter.qwerte.manager.gui.tabs.KitsTab;
+import com.porter.qwerte.manager.gui.tabs.LocalAreaSource;
+import com.porter.qwerte.manager.gui.tabs.ServerAreaSource;
 import com.porter.qwerte.manager.gui.tabs.ConsoleTab;
 import com.porter.qwerte.manager.gui.tabs.PlannerTab;
 import com.porter.qwerte.manager.gui.tabs.BrowseTab;
@@ -89,7 +92,9 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         // Server pages with an in-game version (NavPage.inGame), for a window that has a server
         PROXY(NavPage.PROXY), BOTS(NavPage.BOTS), ACTIVITY(NavPage.ACTIVITY), CONSOLE(NavPage.CONSOLE), PLANNER(NavPage.PLANNER),
         // Reached from the stash page's creative tabs, not the page buttons: it belongs to the Stash page (never in local mode)
-        KITS(NavPage.STASH);
+        KITS(NavPage.STASH),
+        // The stash's area editor, also from the creative tabs: works for a server stash and for the local one
+        AREA(NavPage.STASH);
         // A page without an in-game version would show a note that points to the website. To add one: flip its
         // NavPage.inGame, add its tab object (null in local mode), and handle it in tickServerTabs, onSessionLost and buildMain.
 
@@ -133,6 +138,8 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
     private final BotsTab botsTab;
     /** The Kits page. Null in local mode. */
     private final KitsTab kitsTab;
+    /** The Area page: the stash's area and its editor. In both modes. */
+    private final AreaTab areaTab;
     private final ActivityTab activityTab;
     private final ConsoleTab consoleTab;
     private final PlannerTab plannerTab;
@@ -232,6 +239,8 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             this.usersTab = new UsersTab(th);
             this.settingsTab.attachUsers(usersTab);
         }
+        this.areaTab = new AreaTab(local ? new LocalAreaSource(() -> policy().hideCoords()) : new ServerAreaSource(new TabHost()), new AreaHost());
+        if (mapTab != null) mapTab.attachArea(areaTab);
         this.localOrders = new LocalOrderBackend(module.localOrders());
         this.serverOrders = local ? null : new ServerOrderBackend(client, new ServerOrderBackend.Host() {
             @Override
@@ -425,6 +434,8 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         if (plannerTab != null) plannerTab.clearSecrets();
         if (botsTab != null) botsTab.reset();
         if (kitsTab != null) kitsTab.reset();
+        areaTab.reset();
+        areaDraftHint();
         dropConfirm();
         resetBusy();
     }
@@ -450,6 +461,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         else tickTimers(now);
         if (view == View.MAIN && tab == Tab.BROWSE) browse.tick(now);
         if (view == View.MAIN) tickOrders(now);
+        if (view == View.MAIN && local && tab == Tab.AREA) areaTab.tick(now);
         if (view == View.MAIN && !local) tickServerTabs(now);
         checkResized(now);
     }
@@ -494,6 +506,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             case PROXY -> proxyTab.tick(now);
             case BOTS -> botsTab.tick(now);
             case KITS -> kitsTab.tick(now);
+            case AREA -> areaTab.tick(now);
             case ACTIVITY -> activityTab.tick(now);
             case CONSOLE -> consoleTab.tick(now);
             case PLANNER -> plannerTab.tick(now);
@@ -617,6 +630,33 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             tab = Tab.KITS;
             later(this::rebuild);
         }
+    }
+
+    /** The Area tab is offered: the local stash in local mode; with a server an account that may view stashes (a forced streamer has none, as on the website). */
+    private boolean areaOffered() {
+        if (local) return true;
+        return auth != null && auth.loggedIn() && auth.can("view") && !auth.forcedStreamer();
+    }
+
+    @Override
+    public boolean areaTab() {
+        return areaOffered();
+    }
+
+    @Override
+    public void openArea() {
+        if (areaOffered() && tab != Tab.AREA) {
+            tab = Tab.AREA;
+            later(this::rebuild);
+        }
+    }
+
+    /** One chat line when the window closes with an area draft still open (it stays drawn in the world). */
+    private void areaDraftHint() {
+        com.porter.qwerte.stash.AreaDraft.State st = com.porter.qwerte.stash.AreaDraft.shared().get(System.currentTimeMillis());
+        if (st == null) return;
+        String text = st.clear() ? "Area draft (remove the area): open the Stash window to Save or Cancel." : com.porter.qwerte.stash.AreaDraft.hint(st.draft());
+        meteordevelopment.meteorclient.utils.player.ChatUtils.info("%s", text);
     }
 
     @Override
@@ -757,6 +797,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         proxyTab.reset();
         botsTab.reset();
         kitsTab.reset();
+        areaTab.reset();
         activityTab.reset();
         consoleTab.reset();
         plannerTab.reset();
@@ -1344,7 +1385,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         nav.gapY = 4;
         for (Tab t : navTabs()) {
             String title = local && t != Tab.BROWSE && t != Tab.ORDERS && t != Tab.SETTINGS ? t.title + " (server)" : t.title;
-            WNavPill pill = nav.add(new WNavPill(title, t == tab || (t == Tab.BROWSE && tab == Tab.KITS))).widget();
+            WNavPill pill = nav.add(new WNavPill(title, t == tab || (t == Tab.BROWSE && (tab == Tab.KITS || tab == Tab.AREA)))).widget();
             pill.action = () -> {
                 if (tab != t) {
                     dropConfirm();
@@ -1365,7 +1406,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             return out;
         }
         List<NavPage> pages = NavPage.visible(auth, botHasActivity(), bots.selected() != null);
-        for (Tab t : Tab.values()) if (t != Tab.KITS && pages.contains(t.page)) out.add(t);
+        for (Tab t : Tab.values()) if (t != Tab.KITS && t != Tab.AREA && pages.contains(t.page)) out.add(t);
         // the website's order
         out.sort(java.util.Comparator.comparingInt(t -> t.page.ordinal()));
         return out;
@@ -1463,6 +1504,14 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             }
             return;
         }
+        if (tab == Tab.AREA) {
+            if (!auth.can("view")) {
+                body.add(theme.label("Your account has no access to stashes. Ask the owner.")).expandX();
+            } else {
+                areaTab.build(body, theme);
+            }
+            return;
+        }
         if (tab == Tab.MAP) {
             mapTab.build(body, theme);
             return;
@@ -1499,6 +1548,29 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
     }
 
     /** What the Map, Settings and Users tabs get from the window. */
+    /** What the Area page needs from the window (it has no server tab host in local mode). */
+    private final class AreaHost implements AreaTab.Host {
+        @Override
+        public void later(Runnable r) {
+            StashManagerScreen.this.later(r);
+        }
+
+        @Override
+        public void rebuild() {
+            StashManagerScreen.this.rebuild();
+        }
+
+        @Override
+        public void notice(String text) {
+            StashManagerScreen.this.notice(text);
+        }
+
+        @Override
+        public boolean closed() {
+            return closed;
+        }
+    }
+
     private final class TabHost implements MapTab.Host {
         @Override
         public com.porter.qwerte.manager.net.SmClient client() {
@@ -1680,6 +1752,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
 
     private boolean tabVisible(Tab t) {
         if (t == Tab.KITS) return kitsOffered();
+        if (t == Tab.AREA) return areaOffered();
         return navTabs().contains(t);
     }
 
@@ -1695,6 +1768,10 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         if (tab == Tab.SETTINGS) {
             // Works without a server: the themes
             AppearanceCard.build(body, theme, module.windowTheme(), module::setWindowTheme);
+            return;
+        }
+        if (tab == Tab.AREA) {
+            areaTab.build(body, theme);
             return;
         }
         if (tab != Tab.BROWSE) {

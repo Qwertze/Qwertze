@@ -56,7 +56,7 @@ public final class DmParser {
     /** The whisper in a chat line as plain text, or null if it is not one. */
     public Parsed parse(String line) {
         if (line == null || line.isEmpty() || line.length() > ChatText.MAX_LINE) return null;
-        String text = ChatText.clean(line, ChatText.MAX_LINE);
+        String text = ChatText.stripClientPrefix(ChatText.clean(line, ChatText.MAX_LINE));
         for (DmPattern p : builtin) {
             Matcher m = p.pattern().matcher(text);
             if (!m.matches()) continue;

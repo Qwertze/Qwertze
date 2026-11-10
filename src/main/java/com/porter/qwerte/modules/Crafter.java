@@ -1,8 +1,8 @@
 package com.porter.qwerte.modules;
 
-import com.porter.qwerte.QwerteAddon;
 import com.porter.qwerte.compat.GameVersion;
 import com.porter.qwerte.craft.CraftPlanner;
+import com.porter.qwerte.craft.RecipeBoot;
 import com.porter.qwerte.craft.Recipes;
 import com.porter.qwerte.stash.Kits;
 import com.porter.qwerte.stash.Stash;
@@ -89,13 +89,22 @@ final class Crafter {
     record Abort(String reason) implements Intent {}
 
     /** What a session came to: how many of the item were crafted, and why not more (null when it went through). */
-    record Outcome(String item, int crafted, String failure) {}
+    record Outcome(String item, int crafted, String failure, int crafts, Map<String, Integer> gathered, Set<Integer> gatheredSlots) {
+        Outcome(String item, int crafted, String failure) {
+            this(item, crafted, failure, 0, Map.of(), Set.of());
+        }
+    }
 
     /** The work one session is asked for. {@code pool} is what the crafts may use up (the stash's, less what others need). */
     record Request(String item, int count, String purpose, boolean reserve, int doneOrder, Supplier<Map<String, Long>> pool,
-                   Supplier<Set<String>> reservedKeys, boolean gatherOnly) {
+                   Supplier<Set<String>> reservedKeys, boolean gatherOnly, boolean plainOnly) {
         Request(String item, int count, String purpose, boolean reserve, int doneOrder, Supplier<Map<String, Long>> pool) {
-            this(item, count, purpose, reserve, doneOrder, pool, Set::of, false);
+            this(item, count, purpose, reserve, doneOrder, pool, Set::of, false, false);
+        }
+
+        Request(String item, int count, String purpose, boolean reserve, int doneOrder, Supplier<Map<String, Long>> pool,
+                Supplier<Set<String>> reservedKeys, boolean gatherOnly) {
+            this(item, count, purpose, reserve, doneOrder, pool, reservedKeys, gatherOnly, false);
         }
     }
 
@@ -127,8 +136,20 @@ final class Crafter {
     private static final int RESULT_WAIT_TICKS = 60;
     private static final int MAX_TAKE_TRIES = 6;
 
-    private static Recipes table;
-    private static boolean tableLoaded;
+    /** Why nothing is crafted while there is no recipe table (it is fetched from the Stash Manager server, or built from the game's own data). */
+    static final String NO_RECIPES = "no recipe table (neither the Stash Manager server nor the game's own data gave one)";
+    /** The same while the table is still on its way: a wait, not a refusal (nothing is claimed or started meanwhile). */
+    static final String WAITING_FOR_RECIPES = "waiting for the recipe table";
+
+    /**
+     * No table yet, but one is still on its way: the cache or the build from the game's data has not finished, or the server's fetch has
+     * not yet succeeded or failed. Bounded: once both are over with no table, this is false and {@link #NO_RECIPES} is the answer.
+     */
+    static boolean recipesPending() {
+        if (recipes() != null) return false;
+        StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+        return (manager != null && manager.waitingForServerRecipes()) || !RecipeBoot.localDone();
+    }
 
     private final Owner owner;
 
@@ -159,6 +180,17 @@ final class Crafter {
     private String[] layout;
     private int layoutStep = -1, layoutCraft = -1;
     private boolean lastTake, crafting;
+    // A craft-order chunk (0.4.0-dev.18): the plan is the server's sub-plan and is never planned again; what was gathered from the stash and the
+    // crafts completed are counted for the order's ledger; slots kept for the order's crafted loads and surplus are not put away
+    private boolean fixedPlan;
+    private long timeCapMs = TIME_CAP_MS;
+    private int craftsDone;
+    private final Map<String, Integer> gathered = new HashMap<>();
+    // The slots the session took stacks from the stash into: what is left in them is stock, not something crafted
+    private final Set<Integer> gatheredSlots = new LinkedHashSet<>();
+    // A request for plain stacks is being planned (the pool of its survey leaves out named and patched stacks)
+    private boolean surveyPlain;
+    private final Set<Integer> orderKeep = new LinkedHashSet<>();
 
     Crafter(Owner owner) {
         this.owner = owner;
@@ -166,14 +198,32 @@ final class Crafter {
 
     // The recipe table
 
-    /** The recipes of the running game version, or null when there are none for it. */
+    /**
+     * The recipes of the running game version: the table fetched from the Stash Manager server (or built from the game's own jar), or
+     * null while there is none. Nothing is shipped in the addon (0.4.0-dev.18), so with null everything that crafts is off.
+     */
     static Recipes recipes() {
-        if (!tableLoaded) {
-            tableLoaded = true;
-            table = Recipes.load(GameVersion.name());
-            if (table == null) QwerteAddon.LOG.warn("crafting: no recipe table for Minecraft {}", GameVersion.name());
+        Recipes table = Recipes.current();
+        if (table != null) return table;
+        // Crafting does not depend on stash-manager being on: the cache, or the game's own data, give the table (cheap once tried)
+        try {
+            RecipeBoot.bootstrap(GameVersion.name());
+        } catch (RuntimeException | LinkageError e) {
+            // the version is not known yet
         }
-        return table;
+        return Recipes.current();
+    }
+
+    private static Map<String, Integer> stacks;
+
+    /** The most of an item one stack holds (64 for an id that isn't known). */
+    static synchronized int stackOf(String id) {
+        if (stacks == null) {
+            Map<String, Integer> m = new HashMap<>();
+            for (net.minecraft.world.item.Item item : BuiltInRegistries.ITEM) m.put(BuiltInRegistries.ITEM.getKey(item).toString(), item.getDefaultInstance().getMaxStackSize());
+            stacks = m;
+        }
+        return stacks.getOrDefault(Recipes.ns(id), 64);
     }
 
     static String idOf(ItemStack stack) {
@@ -199,9 +249,24 @@ final class Crafter {
         return active && mine.contains(slot);
     }
 
-    /** A crafted shulker box waiting for its use. */
+    /** A crafted shulker box waiting for its use, or a stack kept for a craft order (a crafted load for its bin, the surplus between chunks). */
     boolean reserved(int slot) {
-        return reserved.contains(slot);
+        return reserved.contains(slot) || orderKeep.contains(slot);
+    }
+
+    /** The slots a craft order keeps (crafted loads and surplus): the sorter does not put them away. Replaces the set. */
+    void keepForOrder(Set<Integer> slots) {
+        orderKeep.clear();
+        orderKeep.addAll(slots);
+    }
+
+    void clearOrderKeep() {
+        orderKeep.clear();
+    }
+
+    /** What the last chunk gathered from the stash, by item id (whole stacks as taken). */
+    Map<String, Integer> gatheredFromStash() {
+        return gathered;
     }
 
     Set<Integer> reservedSlots() {
@@ -265,6 +330,11 @@ final class Crafter {
         lastFetch = null;
         unpacked.clear();
         shulkersBefore.clear();
+        fixedPlan = false;
+        timeCapMs = TIME_CAP_MS;
+        craftsDone = 0;
+        gathered.clear();
+        gatheredSlots.clear();
         stepIdx = craftIdx = fills = resultWait = takeTries = homeStuck = 0;
         srcSlot = -1;
         layout = null;
@@ -290,7 +360,7 @@ final class Crafter {
      */
     CraftPlanner.Result preview(String item, int count, int doneOrder, Map<String, Long> pool, boolean ignoreOps) {
         Recipes recipes = recipes();
-        if (recipes == null) return new CraftPlanner.Result(null, "no recipe table for this version");
+        if (recipes == null) return new CraftPlanner.Result(null, NO_RECIPES);
         CraftPlanner.Caps caps = owner.caps();
         // The caps are for shulker boxes: chests for the delivery storage (and the anvil) only keep the grid fill limit
         if (!item.equals("minecraft:shulker_box")) caps = new CraftPlanner.Caps(Integer.MAX_VALUE, caps.opsPerTask(), Integer.MAX_VALUE);
@@ -301,7 +371,14 @@ final class Crafter {
     /** @return null when the session started, else why not */
     String begin(Request r) {
         if (active) return "already crafting";
-        Map<String, Long> pool = r.pool().get();
+        // A plain-only request is planned from plain stacks only (the pool and the plan must agree with what is gathered)
+        surveyPlain = r.plainOnly();
+        Map<String, Long> pool;
+        try {
+            pool = r.pool().get();
+        } finally {
+            surveyPlain = false;
+        }
         if (r.gatherOnly()) {
             // Only an item to be taken out of the stash (an anvil to place): no recipe, no table
             if (pool.getOrDefault(r.item(), 0L) < 1) return "none in the stash";
@@ -327,6 +404,26 @@ final class Crafter {
         return null;
     }
 
+    /**
+     * Starts a session for a craft-order chunk from the server's sub-plan: the plan is fixed (no planning of its own, no replan), only plain
+     * stacks are taken, and the slots of {@code carried} (crafted surplus from earlier chunks) are the session's from the start, so the plan can use them.
+     * @return null when it started, else why not
+     */
+    String beginPlan(Request r, CraftPlanner.Plan fixed, Set<Integer> carried) {
+        if (active) return "already crafting";
+        clearSession();
+        req = r;
+        plan = fixed;
+        fixedPlan = true;
+        mine.addAll(carried);
+        // Gathering, then 2 minutes and 20 seconds a fill at the table (CRAFT-CONTRACT.md); the walk and the gathering get 5 minutes more
+        timeCapMs = 5 * 60_000L + 120_000L + 20_000L * Math.max(1, fixed.ops());
+        active = true;
+        startedAt = System.currentTimeMillis();
+        snapshotBefore();
+        return null;
+    }
+
     private static String describe(CraftPlanner.Plan plan) {
         StringBuilder sb = new StringBuilder();
         for (CraftPlanner.Step s : plan.steps()) {
@@ -338,6 +435,8 @@ final class Crafter {
 
     private void replan() {
         replans++;
+        // A craft order's plan is the server's: a stash that no longer holds it is a shortfall, not a reason to plan again
+        if (fixedPlan) return;
         Map<String, Long> pool = new HashMap<>(req.pool().get());
         for (var e : carried().entrySet()) pool.merge(e.getKey(), (long) e.getValue(), Long::sum);
         CraftPlanner.Result result = preview(req.item(), plan.count(), req.doneOrder(), pool, false);
@@ -347,7 +446,7 @@ final class Crafter {
 
     /** What the session ends with. */
     Outcome finish() {
-        Outcome out = new Outcome(req == null ? "" : req.item(), craftedTarget, failure);
+        Outcome out = new Outcome(req == null ? "" : req.item(), craftedTarget, failure, craftsDone, new HashMap<>(gathered), new LinkedHashSet<>(gatheredSlots));
         adoptStrays();
         syncHeld();
         lastHeld.clear();
@@ -420,6 +519,8 @@ final class Crafter {
     /** Whether the stack may be used as an ingredient: not damaged, holding nothing, not a shulker box, not on the never-use list. */
     boolean eligible(ItemStack s) {
         if (s.isEmpty() || s.isDamaged() || Utils.isShulker(s.getItem()) || holdsItems(s)) return false;
+        // A craft order counts plain keys only: a stack with a component patch (a name, enchantments) is not an ingredient
+        if (!com.porter.qwerte.craft.CraftPlain.allowed(surveyPlain || (active && req != null && req.plainOnly()), s.getComponentsPatch().isEmpty())) return false;
         return !owner.neverUse().contains(idOf(s));
     }
 
@@ -441,6 +542,17 @@ final class Crafter {
         if (!Utils.isShulker(s.getItem())) return false;
         if (s.has(DataComponents.CUSTOM_NAME) && !owner.namedShulkers()) return false;
         return !owner.claimed(s);
+    }
+
+    /** As {@link #survey()} for plain stacks only (no name, no enchantments) when {@code plain}: what a craft order's own table may be made of. */
+    Map<String, Long> survey(boolean plain) {
+        boolean before = surveyPlain;
+        surveyPlain = plain;
+        try {
+            return survey();
+        } finally {
+            surveyPlain = before;
+        }
     }
 
     /** Everything the stash could give, by item: loose stacks and the contents of shulkers, by the sources and rules above. */
@@ -491,7 +603,7 @@ final class Crafter {
     Intent next() {
         if (!active) return new Done();
         if (failure != null) return new Abort(failure);
-        if (System.currentTimeMillis() - startedAt > TIME_CAP_MS) return new Abort("it took too long");
+        if (System.currentTimeMillis() - startedAt > timeCapMs) return new Abort("it took too long");
         if (mc.player == null || owner.stash() == null) return new Abort("no stash is loaded");
         if (tableDone) return new Done();
         // Once crafting has begun nothing more is gathered: what is in the grid or consumed is not missing
@@ -607,6 +719,8 @@ final class Crafter {
 
         owner.held(into, box.contents[slot]);
         mine.add(into);
+        gathered.merge(idOf(box.contents[slot]), box.contents[slot].getCount(), Integer::sum);
+        gatheredSlots.add(into);
         InvUtils.move().fromId(slot).toId(inventoryToMenu(into, box.contents.length));
         return true;
     }
@@ -623,6 +737,8 @@ final class Crafter {
 
         owner.held(into, menu.getSlot(slot).getItem());
         mine.add(into);
+        gathered.merge(idOf(menu.getSlot(slot).getItem()), menu.getSlot(slot).getItem().getCount(), Integer::sum);
+        gatheredSlots.add(into);
         InvUtils.move().fromId(slot).toId(inventoryToMenu(into, 27));
         return true;
     }
@@ -768,6 +884,7 @@ final class Crafter {
         lastTake = false;
         takeTries = 0;
         craftIdx++;
+        craftsDone++;
         if (step.recipe().result().equals(req.item())) craftedTarget += step.recipe().count();
         layout = null;
         return true;

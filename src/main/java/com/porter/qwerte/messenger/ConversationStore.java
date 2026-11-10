@@ -209,7 +209,9 @@ public final class ConversationStore {
         boolean addedGlobal = false;
         for (Message m : other.global) {
             if (m.direction() != Direction.IN || !seenGlobal.add(signature(m))) continue;
-            global.add(new Message(Direction.IN, m.text(), m.time(), Message.State.SENT));
+            Message copy = new Message(Direction.IN, m.text(), m.time(), Message.State.SENT);
+            copy.console(m.console());
+            global.add(copy);
             addedGlobal = true;
         }
         if (addedGlobal) {

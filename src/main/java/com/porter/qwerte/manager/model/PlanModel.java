@@ -31,8 +31,9 @@ public final class PlanModel {
     // ---------- records ----------
 
     /** One option set. {@code exclude} is sorted. */
-    public record Options(int multiplier, List<String> exclude, boolean fluids, boolean containerItems, String round) {
-        public static final Options DEFAULT = new Options(1, List.of(), false, false, "none");
+    public record Options(int multiplier, List<String> exclude, boolean fluids, boolean containerItems, String round, boolean craft) {
+        /** Craft is on by default: the server only makes craft lines from it when the stash can take them. */
+        public static final Options DEFAULT = new Options(1, List.of(), false, false, "none", true);
 
         public Options {
             multiplier = Math.max(1, Math.min(MAX_MULTIPLIER, multiplier));
@@ -40,27 +41,36 @@ public final class PlanModel {
             round = PlanModel.round(round);
         }
 
+        /** The options of before crafting: craft off. */
+        public Options(int multiplier, List<String> exclude, boolean fluids, boolean containerItems, String round) {
+            this(multiplier, exclude, fluids, containerItems, round, false);
+        }
+
         public Options withMultiplier(int m) {
-            return new Options(m, exclude, fluids, containerItems, round);
+            return new Options(m, exclude, fluids, containerItems, round, craft);
         }
 
         public Options withRound(String r) {
-            return new Options(multiplier, exclude, fluids, containerItems, r);
+            return new Options(multiplier, exclude, fluids, containerItems, r, craft);
         }
 
         public Options withFluids(boolean on) {
-            return new Options(multiplier, exclude, on, containerItems, round);
+            return new Options(multiplier, exclude, on, containerItems, round, craft);
         }
 
         public Options withContainers(boolean on) {
-            return new Options(multiplier, exclude, fluids, on, round);
+            return new Options(multiplier, exclude, fluids, on, round, craft);
+        }
+
+        public Options withCraft(boolean on) {
+            return new Options(multiplier, exclude, fluids, containerItems, round, on);
         }
 
         public Options withExcluded(String id, boolean excluded) {
             TreeSet<String> set = new TreeSet<>(exclude);
             if (excluded) set.add(id);
             else set.remove(id);
-            return new Options(multiplier, new ArrayList<>(set), fluids, containerItems, round);
+            return new Options(multiplier, new ArrayList<>(set), fluids, containerItems, round, craft);
         }
 
         /** The body fields the server reads for the view and the order. */
@@ -72,6 +82,8 @@ public final class PlanModel {
             body.addProperty("fluids", fluids);
             body.addProperty("containerItems", containerItems);
             body.addProperty("round", round);
+            // an old server ignores the key; a new one makes craft lines only when the stash can take them
+            body.addProperty("craft", craft);
         }
     }
 
@@ -86,7 +98,14 @@ public final class PlanModel {
 
     public record Row(String id, String name, long base, long need, long fromBlocks, long fromFluids, long fromContainers,
                       boolean inIndex, long inStash, long available, long missing, long want, int maxStack, long variants,
-                      boolean excluded) {
+                      boolean excluded, CraftModel.RowCraft craft) {
+        /** A row without craft fields (an old server, or no recipes). */
+        public Row(String id, String name, long base, long need, long fromBlocks, long fromFluids, long fromContainers,
+                   boolean inIndex, long inStash, long available, long missing, long want, int maxStack, long variants, boolean excluded) {
+            this(id, name, base, need, fromBlocks, fromFluids, fromContainers, inIndex, inStash, available, missing, want, maxStack, variants,
+                excluded, null);
+        }
+
         /** The server's English name, else the id made readable (minecraft:oak_planks is Oak Planks). */
         public String title() {
             return name.isEmpty() ? pretty(id) : name;
@@ -94,7 +113,16 @@ public final class PlanModel {
     }
 
     public record Totals(long need, long available, long missing, long want, boolean hasSplit, boolean frozen, long lines, long slots,
-                         long shulkers, long parts) {
+                         long shulkers, long parts, CraftModel.Totals craft) {
+        public Totals(long need, long available, long missing, long want, boolean hasSplit, boolean frozen, long lines, long slots,
+                      long shulkers, long parts) {
+            this(need, available, missing, want, hasSplit, frozen, lines, slots, shulkers, parts, null);
+        }
+
+        /** Missing after crafting when the server said so, else missing. */
+        public long missingNow() {
+            return craft == null ? missing : craft.missingAfterCraft();
+        }
     }
 
     public record StashInfo(String server, String stash, boolean indexed, String mcVersion) {
@@ -118,10 +146,19 @@ public final class PlanModel {
     public record Plan(String id, String fileName, String format, long size, long dimX, long dimY, long dimZ, long regions, long blocks,
                        boolean newerThanTable, long createdAt, long expiresAt, Options options, List<Count> fluids,
                        List<Count> containerItems, List<Count> unknown, long unknownOmitted, StashInfo stash, List<Row> items,
-                       Totals totals, Ordered ordered) {
+                       Totals totals, Ordered ordered, CraftModel.Info craft) {
+        /** A plan without craft info (an old server, or a stub). */
+        public Plan(String id, String fileName, String format, long size, long dimX, long dimY, long dimZ, long regions, long blocks,
+                    boolean newerThanTable, long createdAt, long expiresAt, Options options, List<Count> fluids,
+                    List<Count> containerItems, List<Count> unknown, long unknownOmitted, StashInfo stash, List<Row> items,
+                    Totals totals, Ordered ordered) {
+            this(id, fileName, format, size, dimX, dimY, dimZ, regions, blocks, newerThanTable, createdAt, expiresAt, options, fluids,
+                containerItems, unknown, unknownOmitted, stash, items, totals, ordered, null);
+        }
+
         public Plan withOrdered(Ordered o) {
             return new Plan(id, fileName, format, size, dimX, dimY, dimZ, regions, blocks, newerThanTable, createdAt, expiresAt, options,
-                fluids, containerItems, unknown, unknownOmitted, stash, items, totals, o);
+                fluids, containerItems, unknown, unknownOmitted, stash, items, totals, o, craft);
         }
     }
 
@@ -129,7 +166,10 @@ public final class PlanModel {
     public record Summary(String id, String fileName, String format, long blocks, long createdAt, long expiresAt) {
     }
 
-    public record Part(int part, long lineCount, long shulkers, long items, String order) {
+    public record Part(int part, long lineCount, long shulkers, long items, String order, long craftLines, long craftFills) {
+        public Part(int part, long lineCount, long shulkers, long items, String order) {
+            this(part, lineCount, shulkers, items, order, 0, 0);
+        }
     }
 
     /** The answer of a dry run. */
@@ -154,7 +194,7 @@ public final class PlanModel {
         JsonArray a = Json.arr(o.get("exclude"));
         if (a != null) for (JsonElement e : a) if (e.isJsonPrimitive() && e.getAsJsonPrimitive().isString()) ex.add(e.getAsString());
         return new Options((int) Json.lng(o, "multiplier", 1), ex, Json.bool(o, "fluids"), Json.bool(o, "containerItems"),
-            Json.str(o, "round"));
+            Json.str(o, "round"), Json.bool(o, "craft"));
     }
 
     private static List<Count> counts(JsonElement e) {
@@ -212,13 +252,14 @@ public final class PlanModel {
                 items.add(new Row(Json.str(r, "id"), Text.sanitize(Json.str(r, "name"), 64), Json.lng(r, "base", 0), Json.lng(r, "need", 0),
                     Json.lng(from, "blocks", 0), Json.lng(from, "fluids", 0), Json.lng(from, "containers", 0), Json.bool(r, "inIndex"),
                     Json.lng(r, "inStash", 0), Json.lng(r, "available", 0), Json.lng(r, "missing", 0), Json.lng(r, "want", 0),
-                    (int) Math.max(1, Math.min(64, Json.lng(r, "maxStack", 64))), Json.lng(r, "variants", 0), Json.bool(r, "excluded")));
+                    (int) Math.max(1, Math.min(64, Json.lng(r, "maxStack", 64))), Json.lng(r, "variants", 0), Json.bool(r, "excluded"),
+                    CraftModel.parseRow(r)));
             }
         }
         JsonObject t = Json.obj(o.get("totals"));
         Totals totals = new Totals(Json.lng(t, "need", 0), Json.lng(t, "available", 0), Json.lng(t, "missing", 0), Json.lng(t, "want", 0),
             t != null && t.has("parts"), Json.bool(t, "frozen"), Json.lng(t, "lines", 0), Json.lng(t, "slots", 0), Json.lng(t, "shulkers", 0),
-            Json.lng(t, "parts", 0));
+            Json.lng(t, "parts", 0), CraftModel.parseTotals(t));
         JsonObject so = Json.obj(o.get("stash"));
         StashInfo stash = so == null ? null : new StashInfo(Json.str(so, "server"), Json.str(so, "stash"), Json.bool(so, "indexed"),
             Json.str(so, "mcVersion"));
@@ -230,7 +271,7 @@ public final class PlanModel {
             Json.lng(dim, "y", 0), Json.lng(dim, "z", 0), Json.lng(o, "regions", 0), Json.lng(o, "blocks", 0), Json.bool(o, "newerThanTable"),
             Json.lng(o, "createdAt", 0), Json.lng(o, "expiresAt", 0), parseOptions(Json.obj(o.get("options"))), counts(o.get("fluids")),
             counts(o.get("containerItems")), counts(o.get("unknown")), Json.lng(o, "unknownOmitted", 0), stash,
-            Collections.unmodifiableList(items), totals, ordered);
+            Collections.unmodifiableList(items), totals, ordered, CraftModel.parseInfo(o.get("craft")));
     }
 
     /** The answer of GET /api/v1/planner: oldest first, as the server sends it. */
@@ -258,11 +299,29 @@ public final class PlanModel {
                 JsonObject p = Json.obj(el);
                 if (p == null) continue;
                 parts.add(new Part((int) Json.lng(p, "part", parts.size() + 1), Json.lng(p, "lineCount", 0), Json.lng(p, "shulkers", 0),
-                    Json.lng(p, "items", 0), Json.str(p, "order")));
+                    Json.lng(p, "items", 0), Json.str(p, "order"), Json.lng(Json.obj(p.get("craft")), "lines", 0),
+                    Json.lng(Json.obj(p.get("craft")), "fills", 0)));
             }
         }
         return new Dry(parts, (int) Json.lng(o, "partsTotal", parts.size()), ints(o.get("remaining")), ints(o.get("again")),
-            counts(o.get("notAvailable")), counts(o.get("missing")));
+            counts(o.get("notAvailable")), missingCounts(o.get("missing")));
+    }
+
+    /** The dry run's missing list: after crafting ({@code missingAfterCraft}) when the server gave it; kinds that crafting covers drop out. */
+    static List<Count> missingCounts(JsonElement e) {
+        List<Count> out = new ArrayList<>();
+        JsonArray a = Json.arr(e);
+        if (a == null) return out;
+        for (JsonElement el : a) {
+            JsonObject o = Json.obj(el);
+            if (o == null) continue;
+            String id = Json.str(o, "id");
+            if (id.isEmpty()) continue;
+            long n = o.has("missingAfterCraft") ? Json.lng(o, "missingAfterCraft", 0) : Json.lng(o, "count", Json.lng(o, "need", Json.lng(o, "missing", 0)));
+            if (o.has("missingAfterCraft") && n <= 0) continue;
+            out.add(new Count(id, Math.max(0, n)));
+        }
+        return out;
     }
 
     public static Placed parsePlaced(JsonElement body) {
@@ -370,7 +429,7 @@ public final class PlanModel {
         String f = filter == null ? "" : filter.trim().toLowerCase(Locale.ROOT);
         List<Row> out = new ArrayList<>();
         for (Row r : rows) {
-            if (onlyMissing && !(r.missing() > 0 && !r.excluded())) continue;
+            if (onlyMissing && !(CraftModel.missingNow(r) > 0 && !r.excluded())) continue;
             if (!f.isEmpty() && !r.title().toLowerCase(Locale.ROOT).contains(f) && !r.id().toLowerCase(Locale.ROOT).contains(f)) continue;
             out.add(r);
         }
@@ -379,7 +438,7 @@ public final class PlanModel {
             case NEED -> Comparator.comparingLong(Row::need);
             case IN_STASH -> Comparator.comparingLong(Row::inStash);
             case AVAILABLE -> Comparator.comparingLong(Row::available);
-            case MISSING -> Comparator.comparingLong(Row::missing);
+            case MISSING -> Comparator.comparingLong(CraftModel::missingNow);
             default -> null;
         };
         // List.sort is stable: equal rows stay in the server's order
@@ -435,7 +494,7 @@ public final class PlanModel {
     /** The rows still missing (not excluded). */
     public static List<Row> missingRows(Plan p) {
         List<Row> out = new ArrayList<>();
-        if (p != null) for (Row r : p.items()) if (!r.excluded() && r.missing() > 0) out.add(r);
+        if (p != null) for (Row r : p.items()) if (!r.excluded() && CraftModel.missingNow(r) > 0) out.add(r);
         return out;
     }
 
@@ -444,7 +503,8 @@ public final class PlanModel {
         List<Row> rows = missingRows(p);
         StringBuilder sb = new StringBuilder("Missing materials (").append(rows.size()).append(rows.size() == 1 ? " kind)" : " kinds)");
         for (Row r : rows) {
-            sb.append("\n- ").append(r.title()).append(": ").append(Text.grouped(r.missing())).append(" (").append(stacks(r.missing(), r.maxStack())).append(")");
+            long n = CraftModel.missingNow(r);
+            sb.append("\n- ").append(r.title()).append(": ").append(Text.grouped(n)).append(" (").append(stacks(n, r.maxStack())).append(")");
         }
         return sb.append("\n").toString();
     }

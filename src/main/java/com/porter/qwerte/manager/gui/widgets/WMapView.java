@@ -48,6 +48,26 @@ public final class WMapView extends WPressable {
     private double cursorY = -1;
     private boolean dragged;
 
+    /** A rectangle the user dragged (block columns, both corners included); the answer is a refusal text or null. */
+    public interface AreaDrag {
+        String drag(int x1, int z1, int x2, int z2);
+    }
+
+    private static final Color AREA_STORED = new Color(235, 235, 245, 200);
+    private static final Color AREA_DRAFT = new Color(255, 170, 0, 235);
+    private static final Color AREA_DRAFT_FILL = new Color(255, 170, 0, 40);
+
+    /** Area editing: a drag draws a rectangle instead of panning (a right-button drag is dropped); the stored and draft boxes are drawn (min and max corners). */
+    public boolean areaMode;
+    public Supplier<int[]> storedArea = () -> null;
+    public Supplier<int[]> draftArea = () -> null;
+    public AreaDrag onAreaDrag;
+    /** Called with the refusal text of a rectangle that was not taken. */
+    public java.util.function.Consumer<String> onAreaRefused = t -> {
+    };
+    private boolean areaDragging;
+    private double dragAx, dragAy, dragBx, dragBy;
+
     /**
      * @param texture   the map's texture, or null before it exists
      * @param hideNames true while player names must not be drawn (streamer display)
@@ -93,6 +113,16 @@ public final class WMapView extends WPressable {
     public void onMouseMoved(double mouseX, double mouseY, double lastMouseX, double lastMouseY) {
         cursorX = mouseX - x;
         cursorY = mouseY - y;
+        if (pressed && areaMode) {
+            if (!areaDragging && (mouseX != lastMouseX || mouseY != lastMouseY)) {
+                areaDragging = true;
+                dragAx = lastMouseX - x;
+                dragAy = lastMouseY - y;
+            }
+            dragBx = mouseX - x;
+            dragBy = mouseY - y;
+            return;
+        }
         if (pressed) {
             double dx = mouseX - lastMouseX;
             double dy = mouseY - lastMouseY;
@@ -112,6 +142,16 @@ public final class WMapView extends WPressable {
 
     @Override
     protected void onPressed(int button) {
+        if (areaDragging) {
+            areaDragging = false;
+            if (areaMode && button == 0 && onAreaDrag != null) {
+                int x1 = (int) Math.floor(view.toWorldX(dragAx)), z1 = (int) Math.floor(view.toWorldZ(dragAy));
+                int x2 = (int) Math.floor(view.toWorldX(dragBx)), z2 = (int) Math.floor(view.toWorldZ(dragBy));
+                String refused = onAreaDrag.drag(x1, z1, x2, z2);
+                if (refused != null) onAreaRefused.accept(refused);
+            }
+            return;
+        }
         if (dragged) {
             dragged = false;
             return;
@@ -140,6 +180,7 @@ public final class WMapView extends WPressable {
         }
 
         renderer.scissorStart(x, y, width, height);
+        drawAreas(renderer);
         drawMarkers(renderer, self);
         String h = hint.get();
         if (h != null && !h.isEmpty()) {
@@ -153,6 +194,33 @@ public final class WMapView extends WPressable {
         renderer.quad(x, y + height - t, width, t, OUTLINE);
         renderer.quad(x, y, t, height, OUTLINE);
         renderer.quad(x + width - t, y, t, height, OUTLINE);
+    }
+
+    /** The stored area, the draft, and the rectangle being dragged. */
+    private void drawAreas(GuiRenderer renderer) {
+        int[] stored = storedArea.get();
+        if (stored != null) rect(renderer, stored[0], stored[2], stored[3] + 1, stored[5] + 1, AREA_STORED, null);
+        int[] draft = draftArea.get();
+        if (draft != null) rect(renderer, draft[0], draft[2], draft[3] + 1, draft[5] + 1, AREA_DRAFT, AREA_DRAFT_FILL);
+        if (areaMode && areaDragging) {
+            double ax = Math.floor(view.toWorldX(dragAx)), az = Math.floor(view.toWorldZ(dragAy));
+            double bx = Math.floor(view.toWorldX(dragBx)), bz = Math.floor(view.toWorldZ(dragBy));
+            double minX = Math.min(ax, bx), maxX = Math.max(ax, bx) + 1, minZ = Math.min(az, bz), maxZ = Math.max(az, bz) + 1;
+            rect(renderer, minX, minZ, maxX, maxZ, AREA_DRAFT, AREA_DRAFT_FILL);
+            String size = (long) (maxX - minX) + "×" + (long) (maxZ - minZ);
+            label(renderer, size, x + view.toScreenX((minX + maxX) / 2), y + view.toScreenY(minZ) - theme.textHeight() - 2);
+        }
+    }
+
+    /** A rectangle between two world corners (x1, z1 to x2, z2 excluded) as an outline, with an optional fill. */
+    private void rect(GuiRenderer renderer, double x1, double z1, double x2, double z2, Color edge, Color fill) {
+        double sx1 = x + view.toScreenX(x1), sy1 = y + view.toScreenY(z1), sx2 = x + view.toScreenX(x2), sy2 = y + view.toScreenY(z2);
+        double t = Math.max(1, theme.scale(1.5));
+        if (fill != null) renderer.quad(sx1, sy1, sx2 - sx1, sy2 - sy1, fill);
+        renderer.quad(sx1, sy1, sx2 - sx1, t, edge);
+        renderer.quad(sx1, sy2 - t, sx2 - sx1, t, edge);
+        renderer.quad(sx1, sy1, t, sy2 - sy1, edge);
+        renderer.quad(sx2 - t, sy1, t, sy2 - sy1, edge);
     }
 
     private void drawMarkers(GuiRenderer renderer, Self self) {

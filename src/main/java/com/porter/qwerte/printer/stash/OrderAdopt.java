@@ -11,16 +11,28 @@ import java.util.function.Predicate;
 public final class OrderAdopt {
     private OrderAdopt() {}
 
-    /** @param lines item key to count, the item lines of the listed order */
-    public record Listed(String id, boolean open, boolean hasPlacedBy, String placedById, Map<String, Long> lines) {}
+    /**
+     * @param lines item key to count, the item lines of the listed order
+     * @param craft item key to count, its craft lines
+     */
+    public record Listed(String id, boolean open, boolean hasPlacedBy, String placedById, Map<String, Long> lines, Map<String, Long> craft) {
+        public Listed(String id, boolean open, boolean hasPlacedBy, String placedById, Map<String, Long> lines) {
+            this(id, open, hasPlacedBy, placedById, lines, Map.of());
+        }
+    }
 
     /** The id of the listed order that matches, or null. */
     public static String find(List<Listed> listed, String me, Map<String, Long> sent, Predicate<String> known) {
+        return find(listed, me, sent, Map.of(), known);
+    }
+
+    /** The id of the listed order that holds exactly these item lines and these craft lines, or null. */
+    public static String find(List<Listed> listed, String me, Map<String, Long> sent, Map<String, Long> sentCraft, Predicate<String> known) {
         for (Listed e : listed) {
             if (!e.open() || known.test(e.id())) continue;
             // An order with no placedBy is from before there were users: it is the owner's
             if (e.hasPlacedBy() && (me == null || me.isEmpty() || !e.placedById().equals(me))) continue;
-            if (e.lines().equals(sent)) return e.id();
+            if (e.lines().equals(sent) && e.craft().equals(sentCraft)) return e.id();
         }
         return null;
     }
@@ -34,7 +46,13 @@ public final class OrderAdopt {
 
     /** {@link #find} and what to do when it finds nothing: the order may still exist, so it is charged and the stash skipped. */
     public static Outcome resolve(List<Listed> listed, String me, Map<String, Long> sent, Predicate<String> known, int plannedShulkers) {
-        String id = find(listed, me, sent, known);
+        return resolve(listed, me, sent, Map.of(), known, plannedShulkers);
+    }
+
+    /** As above for an order that also had craft lines. */
+    public static Outcome resolve(List<Listed> listed, String me, Map<String, Long> sent, Map<String, Long> sentCraft, Predicate<String> known,
+                                  int plannedShulkers) {
+        String id = find(listed, me, sent, sentCraft, known);
         return id != null ? new Outcome(id, 0, false) : new Outcome(null, Math.max(0, plannedShulkers), true);
     }
 

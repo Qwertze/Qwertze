@@ -37,6 +37,7 @@ public class WCreativeTabs extends WPressable {
         Map.entry("other", new String[] {"Other", "minecraft:chest"}),
         Map.entry("shulkers", new String[] {"Shulkers", "minecraft:shulker_box"}),
         Map.entry("kits", new String[] {"Kits", "minecraft:purple_shulker_box"}),
+        Map.entry("area", new String[] {"Area", "minecraft:map"}),
         Map.entry("orders", new String[] {"Orders", "minecraft:writable_book"}));
 
     private static final int GAP = 1;
@@ -94,24 +95,22 @@ public class WCreativeTabs extends WPressable {
         double pitch = StashLayout.TAB_W * u + GAP * u;
         tabW = StashLayout.TAB_W * u;
         if (n > 0 && n * pitch - GAP * u > avail) {
-            tabW = Math.max(MIN_TAB * u, Math.floor((avail - (n - 1) * GAP * u) / n / u) * u);
+            // Shrunk to fit; below the readable width the tabs still stay inside the row rather than overlap or run out of it
+            double fit = Math.floor((avail - (n - 1) * GAP * u) / n / u) * u;
+            tabW = Math.max(Math.min(MIN_TAB * u, Math.max(1, Math.floor((avail - (n - 1) * GAP * u) / n))), fit);
             pitch = tabW + GAP * u;
         }
         left = new double[n];
-        double xx = 0;
-        int ordersIndex = ids.indexOf(IndexModel.TAB_ORDERS);
-        int kitsIndex = ids.indexOf(IndexModel.TAB_KITS);
+        // In a row, left to right; Area, Kits and Orders are the last ones and move to the right end when there is room to spare
+        int firstRight = n;
+        for (String right : new String[] {IndexModel.TAB_AREA, IndexModel.TAB_KITS, IndexModel.TAB_ORDERS}) {
+            int at = ids.indexOf(right);
+            if (at >= 0) firstRight = Math.min(firstRight, at);
+        }
+        double total = n == 0 ? 0 : n * pitch - GAP * u;
+        double spare = Math.max(0, avail - total);
         for (int i = 0; i < n; i++) {
-            // Kits sits right before Orders at the right end
-            if (i == kitsIndex && ordersIndex >= 0) {
-                left[i] = Math.max(xx, avail - 2 * tabW - GAP * u);
-                xx = left[i] + pitch;
-            }
-            else if (i == ordersIndex) left[i] = Math.max(xx, avail - tabW);
-            else {
-                left[i] = xx;
-                xx += pitch;
-            }
+            left[i] = i * pitch + (i >= firstRight && ids.indexOf(IndexModel.TAB_ORDERS) >= 0 ? spare : 0);
         }
     }
 
@@ -153,7 +152,8 @@ public class WCreativeTabs extends WPressable {
                 if (sel) Paint.rect(renderer, t, tx + bw, ty + th - bw, tabW - 2 * bw, bw, fill);
                 if (p.bevel && sel) Paint.bevel(renderer, t, tx + bw, ty + bw, tabW - 2 * bw, th - bw, u, 0xFFFFFFFF, 0xFFC6C6C6);
                 String[] info = INFO.get(ids.get(i));
-                if (info != null) {
+                // The icon is 16 units wide: a tab narrower than that (a very narrow window) shows none rather than an icon over its neighbours
+                if (info != null && tabW >= 16 * u) {
                     double ix = tx + (tabW - 16 * u) / 2;
                     double iy = ty + (th - 16 * u) / 2 + (sel ? 0 : u);
                     ItemLayer.draw(renderer, t, g, ItemStacks.displayId(info[1]), "", Math.round(ix / u) * u, Math.round(iy / u) * u);

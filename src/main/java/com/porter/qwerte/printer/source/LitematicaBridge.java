@@ -399,4 +399,55 @@ public final class LitematicaBridge {
         }
         return true;
     }
+
+    // ---------- is Litematica drawing its schematic blocks ----------
+
+    // Configs.Visuals.ENABLE_RENDERING, ENABLE_SCHEMATIC_RENDERING and ENABLE_SCHEMATIC_BLOCKS (malilib IConfigBoolean.getBooleanValue)
+    // and SchematicWorldHandler.getSchematicWorld(), javap checked in litematica 0.26.16 / malilib 0.27.20 and 0.21.7 / 0.23.5.
+    // The three switches are the "Rendering", "Schematic rendering" and "Schematic blocks" toggles of Litematica's visuals page;
+    // the overlay boxes (the cyan wireframe) are a separate switch and don't count, since they are not block models.
+    private static Object[] shownFlags;
+    private static MethodHandle shownGet, shownWorld;
+    private static boolean shownTried, shownFailLogged;
+
+    /**
+     * Litematica is loaded and currently draws its ghost block models of a schematic (all three switches on and a schematic
+     * world loaded). False when Litematica is absent or can't be read. Cheap enough to ask once a second; client thread only.
+     */
+    public static synchronized boolean schematicBlocksShown() {
+        if (!available()) return false;
+        if (!shownTried) {
+            shownTried = true;
+            try {
+                ClassLoader cl = LitematicaBridge.class.getClassLoader();
+                Class<?> visuals = Class.forName(P + "config.Configs$Visuals", false, cl);
+                Class<?> flag = Class.forName("fi.dy.masa.malilib.config.IConfigBoolean", false, cl);
+                shownGet = h(flag, "getBooleanValue");
+                shownWorld = h(Class.forName(P + "world.SchematicWorldHandler", false, cl), "getSchematicWorld");
+                shownFlags = new Object[] {
+                    visuals.getField("ENABLE_RENDERING").get(null),
+                    visuals.getField("ENABLE_SCHEMATIC_RENDERING").get(null),
+                    visuals.getField("ENABLE_SCHEMATIC_BLOCKS").get(null),
+                };
+            } catch (Throwable t) {
+                fatal(t);
+                shownFlags = null;
+                QwerteAddon.LOG.warn("printer: Litematica's render switches can't be read; phantom blocks won't hide for it", t);
+            }
+        }
+        if (shownFlags == null) return false;
+        try {
+            for (Object f : shownFlags) {
+                if (f == null || !(boolean) shownGet.invoke(f)) return false;
+            }
+            return shownWorld.invoke() != null;
+        } catch (Throwable t) {
+            fatal(t);
+            if (!shownFailLogged) {
+                shownFailLogged = true;
+                QwerteAddon.LOG.warn("printer: reading Litematica's render switches failed", t);
+            }
+            return false;
+        }
+    }
 }

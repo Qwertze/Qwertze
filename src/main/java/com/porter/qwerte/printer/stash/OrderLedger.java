@@ -20,15 +20,59 @@ import java.util.Set;
 public final class OrderLedger {
     public static final long DELIVERED_EXPIRY_MS = 20 * 60_000L;
 
-    public record Placed(String id, String stashKey, Map<String, Long> lines, long sentAt) {}
+    /**
+     * @param lines item key to count: everything the order brings, the item lines and the crafted items together. Both count as
+     *              supply on its way, so the Printer does not order the same again
+     * @param craft the crafted part of {@code lines} (item key to count), empty for an order without craft lines
+     */
+    public record Placed(String id, String stashKey, Map<String, Long> lines, long sentAt, Map<String, Long> craft) {
+        public Placed(String id, String stashKey, Map<String, Long> lines, long sentAt) {
+            this(id, stashKey, lines, sentAt, Map.of());
+        }
+
+        /** The item lines of the order: {@code lines} without the crafted part. */
+        public Map<String, Long> direct() {
+            Map<String, Long> out = new LinkedHashMap<>();
+            for (Map.Entry<String, Long> e : lines.entrySet()) {
+                long n = e.getValue() - craft.getOrDefault(e.getKey(), 0L);
+                if (n > 0) out.put(e.getKey(), n);
+            }
+            return out;
+        }
+    }
 
     public enum Kind { DELIVERED, FAILED, CANCELLED, VANISHED }
 
-    /** @param message the bot note for a failure or cancel (not cleaned here) */
-    public record Event(Kind kind, Placed order, String message) {}
+    /**
+     * @param message   the bot note for a failure or cancel (not cleaned here)
+     * @param craftNote how the crafting of a delivered order went, in words ("" when it had none)
+     */
+    public record Event(Kind kind, Placed order, String message, String craftNote) {
+        public Event(Kind kind, Placed order, String message) {
+            this(kind, order, message, "");
+        }
+    }
 
-    /** What the server said about one order. */
-    public record Seen(String id, String status, String message) {}
+    /**
+     * What the server said about one order.
+     *
+     * @param craftNote how its crafting went, in words, or ""
+     * @param craftMade crafted item key to how many were made; null when the order has no crafting result (nothing is known)
+     * @param craftShort crafted item key to how many were not made
+     */
+    public record Seen(String id, String status, String message, String craftNote, Map<String, Long> craftMade, Map<String, Long> craftShort) {
+        public Seen(String id, String status, String message, String craftNote) {
+            this(id, status, message, craftNote, null, Map.of());
+        }
+
+        public Seen(String id, String status, String message) {
+            this(id, status, message, "");
+        }
+    }
+
+    /** How long a stash is not asked to craft an item again after a delivery left that much of it uncrafted. */
+    public static final long CRAFT_SHORT_BLOCK_MS = 10 * 60_000L;
+    private final Map<String, Long> craftShortUntil = new HashMap<>();
 
     public static final String DELIVERED = "delivered", FAILED = "failed", CANCELLED = "cancelled";
 
@@ -122,8 +166,20 @@ public final class OrderLedger {
                 it.remove();
                 pollDirty = true;
                 lastStatus.remove(p.id());
-                delivered.add(new Delivery(p, now));
-                events.add(new Event(Kind.DELIVERED, p, s.message()));
+                Delivery d = new Delivery(p, now);
+                for (Map.Entry<String, Long> c : p.craft().entrySet()) {
+                    long want = c.getValue();
+                    long lack = s.craftShort() == null ? 0 : s.craftShort().getOrDefault(c.getKey(), 0L);
+                    if (s.craftMade() != null) lack = Math.max(lack, want - s.craftMade().getOrDefault(c.getKey(), 0L));
+                    lack = Math.max(0, Math.min(want, lack));
+                    if (lack <= 0) continue;
+                    // What was not made is not coming: it stops counting as supply, and is not crafted again right away
+                    d.uncollected.merge(c.getKey(), -lack, Long::sum);
+                    d.uncollected.computeIfPresent(c.getKey(), (k, v) -> Math.max(0, v));
+                    craftShortUntil.put(stashKey + "\u0000" + c.getKey(), now + CRAFT_SHORT_BLOCK_MS);
+                }
+                delivered.add(d);
+                events.add(new Event(Kind.DELIVERED, p, s.message(), s.craftNote()));
             } else if (FAILED.equals(s.status())) {
                 it.remove();
                 pollDirty = true;
@@ -205,6 +261,11 @@ public final class OrderLedger {
         return failed != null && failed.contains(item);
     }
 
+    /** Whether this stash is left out of crafting this item for a while (a delivery from it left some uncrafted). */
+    public boolean craftBlocked(String stashKey, String item, long now) {
+        return craftShortUntil.getOrDefault(stashKey + "\u0000" + item, 0L) > now;
+    }
+
     public int shulkersThisRun() {
         return shulkersThisRun;
     }
@@ -218,6 +279,7 @@ public final class OrderLedger {
         shulkersThisRun = 0;
         cancelledKeys.clear();
         failedKeys.clear();
+        craftShortUntil.clear();
     }
 
     /** Forgets the orders (another game server). The per-run shulker count and the blocked keys stay: they belong to the build. */

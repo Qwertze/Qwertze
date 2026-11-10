@@ -1,6 +1,15 @@
 package com.porter.qwerte.modules;
 
 import com.porter.qwerte.QwerteAddon;
+import com.porter.qwerte.compat.GameVersion;
+import com.porter.qwerte.craft.ClaimWait;
+import com.porter.qwerte.craft.RecipeBoot;
+import com.porter.qwerte.craft.RecipeHttp;
+import com.porter.qwerte.craft.RecipeStore;
+import com.porter.qwerte.craft.RecipeSync;
+import com.porter.qwerte.craft.Recipes;
+import com.porter.qwerte.stash.CraftSettings;
+import com.porter.qwerte.stash.CraftStore;
 import com.porter.qwerte.stash.Stash;
 import com.porter.qwerte.stash.StashIndex;
 import meteordevelopment.meteorclient.events.game.GameLeftEvent;
@@ -209,7 +218,7 @@ public class StashManager extends Module {
 
     private final Setting<Boolean> enableCrafting = sgCrafting.add(new BoolSetting.Builder()
         .name("enable-crafting")
-        .description("Orders and compaction may craft a plain Shulker Box when no empty one is left: shulker shells and a chest (made of planks, made of logs) are taken from the stash and crafted at the crafting table below. Shulker shells can't be crafted, so they have to be in the stash. Needs a crafting table: the one set below, else one is found in the stash area, taken from the stash and placed, or crafted in the inventory grid from 4 planks (or logs) and placed. Kits never craft.")
+        .description("Orders and compaction may craft a plain Shulker Box when no empty one is left: shulker shells and a chest (made of planks, made of logs) are taken from the stash and crafted at the crafting table below. Shulker shells can't be crafted, so they have to be in the stash. Needs a crafting table: the one set below, else one is found in the stash area, taken from the stash and placed, or crafted in the inventory grid from 4 planks (or logs) and placed. Kits never craft. Needs the recipe table: nothing is shipped, it is fetched from the Stash Manager server (server-url and api-key) or, without one, built from the game's own data; until it is there nothing is crafted.")
         .defaultValue(false)
         .build()
     );
@@ -248,6 +257,32 @@ public class StashManager extends Module {
         .build()
     );
 
+    private final Setting<Boolean> craftOrders = sgCrafting.add(new BoolSetting.Builder()
+        .name("craft-orders")
+        .description("Take orders from the website that ask for items the stash can make from what it holds (crafting from the stash). The bot takes the ingredients from the stash, crafts them at the crafting table the website set for this stash, and delivers the results with the order. Needs enable-crafting and a crafting table set on the website (stash settings). Off: such orders are never given to this bot.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Integer> craftOrderMaxFills = sgCrafting.add(new IntSetting.Builder()
+        .name("craft-order-max-fills")
+        .description("The most grid fills (one craft of one recipe) the bot makes for one craft order. An order that needs more is refused when it is placed.")
+        .defaultValue(2048)
+        .min(1)
+        .max(100000)
+        .sliderRange(1, 8192)
+        .build()
+    );
+
+    private final Setting<Integer> craftOrderMaxPerHour = sgCrafting.add(new IntSetting.Builder()
+        .name("craft-order-max-per-hour")
+        .description("The most grid fills the bot makes for craft orders in an hour. Past it, the rest of a craft order's items are left uncrafted (reported as short, reason cap) and the order carries on.")
+        .defaultValue(4096)
+        .min(1)
+        .sliderRange(1, 16384)
+        .build()
+    );
+
     private final SettingGroup sgCraftingTable = settings.createGroup("Crafting table");
 
     private final Setting<Boolean> selectCraftingTable = sgCraftingTable.add(new BoolSetting.Builder()
@@ -274,7 +309,9 @@ public class StashManager extends Module {
         .onChanged(on -> {
             if (!on) return;
             this.clearCraftingTable.set(false);
-            if (Modules.get().get(StashSorter.class).clearCraftingTable()) info("Crafting table cleared.");
+            StashSorter sorter = Modules.get().get(StashSorter.class);
+            if (sorter.websiteTableInUse()) info("A craft order is using a crafting table right now. Try again when it is done.");
+            else if (sorter.clearCraftingTable()) info("Crafting table cleared.");
             else info("There is no crafting table.");
         })
         .build()
@@ -295,6 +332,7 @@ public class StashManager extends Module {
         .build()
     );
 
+    private static final int MAX_REPLY_BYTES = 4 * 1024 * 1024;
     private static final long HEARTBEAT_MS = 15_000;
     private static final long CLAIM_MS = 5_000, STATUS_MS = 2_000;
     private static final long REBUILD_MS = 60_000;
@@ -352,6 +390,19 @@ public class StashManager extends Module {
     private long kitBuiltSig, kitBuiltAt;
     private boolean kitBuiltValid;
     private String kitSentHash, kitRejectedHash, kitInvalidSaid;
+    // The recipe table (0.4.0-dev.18, CRAFT-CONTRACT.md "Recipe tables for the bots"): nothing is shipped. It is cached in meteor-client/qwerte, fetched
+    // from the server (signed GET /api/v1/bot/recipes) when it has none or the heartbeat reply's recipesHash differs, and built from the game's own
+    // jar when there is no server or it has none
+    private final RecipeSync recipeSync = new RecipeSync();
+    private final ExecutorService recipeIo = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "qwerte-stash-manager-recipes");
+        t.setDaemon(true);
+        return t;
+    });
+    private boolean recipeSaid, fetchFailed, craftWarned;
+    private String craftInvalidSaid, gameVersion;
+    // What a 204 to a claim means for an order held with craft lines
+    private final ClaimWait claimWait = new ClaimWait();
     // The rescan id handled and not yet acknowledged to the server, or -1
     private long rescanDone = -1;
     // A website rescan is being carried out: the bot reads until nothing is stale or unread
@@ -381,6 +432,10 @@ public class StashManager extends Module {
                     this.selectCraftingTable.set(false);
                 }
                 case -1 -> info("That isn't a crafting table.");
+                case -3 -> {
+                    info("A craft order is using a crafting table right now. Try again when it is done.");
+                    this.selectCraftingTable.set(false);
+                }
                 case 0 -> {
                     info("Crafting table cleared.");
                     this.selectCraftingTable.set(false);
@@ -505,6 +560,8 @@ public class StashManager extends Module {
         deliveryParts = List.of();
         anvilPart = null;
         craftingTablePart = null;
+        // Crafting without this module may still need the game's own data for the recipe table
+        RecipeBoot.allowLocal(true);
         // Nobody is left to tell the server how an order is going: park it so a later claim carries on
         StashSorter sorter = Modules.get().get(StashSorter.class);
         if (sorter != null) {
@@ -547,6 +604,11 @@ public class StashManager extends Module {
         rescanDone = -1;
         rescanning = false;
         warnedOwner = null;
+        recipeSync.reset();
+        fetchFailed = false;
+        craftWarned = false;
+        claimWait.other();
+        craftInvalidSaid = null;
         StashIndex.clearCache();
     }
 
@@ -561,6 +623,8 @@ public class StashManager extends Module {
 
         driveSorter();
         updateOrdersNote();
+        // The recipe table is kept whether or not a server is set: the game's own data stands in when there is none
+        recipeTick();
 
         // No server set (the default since 0.4.0-dev.8): the addon works without one, so this is a status, not a warning
         if (serverUrl.get().isBlank()) {
@@ -625,7 +689,9 @@ public class StashManager extends Module {
             lastHeartbeat = now;
             String sig = deliverySig();
             long done = rescanDone;
-            send(base, "/api/v1/heartbeat", StashIndex.heartbeat(built, deliveryPos(), orderBlocker(), done, rescanBlocked(), namingInfo(), craftingInfo(), anvilSource(), deliveryStorage(), tableSource(), deliveryHash, kitsBody(built)), key, (code, body) -> {
+            // The reply is for the stash this heartbeat was sent for
+            String sentArea = areaKeyNow();
+            send(base, "/api/v1/heartbeat", StashIndex.heartbeat(built, deliveryPos(), orderBlocker(), done, rescanBlocked(), namingInfo(), craftingInfo(), anvilSource(), deliveryStorage(), tableSource(), deliveryHash, kitsBody(built), craftBody(), areaBody()), key, (code, body) -> {
                 if (code != 200) return false;
                 sentDelivery = sig;
                 if (done >= 0 && rescanDone == done) rescanDone = -1;
@@ -633,6 +699,8 @@ public class StashManager extends Module {
                 needIndex = StashIndex.needsIndex(body);
                 deliverySync.onHeartbeatReply(body);
                 kitsReplied(built, body);
+                craftReplied(built, body);
+                areaReplied(body, sentArea);
                 readOrders(body);
                 return true;
             });
@@ -887,7 +955,7 @@ public class StashManager extends Module {
         if (!acceptOrders.get() && runner.running()) runner.park();
 
         OrderRunner.Report report = runner.report();
-        String blocker = acceptOrders.get() ? sorter.orderBlocker() : "off";
+        String blocker = acceptOrders.get() ? orderBlocker() : "off";
 
         // What the bot is doing, when it changed
         if (report != null) {
@@ -932,12 +1000,18 @@ public class StashManager extends Module {
             JsonObject o = new JsonObject();
             o.addProperty("server", server);
             o.addProperty("stash", name);
+            // Said when the claim is made, never earlier: without the flag the server skips orders with craft lines and fails a held one
+            com.porter.qwerte.craft.CraftCapability.claimFlag(o, sorter.craftOrdersCapable(), runner.resumeHasCraft());
             send(base, "/api/v1/orders/claim", bytes(o), key, (code, body) -> {
                 if (code == 204) {
                     pendingOrders = 0;
+                    // A held craft order claimed without the flag also gets 204 (the server waits for a capable heartbeat before it fails it): its
+                    // saved plan, and the ledger of what it made, is kept through two of them
+                    if (claimWait.keepSaved(runner.resumeHasCraft())) return true;
                     runner.dropSaved(null);
                     return true;
                 }
+                claimWait.other();
                 if (code != 200) return false;
                 takeOrder(sorter, runner, body);
                 return true;
@@ -945,6 +1019,198 @@ public class StashManager extends Module {
             return true;
         }
         return false;
+    }
+
+    // The stash area (0.4.0-dev.20, AREA-CONTRACT.md)
+
+    private String areaIgnored;
+
+    private StashIndex.AreaReport areaBody() {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        return sorter == null ? null : sorter.areaReport();
+    }
+
+    private String areaKeyNow() {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        return sorter == null ? "" : sorter.areaKey();
+    }
+
+    private String areaSig() {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        return sorter == null ? "-" : sorter.areaSig();
+    }
+
+    /**
+     * What a heartbeat reply says about the area (AreaSync decides): an acknowledgement ends our edit only when it is for the hash we edited to;
+     * an area for us is queued unless a change of ours is waiting or was not acknowledged yet.
+     */
+    private void areaReplied(String body, String sentFor) {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        if (sorter == null) return;
+        // The player may have moved to another stash or server since the heartbeat went out: its area is not this one's
+        if (!sentFor.equals(sorter.areaKey())) return;
+        StashIndex.AreaReply r = StashIndex.areaReply(body);
+        com.porter.qwerte.stash.AreaPending pending = sorter.areaPending();
+        String areaKey = sorter.areaKey();
+        pending.acknowledge(areaKey, r.hash());
+        Stash s = sorter.currentStash();
+        StashIndex.AreaReport now = sorter.areaReport();
+        if (s == null || now == null) return;
+        String dimension = com.porter.qwerte.stash.CraftBounds.fullId(s.dimension);
+        com.porter.qwerte.stash.AreaSync.Action action = com.porter.qwerte.stash.AreaSync.react(r, now.hash(), pending.get(areaKey), pending.edited(areaKey), dimension.isEmpty() ? null : dimension);
+        if (action.warn() != null) {
+            if (!action.warn().equals(areaIgnored)) QwerteAddon.LOG.warn("stash-manager: ignoring the stash area from the server: {}.", action.warn());
+            areaIgnored = action.warn();
+        } else {
+            areaIgnored = null;
+        }
+        if (action.queue() != null) {
+            pending.queue(action.queue(), areaKey);
+            QwerteAddon.LOG.info("stash-manager: a stash area from the server waits to be applied between tasks.");
+        }
+    }
+
+    // The recipe table (0.4.0-dev.18)
+
+    /** The server's table is being waited for: a server is set, this module is on, there is no table and the fetch has not failed. */
+    boolean waitingForServerRecipes() {
+        if (!isActive() || Recipes.current() != null || fetchFailed) return false;
+        String key = apiKey.get().trim();
+        return !serverUrl.get().isBlank() && !key.isEmpty() && parse(serverUrl.get()) != null;
+    }
+
+    /** The game version the recipe table is for ("1.21.4"), or null when it can't be told. */
+    private String gameVersion() {
+        if (gameVersion == null) {
+            try {
+                String v = GameVersion.name();
+                if (RecipeStore.validMc(v)) gameVersion = v;
+            } catch (RuntimeException | LinkageError e) {
+                // not known yet
+            }
+        }
+        return gameVersion;
+    }
+
+    /**
+     * Keeps the recipe table: from the cache; fetched from the server when it has none and whenever the heartbeat reply's recipesHash is not
+     * the held table's; built from the game's own data (once, by {@link RecipeBoot}) when there is no server or it could not give one.
+     * Every tick, client thread.
+     */
+    private void recipeTick() {
+        String version = gameVersion();
+        if (version == null) return;
+        long now = System.currentTimeMillis();
+        String key = apiKey.get().trim();
+        URI base = serverUrl.get().isBlank() || key.isEmpty() ? null : parse(serverUrl.get());
+        // With a server set, its table is waited for; the game's own data stands in when there is no server or it has none
+        RecipeBoot.allowLocal(base == null || fetchFailed);
+        RecipeBoot.bootstrap(version);
+        Recipes held = Recipes.current();
+        if (base != null && recipeSync.due(now, held == null ? null : held.hash())) fetchRecipes(base, key, version, now, held == null ? null : held.hash());
+        if (held == null && RecipeBoot.localDone() && enableCrafting.get() && !craftWarned) {
+            craftWarned = true;
+            warning("enable-crafting is on but there is no recipe table: it comes from the Stash Manager server (server-url, api-key) or the game's own data, and neither gave one. Nothing is crafted.");
+        }
+    }
+
+    /** A signed GET of the version's table ({@link RecipeHttp}). The answer is handled by {@link #recipesFetched}. */
+    private void fetchRecipes(URI base, String key, String version, long now, String heldHash) {
+        recipeSync.started();
+        URI uri;
+        try {
+            uri = URI.create(base + "/api/v1/bot/recipes?mc=" + version);
+        } catch (IllegalArgumentException e) {
+            recipeSync.failed(now, -1);
+            return;
+        }
+        int gen = generation;
+        recipeIo.execute(() -> {
+            RecipeHttp.Response r = RecipeHttp.get(http, uri, key, heldHash == null ? null : RecipeStore.quote(heldHash), Duration.ofSeconds(30));
+            mc.execute(() -> {
+                // A new session since: reset() already cleared the sync state, so this answer is just dropped
+                if (gen != generation) return;
+                recipesFetched(version, r.code(), r.body(), r.etag());
+            });
+        });
+    }
+
+    /** The answer to the table request: a table (200, checked and cached), "not changed" (304), or a failure that is backed off from. */
+    private void recipesFetched(String version, int code, String body, String etag) {
+        long now = System.currentTimeMillis();
+        if (code == 304) {
+            recipeSync.succeeded(now);
+            return;
+        }
+        if (code == 200) {
+            try {
+                RecipeStore.Checked checked = RecipeStore.shared().validate(version, body, etag);
+                Recipes table = checked.table();
+                // The table is used as soon as it validates (always replacing a locally built one); failing to cache it is only logged
+                Recipes.setCurrent(table);
+                RecipeStore.shared().persist(version, checked);
+                recipeSync.succeeded(now);
+                recipeSaid = false;
+                fetchFailed = false;
+                QwerteAddon.LOG.info("stash-manager: recipe table for {} fetched ({} recipes, hash {}). Crafting uses it.", version, table.size(), table.hash().substring(0, 8));
+                return;
+            } catch (RecipeStore.Invalid e) {
+                QwerteAddon.LOG.warn("stash-manager: the recipe table from the server was refused: {}.", e.getMessage());
+                recipeSync.failed(now, 400);
+                fetchFailed = true;
+                return;
+            }
+        }
+        recipeSync.failed(now, code);
+        fetchFailed = true;
+        // Said once per run of failures (not every retry): without a table nothing is crafted
+        if (!recipeSaid && Recipes.current() == null) {
+            recipeSaid = true;
+            QwerteAddon.LOG.warn("stash-manager: no recipe table from the server: it answered {} for the recipes of {}. Crafting stays off until there is one.", code < 0 ? "nothing" : code, version);
+        }
+    }
+
+    /** What the heartbeat says about craft orders changes: a heartbeat of its own is sent. */
+    private String craftSig() {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        if (sorter == null || !com.porter.qwerte.craft.CraftCapability.sendOrders(enableCrafting.get(), Recipes.current() != null)) return "-";
+        Recipes table = Recipes.current();
+        String[] bot = sorter.botTable();
+        return table == null ? "-" : table.hash() + "/" + sorter.craftTableStatus() + "/" + sorter.craftTableWhy() + "/" + (bot == null ? "-" : bot[0] + bot[1]);
+    }
+
+    /**
+     * The craft fields of the heartbeat. A bot that can't carry out craft orders (no recipe table, crafting off, or no runner in this build)
+     * sends craftOrders as an explicit null, so it is never given one; one that can says which table it holds, the state of the website's
+     * crafting table and the tables it has seen in the stash area.
+     */
+    private StashIndex.Craft craftBody() {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        Recipes table = Recipes.current();
+        // Sent whenever crafting and craft-orders are on and a recipe table is held, with the table state and why it is not usable, so the website can
+        // say so; the table route being unavailable is not a reason to send null
+        if (sorter == null || table == null || !com.porter.qwerte.craft.CraftCapability.sendOrders(enableCrafting.get(), true))
+            return com.porter.qwerte.craft.CraftCapability.heartbeat(false, null, null, null, 0, null, null);
+        CraftSettings cached = sorter.craftSettings();
+        String[] bot = sorter.botTable();
+        return com.porter.qwerte.craft.CraftCapability.heartbeat(true, craftOrders.get(), table.hash(), gameVersion() == null ? table.version() : gameVersion(), sorter.craftTableStatus(),
+            craftOrderMaxFills.get(), sorter.seenTables(), cached == null ? null : cached.hash(), sorter.craftTableWhy(), bot == null ? null : new StashIndex.BotTable(bot[0], bot[1]));
+    }
+
+    /** What a heartbeat reply says about crafting: the server's recipe hash, and new craft settings (the website's table), checked and cached. */
+    private void craftReplied(StashIndex.Built built, String body) {
+        StashIndex.CraftReply reply = StashIndex.craftReply(body);
+        recipeSync.serverHash(reply.recipesHash());
+        if (reply.invalid() != null) {
+            if (!reply.invalid().equals(craftInvalidSaid)) QwerteAddon.LOG.warn("stash-manager: ignoring craft settings from the server: {}.", reply.invalid());
+            craftInvalidSaid = reply.invalid();
+        } else if (reply.settings() != null) {
+            craftInvalidSaid = null;
+            if (CraftStore.shared().put(StashIndex.clamp(built.server(), 256), StashIndex.clamp(built.stash(), 256), reply.settings())) {
+                // No position is logged
+                QwerteAddon.LOG.info("stash-manager: craft settings updated (revision {}, a crafting table is {}).", reply.settings().rev(), reply.settings().table() == null ? "not set" : "set");
+            }
+        }
     }
 
     private int[] deliveryPos() {
@@ -975,7 +1241,8 @@ public class StashManager extends Module {
     /** What the heartbeat says about crafting: whether it is on, and whether a crafting table is ready. */
     private int[] craftingInfo() {
         StashSorter sorter = Modules.get().get(StashSorter.class);
-        return new int[] { enableCrafting.get() ? 1 : 0, sorter != null && sorter.craftingTableReady() ? 1 : 0 };
+        // Crafting is only on with a recipe table: nothing is crafted without one
+        return new int[] { enableCrafting.get() && Recipes.current() != null ? 1 : 0, sorter != null && sorter.craftingTableReady() ? 1 : 0 };
     }
 
     /** Why a rescan can't start yet, or null. */
@@ -1012,7 +1279,11 @@ public class StashManager extends Module {
     private String orderBlocker() {
         if (!acceptOrders.get()) return "accept-orders off";
         StashSorter sorter = Modules.get().get(StashSorter.class);
-        return sorter == null ? "sorter off" : sorter.orderBlocker();
+        if (sorter == null) return "sorter off";
+        String blocker = sorter.orderBlocker();
+        // Crafting is on but its recipe table is still on its way: nothing is claimed meanwhile (an order that needs crafting would be refused for good)
+        if (blocker == null && enableCrafting.get() && Crafter.recipesPending()) return Crafter.WAITING_FOR_RECIPES;
+        return blocker;
     }
 
     /** What the heartbeat says about delivery; when it changes, another heartbeat goes out at once. */
@@ -1023,7 +1294,7 @@ public class StashManager extends Module {
 
     private String deliverySig() {
         int[] d = deliveryPos();
-        return (d == null ? "none" : d[0] + "," + d[1] + "," + d[2]) + "|" + (namingInfo()[0]) + anvilSource() + "|" + craftingInfo()[0] + craftingInfo()[1] + tableSource() + "|" + orderBlocker() + "|" + rescanDone + "|" + rescanBlocked() + "|" + storageSig();
+        return (d == null ? "none" : d[0] + "," + d[1] + "," + d[2]) + "|" + (namingInfo()[0]) + anvilSource() + "|" + craftingInfo()[0] + craftingInfo()[1] + tableSource() + "|" + orderBlocker() + "|" + rescanDone + "|" + rescanBlocked() + "|" + storageSig() + "|" + craftSig() + "|" + areaSig();
     }
 
     /** The module is on and taking orders. */
@@ -1053,6 +1324,19 @@ public class StashManager extends Module {
     /** enable-crafting. */
     boolean craftingEnabled() {
         return enableCrafting.get();
+    }
+
+    /** craft-orders: craft orders may be taken (it also needs crafting on and a recipe table; see StashSorter.craftOrdersCapable). */
+    boolean craftOrdersOn() {
+        return craftOrders.get();
+    }
+
+    int craftOrderMaxFills() {
+        return craftOrderMaxFills.get();
+    }
+
+    int craftOrderMaxPerHour() {
+        return craftOrderMaxPerHour.get();
     }
 
     /** The items crafting never uses, as ids like minecraft:beacon. */
@@ -1141,7 +1425,8 @@ public class StashManager extends Module {
         }
 
         runner.dropSaved(order.id);
-        String why = runner.offer(order);
+        // A craft order is only given to a bot that said it can carry them out (the claim flag); one that arrives anyway is failed, not half done
+        String why = (order.hasCraft() || order.craft != null) && !sorter.craftOrdersCapable() ? "this bot can't carry out craft orders" : runner.offer(order);
         if (why == null) {
             sorter.orderTaken();
             pendingOrders = Math.max(0, pendingOrders - 1);
@@ -1195,7 +1480,8 @@ public class StashManager extends Module {
         progress.addProperty("total", r.total());
         o.add("progress", progress);
         o.addProperty("message", StashIndex.clamp(r.message(), 300));
-        if (r.terminal() && !r.status().equals("cancelled")) {
+        // A cancelled craft order still reports what it made and gave back (result.craft); other cancelled orders send no result
+        if (r.terminal() && (!r.status().equals("cancelled") || r.craft() != null)) {
             JsonObject result = new JsonObject();
             result.addProperty("shulkers", r.shulkers());
             JsonArray lines = new JsonArray();
@@ -1209,6 +1495,8 @@ public class StashManager extends Module {
             }
             result.add("lines", lines);
             if (r.repair() != null) result.add("repair", r.repair().toJson());
+            // Only when the order had craft lines (CRAFT-CONTRACT.md): numbers, item ids and reason codes only
+            if (r.craft() != null) result.add("craft", r.craft());
             o.add("result", result);
         }
         return o;
@@ -1325,7 +1613,9 @@ public class StashManager extends Module {
                 // The signature covers the body as it is without compression
                 if (response.headers().firstValue("Content-Encoding").map(v -> v.toLowerCase().contains("gzip")).orElse(false) && bytes.length > 0) {
                     try (var in = new java.util.zip.GZIPInputStream(new java.io.ByteArrayInputStream(bytes))) {
-                        bytes = in.readAllBytes();
+                        // A reply that unpacks to more than 4 MiB is not one the server sends (a compression bomb): treated as unsigned
+                        bytes = in.readNBytes(MAX_REPLY_BYTES + 1);
+                        if (bytes.length > MAX_REPLY_BYTES) badSignature = true;
                     } catch (java.io.IOException e) {
                         badSignature = true;
                     }

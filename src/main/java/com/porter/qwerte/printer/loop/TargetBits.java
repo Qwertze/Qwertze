@@ -18,6 +18,25 @@ public final class TargetBits implements LayerCursor.Counts {
 
     private final ConcurrentHashMap<Long, long[]> sections = new ConcurrentHashMap<>();
     private int count;
+    private Listener listener;
+
+    /** Told (on the writing thread) about every cell that is added or removed; keeps the phantom block cache fresh. */
+    public interface Listener {
+        void changed(int x, int y, int z);
+    }
+
+    /** Receives the cells of one section, see {@link #forEach}. */
+    public interface Visitor {
+        void cell(int x, int y, int z);
+    }
+
+    /** Matches every y in {@link #forEach} and {@link #countIn}. */
+    public static final int ANY_Y = Integer.MIN_VALUE;
+
+    /** Sets (or clears with null) the change listener. */
+    public void setListener(Listener l) {
+        listener = l;
+    }
 
     private static long key(int x, int y, int z) {
         return ((long) ((x >> 4) & 0x3FFFFFF) << 38) | ((long) ((z >> 4) & 0x3FFFFFF) << 12) | ((y >> 4) & 0xFFF);
@@ -48,6 +67,7 @@ public final class TargetBits implements LayerCursor.Counts {
             if (y < lo) lo = y;
             if (y > hi) hi = y;
         }
+        if (listener != null) listener.changed(x, y, z);
         return true;
     }
 
@@ -63,6 +83,7 @@ public final class TargetBits implements LayerCursor.Counts {
         count--;
         int yi = y + Y_OFFSET;
         if (yi >= 0 && yi < Y_RANGE && --perY[yi] == 0 && (y == lo || y == hi)) bounds = false;
+        if (listener != null) listener.changed(x, y, z);
         return true;
     }
 
@@ -70,6 +91,43 @@ public final class TargetBits implements LayerCursor.Counts {
         return count;
     }
 
+    /** Cells in the 16x16x16 section (section coordinates), or in its row at {@code y} ({@link #ANY_Y}: all of it). */
+    public int countIn(int sx, int sy, int sz, int y) {
+        long[] s = sections.get(key(sx << 4, sy << 4, sz << 4));
+        if (s == null) return 0;
+        int from = 0, to = 64;
+        if (y != ANY_Y) {
+            if ((y >> 4) != sy) return 0;
+            from = (y & 15) * 4;
+            to = from + 4;
+        }
+        int n = 0;
+        for (int i = from; i < to; i++) n += Long.bitCount(s[i]);
+        return n;
+    }
+
+    /** Hands every cell of the section (or of its row at {@code y}) to the visitor, x first. The visitor must not change this set. */
+    public void forEach(int sx, int sy, int sz, int y, Visitor v) {
+        long[] s = sections.get(key(sx << 4, sy << 4, sz << 4));
+        if (s == null) return;
+        int from = 0, to = 64;
+        if (y != ANY_Y) {
+            if ((y >> 4) != sy) return;
+            from = (y & 15) * 4;
+            to = from + 4;
+        }
+        int bx = sx << 4, by = sy << 4, bz = sz << 4;
+        for (int w = from; w < to; w++) {
+            long bits = s[w];
+            while (bits != 0) {
+                int b = (w << 6) | Long.numberOfTrailingZeros(bits);
+                bits &= bits - 1;
+                v.cell(bx + (b & 15), by + (b >> 8), bz + ((b >> 4) & 15));
+            }
+        }
+    }
+
+    /** Empties the set. Does NOT tell the listener: whoever listens (the phantom blocks) must be reset along with it. */
     public void clear() {
         sections.clear();
         count = 0;

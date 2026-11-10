@@ -62,6 +62,15 @@ public final class BrowseTab {
         default void openKits() {
         }
 
+        /** True when the Area tab is offered (the stash's area editor: a server stash the account may view, or the local stash). */
+        default boolean areaTab() {
+            return false;
+        }
+
+        /** The Area tab of the creative tabs was clicked: show the Area page. */
+        default void openArea() {
+        }
+
         /** True when right-clicking an item can put it in the order cart (for the hint under the grid). */
         default boolean cartEnabled() {
             return false;
@@ -128,6 +137,10 @@ public final class BrowseTab {
             }
             if (IndexModel.TAB_KITS.equals(id)) {
                 host.openKits();
+                return;
+            }
+            if (IndexModel.TAB_AREA.equals(id)) {
+                host.openArea();
                 return;
             }
             if (!id.equals(tab)) {
@@ -214,7 +227,7 @@ public final class BrowseTab {
         if (grid == null) return;
         dirty = false;
         IndexModel index = source.index();
-        List<String> ids = index.visibleTabs(host.kitsTab());
+        List<String> ids = index.visibleTabs(host.kitsTab(), host.areaTab());
         if (!ids.contains(tab)) tab = IndexModel.TAB_ALL;
         page.tabs.setTabs(ids, tab);
         page.label = IndexModel.TAB_ALL.equals(tab) ? "Search Items" : WCreativeTabs.nameOf(tab);

@@ -250,7 +250,111 @@ public final class StashIndex {
     /** As above, with {@code kits} sent as {@code kitsHash} and {@code kitsReportHash}; null leaves both out (kit sorting is off). */
     public static byte[] heartbeat(Built b, int[] delivery, String orderBlocker, long rescanDone, String rescanBlocked, int[] naming, int[] crafting, String anvilSource,
                                    DeliveryStorage storage, String tableSource, String deliveryHash, KitsHashes kits) {
+        return heartbeat(b, delivery, orderBlocker, rescanDone, rescanBlocked, naming, crafting, anvilSource, storage, tableSource, deliveryHash, kits, null);
+    }
+
+    /** The most crafting tables the heartbeat lists as seen in the stash area. */
+    public static final int MAX_SEEN = 8;
+
+    /** The state of the website's crafting table, as the heartbeat words it. */
+    public static final String TABLE_UNSET = "unset", TABLE_OK = "ok", TABLE_UNLOADED = "unloaded", TABLE_NOT_TABLE = "not_table",
+        TABLE_UNREACHABLE = "unreachable", TABLE_OTHER_DIMENSION = "other_dimension";
+
+    /**
+     * What the heartbeat says about craft orders (0.4.0-dev.18, CRAFT-CONTRACT.md "Heartbeat"): {@code v} 1, whether this bot takes them,
+     * the tableHash of the recipe table it holds, its Minecraft version, the state of the website's crafting table, the most grid
+     * fills it makes for one order, and up to 8 tables seen in the stash area ("x,y,z").
+     */
+    public record CraftOrders(boolean enabled, String recipes, String mc, String table, int maxFills, List<String> seen, String tableWhy, BotTable botTable) {
+        public CraftOrders(boolean enabled, String recipes, String mc, String table, int maxFills, List<String> seen) {
+            this(enabled, recipes, mc, table, maxFills, seen, null, null);
+        }
+    }
+
+    /**
+     * The bot's own crafting table in use (found, placed or crafted by it; {@code craftOrders.botTable}): "x,y,z" and where it came from. A
+     * position: the server hides it from streamers.
+     */
+    public record BotTable(String pos, String source) {}
+
+    /**
+     * @param orders       the craftOrders object, or null when the bot can't carry out craft orders (sent as an explicit null: it is
+     *                     never given one)
+     * @param settingsHash the hash of the cached craft settings for this stash, or null when it has none (sent as an explicit null, so
+     *                     the server answers with them); only written with {@code orders}
+     */
+    public record Craft(CraftOrders orders, String settingsHash) {}
+
+    /** As above, with {@code craft} sent as {@code craftOrders} and {@code craftHash}; null leaves both out. */
+    public static byte[] heartbeat(Built b, int[] delivery, String orderBlocker, long rescanDone, String rescanBlocked, int[] naming, int[] crafting, String anvilSource,
+                                   DeliveryStorage storage, String tableSource, String deliveryHash, KitsHashes kits, Craft craft) {
+        return heartbeat(b, delivery, orderBlocker, rescanDone, rescanBlocked, naming, crafting, anvilSource, storage, tableSource, deliveryHash, kits, craft, null);
+    }
+
+    /**
+     * What the heartbeat says about the stash area (0.4.0-dev.20, AREA-CONTRACT.md "Heartbeat"). {@code hash} is the hash of the area the bot uses
+     * now; {@code box}/{@code dimension} that area (null: none set); {@code derived} its working box when none is set; {@code edited} the area was
+     * changed in game and the server has not taken it yet; {@code pendingHash}/{@code pendingWhy} an area received and not applied yet, and why
+     * (busy, far, dimension); {@code containersOutside} how many containers lie outside the set area.
+     */
+    public record AreaReport(String hash, int[] box, String dimension, int[] derived, boolean edited, String pendingHash, String pendingWhy, int containersOutside) {}
+
+    /** As above, with {@code area} sent as {@code area} (it needs a player); null leaves it out. */
+    public static byte[] heartbeat(Built b, int[] delivery, String orderBlocker, long rescanDone, String rescanBlocked, int[] naming, int[] crafting, String anvilSource,
+                                   DeliveryStorage storage, String tableSource, String deliveryHash, KitsHashes kits, Craft craft, AreaReport area) {
         JsonObject o = new JsonObject();
+        if (area != null && b.player() != null && !b.player().isBlank()) {
+            JsonObject a = new JsonObject();
+            a.addProperty("v", 1);
+            a.addProperty("hash", area.hash());
+            if (area.box() == null || area.dimension() == null) a.add("area", com.google.gson.JsonNull.INSTANCE);
+            else a.add("area", areaObject(area.box(), area.dimension()));
+            if (area.derived() == null) a.add("derived", com.google.gson.JsonNull.INSTANCE);
+            else a.add("derived", boxArray(area.derived()));
+            a.addProperty("edited", area.edited());
+            if (area.pendingHash() == null) a.add("pending", com.google.gson.JsonNull.INSTANCE);
+            else {
+                JsonObject pend = new JsonObject();
+                pend.addProperty("hash", area.pendingHash());
+                pend.addProperty("why", area.pendingWhy() == null ? AreaRules.BUSY : area.pendingWhy());
+                a.add("pending", pend);
+            }
+            a.addProperty("containersOutside", Math.max(0, area.containersOutside()));
+            o.add("area", a);
+        }
+        // The server answers 400 to craftOrders or craftHash without a player, and only gives the craft settings after checking the owner: with
+        // no player known the craft fields are left out altogether
+        if (craft != null && b.player() != null && !b.player().isBlank()) {
+            CraftOrders c = craft.orders();
+            if (c == null) o.add("craftOrders", com.google.gson.JsonNull.INSTANCE);
+            else {
+                JsonObject co = new JsonObject();
+                co.addProperty("v", 1);
+                co.addProperty("enabled", c.enabled());
+                co.addProperty("recipes", clamp(c.recipes(), 40));
+                co.addProperty("mc", clamp(c.mc(), 32));
+                co.addProperty("table", c.table());
+                co.addProperty("maxFills", Math.max(1, Math.min(100_000, c.maxFills())));
+                // The auto table (additive): why the table is not usable (null when it is), and the bot's own table in use
+                if (c.tableWhy() == null) co.add("tableWhy", com.google.gson.JsonNull.INSTANCE);
+                else co.addProperty("tableWhy", clamp(c.tableWhy(), 32));
+                if (c.botTable() == null) co.add("botTable", com.google.gson.JsonNull.INSTANCE);
+                else {
+                    JsonObject bt = new JsonObject();
+                    bt.addProperty("pos", clamp(c.botTable().pos(), 48));
+                    bt.addProperty("source", clamp(c.botTable().source(), 16));
+                    co.add("botTable", bt);
+                }
+                if (c.seen() != null && !c.seen().isEmpty()) {
+                    JsonArray seen = new JsonArray();
+                    for (String s : c.seen()) if (seen.size() < MAX_SEEN) seen.add(s);
+                    co.add("seen", seen);
+                }
+                o.add("craftOrders", co);
+                if (craft.settingsHash() == null) o.add("craftHash", com.google.gson.JsonNull.INSTANCE);
+                else o.addProperty("craftHash", clamp(craft.settingsHash(), 64));
+            }
+        }
         if (kits != null) {
             if (kits.settingsHash() == null) o.add("kitsHash", com.google.gson.JsonNull.INSTANCE);
             else o.addProperty("kitsHash", clamp(kits.settingsHash(), 64));
@@ -517,6 +621,86 @@ public final class StashIndex {
         } catch (RuntimeException ex) {
             return NO_KITS;
         }
+    }
+
+    /**
+     * What a heartbeat reply says about craft orders. {@code hash}: the server's hash of the stash's craft settings (null when the
+     * reply has none: an older server, or its settings file couldn't be read). {@code settings}: a valid {@code craft} object, else
+     * null. {@code invalid}: why a {@code craft} object was refused (null when there was none or it was fine). {@code recipesHash}:
+     * the server's tableHash for the stash's version (null when not said).
+     */
+    public record CraftReply(String hash, CraftSettings settings, String invalid, String recipesHash) {}
+
+    private static final CraftReply NO_CRAFT = new CraftReply(null, null, null, null);
+
+    /** Reads the craft fields of a heartbeat reply. Missing or broken fields mean nothing was said; a bad {@code craft} object is refused whole. */
+    public static CraftReply craftReply(String body) {
+        try {
+            JsonElement e = com.porter.qwerte.craft.SafeJson.parse(body);
+            if (!e.isJsonObject()) return NO_CRAFT;
+            JsonObject o = e.getAsJsonObject();
+            String hash = hex40(o.get("craftHash")), recipes = hex40(o.get("recipesHash"));
+            CraftSettings settings = null;
+            String invalid = null;
+            JsonElement c = o.get("craft");
+            if (c != null && !c.isJsonNull()) {
+                try {
+                    settings = CraftSettings.parse(c);
+                } catch (CraftSettings.Invalid ex) {
+                    invalid = ex.getMessage();
+                }
+            }
+            return new CraftReply(hash, settings, invalid, recipes);
+        } catch (RuntimeException ex) {
+            return NO_CRAFT;
+        }
+    }
+
+    private static JsonObject areaObject(int[] box, String dimension) {
+        JsonObject a = new JsonObject();
+        a.add("box", boxArray(box));
+        a.addProperty("dimension", dimension);
+        return a;
+    }
+
+    private static JsonArray boxArray(int[] box) {
+        JsonArray a = new JsonArray();
+        for (int v : box) a.add(v);
+        return a;
+    }
+
+    /**
+     * What a heartbeat reply says about the stash area. {@code hash}: the server's {@code areaHash} (null when absent: an older server).
+     * {@code areaPresent}: the reply has an {@code area} key (an object, or null for "cleared"). {@code invalid}: why that area was refused.
+     */
+    public record AreaReply(String hash, boolean areaPresent, AreaRules.Parsed area, String invalid) {}
+
+    private static final AreaReply NO_AREA = new AreaReply(null, false, null, null);
+
+    /** Reads the area fields of a heartbeat reply. Missing or broken fields mean nothing was said; a bad {@code area} object is refused. */
+    public static AreaReply areaReply(String body) {
+        try {
+            JsonElement e = com.porter.qwerte.craft.SafeJson.parse(body);
+            if (!e.isJsonObject()) return NO_AREA;
+            JsonObject o = e.getAsJsonObject();
+            String hash = hex40(o.get("areaHash"));
+            if (!o.has("area")) return new AreaReply(hash, false, null, null);
+            JsonElement a = o.get("area");
+            if (a.isJsonNull()) return new AreaReply(hash, true, null, null);
+            try {
+                return new AreaReply(hash, true, AreaRules.parse(a), null);
+            } catch (AreaRules.Invalid ex) {
+                return new AreaReply(hash, true, null, ex.getMessage());
+            }
+        } catch (RuntimeException ex) {
+            return NO_AREA;
+        }
+    }
+
+    private static String hex40(JsonElement e) {
+        if (e == null || !e.isJsonPrimitive() || !e.getAsJsonPrimitive().isString()) return null;
+        String s = e.getAsString();
+        return s.matches("^[0-9a-f]{40}$") ? s : null;
     }
 
     private static String mcVersion() {

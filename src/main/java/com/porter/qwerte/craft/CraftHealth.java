@@ -41,6 +41,14 @@ public final class CraftHealth {
         table = tableSpot;
     }
 
+    /** Forgets the trouble remembered (a craft order tries its chunk once more). */
+    public void forget() {
+        failure = null;
+        order = null;
+        table = null;
+        closed = 0;
+    }
+
     /** The table trouble remembered for this order and table, or null. */
     public String problem(String orderId, Object tableSpot) {
         return failure != null && orderId != null && Objects.equals(orderId, order) && Objects.equals(tableSpot, table) ? failure : null;

@@ -1,8 +1,10 @@
 package com.porter.qwerte.messenger;
 
+import net.minecraft.client.GuiMessageTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.contents.TranslatableContents;
 
+import java.util.List;
 import java.util.function.Predicate;
 
 /**
@@ -12,6 +14,13 @@ import java.util.function.Predicate;
  */
 public final class ChatLines {
     private ChatLines() {
+    }
+
+    /** Whether a chat line is a console line (system message, death, join, client notice) and not player chat. See {@link LineKind}. */
+    public static boolean isConsole(Component message, GuiMessageTag tag, List<String> prefixes) {
+        if (message == null) return false;
+        String key = message.getContents() instanceof TranslatableContents tc ? tc.getKey() : null;
+        return LineKind.isConsole(tag == null ? null : tag.logTag(), key, ComponentText.plain(message), prefixes);
     }
 
     /**
@@ -32,7 +41,7 @@ public final class ChatLines {
                 }
             }
         }
-        String line = message.getString();
+        String line = ComponentText.plain(message);
         return parser.parse(line);
     }
 
@@ -44,7 +53,7 @@ public final class ChatLines {
      */
     static String senderName(Object arg, Predicate<String> isOnline) {
         if (arg instanceof Component c) {
-            return resolveName(c.getStyle().getInsertion(), c.getString(), isOnline);
+            return resolveName(c.getStyle().getInsertion(), ComponentText.plain(c), isOnline);
         }
         return resolveName(null, String.valueOf(arg), isOnline);
     }
@@ -78,7 +87,7 @@ public final class ChatLines {
 
 
     private static String text(Object arg) {
-        if (arg instanceof Component c) return c.getString();
+        if (arg instanceof Component c) return ComponentText.plain(c);
         return String.valueOf(arg);
     }
 }

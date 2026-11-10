@@ -151,9 +151,32 @@ public final class MessengerCore {
 
     /** A line that arrived in the chat feed, for the Global log. Lines that are empty after cleaning are ignored. */
     public void receiveGlobal(String line, long now) {
-        String text = ChatText.message(line);
-        if (!text.isEmpty()) store().addGlobal(text, now);
+        receiveGlobal(line, now, null);
     }
+
+    /**
+     * @param console whether the line is a console line (see {@link LineKind}), or null if unknown
+     * @return true if the line was added; false if it was empty or a repeat of the line just before
+     */
+    public boolean receiveGlobal(String line, long now, Boolean console) {
+        String text = ChatText.message(line);
+        if (text.isEmpty()) return false;
+        // The same line delivered twice at once (a mod that re-adds a line it changed): show it once. The comparison
+        // ignores a timestamp or icon in front, so the two copies need not be identical.
+        String key = ChatText.stripClientPrefix(text).strip();
+        key = WHITESPACE.matcher(key).replaceAll(" ");
+        if (key.equals(lastGlobalKey) && now - lastGlobalAt >= 0 && now - lastGlobalAt <= DUPLICATE_WINDOW_MS) return false;
+        lastGlobalKey = key;
+        lastGlobalAt = now;
+        store().addGlobal(text, now).console(console);
+        return true;
+    }
+
+    /** Two public lines this close with the same text are one line delivered twice. */
+    static final long DUPLICATE_WINDOW_MS = 300;
+    private static final java.util.regex.Pattern WHITESPACE = java.util.regex.Pattern.compile("\\s+");
+    private String lastGlobalKey;
+    private long lastGlobalAt;
 
     /**
      * Checks and queues what the user typed in Global. Nothing is sent here; {@link #tick} sends it, in the same queue

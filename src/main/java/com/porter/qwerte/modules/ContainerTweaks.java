@@ -2,6 +2,7 @@ package com.porter.qwerte.modules;
 
 import com.porter.qwerte.QwerteAddon;
 import com.porter.qwerte.compat.ItemIcons;
+import com.porter.qwerte.compat.RawKeys;
 import com.porter.qwerte.compat.ScreenOverlay;
 import com.porter.qwerte.events.ContainerScreenRenderEvent;
 import com.porter.qwerte.events.ContainerSlotClickEvent;
@@ -9,6 +10,7 @@ import com.porter.qwerte.events.ContainerSlotRenderEvent;
 import com.porter.qwerte.events.ContainerTooltipEvent;
 import com.porter.qwerte.events.HotbarSlotRenderEvent;
 import com.porter.qwerte.events.ShulkerTooltipLinesEvent;
+import com.porter.qwerte.tweaks.FreezeDecision;
 import com.porter.qwerte.tweaks.FrozenGrid;
 import com.porter.qwerte.tweaks.Orphans;
 import com.porter.qwerte.tweaks.ShulkerSummaries;
@@ -332,19 +334,20 @@ public class ContainerTweaks extends Module {
             unfreeze();
             return;
         }
-        if (frozen && (event.screen != frozenScreen || !freezeKey.get().isPressed())) unfreeze();
-
-        if (!frozen && event.hoveredSlot != null && freezeKey.get().isPressed()) {
-            ItemStack stack = event.hoveredSlot.getItem();
-            ShulkerSummaries.Summary summary = ShulkerSummaries.of(stack);
-            if (summary != null) {
+        boolean held = freezeHeld();
+        ItemStack hovered = event.hoveredSlot == null ? ItemStack.EMPTY : event.hoveredSlot.getItem();
+        ShulkerSummaries.Summary hoveredSummary = event.hoveredSlot == null ? null : ShulkerSummaries.of(hovered);
+        switch (FreezeDecision.decide(held, hoveredSummary != null, frozen, event.screen == frozenScreen)) {
+            case UNFREEZE -> unfreeze();
+            case FREEZE -> {
                 frozen = true;
                 frozenScreen = event.screen;
-                frozenStack = stack;
-                frozenSummary = summary;
+                frozenStack = hovered;
+                frozenSummary = hoveredSummary;
                 panelX = FrozenGrid.placeX(event.mouseX, event.screen.width);
                 panelY = FrozenGrid.placeY(event.mouseY, event.screen.height);
             }
+            case NONE -> {}
         }
         if (!frozen) return;
 
@@ -356,6 +359,12 @@ public class ContainerTweaks extends Module {
         if (cell >= 0 && !frozenSummary.items[cell].isEmpty()) {
             ScreenOverlay.itemTooltip(event.graphics, mc.font, frozenSummary.items[cell], event.mouseX, event.mouseY);
         }
+    }
+
+    /** Read from GLFW: Meteor's key state is switched off while its text boxes have focus and misses keys other mods eat. */
+    private boolean freezeHeld() {
+        Keybind bind = freezeKey.get();
+        return bind.hasMods() ? bind.isPressed() : RawKeys.down(bind);
     }
 
     private void drawPanel() {

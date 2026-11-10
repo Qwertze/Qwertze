@@ -19,6 +19,7 @@ import com.porter.qwerte.manager.gui.widgets.WSlotGrid;
 import com.porter.qwerte.manager.model.BotInfo;
 import com.porter.qwerte.manager.model.Cart;
 import com.porter.qwerte.manager.model.CartPlan;
+import com.porter.qwerte.manager.model.CraftModel;
 import com.porter.qwerte.manager.model.DeliveryModel;
 import com.porter.qwerte.manager.model.IndexModel;
 import com.porter.qwerte.manager.model.NamesDraft;
@@ -1010,6 +1011,12 @@ public final class OrdersTab {
         RepairEstimate.Result res = e.repairResult();
         if (res != null) sb.append(res.bottlesUsed()).append(',').append(res.repaired()).append(',').append(res.partial().size()).append(',').append(res.skipped().size());
         for (Order.Line l : e.lines()) sb.append(l.key()).append(l.count()).append(l.repair());
+        CraftModel.OrderCraft craft = e.craft();
+        if (craft != null) {
+            for (CraftModel.Line l : craft.lines()) sb.append('c').append(l.key()).append(l.count());
+            CraftModel.Result cr = craft.result();
+            if (cr != null) sb.append(cr.fills()).append(',').append(cr.made().size()).append(',').append(cr.shorts().size()).append(',').append(cr.returned().size());
+        }
         return sb.toString();
     }
 
@@ -1129,9 +1136,35 @@ public final class OrdersTab {
             for (Order.Line l : e.lines()) lineTexts.add(Text.grouped(l.count()) + " x " + Text.sanitize(lineName(l, idx), 40) + (wantedRepair(l, e.repairAll(), idx) ? " (repair)" : ""));
             String summary = String.join(", ", lineTexts.size() > 3 ? lineTexts.subList(0, 3) : lineTexts) + (lineTexts.size() > 3 ? ", +" + (lineTexts.size() - 3) + " more" : "");
             card.add(Ui.wrap(theme, summary, wrap)).expandX();
+            craftLines(card, e, wrap);
             if (e.hasResult()) card.add(Ui.muted(theme, "Delivered in " + e.shulkers() + (e.shulkers() == 1 ? " shulker" : " shulkers"))).expandX();
+            craftResult(card, e, wrap);
             repairSummary(card, e, wrap);
         }
+    }
+
+    /** The craft lines of an order: "Craft: 8 Spruce Stairs". */
+    private void craftLines(SmCard card, OrderModel.Entry e, double wrap) {
+        CraftModel.OrderCraft c = e.craft();
+        if (c == null || c.lines().isEmpty()) return;
+        List<String> texts = CraftModel.orderLines(c, 3);
+        String more = c.lines().size() > 3 ? ", +" + (c.lines().size() - 3) + " more" : "";
+        card.add(Ui.wrap(theme, String.join(", ", texts) + more, wrap)).expandX();
+        if (e.open() && !c.take().isEmpty()) {
+            card.add(Ui.muted(theme, "Crafting takes " + CraftModel.countList(c.take(), 4) + " from the stash.", wrap)).expandX();
+        }
+    }
+
+    /** How the crafting of an order went: what was made, what was short (and why, in plain words), what went back. */
+    private void craftResult(SmCard card, OrderModel.Entry e, double wrap) {
+        CraftModel.Result r = e.craft() == null ? null : e.craft().result();
+        if (r == null) return;
+        String made = CraftModel.madeText(r);
+        if (!made.isEmpty()) card.add(Ui.muted(theme, made, wrap)).expandX();
+        String shortText = CraftModel.shortText(r);
+        if (!shortText.isEmpty()) card.add(Ui.wrap(theme, shortText, wrap)).expandX().widget().color(Ui.warn(theme));
+        String back = CraftModel.returnedText(r);
+        if (!back.isEmpty()) card.add(Ui.muted(theme, back, wrap)).expandX();
     }
 
     /** What the repair of a finished (or placed) order says: the estimate it was placed with, and how it went. */

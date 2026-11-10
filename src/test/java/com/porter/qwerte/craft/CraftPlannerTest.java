@@ -16,11 +16,17 @@ class CraftPlannerTest {
     private static final String BOX = "minecraft:shulker_box";
     private static final CraftPlanner.Caps CAPS = new CraftPlanner.Caps(27, 128, 54);
 
+    /** The small hand-written fixture (src/test/resources/recipes-test.json): nothing derived from the game is shipped, so there is no full table here. */
     private static Recipes recipes(String version) {
-        Recipes r = Recipes.load(version);
+        Recipes r = TestRecipes.table();
         assertNotNull(r, "table for " + version);
         return r;
     }
+
+    /** stone_bricks from 4 stone, and stone is smelted: the furnace refusal. */
+    private static final String STONE = "{\"version\":\"1.21.4\",\"format\":1,\"recipes\":[{\"id\":\"minecraft:stone_bricks\",\"type\":\"shaped\",\"w\":2,\"h\":2,"
+        + "\"cells\":[[\"minecraft:stone\"],[\"minecraft:stone\"],[\"minecraft:stone\"],[\"minecraft:stone\"]],\"result\":\"minecraft:stone_bricks\",\"count\":4}],"
+        + "\"otherStations\":{\"minecraft:stone\":\"smelting\"}}";
 
     private static Map<String, Long> pool(Object... kv) {
         Map<String, Long> m = new HashMap<>();
@@ -33,11 +39,11 @@ class CraftPlannerTest {
     }
 
     @Test
-    void loadsBothTables() {
-        for (String v : List.of("1.21.4", "1.21.11")) {
+    void loadsTheTestTable() {
+        for (String v : List.of("1.21.4")) {
             Recipes r = recipes(v);
             assertEquals(v, r.version());
-            assertTrue(r.size() > 800);
+            assertTrue(r.size() > 20);
             // The shulker box, chest and planks recipes
             Recipes.Recipe box = r.producing(BOX).get(0);
             assertTrue(box.shaped());
@@ -51,7 +57,8 @@ class CraftPlannerTest {
             assertNull(chest.cells().get(4));
             assertEquals(4, r.producing("minecraft:oak_planks").get(0).count());
             assertNull(r.producing("minecraft:shulker_shell").isEmpty() ? null : "has a recipe");
-            assertEquals("smelting", r.station("minecraft:stone"));
+            assertEquals("transmute", r.station("minecraft:red_shulker_box"));
+            assertEquals("smelting", Recipes.parse(STONE).station("minecraft:stone"));
         }
     }
 
@@ -70,7 +77,7 @@ class CraftPlannerTest {
 
     @Test
     void threeLevelsShellsPlusChestFromPlanksFromLog() {
-        for (String v : List.of("1.21.4", "1.21.11")) {
+        for (String v : List.of("1.21.4")) {
             Recipes r = recipes(v);
             CraftPlanner.Result res = plan(r, 1, pool("shulker_shell", 2, "oak_log", 2));
             assertTrue(res.ok(), res.refusal());
@@ -124,7 +131,7 @@ class CraftPlannerTest {
         assertEquals(CraftPlanner.NOT_ENOUGH, plan(r, 1, pool("shulker_shell", 2, "oak_log", 1)).refusal());
         assertEquals(CraftPlanner.NOT_ENOUGH, plan(r, 1, pool("shulker_shell", 2)).refusal());
         // Stone is smelted, not crafted
-        CraftPlanner.Result bricks = CraftPlanner.plan(r, "minecraft:stone_bricks", 1, pool("cobblestone", 4), Set.of(), CAPS, 0, 0);
+        CraftPlanner.Result bricks = CraftPlanner.plan(Recipes.parse(STONE), "minecraft:stone_bricks", 1, pool("cobblestone", 4), Set.of(), CAPS, 0, 0);
         assertEquals("stone needs a furnace", bricks.refusal());
     }
 

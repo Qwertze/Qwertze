@@ -6,6 +6,7 @@
   "mixins": [
     "AbstractContainerScreenMixin",
     "AbstractContainerScreenSlotMixin",
+    "ChatComponentMixin",
     "ChatScreenAccessor",
     "GuiMixin",
     "ShulkerBoxBlockMixin"

@@ -208,6 +208,14 @@ class IndexModelTest {
     }
 
     @Test
+    void theAreaAndKitsTabsSitBeforeOrders() {
+        IndexModel empty = IndexModel.empty();
+        assertEquals(List.of("all", "area", "orders"), empty.visibleTabs(false, true));
+        assertEquals(List.of("all", "area", "kits", "orders"), empty.visibleTabs(true, true));
+        assertEquals(List.of("all", "kits", "orders"), empty.visibleTabs(true), "the old overload has no area");
+    }
+
+    @Test
     void aCreativeTabShowsOnlyItsItems() {
         IndexModel m = model();
         assertEquals(List.of("minecraft:diamond"), keys(m.view("", Sort.COUNT, false, "ingredients")));

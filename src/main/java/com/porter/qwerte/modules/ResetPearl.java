@@ -23,6 +23,7 @@ import com.porter.qwerte.pearl.ShaftScan;
 import com.porter.qwerte.pearl.ShaftScan.Kind;
 import com.porter.qwerte.pearl.TrapClicks;
 import com.porter.qwerte.pearl.TrapRoles;
+import com.porter.qwerte.pearl.ThrowGate;
 import com.porter.qwerte.utils.BaritoneHelper;
 import meteordevelopment.meteorclient.events.game.GameLeftEvent;
 import meteordevelopment.meteorclient.events.packets.PacketEvent;
@@ -167,6 +168,13 @@ public class ResetPearl extends Module {
         .name("experimental-sprint-swim")
         .description("EXPERIMENTAL, off by default: look straight up and sprint-swim up the shaft, which is roughly 1.6 times faster than holding jump, but less precise.")
         .defaultValue(false)
+        .build()
+    );
+
+    private final Setting<Boolean> silentRotations = sgGeneral.add(new BoolSetting.Builder()
+        .name("silent-rotations")
+        .description("Aims the pearl throw with rotations that are sent to the server only: your camera does not move. Some anti-cheats may flag silent rotations. Off turns the camera to the aim. Walking out of the chamber still turns you, as walking follows where you look.")
+        .defaultValue(true)
         .build()
     );
 
@@ -357,7 +365,8 @@ public class ResetPearl extends Module {
     private int swappedTo = -1;
     private boolean displacedItem;
     private boolean pendingRestore;
-    private boolean throwQueued, thrown;
+    private final ThrowGate throwGate = new ThrowGate();
+    private boolean thrown;
 
     public ResetPearl() {
         super(QwerteAddon.CATEGORY, "reset-pearl", "After you are pulled through a saved stasis chamber, climbs out, throws a fresh pearl into its water and closes the cover again.");
@@ -675,7 +684,7 @@ public class ResetPearl extends Module {
         }
         opened.clear();
         attempts.clear();
-        throwQueued = false;
+        throwGate.cancel();
     }
 
     /**
@@ -899,7 +908,7 @@ public class ResetPearl extends Module {
         displacedKind = null;
         pearlReady = false;
         prepTries = 0;
-        throwQueued = false;
+        throwGate.cancel();
         thrown = false;
         swappedFrom = -1;
         pendingRestore = false;
@@ -948,6 +957,7 @@ public class ResetPearl extends Module {
     }
 
     private void runTick() {
+        if (throwGate.expire(tick)) dbg("throw: the rotation callback did not run within %d ticks, request dropped", ThrowGate.EXPIRY_TICKS);
         checkClick();
         if (verifying) {
             if (sp().parallelRestore()) tryRestoreElytra();
@@ -1188,7 +1198,7 @@ public class ResetPearl extends Module {
      * whole path fits the shaft and is clear. Then there is nothing left to do on the rim but close the cover.
      */
     private void tryEarlyThrow(Vec3 pos) {
-        if (!climbThrow.get() || thrown || throwQueued || !pearlReady || !holdsPearl()) return;
+        if (!climbThrow.get() || thrown || throwGate.pending() || !pearlReady || !holdsPearl()) return;
         double surface = shaft.waterTop() + 0.89;
         Vec3 v = mc.player.getDeltaMovement();
         double px = pos.x + v.x, pz = pos.z + v.z, eye = mc.player.getEyeY() + v.y;
@@ -1486,7 +1496,7 @@ public class ResetPearl extends Module {
     }
 
     private void throwTick() {
-        if (thrown || throwQueued) return;
+        if (thrown || throwGate.pending()) return;
         if (!holdsPearl()) {
             pearlReady = false;
             preparePearl();
@@ -1503,17 +1513,58 @@ public class ResetPearl extends Module {
         return true;
     }
 
-    /** Queues the throw with this aim: the rotation goes out silently and the pearl is used in the same tick. */
+    /**
+     * Queues the throw with this aim. The use-item is sent from the rotation's callback, which Meteor runs after the
+     * rotation packet (the movement packet of the tick, or the extra packet of a later queued rotation), so the
+     * server sees the aim before the throw. Silent: the packet only, the camera stays. Off: the camera turns to the
+     * aim first, and the packet carries the same angles.
+     */
     private void queueThrow(Hang.Aim aim) {
-        throwQueued = true;
+        long token = throwGate.request(tick);
+        if (token < 0) return;
         InteractionHand h = hand;
-        dbg("throw: aim yaw %.1f pitch %.1f from %.2f, %.2f (eye y %.2f), %d path point(s), hand %s", aim.yaw(), aim.pitch(),
-            mc.player.getX(), mc.player.getZ(), mc.player.getEyeY(), aim.path().length, h);
+        dbg("throw: aim yaw %.1f pitch %.1f from %.2f, %.2f (eye y %.2f), %d path point(s), hand %s, %s rotation", aim.yaw(), aim.pitch(),
+            mc.player.getX(), mc.player.getZ(), mc.player.getEyeY(), aim.path().length, h, silentRotations.get() ? "silent" : "camera");
+        if (!silentRotations.get()) {
+            if (!pitchTouched) {
+                pitchTouched = true;
+                origPitch = mc.player.getXRot();
+            }
+            mc.player.setYRot((float) aim.yaw());
+            mc.player.setXRot((float) aim.pitch());
+        }
         // Down the shaft, leaning towards its middle by what the real offset needs. The pearl leaves from our x and z
         // with our velocity, which is zero by now.
-        Rotations.rotate(aim.yaw(), aim.pitch(), () -> {
-            if (!running) return;
-            InteractionResult result = mc.gameMode.useItem(mc.player, h);
+        Rotations.rotate(aim.yaw(), aim.pitch(), ThrowGate.ROTATION_PRIORITY, false, () -> {
+            if (!running || !throwGate.rotationSent(token)) return;
+            if (mc.player == null || mc.gameMode == null || !mc.player.getItemInHand(h).is(Items.ENDER_PEARL)) {
+                // The pearl is gone from the hand: nothing to throw, the rethrow logic decides what next
+                throwGate.finished();
+                dbg("throw skipped: no pearl in the %s", h);
+                return;
+            }
+            // Meteor only puts a rotation first if its priority is strictly higher. If another module queued an equal or
+            // higher one this tick, the player still has its camera angles here, and the use-item packet (1.21.2+: hand,
+            // sequence, yaw, pitch of the player) would carry those instead of the aim. So the angles are set to the aim
+            // for the call and put back right after; both 1.21.4 and 1.21.11 read them from the player in useItem.
+            float oldYaw = mc.player.getYRot(), oldPitch = mc.player.getXRot();
+            float aimYaw = (float) aim.yaw(), aimPitch = (float) aim.pitch();
+            boolean swapped = oldYaw != aimYaw || oldPitch != aimPitch;
+            InteractionResult result = null;
+            try {
+                if (swapped) {
+                    mc.player.setYRot(aimYaw);
+                    mc.player.setXRot(aimPitch);
+                }
+                result = mc.gameMode.useItem(mc.player, h);
+            }
+            finally {
+                if (swapped) {
+                    mc.player.setYRot(oldYaw);
+                    mc.player.setXRot(oldPitch);
+                }
+                throwGate.finished();
+            }
             // A pearl on cooldown or a refused use is tried again next tick, within the throw phase's limit
             dbg("throw result: %s", result);
             if (result.consumesAction()) {
@@ -1521,7 +1572,6 @@ public class ResetPearl extends Module {
                 throwAt = tick;
                 mark("pearl thrown");
             }
-            else throwQueued = false;
         });
     }
 
@@ -1530,7 +1580,7 @@ public class ResetPearl extends Module {
         waitTicks++;
         Entity seenPearl = findPearl();
         if (seenPearl != null && waitTicks % 10 == 1) dbg("pearl seen at y %.2f (water top %d, lowest opened trapdoor %s)", seenPearl.getY(), shaft.waterTop(), opened.isEmpty() ? "none" : opened.first());
-        if (throwQueued || seenPearl != null) return;
+        if (throwGate.pending() || seenPearl != null) return;
         dbgThrottled("nopearl", "no pearl of yours seen in the shaft %d ticks after the throw (rethrows %d)", tick - throwAt, rethrows);
         if (rethrows >= MAX_RETHROWS || tick - throwAt < RETHROW_AFTER * (rethrows + 1L)) return;
         if (!holdsPearl()) {
@@ -2251,7 +2301,7 @@ public class ResetPearl extends Module {
         }
         opened.clear();
         attempts.clear();
-        throwQueued = false;
+        throwGate.cancel();
     }
 
     private static boolean classExists(String name) {

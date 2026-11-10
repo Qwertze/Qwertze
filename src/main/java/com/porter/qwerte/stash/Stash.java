@@ -154,6 +154,9 @@ public class Stash {
      * The order the bot is working on, saved so a restart carries on instead of starting again: its id, how many of its
      * units (shulkers to deliver) are already delivered, and what was delivered per line key.
      */
+    /** The longest saved craft ledger read back. */
+    public static final int MAX_LEDGER_CHARS = 64 * 1024;
+
     public static class ActiveOrder {
         /** One shulker of the plan: kind 0 = packed shulker (key = group key), 1 = empty shulker (key = item key), 2 = built from lots. */
         public static class UnitPlan {
@@ -165,6 +168,8 @@ public class Stash {
             public final List<String> lotAsked = new ArrayList<>();
             /** Lots whose items were gathered for a repair (carried, not in the stash any more), by lot index. */
             public final List<Integer> lotCarried = new ArrayList<>();
+            /** Whether each lot is a craft load: 0 an ordinary one, 1 still to be crafted, 2 crafted (see {@link Order.Lot}); empty for none. */
+            public final List<Integer> lotCraft = new ArrayList<>();
             /** How naming went: done (named or given up on), named, why not, and the key it has with its name. */
             public boolean nameDone, named;
             public String nameFailure = "", namedKey = "";
@@ -193,12 +198,18 @@ public class Stash {
         public final List<String> repairReasons = new ArrayList<>();
         public final List<String[]> repairPartial = new ArrayList<>();
         public final List<String[]> repairSkipped = new ArrayList<>();
+        /** The craft ledger of the order as JSON (CraftLedger.toSaved), or "" for none. */
+        public String craftLedger = "";
     }
 
     /** Menu slot pairs {from, to} of the bot's own gear stowed for a repair and not put back yet (restored at the next chance). */
     public final List<int[]> repairGear = new ArrayList<>();
 
     public ActiveOrder activeOrder;
+    /** Grid fills made for craft orders in the last hour as {time ms, fills}, kept so a restart does not reset the hourly cap (CraftFills). */
+    public final List<long[]> craftFills = new ArrayList<>();
+    /** Crafting tables placed on the craft-order path in the last hour as {time ms, 1} (CraftTableCap), kept so a restart does not reset the cap. */
+    public final List<long[]> craftTables = new ArrayList<>();
     // The delivery storage (0.4.0-dev.5): the delivery container and the chests put up above it, which are full. Positions only
     public final List<DeliveryBook.Entry> deliveryStorage = new ArrayList<>();
     public final List<Orphan> orphans = new ArrayList<>();
@@ -227,6 +238,50 @@ public class Stash {
     public String anvilSource = "";
     // The crafting table orders craft at. Not a container: never a box, never indexed. Stays until the user clears it
     public BlockPos craftingTablePos;
+    // The website's table standing in for ours during a craft chunk (never saved)
+    public final com.porter.qwerte.craft.TableSwap<BlockPos> tableSwap = new com.porter.qwerte.craft.TableSwap<>();
+
+    /** The website's table is used instead of ours until {@link #restoreTable}; the user's own is kept and is what is saved. */
+    public void overrideTable(BlockPos website) {
+        // Whatever stands in now is put back first: the website's table must never be copied into the order table slot
+        restoreTable();
+        tableSwap.engage(craftingTablePos, craftingTableSource);
+        craftingTablePos = website.immutable();
+        // "set": a table that is set by hand is never forgotten when it can't be reached
+        craftingTableSource = "set";
+    }
+
+    // The table of craft orders when the user's own (set by hand) is out of the limits: a slot of its own, persisted, never written over the user's.
+    // While the order table is in use the live fields hold it and the user's own is kept in the swap
+    public BlockPos orderTablePos;
+    public String orderTableSource = "";
+    private boolean orderSlot;
+
+    /** The order table (found, placed or crafted for craft orders) stands in for the user's own until {@link #restoreTable}; it may be none yet. */
+    public void useOrderSlot() {
+        if (tableSwap.engaged()) return;
+        tableSwap.engage(craftingTablePos, craftingTableSource);
+        orderSlot = true;
+        craftingTablePos = orderTablePos;
+        craftingTableSource = orderTableSource;
+    }
+
+    public boolean orderSlotInUse() {
+        return orderSlot;
+    }
+
+    /** Puts the user's own table back (what the order table became while it stood in is kept in its slot). */
+    public void restoreTable() {
+        if (!tableSwap.engaged()) return;
+        if (orderSlot) {
+            orderTablePos = craftingTablePos;
+            orderTableSource = craftingTableSource;
+            orderSlot = false;
+        }
+        craftingTablePos = tableSwap.savedPos();
+        craftingTableSource = tableSwap.savedSource();
+        tableSwap.release();
+    }
     // How the table came to be remembered: "set" (picked by hand), "found" (placed, found in the area), "placed" (taken from the
     // stash and placed) or "crafted" (made in the inventory grid and placed). "" counts as set
     public String craftingTableSource = "";
@@ -282,7 +337,7 @@ public class Stash {
 
     /** The perimeter applies: both corners are set, and we are in the dimension they were set in. */
     public boolean hasArea() {
-        return corner1 != null && corner2 != null && (areaDimension.isEmpty() || areaDimension.equals(currentDimension()));
+        return corner1 != null && corner2 != null && (areaDimension.isEmpty() || CraftBounds.sameDimension(areaDimension, currentDimension()));
     }
 
     public BlockPos areaMin() {
@@ -471,6 +526,73 @@ public class Stash {
         if (mc.level != null) lastRegistries = mc.level.registryAccess();
     }
 
+    // The craft parts of the saved stash (0.4.0-dev.18), kept in small methods so a test can write and read them without a world
+
+    /** Writes the order table slot, the tables placed on the order path in the last hour and the fills of the last hour. */
+    static void writeCraft(Stash st, CompoundTag root) {
+        BlockPos slotPos = st.orderSlot ? st.craftingTablePos : st.orderTablePos;
+        String slotSource = st.orderSlot ? st.craftingTableSource : st.orderTableSource;
+        if (slotPos != null) root.put("orderTablePos", positions(List.of(slotPos)));
+        if (slotPos != null && !slotSource.isEmpty()) root.putString("orderTableSource", slotSource);
+        putStamps(root, "craftTables", st.craftTables);
+        putStamps(root, "craftFills", st.craftFills);
+    }
+
+    /** Reads them back; a damaged stamp is left out and no list grows past the limit. */
+    static void readCraft(Stash st, CompoundTag root) {
+        if (root.get("orderTablePos") instanceof ListTag ot) {
+            List<BlockPos> at = readPositions(ot);
+            if (!at.isEmpty()) st.orderTablePos = at.getFirst();
+        }
+        String orderSource = string(root.get("orderTableSource"));
+        if (orderSource != null && st.orderTablePos != null) st.orderTableSource = orderSource;
+        readStamps(root, "craftTables", st.craftTables);
+        readStamps(root, "craftFills", st.craftFills);
+    }
+
+    private static void putStamps(CompoundTag root, String name, List<long[]> stamps) {
+        if (stamps.isEmpty()) return;
+        ListTag list = new ListTag();
+        for (long[] f : stamps) {
+            CompoundTag e = new CompoundTag();
+            e.putString("at", Long.toString(f[0]));
+            e.putInt("n", (int) Math.min(Integer.MAX_VALUE, f[1]));
+            list.add(e);
+        }
+        root.put(name, list);
+    }
+
+    private static void readStamps(CompoundTag root, String name, List<long[]> into) {
+        if (!(root.get(name) instanceof ListTag list)) return;
+        for (Tag t : list) {
+            if (!(t instanceof CompoundTag e) || into.size() >= com.porter.qwerte.craft.CraftFills.MAX_STAMPS) continue;
+            try {
+                into.add(new long[] {Long.parseLong(text(e, "at")), number(e.get("n"), 0)});
+            } catch (NumberFormatException ex) {
+                // a damaged stamp is left out
+            }
+        }
+    }
+
+    /** A lot's craft state (0 is not written). */
+    static void writeLotCraft(ActiveOrder.UnitPlan u, int i, CompoundTag lot) {
+        if (u.lotCraft.size() == u.lotKeys.size() && u.lotCraft.get(i) != 0) lot.putInt("craft", u.lotCraft.get(i));
+    }
+
+    static void readLotCraft(CompoundTag lot, ActiveOrder.UnitPlan u) {
+        u.lotCraft.add(number(lot.get("craft"), 0));
+    }
+
+    static void writeLedger(ActiveOrder a, CompoundTag order) {
+        if (!a.craftLedger.isEmpty()) order.putString("craftLedger", a.craftLedger);
+    }
+
+    /** A saved ledger is a few KiB at most; a bigger one is damaged and counts as missing (the craft lines are then refused). */
+    static void readLedger(CompoundTag order, ActiveOrder a) {
+        String ledger = string(order.get("craftLedger"));
+        a.craftLedger = ledger == null || ledger.length() > MAX_LEDGER_CHARS ? "" : ledger;
+    }
+
     public void save() {
         remember();
         net.minecraft.core.RegistryAccess registries = mc.level != null ? mc.level.registryAccess() : lastRegistries;
@@ -592,6 +714,7 @@ public class Stash {
                     lot.putString("key", u.lotKeys.get(i));
                     lot.putInt("count", u.lotCounts.get(i));
                     if (u.lotAsked.size() == u.lotKeys.size() && !u.lotAsked.get(i).equals(u.lotKeys.get(i))) lot.putString("asked", u.lotAsked.get(i));
+                    writeLotCraft(u, i, lot);
                     lots.add(lot);
                 }
                 unit.put("lots", lots);
@@ -615,6 +738,7 @@ public class Stash {
                 order.put("namesEach", each);
             }
             if (activeOrder.crafted > 0) order.putInt("crafted", activeOrder.crafted);
+            writeLedger(activeOrder, order);
             if (activeOrder.repairBottles > 0) order.putInt("repairBottles", activeOrder.repairBottles);
             if (activeOrder.repaired > 0) order.putInt("repaired", activeOrder.repaired);
             if (activeOrder.repairTicks > 0) order.putInt("repairTicks", activeOrder.repairTicks);
@@ -661,20 +785,32 @@ public class Stash {
         if (deliveryPos != null) root.put("deliveryPos", positions(List.of(deliveryPos)));
         if (anvilPos != null) root.put("anvilPos", positions(List.of(anvilPos)));
         if (anvilPos != null && !anvilSource.isEmpty()) root.putString("anvilSource", anvilSource);
-        if (craftingTablePos != null) root.put("craftingTablePos", positions(List.of(craftingTablePos)));
-        if (craftingTablePos != null && !craftingTableSource.isEmpty()) root.putString("craftingTableSource", craftingTableSource);
+        // While the website's table stands in for it (a craft chunk), the user's own is what is saved
+        BlockPos savedTable = tableSwap.persistedPos(craftingTablePos);
+        String savedTableSource = tableSwap.persistedSource(craftingTableSource);
+        if (savedTable != null) root.put("craftingTablePos", positions(List.of(savedTable)));
+        if (savedTable != null && !savedTableSource.isEmpty()) root.putString("craftingTableSource", savedTableSource);
+        writeCraft(this, root);
         if (!dimension.isEmpty()) root.putString("dimension", dimension);
 
         try {
             Files.createDirectories(folder());
-            // Written beside the file and moved over it, so a crash in the middle never leaves half a stash
+            // Written to a fresh temp file beside it (owner only where the file system has permissions: the file holds positions) and moved
+            // over it, so a crash in the middle never leaves half a stash
             Path target = file(name, server);
-            Path temp = target.resolveSibling(target.getFileName() + ".tmp");
-            NbtIo.writeCompressed(root, temp);
+            Path temp = Files.createTempFile(target.toAbsolutePath().getParent(), target.getFileName().toString(), ".tmp");
             try {
-                Files.move(temp, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            } catch (java.nio.file.AtomicMoveNotSupportedException e) {
-                Files.move(temp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                if (java.nio.file.FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+                    Files.setPosixFilePermissions(temp, java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"));
+                }
+                NbtIo.writeCompressed(root, temp);
+                try {
+                    Files.move(temp, target, java.nio.file.StandardCopyOption.ATOMIC_MOVE, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                    Files.move(temp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            } finally {
+                Files.deleteIfExists(temp);
             }
             dirty = false;
         } catch (IOException e) {
@@ -812,6 +948,7 @@ public class Stash {
             }
             String tableSource = string(root.get("craftingTableSource"));
             if (tableSource != null && stash.craftingTablePos != null) stash.craftingTableSource = tableSource;
+            readCraft(stash, root);
             String dim = string(root.get("dimension"));
             if (dim != null) stash.dimension = dim;
             if (root.get("held") instanceof ListTag heldList) {
@@ -861,6 +998,7 @@ public class Stash {
                                     u.lotCounts.add(number(lot.get("count"), 0));
                                     String asked = text(lot, "asked");
                                     u.lotAsked.add(asked.isEmpty() ? text(lot, "key") : asked);
+                                    readLotCraft(lot, u);
                                 }
                             }
                         }
@@ -883,6 +1021,7 @@ public class Stash {
                 }
                 active.unnamed = number(order.get("unnamed"), 0);
                 active.crafted = number(order.get("crafted"), 0);
+                readLedger(order, active);
                 active.repairBottles = number(order.get("repairBottles"), 0);
                 active.repaired = number(order.get("repaired"), 0);
                 active.repairTicks = number(order.get("repairTicks"), 0);

@@ -33,7 +33,18 @@ public final class OrderModel {
                         boolean hasPlacedBy, String placedById, String placedByName, String retriedAs,
                         List<Order.Line> lines, String namesMode, String namesAll, List<String> namesEach,
                         int shulkers, boolean hasResult, boolean repairAll, RepairEstimate.Estimate repairEstimate,
-                        RepairEstimate.Result repairResult) {
+                        RepairEstimate.Result repairResult, CraftModel.OrderCraft craft) {
+
+        /** An order without crafting: the fields of before crafting from the stash. */
+        public Entry(String id, String status, String phase, String message, int done, int total,
+                     boolean cancelRequested, long cancelRequestedAt, long updatedAt, long createdAt,
+                     boolean hasPlacedBy, String placedById, String placedByName, String retriedAs,
+                     List<Order.Line> lines, String namesMode, String namesAll, List<String> namesEach,
+                     int shulkers, boolean hasResult, boolean repairAll, RepairEstimate.Estimate repairEstimate,
+                     RepairEstimate.Result repairResult) {
+            this(id, status, phase, message, done, total, cancelRequested, cancelRequestedAt, updatedAt, createdAt, hasPlacedBy, placedById,
+                placedByName, retriedAs, lines, namesMode, namesAll, namesEach, shulkers, hasResult, repairAll, repairEstimate, repairResult, null);
+        }
 
         /** An order without repair: the fields of before the repair feature. */
         public Entry(String id, String status, String phase, String message, int done, int total,
@@ -42,13 +53,13 @@ public final class OrderModel {
                      List<Order.Line> lines, String namesMode, String namesAll, List<String> namesEach,
                      int shulkers, boolean hasResult) {
             this(id, status, phase, message, done, total, cancelRequested, cancelRequestedAt, updatedAt, createdAt, hasPlacedBy, placedById,
-                placedByName, retriedAs, lines, namesMode, namesAll, namesEach, shulkers, hasResult, false, null, null);
+                placedByName, retriedAs, lines, namesMode, namesAll, namesEach, shulkers, hasResult, false, null, null, null);
         }
 
         /** The same order with another message, status and so on kept: used where only the repair part changes. */
         public Entry withRepair(boolean repairAll, RepairEstimate.Estimate estimate, RepairEstimate.Result result) {
             return new Entry(id, status, phase, message, done, total, cancelRequested, cancelRequestedAt, updatedAt, createdAt, hasPlacedBy,
-                placedById, placedByName, retriedAs, lines, namesMode, namesAll, namesEach, shulkers, hasResult, repairAll, estimate, result);
+                placedById, placedByName, retriedAs, lines, namesMode, namesAll, namesEach, shulkers, hasResult, repairAll, estimate, result, craft);
         }
 
         /** A line is wanted for repair: an item line, and the cart-wide switch or its own toggle. */
@@ -167,6 +178,7 @@ public final class OrderModel {
                 lines.add(new Order.Line(type, key, (int) Math.min(Integer.MAX_VALUE, count), Json.bool(l, "repair")));
             }
         }
+        List<CraftModel.Line> craftLines = CraftModel.parseLines(rawLines);
         JsonObject progress = Json.obj(o.get("progress"));
         JsonObject by = Json.obj(o.get("placedBy"));
         JsonObject result = Json.obj(o.get("result"));
@@ -188,7 +200,7 @@ public final class OrderModel {
             Json.str(o, "retriedAs"), List.copyOf(lines), mode, names == null ? "" : Text.sanitize(Json.str(names, "name"), 60),
             List.copyOf(each), result == null ? 0 : (int) Math.max(0, Json.num(result, "shulkers", 0)), result != null,
             Json.bool(o, "repairAll"), RepairEstimate.parseEstimate(o.get("repairEstimate")),
-            result == null ? null : RepairEstimate.parseResult(result.get("repair")));
+            result == null ? null : RepairEstimate.parseResult(result.get("repair")), CraftModel.parseOrder(o, craftLines));
     }
 
     // ---------- who may do what (the website's canManageOrder and friends) ----------

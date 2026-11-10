@@ -1,7 +1,7 @@
 # Qwerte
 A Meteor Addon For 2b2t Dedicated to Regrowing &amp; Creating Farmland
 
-Qwerte adds ten modules to [Meteor Client](https://meteorclient.com):
+Qwerte adds eleven modules to [Meteor Client](https://meteorclient.com):
 
 - **Auto Till** turns nearby dirt and grass into farmland, digs and fills water holes so the farmland stays hydrated,
   plants and bone meals crops, and restocks its own seeds. With [Baritone](https://github.com/dekrom/baritone)
@@ -16,6 +16,7 @@ Qwerte adds ten modules to [Meteor Client](https://meteorclient.com):
 - **Stash Overlay** shows what each container in a saved stash mostly holds, as an item icon on the container.
 - **Stash Manager** sends what's in the stash saved by Stash Sorter to a [Stash Manager server](stash-manager-server/README.md)
   on your network: a small website that shows the stash and takes orders for the bot to fill.
+- **Order Notifications** plays a sound and shows a toast when one of your Stash Manager orders is delivered, comes up short, fails or is cancelled.
 - **Reset Pearl** climbs out of a saved stasis chamber after you're pulled through it, throws a fresh pearl into the water
   and closes the cover again.
 - **Messenger** is a small chat window over the game: a Global view of public chat you can type into, a conversation per player for whispers with history and emoji, and a picker to start a new one.
@@ -24,7 +25,7 @@ Qwerte adds ten modules to [Meteor Client](https://meteorclient.com):
   Smart Shulker or Smart Echest turned on, right-clicking a shulker box or ender chest places it, opens it and picks it up again.
 - **Printer** builds a Litematica schematic (or a `.litematic` file) in the world, block by block, with each block's facing
   and state. It walks with Baritone, fetches the materials from your inventory, shulker boxes, listed containers and your
-  ender chest, or orders what it runs short of from the stash bots, and lists what it had to skip. Litematica is optional.
+  ender chest, or orders what it runs short of from the stash bots (which can craft what their stash has the materials for), and lists what it had to skip. Litematica is optional.
 
 | | |
 |---|---|
@@ -198,6 +199,47 @@ Kit sorting below).
 
 Once everything is in place, partial stacks of the same item in each container are merged ("downstacked"), so a
 chest with three stacks of 20 cobblestone ends up with one of 60.
+
+#### Crafting
+New in 0.4.0-dev.18 and 0.4.0-dev.19. Not tested in game yet.
+
+The bot can craft at a crafting table: the one you set, or one it finds, places or crafts near the stash. Its settings
+are in the [Stash Manager](#stash-manager) module's Crafting and Crafting table groups.
+
+- **Empty shulker boxes** (`enable-crafting`, off by default): when an order or compaction needs a shulker box and none is
+  left, the bot crafts a plain one from shulker shells and a chest (made of planks, or of logs). Shulker shells can't be
+  crafted, so the shells must be in the stash. Kits never craft. `craft-max-per-order` (27 by default, at least 1; the slider goes
+  to 54) is the most boxes for one order, `craft-max-ops-per-task` (128 by default, at least 8) the most grid fills in one trip to the table,
+  and `craft-max-per-hour` (54 by default, at least 1) the most boxes in an hour. `craft-never-use` lists items crafting
+  never uses as ingredients (none by default).
+- **The crafting table.** Turn on `select-crafting-table`, then right-click a crafting table to make it the one crafting is
+  done at. Right-click the current one to clear it, or turn on `clear-crafting-table`. Without one set, the bot finds a
+  table in the stash area, takes one out of the stash and places it, or crafts one. `show-crafting-table` (on) outlines
+  it while the module is on, and the chat says whether it was set, found, placed or crafted.
+- **The recipe table.** Nothing is shipped in the addon. The bot fetches the table from the Stash Manager server (set
+  `server-url` and `api-key`), keeps a copy and checks it against its hash. With no server set, or when the fetch fails,
+  it builds the table once from the game's own client jar. Until the table is there, crafting waits. If there is none,
+  crafting reports that there is no recipe table.
+- **Craft orders** (`craft-orders`, on by default): the bot also takes orders from the website for items it can make from
+  what its stash holds (see [Stash orders](#stash-orders) in the Printer section). It needs `enable-crafting` on and a
+  crafting table, the website's or its own.
+  - Checks the order before any click. If the recipes or steps don't match the bot's own table, each craft line is
+    left short and the rest of the order goes on.
+  - Crafts bin by bin. The ingredients come from the stash, within the order's budget, in as many table trips as needed,
+    and then the bin is packed.
+  - A budget ledger keeps what each order has used. It is saved with the order, so a restart carries on with what is left.
+  - **Crafting table for orders.** The website's table comes first. With none set, the bot finds, places (from plain stash
+    items) or crafts its own table, and uses it for that stash. It puts down at most 1 of its own tables per order and 3
+    per hour. A table you set by hand outside those limits is left for shulker-box crafting, and craft orders use a table of their own.
+  - **Results.** The order's report says what was made, what was short and why, and what went back to the stash. The
+    final report waits up to 90 seconds for the put-back. A circuit breaker gives up on the remaining craft lines after 3
+    empty chunks in a row.
+  - `craft-order-max-fills` (2048 by default, from 1 to 100000) is the most grid fills for one order, and
+    `craft-order-max-per-hour` (4096 by default, at least 1) the most in an hour. An order that needs more is refused when
+    it is placed, and past the hourly limit the rest is left short.
+  - **Known limits:**
+    - Gathering takes whole stacks from the stash and puts back what isn't used. The budget is charged exactly.
+    - A broken website table does not fall back to the bot's own table.
 
 #### Kits
 A kit is a set of items packed together in one shulker, slot for slot with the same counts, like a PvP kit. These are the
@@ -376,6 +418,11 @@ New in 0.4.0-dev and still being tested.
 - `speed`: Safe, Fast (the default) or Max. Safe keeps the longer waits; the faster modes overlap the safe steps.
 - `pearl-wait` (20 seconds by default): when you're pulled without a pearl, it waits this long for one. 0 gives up at once.
 - `elytra-handling` (Auto by default) takes an elytra off for the climb and puts it back afterwards.
+- `silent-rotations` (on by default, New in 0.5.0): the pearl is thrown with rotations sent to the server only, so your
+  camera does not move. Off turns the camera to the aim. Walking out of the chamber still turns you. Some anti-cheats may
+  flag silent rotations.
+- Throw safety (New in 0.5.0): the throw is skipped when no pearl is in the hand, and a queued throw expires after 5 ticks
+  if its rotation never runs.
 - It stops with a chat message on a timeout, damage, a nearby player or hostile mob, an open screen, or a dimension change.
 - It closes only the covers, never the stasis trapdoor at the water. In a shaft with no trapdoor at the water, the lowest
   trapdoor is taken for the stasis one (never closed) only when it is at most 2 blocks above the water top, where a stasis
@@ -388,14 +435,14 @@ New in 0.4.0-dev and still being tested.
   `experimental-climb-throw` are off by default.
 
 ### Messenger
-New in 0.4.0-dev.16, extended in 0.4.0-dev.17. Not tested in game yet.
+New in 0.4.0-dev.16, extended in 0.4.0-dev.17 and in 0.5.0 (display, theme and chat replacement). Not tested in game yet.
 
 Messenger reads your whispers into a small chat window with a history per player and a Global view of the public chat,
 and sends from the window. Turn it on with the **Messenger** module (category Qwerte).
 
 - **The window.** Drawn over the game while you play (`show-overlay`, on; `window-opacity`, 75 by default, from 20 to 100).
-  It takes the keyboard and mouse only when you focus it: with `focus-key` (none by default), or by clicking it while the
-  chat is open. Esc always lets go. The window has its own input line; a draft in the chat is not carried into it.
+  It takes the keyboard and mouse only when you focus it: with `focus-key` (Right Ctrl by default, from 0.5.0; a key you
+  already set, or cleared, is kept), or by clicking it while the chat is open. Esc always lets go. The window has its own input line; a draft in the chat is not carried into it.
   `notification-sound` (on) plays a quiet sound when a whisper arrives that you are not reading.
 - **Left pane.** Global first (selected when the window opens), then your conversations: friends first, then the most
   recent, each with an unread badge. Delete asks first. On Global the button is Clear, which empties the Global log after
@@ -440,10 +487,26 @@ and sends from the window. Turn it on with the **Messenger** module (category Qw
   `/` still opens the normal chat. Only a chat that opens empty is taken: on 1.21.11 a chat that opens with a saved draft
   still opens the normal chat. `overlay-global` (off by default) puts Global in the overlay while the window isn't focused;
   off, the overlay shows your conversations instead.
+- **Display (New in 0.5.0).** `auto-font-scale` (on) grows and shrinks the text, rows, badges and emoji with the window: its
+  size against the default 330 x 190, from 0.75x to 2x. Off, `font-scale` (1.0, from 0.75 to 2.0) is used instead.
+  `system-message-opacity` (55 per cent, from 10 to 100) dims the console lines in Global (server messages, joins and
+  leaves, and notices from Meteor and its addons). Player chat is always at full opacity. `show-player-heads` (on) draws the
+  player's head in front of a public chat line written `<Name> text`.
+- **Theme (New in 0.5.0).** The window's colours are set in the Theme settings. `follow-meteor-theme` (off) uses the colours
+  of Meteor's current GUI theme all the time, checked twice a second. The **Sync theme with Meteor** button copies them once
+  instead.
+- **Replacing the chat (New in 0.5.0).** `replace-chat` (off) turns the game's chat list off: the normal chat lines are not
+  drawn, the Messenger window is the only chat display, and Global shows in the overlay. The chat key opens the Messenger
+  (as with `take-chat-key`); `/` still opens the normal input line, with its suggestions. The hidden lines can't be clicked
+  or hovered. Alerts that normally show in the vanilla chat (kicks, module warnings, server notices) show only in the
+  Messenger while this is on, so keep `show-overlay` on. Turn it off to get the normal chat back.
+- **Debugging (New in 0.5.0).** `debug-lines` (off, in the Debug group) writes every public chat line to `latest.log` with
+  how it was read. It can log private text, so leave it off unless you are troubleshooting.
 - **Settings (defaults).** Patterns: `pattern-vanilla`, `pattern-2b2t`, `pattern-essentials` and `pattern-from-to` on,
   `extra-patterns` empty. Sending: `command-template` `/msg {name} {text}`, `send-interval-ms` 1500. History: `save-history`
-  off, `max-history` 200, `global-scrollback` 500. Window: `show-overlay` on, `window-opacity` 75, `focus-key` none,
-  `take-chat-key` off, `overlay-global` off, `notification-sound` on.
+  off, `max-history` 200, `global-scrollback` 500. Window: `show-overlay` on, `window-opacity` 75, `focus-key` Right Ctrl,
+  `take-chat-key` off, `overlay-global` off, `notification-sound` on, `replace-chat` off, `auto-font-scale` on,
+  `system-message-opacity` 55, `show-player-heads` on. Theme: `follow-meteor-theme` off. Debug: `debug-lines` off.
 
 ### Stash Manager
 New in 0.4.0-dev and still being tested.
@@ -463,6 +526,21 @@ New in 0.4.0-dev and still being tested.
   fully repaired are delivered as they are, and the order's message says how many. The addon also takes bottles out of
   shulker boxes in the stash; the Stash Sorter plugin on AquariusProxy uses loose bottles only.
 
+### Order Notifications
+New in 0.5.0. Not tested in game yet.
+
+Plays a sound and shows a toast (like an advancement) when one of your Stash Manager orders is delivered, delivered with
+shortfalls, fails or is cancelled. It is on by default (module `order-notifications`, category Qwerte). It needs the Stash
+Window's `connect-to-server` on and a login.
+
+- `enable` (on): turns the notifications on or off.
+- Sounds: `complete-sound` (level up) for a full delivery, `partial-sound` (note block) for a delivery with shortfalls,
+  `failed-sound` (villager no) for a failed or cancelled order, and `arriving-sound` (none by default) for the bot starting
+  the delivery trip. `volume` (100 per cent, from 0 to 200) and `pitch` (1.0, from 0.5 to 2.0) apply to all of them.
+- `toast` (on) shows a toast for each notification. `chat-messages` (off) writes a chat line for each one; with streamer
+  display on in the Stash Window, nothing that could hold a position is shown.
+- A failed or invalid answer from the server changes nothing: an order is not announced again, and nothing is forgotten.
+
 ### Stash Window
 New in 0.4.0-dev and still being tested.
 - A window (keybind `open-window`, the `.stash-window` command, or the module's button) to search the containers you have
@@ -477,7 +555,7 @@ New in 0.4.0-dev and still being tested.
   your game's `schematics` folder (or an uploaded file) and can order a build's materials part by part.
 - The server pages follow the website's layout. Orders has two columns: the order maker (with item-type buttons) and the
   cart (the delivery chest, the lines, the shulker names and the Repair box), with the order history below. Build Planner
-  shows five summary tiles, Bots one card per bot above the stash table, and Activity puts Now doing and Events side by
+  shows five summary tiles (six with the Craftable tile, while crafting shows), Bots one card per bot above the stash table, and Activity puts Now doing and Events side by
   side. Live has a Chat column beside the map and the bot's 27-slot inventory with its hotbar and gear. The console's input
   row stays pinned at the bottom. Not matched to the website yet: no drag-and-drop in Orders, no drop zone in the Build
   Planner, and no latency overlay on Live.
@@ -497,6 +575,28 @@ New in 0.4.0-dev and still being tested.
   status, and the kit scoring editor (threshold, the four points and "OP items needed"). Changing a setting needs the
   `settings` permission. The window's streamer mode shows kits as "Kit 1" and chests as "Chest 1" with no labels or
   coordinates. See [Kit sorting](#kit-sorting).
+- **Build Planner crafting** (New in 0.4.0-dev.18; not tested in game yet). The planner also shows what the stash can make
+  from what it holds.
+  - A Craft column shows how many of each row can be made: "-" when there is nothing to make or nothing can be made, "0"
+    when a recipe exists but makes none, and "..." while the recipes load. Hover for what is taken from the stash, what
+    is made and what goes back.
+  - A row the stash covers by crafting reads "craftable" in the Missing column. A partly covered row shows what is still
+    missing, with "+N craftable".
+  - A Craftable tile shows how many items the stash can make, in how many kinds, or why they can't be ordered. The Missing
+    tile shows what is left after crafting.
+  - Banners say when the recipes are loading, when crafting info isn't available for the Minecraft version, when the plan
+    was cut short, and why orders can't use crafting: the stash's bot can't craft orders, its recipe table differs from the
+    server's, there is no crafting table for the stash, or the table isn't usable.
+  - A craft checkbox, "Craft what the stash can make (N items from the stash)", adds the craftable amounts to the order as
+    craft lines. It is on by default when the stash can take craft orders. Otherwise it is off and disabled, with the reason beside it.
+- **Orders crafting.** A craft line reads "Craft: 8 Spruce Stairs" and "Crafting takes ... from the stash." A finished order
+  shows "Crafted: ...", "Not crafted: ..." with the reason for each item, and "Returned to the stash: ...".
+- **Stash area editor (New in 0.5.0; not tested in game yet).** The Area page shows the stash's area as stored, and what the
+  bot has done with it. Edits are made on a draft, and nothing is sent until you press **Save**; the bot applies it between
+  tasks. The draft can set corners at your feet or at the block you look at, expand a side (or all six) by N blocks, include
+  the block where you stand, take a rectangle dragged on the map for X and Z, or start from the bot's current area. The draft
+  shows in the world as an amber box with its size. Your account needs permission to change the stash area. A draft is
+  dropped when you leave the world.
 - `window-theme` (or the palette button in the header, which opens Settings > Appearance) picks its colours: Classic (the default), Modern, Light, Dark,
   Midnight, High contrast or Mac, the same palettes as the website. Classic matches the website's default.
 - The session token of a server login is stored in plain text in Meteor's `modules.nbt`. Do not share your `meteor-client`
@@ -508,7 +608,9 @@ New in 0.4.0-dev and still being tested.
 #### Shulker preview
 - Hover a shulker box in a container or your inventory to see what is inside as a grid, in the box's colour.
 - Hold `freeze-key` (Left Alt by default) to freeze the grid where it is. Hover an item in the frozen grid to see its full
-  tooltip. Clicks inside the frozen grid do nothing.
+  tooltip. Clicks inside the frozen grid do nothing. It stays hold-to-freeze. The key is read straight from the keyboard
+  (New in 0.4.0-dev.18.1), so it still works when another mod takes the key; before, holding Alt could do nothing with
+  some mods installed. A key bound with modifiers is still checked by Meteor.
 - While `preview` is on, Meteor's own shulker preview is hidden, and Meteor's BetterTooltips settings are left as they are.
   `hide-text-list` (on by default) also leaves the text list of contents (such as "Dirt x64, and 5 more") out of the tooltip.
   On 1.21.11 that applies to every item with contents, since the game doesn't say which item the list belongs to.
@@ -762,6 +864,23 @@ movement (off: only what is in reach is built).
   breaking the stand blocks at the end); the stand blocks are broken from the top down, so you fall one block at a time
   while they go; flight modules that do not use the movement keys are not supported.
 
+#### Phantom blocks
+New in 0.5.0. Not tested in game yet.
+
+- While the Printer runs, the blocks still to place are drawn as translucent ghost models of the real block, with its
+  facing, slab half, stair shape and so on. A ghost goes away when its block is placed, and comes back if it is broken.
+- A wrong block (where the schematic wants another one) gets an outline, or with `phantom-wrong-style` **Phantom**, the
+  ghost of the right block over it. `phantom-wrong-color` (red by default) colours both.
+- `phantom-blocks` (on) turns them on. `phantom-opacity` (35 per cent, from 5 to 100) sets how solid they are.
+  `phantom-tint` (off) with `phantom-tint-color` multiplies a colour into the texture; the colour's alpha is not used.
+- `phantom-range` (32 blocks) limits them to blocks near you. `phantom-max-blocks` (4096) caps how many are drawn, the
+  nearest first.
+- `phantom-current-layer-only` (on) shows only the layer being printed, when `layer-order` is not Off.
+- `phantom-wrong-blocks` (on) also marks wrong blocks. `phantom-hide-with-litematica` (on) hides the ghosts while
+  Litematica draws the same schematic blocks, so the schematic is not drawn twice. Litematica's wireframe alone does not hide them.
+- Known limits: ghosts are not drawn for block-entity blocks (chests, signs, beds, banners, heads), they have no ambient
+  occlusion, and the cap can overshoot by one distance shell.
+
 #### Wrong blocks
 `wrong-blocks` says what to do with a block that is where the schematic wants another one:
 - **SkipAndList** (the default): leaves it and lists it at the end.
@@ -832,6 +951,13 @@ Stash Window's local index.
 - `order-max-shulkers-per-run` (27 by default, from 1 to 540; the slider goes from 1 to 108): the most shulker boxes all
   orders of one build may need together. The count starts again when you turn the module on, when you leave the world, and
   when the source, file name, origin, rotation or mirror changes. A reload keeps it.
+- `craft-missing-from-stash` (on by default; it shows only while `order-from-stash` is on): uses stash materials to craft
+  what no stash holds. When no stash holds an item the printer needs, but a stash can make it from what it does hold
+  (logs for planks and stairs, for example), the printer orders it crafted. The stash bot takes the ingredients from the
+  stash, crafts them at that stash's crafting table, and delivers the result with the order. This spends stash materials
+  without asking, and the chat says what was crafted from what. It needs a crafting table set for the stash on the Stash
+  Manager website and a bot that can carry out craft orders. Without them, or on an older server, the chat says so once
+  and only what the stash holds is ordered. Off: only items the stash holds are ordered.
 
 How orders are placed:
 - Orders go to the stash bots on this game server that have the items, online bots first, and at most 12 stashes are asked
@@ -841,9 +967,20 @@ How orders are placed:
 - Nothing already covered is ordered again. Open order lines count as covered, and so do delivered lines you have not
   collected yet. A delivery is assumed to cover what was ordered until it is collected or 20 minutes have passed, so after
   a partial delivery, a re-order for the rest can wait up to 20 minutes.
+- Crafting (with `craft-missing-from-stash`): the server's plan is asked for up to 3 stashes, the ones that hold the items
+  first. Its craftable amounts go into the same order as craft lines, next to the item lines, and count as supply on
+  their way, like item lines. Crafted items count toward `order-max-shulkers` and `order-max-shulkers-per-run`.
+- An item is never ordered twice. A stash whose delivery left some of a crafted item uncrafted is left out of crafting
+  that item for 10 minutes. An item whose order was cancelled is not ordered or crafted again this run, and one that
+  failed at a stash is not asked of that stash again this run.
+- A stash that is busy (rate limited or unreachable) is asked again later. Items a busy stash may hold wait up to 3
+  minutes; the others are crafted at once.
+- After three 503 answers from the server for one order, that order goes ahead without crafting, and that stash is left
+  out of crafting for 5 minutes. A stash the server doesn't know is left out alone; crafting stays on for the others.
 - One chat line when an order is placed, for example `Ordered 2 shulkers [3 kinds, 150 items] from stash NAME @ SERVER
-  [order ID].` (the server is left out in streamer mode). One more when it is delivered, fails, is cancelled or is no
-  longer listed on the server.
+  [order ID].` (the server is left out in streamer mode). With crafting, the line reads like
+  `Ordered 64 Oak Planks + crafting 8 Spruce Stairs (from 2 Spruce Log) [2 shulkers] from stash NAME @ SERVER [order ID].`
+  One more when it is delivered, fails, is cancelled or is no longer listed on the server.
 
 Out of materials:
 - The printer keeps building with what it carries until it is out of the next block's material. Then it pauses:
@@ -899,9 +1036,9 @@ Out of materials:
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) for Minecraft **1.21.11** or **1.21.4**.
 2. Put [Meteor Client](https://meteorclient.com) for the same Minecraft version in your `mods` folder.
 3. Download the `qwerte-addon` jar for your Minecraft version from the
-   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.4.0-dev.16`, see
-   [Dev builds](#dev-builds)): `qwerte-addon-0.4.0-dev.16+1.21.11.jar` or `qwerte-addon-0.4.0-dev.16+1.21.4.jar`. Put it
-   in your `mods` folder.
+   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.5.0`, see
+   [Versioning](#versioning) and [Dev builds](#dev-builds)): `qwerte-addon-0.5.0+1.21.11.jar` or `qwerte-addon-0.5.0+1.21.4.jar`.
+   Put it in your `mods` folder. It works with Stash Manager server 1.1.0 and Stash Sorter plugin 1.16.1.
 4. *(Optional, for auto-walk and refilling)* Download `baritone-api-fabric-1.3.0-<minecraft>.jar` for your version from
    [dekrom's Baritone releases](https://github.com/dekrom/baritone/releases) (for example
    [1.21.11](https://github.com/dekrom/baritone/releases/tag/v1.3.0-1.21.11) or
@@ -916,11 +1053,25 @@ Out of materials:
 > **Updating:** close Minecraft before replacing the jar, and delete the old one. Swapping a mod's jar while the game is
 > running can crash it later.
 
+## Versioning
+
+Qwerte uses `MAJOR.MINOR.PATCH` versions:
+
+- **x.0.0**: major breaking changes.
+- **x.y.0**: new features, bug fixes and more.
+- **x.y.z**: minor bug fixes, single one-off patches and hotfixes.
+
+The `0.4.0-dev.N` counting has ended. 0.5.0 is the first release under this scheme. 0.5.x releases are fixes, 0.6.0 is the
+next feature batch, and 1.0.0 will mark the first stable release.
+
+**Compatibility:** Qwerte **0.5.0** works with [Stash Manager server](stash-manager-server/README.md) **1.1.0** and the
+Stash Sorter plugin **1.16.1** (see [Stash Sorter for AquariusProxy](https://github.com/Qwertze/Stash-Sorter)).
+
 ## Dev builds
 
 New features are tested on the [`dev`](https://github.com/Qwertze/Qwertze/tree/dev) branch before they reach `main`.
 Each round of testing gets a **pre-release** on the [releases page](https://github.com/Qwertze/Qwertze/releases), named
-like `v0.2.7-dev.1`. These are unofficial: they may be buggy and settings may change. Use the latest regular release
+by its version, like `v0.5.0`. These are unofficial: they may be buggy and settings may change. Use the latest regular release
 unless you're helping test.
 
 ## Setup guide

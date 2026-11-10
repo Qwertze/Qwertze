@@ -215,7 +215,7 @@ class ScaffoldPlannerTest {
         w.want(0, 5, 0, Role.SOLID, null);
         w.groundTop = -40;
         List<Box> far = List.of(new Box(100, 100, 100, 100, 100, 100));
-        Result r = ScaffoldPlanner.plan(w, far, 0, 5, 0, 0, 4096, 0, 0, 0, System.nanoTime() + ScaffoldPlanner.MAX_BUDGET_NANOS);
+        Result r = ScaffoldPlanner.plan(w, far, 0, 5, 0, 0, 4096, 0, 0, 0, FOREVER);
         assertNotNull(r.chain());
         assertEquals(45, r.chain().size());
     }

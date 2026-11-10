@@ -34,6 +34,7 @@ import com.porter.qwerte.printer.place.ToolAction;
 import com.porter.qwerte.printer.place.ToolRules;
 import com.porter.qwerte.printer.place.ToolTables;
 import com.porter.qwerte.printer.place.TickBatcher;
+import com.porter.qwerte.printer.render.PhantomRenderer;
 import com.porter.qwerte.printer.place.WaterlogRules;
 import com.porter.qwerte.printer.stash.StashOrders;
 import com.porter.qwerte.printer.schematic.LitematicReader;
@@ -51,8 +52,11 @@ import com.porter.qwerte.tweaks.SmartPlaceFlow.Kind;
 import com.porter.qwerte.utils.AutoHotbar;
 import com.porter.qwerte.utils.BaritoneHelper;
 import meteordevelopment.meteorclient.events.game.GameLeftEvent;
+import meteordevelopment.meteorclient.events.render.Render3DEvent;
+import meteordevelopment.meteorclient.events.world.BlockUpdateEvent;
 import meteordevelopment.meteorclient.events.world.TickEvent;
 import meteordevelopment.meteorclient.settings.BoolSetting;
+import meteordevelopment.meteorclient.settings.ColorSetting;
 import meteordevelopment.meteorclient.settings.DoubleSetting;
 import meteordevelopment.meteorclient.settings.EnumSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
@@ -68,6 +72,8 @@ import meteordevelopment.meteorclient.systems.modules.Modules;
 import meteordevelopment.meteorclient.systems.modules.movement.Flight;
 import meteordevelopment.meteorclient.utils.Utils;
 import meteordevelopment.meteorclient.utils.misc.Keybind;
+import meteordevelopment.meteorclient.utils.render.color.Color;
+import meteordevelopment.meteorclient.utils.render.color.SettingColor;
 import meteordevelopment.meteorclient.utils.misc.input.Input;
 import meteordevelopment.meteorclient.utils.player.FindItemResult;
 import meteordevelopment.meteorclient.utils.player.InvUtils;
@@ -160,6 +166,7 @@ public class Printer extends Module {
     private final SettingGroup sgStash = settings.createGroup("Stash Orders");
     private final SettingGroup sgBaritone = settings.createGroup("Baritone");
     private final SettingGroup sgSounds = settings.createGroup("Sounds");
+    private final SettingGroup sgPhantom = settings.createGroup("Phantom blocks");
 
     public enum Source {
         LitematicaLatest(SourcePicker.Mode.LITEMATICA_LATEST), LitematicaByName(SourcePicker.Mode.LITEMATICA_BY_NAME), File(SourcePicker.Mode.FILE);
@@ -583,6 +590,14 @@ public class Printer extends Module {
         .build()
     );
 
+    private final Setting<Boolean> craftMissingFromStash = sgStash.add(new BoolSetting.Builder()
+        .name("craft-missing-from-stash")
+        .description("Automatically uses stash materials to craft missing blocks. When no stash holds an item you need but it can be made from what a stash does hold (logs for planks and stairs, for example), the Printer orders it crafted: the stash bot takes the ingredients from the stash, crafts them at the stash's crafting table and delivers the result with the order. This spends stash materials without asking, and the chat says what was crafted from what. Crafted items count toward order-max-shulkers and order-max-shulkers-per-run like any other ordered item. Needs a crafting table set for the stash on the Stash Manager website and a bot that can craft orders; without them (or on an older server) the chat says so once and only what the stash holds is ordered. Off: only items the stash holds are ordered.")
+        .defaultValue(true)
+        .visible(orderFromStash::get)
+        .build()
+    );
+
     private final Setting<Integer> orderWhenBelow = sgStash.add(new IntSetting.Builder()
         .name("order-when-below")
         .description("Orders an item when you carry fewer than this many of it (or fewer than the build still needs, when that is less) and what is on order doesn't cover the rest.")
@@ -702,6 +717,103 @@ public class Printer extends Module {
         .min(0)
         .sliderRange(0, 2)
         .visible(() -> finishSound.get() || errorSound.get())
+        .build()
+    );
+
+    // Phantom blocks: the blocks still to place, drawn as translucent models of the real block states
+
+    public enum WrongStyle { Outline, Phantom }
+
+    private final Setting<Boolean> phantomBlocks = sgPhantom.add(new BoolSetting.Builder()
+        .name("phantom-blocks")
+        .description("Shows the blocks that are still to be placed as translucent ghost models of the real block (facing, slab half, stair shape and so on) while the Printer runs. A ghost goes away the moment the block is placed and comes back if it is broken.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Integer> phantomOpacity = sgPhantom.add(new IntSetting.Builder()
+        .name("phantom-opacity")
+        .description("How solid the ghost blocks are, in percent.")
+        .defaultValue(35)
+        .range(5, 100)
+        .sliderRange(5, 100)
+        .visible(phantomBlocks::get)
+        .build()
+    );
+
+    private final Setting<Boolean> phantomTint = sgPhantom.add(new BoolSetting.Builder()
+        .name("phantom-tint")
+        .description("Colors the ghost blocks with the tint color (multiplied into the texture).")
+        .defaultValue(false)
+        .visible(phantomBlocks::get)
+        .build()
+    );
+
+    private final Setting<SettingColor> phantomTintColor = sgPhantom.add(new ColorSetting.Builder()
+        .name("phantom-tint-color")
+        .description("The tint of the ghost blocks. The alpha of this color is not used, the opacity setting is.")
+        .defaultValue(new SettingColor(120, 200, 255, 255))
+        .visible(() -> phantomBlocks.get() && phantomTint.get())
+        .build()
+    );
+
+    private final Setting<Integer> phantomRange = sgPhantom.add(new IntSetting.Builder()
+        .name("phantom-range")
+        .description("Only blocks this close to you (in blocks) are drawn.")
+        .defaultValue(32)
+        .range(4, PhantomRenderer.MAX_RANGE)
+        .sliderRange(8, PhantomRenderer.MAX_RANGE)
+        .visible(phantomBlocks::get)
+        .build()
+    );
+
+    private final Setting<Integer> phantomMax = sgPhantom.add(new IntSetting.Builder()
+        .name("phantom-max-blocks")
+        .description("The most ghost blocks drawn at once, the nearest ones first (it can pass this by the few blocks at the same distance).")
+        .defaultValue(4096)
+        .range(64, PhantomRenderer.MAX_BLOCKS)
+        .sliderRange(256, 8192)
+        .visible(phantomBlocks::get)
+        .build()
+    );
+
+    private final Setting<Boolean> phantomLayerOnly = sgPhantom.add(new BoolSetting.Builder()
+        .name("phantom-current-layer-only")
+        .description("With layer building on (layer-order is not Off), only the layer being printed gets ghost blocks. Off: everything still to place.")
+        .defaultValue(true)
+        .visible(phantomBlocks::get)
+        .build()
+    );
+
+    private final Setting<Boolean> phantomWrong = sgPhantom.add(new BoolSetting.Builder()
+        .name("phantom-wrong-blocks")
+        .description("Also marks the wrong blocks (a block where the schematic wants another one).")
+        .defaultValue(true)
+        .visible(phantomBlocks::get)
+        .build()
+    );
+
+    private final Setting<WrongStyle> phantomWrongStyle = sgPhantom.add(new EnumSetting.Builder<WrongStyle>()
+        .name("phantom-wrong-style")
+        .description("Outline: a box around the wrong block. Phantom: also the ghost of the right block over it, in the wrong-block color.")
+        .defaultValue(WrongStyle.Outline)
+        .visible(() -> phantomBlocks.get() && phantomWrong.get())
+        .build()
+    );
+
+    private final Setting<SettingColor> phantomWrongColor = sgPhantom.add(new ColorSetting.Builder()
+        .name("phantom-wrong-color")
+        .description("The color of the outline (and of the ghost, with the Phantom style) of a wrong block.")
+        .defaultValue(new SettingColor(255, 60, 60, 255))
+        .visible(() -> phantomBlocks.get() && phantomWrong.get())
+        .build()
+    );
+
+    private final Setting<Boolean> phantomHideWithLitematica = sgPhantom.add(new BoolSetting.Builder()
+        .name("phantom-hide-with-litematica")
+        .description("Hides the ghost blocks while Litematica's schematic blocks are rendered (its Rendering, Schematic rendering and Schematic blocks switches are all on), so the schematic is not drawn twice. Litematica's wireframe overlay alone does not hide them.")
+        .defaultValue(true)
+        .visible(phantomBlocks::get)
         .build()
     );
 
@@ -853,6 +965,98 @@ public class Printer extends Module {
 
     private BuildOrderer orderer;
     private final TargetBits targets = new TargetBits();
+    /** The skipped wrong blocks as bits, for the phantom blocks (they are no longer open cells but are still marked). */
+    private final TargetBits skippedBits = new TargetBits();
+    /** The ghost blocks of what is still to place; reads the open cells ({@link #targets}), the schematic and the layer cursor. */
+    private final PhantomRenderer phantoms = new PhantomRenderer(new PhantomRenderer.Host() {
+        @Override
+        public TargetBits targets() {
+            return targets;
+        }
+
+        @Override
+        public TargetBits skipped() {
+            return skippedBits;
+        }
+
+        @Override
+        public BlockState wanted(BlockPos pos) {
+            BuildSource b = built;
+            return b == null ? null : b.stateAt(pos);
+        }
+
+        @Override
+        public Integer activeLayer() {
+            LayerCursor l = layers;
+            return l == null ? null : l.active();
+        }
+
+        @Override
+        public boolean running() {
+            return loop != null && built != null;
+        }
+    }, new PhantomRenderer.Config() {
+        @Override
+        public boolean enabled() {
+            return phantomBlocks.get();
+        }
+
+        @Override
+        public float opacity() {
+            return phantomOpacity.get() / 100f;
+        }
+
+        @Override
+        public boolean tint() {
+            return phantomTint.get();
+        }
+
+        @Override
+        public Color tintColor() {
+            return phantomTintColor.get();
+        }
+
+        @Override
+        public int range() {
+            return phantomRange.get();
+        }
+
+        @Override
+        public int maxBlocks() {
+            return phantomMax.get();
+        }
+
+        @Override
+        public boolean currentLayerOnly() {
+            return phantomLayerOnly.get();
+        }
+
+        @Override
+        public boolean showWrong() {
+            return phantomWrong.get();
+        }
+
+        @Override
+        public boolean wrongAsPhantom() {
+            return phantomWrongStyle.get() == WrongStyle.Phantom;
+        }
+
+        @Override
+        public Color wrongColor() {
+            return phantomWrongColor.get();
+        }
+
+        @Override
+        public boolean hideWithLitematica() {
+            return phantomHideWithLitematica.get();
+        }
+    });
+
+    {
+        targets.setListener(phantoms::targetChanged);
+        skippedBits.setListener(phantoms::targetChanged);
+    }
+
     private final List<BuildOrderer.Cell> sweep = new ArrayList<>();
     private int sweepAt;
     private BuildOrderer.Cell unloadedHint, cycleHint;
@@ -1005,6 +1209,7 @@ public class Printer extends Module {
         @Override public int threshold() { return orderWhenBelow.get(); }
         @Override public int maxShulkersPerOrder() { return orderMaxShulkers.get(); }
         @Override public int maxShulkersPerRun() { return orderMaxShulkersPerRun.get(); }
+        @Override public boolean craftMissing() { return craftMissingFromStash.get(); }
     });
     private final OrdersView ordersView = new OrdersView();
     private String buildKey = "";
@@ -1141,6 +1346,7 @@ public class Printer extends Module {
             }
             queue = new BuildQueue(parsed.entries());
         }
+        phantoms.rearm();
         startRun();
     }
 
@@ -1158,6 +1364,7 @@ public class Printer extends Module {
     @EventHandler
     private void onGameLeft(GameLeftEvent event) {
         session.gameLeft();
+        phantoms.reset();
         orphanLevel = null;
         echestMemory = null;
         buildKey = "";
@@ -1217,6 +1424,7 @@ public class Printer extends Module {
 
     /** Everything the run changed is given back. Safe to call twice and at any time. */
     private void stopRun() {
+        phantoms.reset();
         if (loadFuture != null) {
             loadFuture.cancel(true);
             loadFuture = null;
@@ -1297,6 +1505,7 @@ public class Printer extends Module {
         openedInstead = 0;
         rechecks.clear();
         skippedWrong.clear();
+        skippedBits.clear();
         layerLogged = false;
         layerModeLogged = null;
         plan = null;
@@ -1337,10 +1546,23 @@ public class Printer extends Module {
     // The tick
 
     @EventHandler
+    private void onBlockUpdate(BlockUpdateEvent event) {
+        phantoms.blockChanged(event.pos, event.oldState, event.newState);
+    }
+
+    @EventHandler
+    private void onRender3D(Render3DEvent event) {
+        phantoms.render(event);
+    }
+
+    @EventHandler
     private void onTick(TickEvent.Pre event) {
         if (mc.player == null || mc.level == null || mc.gameMode == null) return;
         orphanCheck();
         session.tick();
+        phantoms.tick();
+        String phantomFailure = phantoms.takeFailure();
+        if (phantomFailure != null) warning("%s", phantomFailure);
         if (loop == null) return;
         tick++;
         try {
@@ -1766,7 +1988,10 @@ public class Printer extends Module {
             }
             case DROPPED -> {}
             case SKIPPED -> {
-                if (skippedWrong.size() < 20000) skippedWrong.add(new int[] { cell.x(), cell.y(), cell.z() });
+                if (skippedWrong.size() < 20000) {
+                    skippedWrong.add(new int[] { cell.x(), cell.y(), cell.z() });
+                    skippedBits.add(cell.x(), cell.y(), cell.z());
+                }
                 if (wrongLines.size() < STORED_LIST) wrongLines.add(why + " at " + where + " (wanted " + what + ")");
             }
             case FAILED -> {
@@ -2171,6 +2396,7 @@ public class Printer extends Module {
             }
             orderer.placed(c);
             awaiting.put(k, new Awaiting(c, p.info(), r, tick, p.raw()));
+            phantoms.touch(c.x(), c.y(), c.z());
             loop.placed(k);
             if (p.raw()) {
                 addTool(c.x(), c.y(), c.z(), p.info());
@@ -2836,6 +3062,8 @@ public class Printer extends Module {
         if (built == null || mc.level == null || skippedWrong.isEmpty()) return;
         List<int[]> cells = new ArrayList<>(skippedWrong);
         skippedWrong.clear();
+        skippedBits.clear();
+        phantoms.reset();
         wrongLines.clear();
         for (int[] p : cells) {
             BlockState want = built.stateAt(scratch.set(p[0], p[1], p[2]));

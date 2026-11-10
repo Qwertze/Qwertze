@@ -16,12 +16,19 @@ import java.util.TreeMap;
  * into shulker loads. Nothing here touches Minecraft types, so it can be tested and ported on its own.
  */
 public final class Order {
-    public static final String ITEM = "item", SHULKER = "shulker";
+    public static final String ITEM = "item", SHULKER = "shulker", CRAFT = "craft";
+    /** The most steps and take entries a craft block may have (CRAFT-CONTRACT.md "Orders"). */
+    public static final int MAX_CRAFT_STEPS = 64, MAX_CRAFT_TAKE = 64;
+    /** A line asking for more than this is not read (it shows up as undelivered); the server caps them as well. */
+    public static final int MAX_LINE_COUNT = 1_000_000;
     /** The most shulkers one order may need. */
     public static final int MAX_BINS = 54;
     public static final int SLOTS = 27;
 
-    /** One line: {@code type} is "item" (key is an items[] key) or "shulker" (key is a shulkers[] group key). */
+    /**
+     * One line: {@code type} is "item" (key is an items[] key), "shulker" (key is a shulkers[] group key) or "craft" (0.4.0-dev.18: key is a
+     * plain item id the stash can make; the order's {@link Craft} block has the plan).
+     */
     public record Line(String type, String key, int count, boolean repair) {
         public Line(String type, String key, int count) {
             this(type, key, count, false);
@@ -33,8 +40,65 @@ public final class Order {
         }
     }
 
-    /** The stacks to put in one slot: an item key and how many. */
-    public record Lot(String key, int count) {}
+    /**
+     * The stacks to put in one slot: an item key and how many, and (0.4.0-dev.18) whether it is a load of a craft line: still to be made before
+     * its bin is built, or made (in hand, not in the stash, never topped up from it).
+     */
+    public record Lot(String key, int count, int craftState) {
+        /** An ordinary load, taken from the stash; a load still to be crafted (not in the stash); a load that was crafted (in hand, not in the stash). */
+        public static final int NONE = 0, PENDING = 1, CRAFTED = 2;
+
+        public Lot(String key, int count) {
+            this(key, count, NONE);
+        }
+
+        /** A load of a craft line, still to be made before its bin is built. */
+        public static Lot toCraft(String key, int count) {
+            return new Lot(key, count, PENDING);
+        }
+
+        public boolean craft() {
+            return craftState == PENDING;
+        }
+
+        public boolean crafted() {
+            return craftState == CRAFTED;
+        }
+
+        /** The same load with another count (a craft load that came out smaller). */
+        public Lot withCount(int n) {
+            return new Lot(key, n, craftState);
+        }
+
+        /** The same load, made: a stack in hand now, not something to craft. */
+        public Lot made(int n) {
+            return new Lot(key, n, CRAFTED);
+        }
+    }
+
+    /** An item id and a count: a craft block's lines, inputs, take and leftovers. */
+    public record Qty(String id, int count) {}
+
+    /** One recipe made {@code fills} times, as the server planned it: what it makes per fill ({@code count}) and what goes in, by id. */
+    public record CraftStep(String recipe, String result, int count, int fills, List<Qty> inputs) {}
+
+    /**
+     * The craft block of an order (CRAFT-CONTRACT.md "Stored order"): the plan the server made at placement. {@code take} is the budget:
+     * never more of an id is taken from the stash than it says. {@code malformed} is a block that is there but could not be read: every
+     * craft line is then short ({@code recipe_mismatch}). Mirrors the plugin's {@code Order.Craft}.
+     */
+    public record Craft(int v, String mc, String recipes, List<Qty> lines, List<CraftStep> steps, List<Qty> take, List<Qty> leftovers, int fills, boolean malformed) {
+        public static Craft unreadable() {
+            return new Craft(0, "", "", List.of(), List.of(), List.of(), List.of(), 0, true);
+        }
+
+        /** Grid fills of all the steps. */
+        public long stepFills() {
+            long n = 0;
+            for (CraftStep s : steps) n += s.fills();
+            return n;
+        }
+    }
 
     /** The longest name the anvil takes. */
     public static final int MAX_NAME = 50;
@@ -104,6 +168,8 @@ public final class Order {
     public final boolean repairAll;
     /** The estimate made when the order was placed (a local order stores it; null when no line is wanted for repair or none was made). */
     public final RepairEstimate.Estimate repairEstimate;
+    /** The craft block (0.4.0-dev.18), or null when the order has no craft lines (or an older server sent none). */
+    public final Craft craft;
 
     public Order(String id, List<Line> lines) {
         this(id, lines, null);
@@ -114,11 +180,29 @@ public final class Order {
     }
 
     public Order(String id, List<Line> lines, Names names, boolean repairAll, RepairEstimate.Estimate repairEstimate) {
+        this(id, lines, names, repairAll, repairEstimate, null);
+    }
+
+    public Order(String id, List<Line> lines, Names names, boolean repairAll, RepairEstimate.Estimate repairEstimate, Craft craft) {
         this.id = id;
         this.lines = lines;
         this.names = names;
         this.repairAll = repairAll;
         this.repairEstimate = repairEstimate;
+        this.craft = craft;
+    }
+
+    /** The craft lines, in line order. */
+    public List<Line> craftLines() {
+        List<Line> out = new ArrayList<>();
+        for (Line l : lines) if (l.type().equals(CRAFT)) out.add(l);
+        return out;
+    }
+
+    /** Any line is a craft line. */
+    public boolean hasCraft() {
+        for (Line l : lines) if (l.type().equals(CRAFT)) return true;
+        return false;
     }
 
     /** Whether any line is wanted for repair. */
@@ -147,14 +231,54 @@ public final class Order {
                 String key = l.get("key").getAsString();
                 int count = l.get("count").getAsInt();
                 boolean repair = l.has("repair") && l.get("repair").isJsonPrimitive() && l.get("repair").getAsJsonPrimitive().isBoolean() && l.get("repair").getAsBoolean();
-                if ((type.equals(ITEM) || type.equals(SHULKER)) && !key.isEmpty() && count >= 1) lines.add(new Line(type, key, count, repair));
+                if ((type.equals(ITEM) || type.equals(SHULKER) || type.equals(CRAFT)) && !key.isEmpty() && count >= 1 && count <= MAX_LINE_COUNT) lines.add(new Line(type, key, count, repair));
             } catch (RuntimeException ex) {
                 // A broken line is left out and shows up as undelivered
             }
         }
         String id = o.get("id").getAsString();
         boolean repairAll = o.has("repairAll") && o.get("repairAll").isJsonPrimitive() && o.get("repairAll").getAsJsonPrimitive().isBoolean() && o.get("repairAll").getAsBoolean();
-        return id.isEmpty() || lines.isEmpty() ? null : new Order(id, lines, parseNames(o), repairAll, RepairEstimate.parseEstimate(o.get("repairEstimate")));
+        return id.isEmpty() || lines.isEmpty() ? null : new Order(id, lines, parseNames(o), repairAll, RepairEstimate.parseEstimate(o.get("repairEstimate")), parseCraft(o.get("craft")));
+    }
+
+    /** The craft block: null for none (absent or null), {@link Craft#unreadable()} for one that is there but not what the contract says. */
+    static Craft parseCraft(JsonElement e) {
+        if (e == null || e.isJsonNull()) return null;
+        try {
+            if (!e.isJsonObject()) return Craft.unreadable();
+            JsonObject c = e.getAsJsonObject();
+            int v = c.get("v").getAsInt();
+            String mc = c.get("mc").getAsString(), recipes = c.get("recipes").getAsString();
+            List<Qty> lines = qtys(c.get("lines"), "key", 200);
+            List<Qty> take = qtys(c.get("take"), "id", MAX_CRAFT_TAKE);
+            List<Qty> leftovers = qtys(c.get("leftovers"), "id", 4096);
+            List<CraftStep> steps = new ArrayList<>();
+            JsonArray sa = c.getAsJsonArray("steps");
+            if (sa.size() > MAX_CRAFT_STEPS) return Craft.unreadable();
+            for (JsonElement s : sa) {
+                JsonObject so = s.getAsJsonObject();
+                steps.add(new CraftStep(so.get("recipe").getAsString(), so.get("result").getAsString(), so.get("count").getAsInt(), so.get("fills").getAsInt(),
+                    qtys(so.get("inputs"), "id", 64)));
+            }
+            int fills = c.get("fills").getAsInt();
+            return new Craft(v, mc, recipes, lines, steps, take, leftovers, fills, false);
+        } catch (RuntimeException ex) {
+            return Craft.unreadable();
+        }
+    }
+
+    private static List<Qty> qtys(JsonElement e, String idName, int max) {
+        if (e == null || !e.isJsonArray()) throw new IllegalArgumentException("not a list");
+        JsonArray a = e.getAsJsonArray();
+        if (a.size() > max) throw new IllegalArgumentException("too many");
+        List<Qty> out = new ArrayList<>();
+        for (JsonElement x : a) {
+            JsonObject o = x.getAsJsonObject();
+            int count = o.get("count").getAsInt();
+            if (count < 0) throw new IllegalArgumentException("negative");
+            out.add(new Qty(o.get(idName).getAsString(), count));
+        }
+        return out;
     }
 
     private static boolean isText(JsonElement e) {

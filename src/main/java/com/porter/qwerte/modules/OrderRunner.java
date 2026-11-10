@@ -1,7 +1,18 @@
 package com.porter.qwerte.modules;
 
 import com.porter.qwerte.craft.AnvilFinder;
+import com.porter.qwerte.craft.CraftBatch;
+import com.porter.qwerte.craft.CraftCapability;
+import com.porter.qwerte.craft.CraftCharge;
+import com.porter.qwerte.craft.CraftEnd;
+import com.porter.qwerte.craft.CraftFills;
+import com.porter.qwerte.craft.CraftLedger;
+import com.porter.qwerte.craft.CraftLots;
+import com.porter.qwerte.craft.CraftOrder;
+import com.porter.qwerte.craft.CraftPlan;
 import com.porter.qwerte.craft.CraftPlanner;
+import com.porter.qwerte.craft.CraftResume;
+import com.porter.qwerte.craft.Recipes;
 import com.porter.qwerte.stash.DeliveryRoom;
 import com.porter.qwerte.stash.Kit;
 import com.porter.qwerte.stash.Kits;
@@ -93,9 +104,36 @@ final class OrderRunner {
 
         /** The delivery chest the next shulker goes into: the lowest with room; with {@code verify} the one the last went into. */
         Box deliveryChest(boolean verify);
+
+        /** Free carry slots now. */
+        default int freeCarryCount() {
+            return 0;
+        }
+
+        /** Craft orders (0.4.0-dev.18): the setting and its caps. */
+        default int craftMaxFills() {
+            return 2048;
+        }
+
+        default int craftMaxPerHour() {
+            return 4096;
+        }
+
+        /** Why the website's crafting table can't be used now (a {@link CraftOrder} reason: no_table, table_blocked, table_missing), or null. */
+        default String craftTableProblem() {
+            return null;
+        }
+
+        /** A table trouble remembered for this order is forgotten, so a chunk that met it is tried once more. */
+        default void retryTable() {}
+
+        /** A crafting table is being gathered, crafted or placed for the order: the chunk waiting for it is not stuck. */
+        default boolean craftBusy() {
+            return false;
+        }
     }
 
-    sealed interface Intent permits Idle, Build, Fetch, Deliver, Rename, Craft, FindAnvil, Expand, Recheck, Repair {}
+    sealed interface Intent permits Idle, Build, Fetch, Deliver, Rename, Craft, FindAnvil, Expand, Recheck, Repair, CraftChunk {}
 
     /** Nothing for the sorter to do for the order now. */
     record Idle() implements Intent {}
@@ -114,6 +152,13 @@ final class OrderRunner {
 
     /** Craft this many plain shulker boxes (0: carry on with the crafting in hand). A failure is told with {@link #craftEnded}. */
     record Craft(int count) implements Intent {}
+
+    /**
+     * Make {@code count} of {@code key} for a craft line (0.4.0-dev.18): one chunk of the server's plan, from its sub-plan (a legacy plan for the
+     * crafter), with the carry slots of crafted surplus the plan may use. The sorter runs it at the website's table and tells the end with
+     * {@link #craftEnded}. Nothing is planned again: the plan is the order's.
+     */
+    record CraftChunk(String key, int count, CraftPlanner.Plan plan, Set<Integer> carried) implements Intent {}
 
     /** Look for an anvil in the stash area, or take one from the stash and place it. The outcome is told with {@link #anvilFound}. */
     record FindAnvil() implements Intent {}
@@ -134,9 +179,14 @@ final class OrderRunner {
 
     /** A snapshot of the order for the server. */
     record Report(String id, String status, String phase, int done, int total, String message, int shulkers, Map<String, Integer> delivered,
-                  RepairEstimate.Result repair) {
+                  RepairEstimate.Result repair, com.google.gson.JsonObject craft) {
         Report(String id, String status, String phase, int done, int total, String message, int shulkers, Map<String, Integer> delivered) {
-            this(id, status, phase, done, total, message, shulkers, delivered, null);
+            this(id, status, phase, done, total, message, shulkers, delivered, null, null);
+        }
+
+        Report(String id, String status, String phase, int done, int total, String message, int shulkers, Map<String, Integer> delivered,
+               RepairEstimate.Result repair) {
+            this(id, status, phase, done, total, message, shulkers, delivered, repair, null);
         }
 
         boolean terminal() {
@@ -270,6 +320,53 @@ final class OrderRunner {
     private Set<String> lastSurveyWanted;
     private boolean chat = true;
 
+    // Craft orders (0.4.0-dev.18, CRAFT-CONTRACT.md "Bot execution"): the order's craft ledger (null: no craft lines), the chunk being made, the
+    // carry slots the order keeps (crafted loads waiting for their bin, surplus between chunks) or just carries (unused ingredients), the
+    // fills of the last hour, and the end-of-order wait for the put-back
+    private CraftLedger ledger;
+    private String craftRefusal;
+    private Chunk chunk;
+    private int tableTries, interruptTries;
+    private final Map<Integer, String> craftLotSlots = new LinkedHashMap<>(), craftSurplus = new LinkedHashMap<>(), craftLeftover = new LinkedHashMap<>();
+    private final CraftFills craftFills = new CraftFills();
+    private CraftEnd craftEnd;
+    private boolean craftFinal, purgedCraft;
+
+    /** A craft chunk was asked of the sorter and has not ended: a table may be on its way for it. */
+    boolean craftChunkPending() {
+        return chunk != null && running();
+    }
+    private final com.porter.qwerte.craft.CraftBreaker breaker = new com.porter.qwerte.craft.CraftBreaker();
+    private Stash fillsStash;
+    private String craftEndReason = CraftOrder.INTERRUPTED;
+    private com.google.gson.JsonObject craftResult;
+    private static final Idle CONTINUE = new Idle();
+    // A chunk the sorter has not started: walking to a table, gathering and placing one may take a while
+    private static final long CHUNK_START_MS = 10 * 60_000L;
+
+
+    /** The chunk in hand: which load of which unit, what the batch chose, the plan, and when the sorter was asked. */
+    private static final class Chunk {
+        final Unit unit;
+        final int lot;
+        final CraftBatch.Choice choice;
+        final CraftChunk intent;
+        // Unused ingredients of earlier chunks this one took over (they were not charged when they were put aside)
+        final Map<String, Long> adopted;
+        // The slots those unused ingredients were in: what is left in them (and in the slots gathered into) is stock, not something crafted
+        final Set<Integer> adoptedSlots;
+        long issuedAt = System.currentTimeMillis();
+
+        Chunk(Unit unit, int lot, CraftBatch.Choice choice, CraftChunk intent, Map<String, Long> adopted, Set<Integer> adoptedSlots) {
+            this.unit = unit;
+            this.lot = lot;
+            this.choice = choice;
+            this.intent = intent;
+            this.adopted = adopted;
+            this.adoptedSlots = adoptedSlots;
+        }
+    }
+
     // Which stacks are the order's, worked out once per tick and unit
     private final IdentityHashMap<ItemStack, Boolean> claimCache = new IdentityHashMap<>();
     private int claimTick = -1, epoch, claimEpoch;
@@ -322,6 +419,7 @@ final class OrderRunner {
         endCrafting("the order was left");
         owner.crafter().release();
         clearRepair();
+        clearCraft();
         cancelRequested = false;
         parked = false;
         pausedSince = 0;
@@ -368,6 +466,9 @@ final class OrderRunner {
      */
     String offer(Order o) {
         if (order != null) return order.id.equals(o.id) ? null : "already working on another order";
+        // A craft block that is missing, can't be read, or has no craft line is refused (the server then releases its reservations). Everything else
+        // about the craft lines (the bot's own table, the caps) is checked in the plan and makes the lines short instead
+        if ((o.hasCraft() || o.craft != null) && (o.craft == null || o.craft.malformed() || !o.hasCraft())) return "the craft block can't be read";
         Stash stash = owner.stash();
         if (stash == null || mc.level == null) return "no stash is loaded";
         if (deliveryBox() == null) return "no delivery container is set";
@@ -386,6 +487,7 @@ final class OrderRunner {
         craftFailure = null;
         anvilNone = false;
         clearRepair();
+        clearCraft();
         for (Order.Line l : o.lines) {
             if (!Order.ITEM.equals(l.type())) continue;
             if (l.repair()) {
@@ -416,6 +518,7 @@ final class OrderRunner {
                 shulkersDelivered = 0;
                 unnamed = 0;
                 unnamedReasons.clear();
+                clearCraft();
                 return why;
             }
         }
@@ -438,9 +541,31 @@ final class OrderRunner {
         boolean resumed = saved != null && saved.id.equals(o.id) && !saved.units.isEmpty();
 
         if (resumed) {
+            // A save of a craft order that lists no craft states is from before they were kept: its loads of a craft line's item (that no item line
+            // asks for) are dropped, never taken from the stash as plain items, and its ledger is not trusted
+            Set<String> craftOnly = new HashSet<>();
+            for (Order.Line l : o.craftLines()) craftOnly.add(l.key());
+            for (Order.Line l : o.lines) if (!l.type().equals(Order.CRAFT)) craftOnly.remove(l.key());
+            boolean oldFormat = false;
             for (Stash.ActiveOrder.UnitPlan p : saved.units) {
                 List<Order.Lot> lots = new ArrayList<>();
-                for (int i = 0; i < p.lotKeys.size(); i++) lots.add(new Order.Lot(p.lotKeys.get(i), p.lotCounts.get(i)));
+                boolean listed = p.lotCraft.size() == p.lotKeys.size();
+                for (int i = 0; i < p.lotKeys.size(); i++) {
+                    int craftState = listed ? p.lotCraft.get(i) : 0;
+                    int count = p.lotCounts.get(i);
+                    // A state that is none of the three is a damaged record: the load is dropped. A save from before the states were kept
+                    // (none listed) has its craft lines' loads still to make, never taken as plain items from the stash
+                    if (craftState < Order.Lot.NONE || craftState > Order.Lot.CRAFTED) {
+                        craftState = Order.Lot.NONE;
+                        count = 0;
+                    } else if (CraftLots.oldFormatLot(craftState, p.lotKeys.get(i), craftOnly, !saved.craftLedger.isEmpty())) {
+                        // Detected by content: a plain load of an item only a craft line asks for, in a save that has a craft ledger, is from before the
+                        // states were kept (or damaged). It is dropped, never taken from the stash as a plain item, and the ledger is not trusted
+                        count = 0;
+                        oldFormat = true;
+                    }
+                    lots.add(new Order.Lot(p.lotKeys.get(i), count, craftState));
+                }
                 Unit restored = new Unit(p.kind == 0 ? Kind.Shulker : p.kind == 1 ? Kind.Empty : Kind.Bin, p.key, lots);
                 restored.nameDone = p.nameDone;
                 restored.named = p.named;
@@ -462,6 +587,21 @@ final class OrderRunner {
             unnamedReasons.addAll(saved.unnamedReasons);
             craftedTotal = saved.crafted;
             loadRepair(saved);
+            // The craft ledger of the order comes back with what it made and spent; the stacks it carried are set aside again
+            CraftLots.Prepared prep = CraftLots.prepare(o, tableOrEmpty(), owner.craftMaxFills(), Crafter::stackOf);
+            if (prep != null) {
+                ledger = prep.ledger();
+                craftRefusal = prep.refusal();
+                // A ledger that is missing or fails any check is never replaced by a fresh one with a full budget: the craft lines are refused
+                if (craftRefusal == null && (oldFormat || !restoreLedger(saved.craftLedger))) {
+                    ledger = CraftLedger.refused(o.craftLines(), tableOrEmpty(), owner.craftMaxFills(), CraftOrder.RECIPE_MISMATCH);
+                    craftRefusal = "the saved craft ledger is missing or damaged";
+                    com.porter.qwerte.QwerteAddon.LOG.warn("orders: order {}: {}", o.id, craftRefusal);
+                }
+                if (craftRefusal == null) resumeCraft(plan.subList(start, plan.size()));
+            }
+            // A load still to make is never taken from the stash as a plain item: with no usable ledger every one of them is short
+            if (craftRefusal != null || ledger == null) purgedCraft = purgeCraftLots(plan);
         }
         else {
             String why = planFresh(stash, o, plan, notes);
@@ -479,6 +619,8 @@ final class OrderRunner {
         units.addAll(plan);
         index = start;
         problems.addAll(notes);
+        if (purgedCraft) for (Unit u : units) saveLots(u);
+        purgedCraft = false;
         planned = true;
         phase = "starting";
         epoch++;
@@ -494,6 +636,7 @@ final class OrderRunner {
                 for (Order.Lot lot : u.lots) {
                     p.lotKeys.add(lot.key());
                     p.lotCounts.add(lot.count());
+                    if (ledger != null) p.lotCraft.add(lot.craftState());
                 }
                 active.units.add(p);
             }
@@ -502,6 +645,7 @@ final class OrderRunner {
                 active.namesAll = names.all();
                 active.namesEach.addAll(names.each());
             }
+            if (ledger != null) active.craftLedger = ledger.toSaved().toString();
             stash.activeOrder = active;
             stash.save();
         }
@@ -571,13 +715,31 @@ final class OrderRunner {
             lots.addAll(mine);
         }
 
+        // The craft lines join the packer as loads of their result (CRAFT-CONTRACT.md "Bot execution", point 2); any failure of the check makes
+        // every craft line short with recipe_mismatch and nothing is crafted
+        CraftLots.Prepared prep = CraftLots.prepare(o, tableOrEmpty(), owner.craftMaxFills(), Crafter::stackOf);
+        if (prep != null) {
+            ledger = prep.ledger();
+            craftRefusal = prep.refusal();
+            if (prep.refused()) com.porter.qwerte.QwerteAddon.LOG.warn("orders: the craft lines of order {} are not made: {}", o.id, prep.refusal());
+            else {
+                stacks += prep.lots().size();
+                if (stacks > (long) Order.MAX_BINS * Order.SLOTS) return "too big: that is more than " + Order.MAX_BINS + " shulkers";
+                lots.addAll(prep.lots());
+            }
+        }
+
         List<List<Order.Lot>> bins = Order.pack(lots);
         if (shulkerUnits.size() + emptyUnits.size() + bins.size() > Order.MAX_BINS) return "too big: that is more than " + Order.MAX_BINS + " shulkers";
 
         plan.addAll(shulkerUnits);
         plan.addAll(emptyUnits);
         for (List<Order.Lot> bin : bins) plan.add(new Unit(Kind.Bin, "", bin));
-        if (plan.isEmpty()) return notes.isEmpty() ? "nothing to deliver" : "nothing can be done: " + notes.get(0);
+        if (plan.isEmpty()) {
+            String craftNote = ledger == null ? null : ledger.note();
+            if (craftNote != null) return craftNote;
+            return notes.isEmpty() ? "nothing to deliver" : "nothing can be done: " + notes.get(0);
+        }
         return null;
     }
 
@@ -630,11 +792,20 @@ final class OrderRunner {
      * the plan, the replan and the run.
      */
     Map<String, Long> craftPool() {
-        return craftPool(index < units.size() ? units.subList(index, units.size()) : List.of());
+        return craftPool(index < units.size() ? units.subList(index, units.size()) : List.of(), false);
+    }
+
+    /** As above; with {@code plain} only plain stacks (no name, no enchantments) count: what the bot's own table for a craft order may be made of. */
+    Map<String, Long> craftPool(boolean plain) {
+        return craftPool(index < units.size() ? units.subList(index, units.size()) : List.of(), plain);
     }
 
     private Map<String, Long> craftPool(List<Unit> remaining) {
-        Map<String, Long> pool = owner.crafter().survey();
+        return craftPool(remaining, false);
+    }
+
+    private Map<String, Long> craftPool(List<Unit> remaining, boolean plain) {
+        Map<String, Long> pool = owner.crafter().survey(plain);
         for (Unit u : remaining) {
             for (Order.Lot lot : u.lots) {
                 String key = lot.key();
@@ -642,6 +813,8 @@ final class OrderRunner {
                 pool.merge(hash < 0 ? key : key.substring(0, hash), -(long) lot.count(), Long::sum);
             }
         }
+        // What the craft order still may take is reserved for its crafts: the bot's own crafting table (planks, a table) never eats into it
+        if (ledger != null) for (var e : ledger.budget().entrySet()) pool.merge(e.getKey(), -e.getValue(), Long::sum);
         pool.values().removeIf(n -> n <= 0);
         return pool;
     }
@@ -690,6 +863,11 @@ final class OrderRunner {
 
     /** The crafting the sorter ran for the order is over: this many boxes were made, and this is why not more. */
     void craftEnded(Crafter.Outcome outcome) {
+        // The end of a craft-order chunk (the legacy shulker craft below has no chunk)
+        if (chunk != null) {
+            chunkEnded(outcome);
+            return;
+        }
         if (order == null) return;
         craftedTotal += outcome.crafted();
         Stash stash = owner.stash();
@@ -714,6 +892,8 @@ final class OrderRunner {
     private Intent craftFor(Unit u, int pending) {
         if (!owner.craftingOn()) return null;
         String why = craftFailure != null ? craftFailure : u.craftTries >= MAX_CRAFT_TRIES ? "tries used up" : owner.craftBlocker();
+        // The recipe table is still on its way: wait for it, don't give the unit up
+        if (Crafter.WAITING_FOR_RECIPES.equals(why)) return new Idle();
         if (why != null) {
             skip("no empty shulker; couldn't craft one: " + why);
             return new Idle();
@@ -803,8 +983,30 @@ final class OrderRunner {
             case Cancelled -> "cancelled";
         };
         String shown = state == State.Running && owner.rereading() ? "re-reading containers" : phase;
+        // A craft order is not over until what it carried has gone back (a little while), so the report can say what did
+        if (ledger != null && state != State.Running && !craftFinished()) {
+            return new Report(order.id, "in_progress", "putting crafted items back", Math.min(index, units.size()), units.size(), message, shulkersDelivered,
+                new LinkedHashMap<>(delivered));
+        }
         return new Report(order.id, status, shown, Math.min(index, units.size()), units.size(), message, shulkersDelivered, new LinkedHashMap<>(delivered),
-            state == State.Running ? null : repairTally.result());
+            state == State.Running ? null : repairTally.result(), state == State.Running ? null : craftResult);
+    }
+
+    /**
+     * A saved order the server may still hold with craft lines (its ledger is kept through two {@code 204} claim answers).
+     */
+    boolean resumeHasCraft() {
+        return heldCraftOrderId() != null;
+    }
+
+    /**
+     * The id of the craft order the bot holds (in hand, or saved with its ledger and the same id as the saved plan), or null. The claim carries
+     * the craft flag for it whatever the table is for the moment; a ledger of another order does not count.
+     */
+    String heldCraftOrderId() {
+        Stash stash = owner.stash();
+        if (stash == null || stash.activeOrder == null) return null;
+        return CraftCapability.heldId(stash.activeOrder.id, !stash.activeOrder.craftLedger.isEmpty(), order == null ? null : order.id);
     }
 
     /** What the server asked for, per line key. */
@@ -1023,9 +1225,15 @@ final class OrderRunner {
         }
 
         // Crafting in hand carries on until it is over
+        if (chunk != null && (owner.crafter().active() || owner.craftBusy())) chunk.issuedAt = System.currentTimeMillis();
         if (owner.crafter().active()) {
-            phase = "crafting " + (index + 1) + "/" + units.size();
+            if (chunk == null) phase = "crafting " + (index + 1) + "/" + units.size();
             return new Craft(0);
+        }
+        // The sorter was asked for a chunk and has not started it: asked again, and given up on after a while
+        if (chunk != null) {
+            if (System.currentTimeMillis() - chunk.issuedAt > CHUNK_START_MS) chunkEnded(new Crafter.Outcome(chunk.intent.key(), 0, "the crafting did not start"));
+            else return chunk.intent;
         }
 
         skips = 0;
@@ -1157,6 +1365,9 @@ final class OrderRunner {
                     continue;
                 }
                 // Items wanted for repair are repaired before the shulker is built (never fails the order)
+                Intent craftStep = craftLotsStep(u);
+                if (craftStep == CONTINUE) continue;
+                if (craftStep != null) return craftStep;
                 Intent repair = repairStep(u);
                 if (repair != null) return repair;
                 if (!kits.active()) {
@@ -1352,6 +1563,14 @@ final class OrderRunner {
         for (int li = 0; li < u.lots.size(); li++) {
             Order.Lot lot = u.lots.get(li);
             int want = lot.count();
+            if (want <= 0) continue;
+            // A crafted load is the stack in hand: never topped up from the stash, and left out (with a note) when it is not there any more
+            if (lot.crafted()) {
+                ItemStack made = craftedStack(lot.key(), want, carriedUsed);
+                if (made != null && n < Kit.SLOTS) stacks[n++] = made.copyWithCount(Math.max(1, Math.min(want, made.getCount())));
+                else problems.add(StashIndex.nameOf(lot.key()) + ": " + want + " crafted but no longer in hand");
+                continue;
+            }
             // An item gathered for a repair is carried (repaired or not, it is no longer in the stash)
             if (u.carriedLots.contains(li)) {
                 ItemStack carried = carriedStack(lot.key(), carriedUsed);
@@ -1405,6 +1624,392 @@ final class OrderRunner {
         for (var e : cut.entrySet()) problems.add(e.getKey() + ": " + e.getValue() + " couldn't be taken out of the stash, shipped short");
         if (m == 0) return null;
         return m == n && cut.isEmpty() ? probe : new Kit(probe.name, trimmed, true);
+    }
+
+    // ---- Craft orders (CRAFT-CONTRACT.md "Bot execution")
+
+    private Recipes tableOrEmpty() {
+        Recipes t = Recipes.current();
+        return t == null ? Recipes.empty() : t;
+    }
+
+    private void clearCraft() {
+        ledger = null;
+        craftRefusal = null;
+        chunk = null;
+        tableTries = 0;
+        interruptTries = 0;
+        craftLotSlots.clear();
+        craftSurplus.clear();
+        craftLeftover.clear();
+        craftEnd = null;
+        craftFinal = false;
+        craftResult = null;
+        craftEndReason = CraftOrder.INTERRUPTED;
+        breaker.reset();
+        purgedCraft = false;
+        owner.crafter().clearOrderKeep();
+    }
+
+    /** Forgets slots that no longer hold what was set aside in them (used in a bin, put back, taken). */
+    private void pruneTracking() {
+        if (mc.player == null) {
+            craftLotSlots.clear();
+            craftSurplus.clear();
+            craftLeftover.clear();
+            return;
+        }
+        var inv = mc.player.getInventory();
+        for (Map<Integer, String> m : List.of(craftLotSlots, craftSurplus, craftLeftover)) {
+            m.entrySet().removeIf(e -> {
+                ItemStack st = inv.getItem(e.getKey());
+                return st.isEmpty() || !e.getValue().equals(idOf(st));
+            });
+        }
+    }
+
+    @SafeVarargs
+    private final Map<String, Long> countsOf(Map<Integer, String>... maps) {
+        Map<String, Long> out = new LinkedHashMap<>();
+        if (mc.player == null) return out;
+        var inv = mc.player.getInventory();
+        for (Map<Integer, String> m : maps) {
+            for (var e : m.entrySet()) {
+                ItemStack st = inv.getItem(e.getKey());
+                if (!st.isEmpty() && e.getValue().equals(idOf(st))) out.merge(e.getValue(), (long) st.getCount(), Long::sum);
+            }
+        }
+        return out;
+    }
+
+    /** Everything the order carries of crafted items and unused ingredients, by item id. */
+    private Map<String, Long> trackedCounts() {
+        return countsOf(craftLotSlots, craftSurplus, craftLeftover);
+    }
+
+    private Map<String, Long> surplusCounts() {
+        return countsOf(craftSurplus);
+    }
+
+    /** The crafted loads and the surplus are the order's: the sorter does not put them away until it ends. */
+    private void keepSlots() {
+        Set<Integer> keep = new java.util.LinkedHashSet<>(craftLotSlots.keySet());
+        keep.addAll(craftSurplus.keySet());
+        owner.crafter().keepForOrder(keep);
+    }
+
+    private int stashLoads(Map<String, Long> fromStock) {
+        long n = 0;
+        for (var e : fromStock.entrySet()) {
+            int stack = Math.max(1, Crafter.stackOf(e.getKey()));
+            n += (e.getValue() + stack - 1) / stack;
+        }
+        return (int) Math.min(Integer.MAX_VALUE, n);
+    }
+
+    /** The load of a craft line is given up on for this reason. */
+    private void failLot(Unit u, int li, String reason) {
+        Order.Lot lot = u.lots.get(li);
+        ledger.addShort(lot.key(), lot.count(), reason);
+        u.lots.set(li, lot.withCount(0));
+        u.lotTotals = null;
+        saveLots(u);
+        epoch++;
+    }
+
+    /** No craft line can be made (no usable table): every load still to make is short with this reason, and the rest of the order goes on. */
+    private void failAllCraft(String reason) {
+        for (int i = Math.max(0, index); i < units.size(); i++) {
+            Unit u = units.get(i);
+            for (int li = 0; li < u.lots.size(); li++) {
+                if (u.lots.get(li).craft() && u.lots.get(li).count() > 0) failLot(u, li, reason);
+            }
+        }
+    }
+
+    private static boolean allEmpty(Unit u) {
+        if (u.lots.isEmpty()) return false;
+        for (Order.Lot lot : u.lots) if (lot.count() > 0) return false;
+        return true;
+    }
+
+    /**
+     * The craft step of a bin that has loads of craft lines to make (CRAFT-CONTRACT.md "Bot execution", point 3): the next load in line order is
+     * made in one chunk, as much as the budget, the caps and the free carry slots allow ({@link CraftBatch}), at the website's table; what comes
+     * out waits in the inventory for the bin. Never fails the order: a load that can't be made is short with a reason.
+     * @return null when the bin has nothing (more) to make, {@link #CONTINUE} to look at the unit again, else the intent
+     */
+    private Intent craftLotsStep(Unit u) {
+        if (ledger == null || craftRefusal != null || chunk != null || cancelRequested) return null;
+        int li = CraftLots.next(u.lots, ledger);
+        if (li < 0) {
+            // Every load of the bin came to nothing: there is no shulker to build
+            if (allEmpty(u)) {
+                advance();
+                return CONTINUE;
+            }
+            return null;
+        }
+        Order.Lot lot = u.lots.get(li);
+        Stash fs = owner.stash();
+        if (fs != null && fs != fillsStash) {
+            fillsStash = fs;
+            craftFills.load(fs.craftFills);
+        }
+        String problem = owner.craftTableProblem();
+        if (problem != null) {
+            com.porter.qwerte.QwerteAddon.LOG.info("orders: craft lines not made: {}", problem);
+            failAllCraft(problem);
+            return CONTINUE;
+        }
+        long now = System.currentTimeMillis();
+        pruneTracking();
+        ledger.setSurplus(surplusCounts());
+        long left = Math.min((long) ledger.maxFills() - ledger.fills(), (long) owner.craftMaxPerHour() - craftFills.lastHour(now));
+        CraftBatch.Choice c = CraftBatch.choose(ledger, lot.key(), lot.count(), owner.freeCarryCount(), left, Crafter::stackOf, this::stashLoads);
+        if (!c.ok()) {
+            com.porter.qwerte.QwerteAddon.LOG.info("orders: {} not made: {} ({})", StashIndex.nameOf(lot.key()), c.reason(), c.detail());
+            failLot(u, li, c.reason() == null ? CraftOrder.INGREDIENTS_SHORT : c.reason());
+            return CONTINUE;
+        }
+
+        CraftPlan.Plan p = c.plan();
+        int ops = 0;
+        List<CraftPlanner.Step> steps = new ArrayList<>();
+        for (CraftPlan.Step st : p.steps()) {
+            ops += st.fills() * st.recipe().filled();
+            steps.add(new CraftPlanner.Step(st.recipe(), st.fills()));
+        }
+        Map<String, Integer> take = new LinkedHashMap<>();
+        for (var e : p.fromStock().entrySet()) take.put(e.getKey(), (int) Math.min(Integer.MAX_VALUE, e.getValue()));
+        CraftPlanner.Plan legacy = new CraftPlanner.Plan(lot.key(), c.count(), steps, take, ops, null);
+
+        // Surplus and unused ingredients from earlier chunks are the session's from the start, so the plan can use them
+        // Crafted surplus and unused ingredients are both adopted; only the unused ingredients (taken from the stash) are charged when they are used up
+        Set<Integer> carried = new java.util.LinkedHashSet<>(), adoptedSlots = new java.util.LinkedHashSet<>();
+        Map<String, Long> adopted = new LinkedHashMap<>();
+        for (Map<Integer, String> m : List.of(craftSurplus, craftLeftover)) {
+            for (var e : m.entrySet()) {
+                if (e.getValue().equals(lot.key())) continue;
+                carried.add(e.getKey());
+                if (m != craftLeftover) continue;
+                adoptedSlots.add(e.getKey());
+                ItemStack st = mc.player.getInventory().getItem(e.getKey());
+                if (!st.isEmpty()) adopted.merge(e.getValue(), (long) st.getCount(), Long::sum);
+            }
+        }
+        CraftChunk intent = new CraftChunk(lot.key(), c.count(), legacy, carried);
+        chunk = new Chunk(u, li, c, intent, adopted, adoptedSlots);
+        ledger.chunkStarted();
+        saveLots(u);
+        phase = "crafting " + ledger.fills() + "/" + ledger.plannedFills() + " fills: " + Recipes.pretty(lot.key());
+        epoch++;
+        return intent;
+    }
+
+    /** The sorter's craft session for the chunk is over (or never began). */
+    private void chunkEnded(Crafter.Outcome o) {
+        Chunk c = chunk;
+        chunk = null;
+        if (c == null || ledger == null) return;
+        Unit u = c.unit;
+        int li = c.lot;
+        if (li >= u.lots.size()) return;
+        Order.Lot lot = u.lots.get(li);
+        String key = c.intent.key();
+        boolean running = running() && !cancelRequested;
+        var inv = mc.player == null ? null : mc.player.getInventory();
+
+        // What the session held at its end: the made stack for the load, the rest is leftover ingredients or surplus of what the steps made
+        Set<Integer> held = new java.util.LinkedHashSet<>(owner.crafter().lastHeld());
+        craftSurplus.keySet().removeAll(held);
+        craftLeftover.keySet().removeAll(held);
+        Set<String> madeIds = new HashSet<>();
+        for (CraftPlan.Step st : c.choice.plan().steps()) madeIds.add(st.recipe().result());
+        int lotSlot = -1, best = 0;
+        boolean lotFromStock = false;
+        // Taken from the stash (or unused ingredients taken over from an earlier chunk): stock. Everything else the session holds was made by it.
+        // Stock stays stock and made stays made, whatever the item: a made surplus never offsets what was gathered, and a surplus taken over
+        // later is never charged
+        Set<Integer> stockSlots = new HashSet<>(o.gatheredSlots());
+        stockSlots.addAll(c.adoptedSlots);
+        if (inv != null) {
+            List<com.porter.qwerte.craft.CraftSplit.Slot> carriedNow = new ArrayList<>();
+            for (int slot : held) {
+                ItemStack st = inv.getItem(slot);
+                if (!st.isEmpty()) carriedNow.add(new com.porter.qwerte.craft.CraftSplit.Slot(slot, idOf(st), st.getCount()));
+            }
+            com.porter.qwerte.craft.CraftSplit.Sorted sorted = com.porter.qwerte.craft.CraftSplit.sort(key, carriedNow, stockSlots);
+            lotSlot = sorted.lotSlot();
+            best = sorted.lotCount();
+            lotFromStock = sorted.lotFromStock();
+            craftLeftover.putAll(sorted.stock());
+            craftSurplus.putAll(sorted.made());
+        }
+
+        int made = lotSlot < 0 ? 0 : Math.min(c.choice.count(), best);
+        int fillsMade = Math.max(0, o.crafts());
+        // Charged: what was gathered from the stash (and what earlier chunks left unused and this one took over), less what is still carried of it
+        Map<String, Long> gathered = new LinkedHashMap<>(c.adopted);
+        for (var e : o.gathered().entrySet()) gathered.merge(Recipes.ns(e.getKey()), (long) e.getValue(), Long::sum);
+        // ... less what is still carried of it, from the stock slots only (the surplus the steps made is not stock and is never counted here)
+        Map<String, Long> back = countsOf(craftLeftover);
+        // The load can be a stack taken from the stash as itself (the order's take names the line's own item): what it holds beyond the load goes back
+        if (lotFromStock && lotSlot >= 0 && best > made) back.merge(Recipes.ns(key), (long) (best - made), Long::sum);
+        Map<String, Long> charge = CraftCharge.charge(gathered, fillsMade, back);
+        charge.keySet().retainAll(ledger.take().keySet());
+        ledger.madeChunk(key, made, fillsMade, charge);
+        long stamp = System.currentTimeMillis();
+        craftFills.add(stamp, fillsMade);
+        Stash fillStash = owner.stash();
+        if (fillStash != null && fillsMade > 0) {
+            fillStash.craftFills.clear();
+            fillStash.craftFills.addAll(craftFills.export(stamp));
+            fillStash.markDirty();
+        }
+
+        boolean cancelled = !running && (state == State.Cancelled || cancelRequested);
+        String reason = o.failure() == null ? null : CraftOrder.reasonOf(o.failure(), false, cancelled);
+        // Nothing made and the table was the trouble (or the chunk was cut short): tried once more
+        if (running && made == 0 && reason != null) {
+            boolean again = false;
+            if (CraftOrder.TABLE_BLOCKED.equals(reason) && tableTries < 1) {
+                tableTries++;
+                owner.retryTable();
+                again = true;
+            } else if (CraftOrder.INTERRUPTED.equals(reason) && interruptTries < 1) {
+                interruptTries++;
+                again = true;
+            }
+            if (again) {
+                com.porter.qwerte.QwerteAddon.LOG.info("orders: a craft chunk of {} is tried once more ({})", StashIndex.nameOf(key), reason);
+                pruneTracking();
+                ledger.setSurplus(surplusCounts());
+                saveLots(u);
+                keepSlots();
+                epoch++;
+                return;
+            }
+        }
+        int shortBy = lot.count() - made;
+        if (shortBy > 0) ledger.addShort(key, shortBy, reason != null ? reason : cancelled ? CraftOrder.CANCELLED : CraftOrder.INGREDIENTS_SHORT);
+        if (made > 0) {
+            u.lots.set(li, lot.made(made));
+            u.carriedLots.add(li);
+            craftLotSlots.put(lotSlot, key);
+        } else {
+            u.lots.set(li, lot.withCount(0));
+        }
+        u.lotTotals = null;
+        // The surplus is what is really carried now, so a restart finds it in the saved ledger
+        pruneTracking();
+        ledger.setSurplus(surplusCounts());
+        saveLots(u);
+        if (state == State.Running) keepSlots();
+        else if (craftEnd != null) craftEnd.raise(trackedCounts());
+        // A circuit breaker: chunks that keep making nothing are not tried for ever
+        if (running && breaker.record(made)) {
+            com.porter.qwerte.QwerteAddon.LOG.warn("orders: {} craft chunks in a row made nothing, the rest of the craft lines are given up on", com.porter.qwerte.craft.CraftBreaker.MAX_ZERO);
+            failAllCraft(reason != null ? reason : CraftOrder.INGREDIENTS_SHORT);
+        }
+        if (o.failure() != null) com.porter.qwerte.QwerteAddon.LOG.info("orders: craft chunk of {} ended: {}", StashIndex.nameOf(key), o.failure());
+        epoch++;
+    }
+
+    /** The report of a finished craft order waits for the put-back (at most 90 s); true when it can be made now. */
+    private boolean craftFinished() {
+        if (craftFinal) return true;
+        if (craftEnd == null || order == null) {
+            craftFinal = true;
+            return true;
+        }
+        long now = System.currentTimeMillis();
+        if (chunk != null && !owner.crafter().active()) chunk = null;
+        pruneTracking();
+        Map<String, Long> still = trackedCounts();
+        boolean busy = owner.crafter().active() || chunk != null;
+        if (busy ? !craftEnd.timeUp(now) : !craftEnd.done(now, still)) return false;
+        ledger.setReturned(craftEnd.returned(still));
+        ledger.setDelivered(delivered, order.requested());
+        ledger.closeOpen(craftEndReason);
+        craftResult = ledger.toResult();
+        String note = ledger.note();
+        if (note != null && !message.contains(note)) message = cut(message.isEmpty() ? note : message + "; " + note);
+        craftFinal = true;
+        return true;
+    }
+
+    /** Reads the saved ledger back; false when it is missing or fails any check (nothing is then taken from it). */
+    private boolean restoreLedger(String text) {
+        if (text == null || text.isEmpty()) return false;
+        try {
+            com.google.gson.JsonElement e = com.porter.qwerte.craft.SafeJson.parse(text);
+            return e.isJsonObject() && ledger.restore(e.getAsJsonObject());
+        } catch (RuntimeException ex) {
+            return false;
+        }
+    }
+
+    /**
+     * With no usable craft ledger every load still to make is short (recipe_mismatch) and emptied, so it can never go down the plain-item path.
+     * @return true when something was changed (the units are saved)
+     */
+    private boolean purgeCraftLots(List<Unit> plan) {
+        boolean any = false;
+        for (Unit u : plan) {
+            for (int li = 0; li < u.lots.size(); li++) {
+                Order.Lot lot = u.lots.get(li);
+                if (!lot.craft() || lot.count() <= 0) continue;
+                if (ledger != null) ledger.addShort(lot.key(), lot.count(), CraftOrder.RECIPE_MISMATCH);
+                u.lots.set(li, lot.withCount(0));
+                u.lotTotals = null;
+                any = true;
+            }
+        }
+        return any;
+    }
+
+    /** Sets aside again, after a restart, the stacks a craft order carried (crafted loads, surplus), and gives back what is gone. */
+    private void resumeCraft(List<Unit> remaining) {
+        if (ledger == null || mc.player == null) return;
+        var inv = mc.player.getInventory();
+        List<CraftResume.Load> loads = new ArrayList<>();
+        for (Unit u : remaining) for (Order.Lot lot : u.lots) if (lot.crafted() && lot.count() > 0) loads.add(new CraftResume.Load(lot.key(), lot.count()));
+        List<CraftResume.Stack> carried = new ArrayList<>();
+        for (int slot : owner.carry()) {
+            ItemStack st = inv.getItem(slot);
+            if (!st.isEmpty() && st.getComponentsPatch().isEmpty()) carried.add(new CraftResume.Stack(slot, idOf(st), st.getCount()));
+        }
+        CraftResume.Result r = CraftResume.remark(loads, ledger.savedSurplus(), carried);
+        int i = 0;
+        for (Unit u : remaining) {
+            for (Order.Lot lot : u.lots) {
+                if (!lot.crafted() || lot.count() <= 0) continue;
+                int slot = r.lotSlots().get(i++);
+                if (slot >= 0) craftLotSlots.put(slot, lot.key());
+            }
+        }
+        craftSurplus.putAll(r.surplusSlots());
+        ledger.refund(r.refund());
+        keepSlots();
+    }
+
+    /** The carried stack for a crafted load: the stack set aside for it with exactly its count, else any of that count, else any of the key. */
+    private ItemStack craftedStack(String key, int count, Set<Integer> used) {
+        if (mc.player == null) return null;
+        var inv = mc.player.getInventory();
+        for (int pass = 0; pass < 3; pass++) {
+            Iterable<Integer> slots = pass == 0 ? new ArrayList<>(craftLotSlots.keySet()) : owner.carry();
+            for (int slot : slots) {
+                if (used.contains(slot)) continue;
+                ItemStack s = inv.getItem(slot);
+                if (s.isEmpty() || !key.equals(StashIndex.keyOf(s))) continue;
+                if (pass < 2 && s.getCount() != count) continue;
+                used.add(slot);
+                return s;
+            }
+        }
+        return null;
     }
 
     // ---- Repair (REPAIR-CONTRACT.md)
@@ -1676,8 +2281,11 @@ final class OrderRunner {
         if (u.asked != null) p.lotAsked.addAll(u.asked);
         p.lotCarried.clear();
         p.lotCarried.addAll(u.carriedLots);
+        p.lotCraft.clear();
+        if (ledger != null) for (Order.Lot lot : u.lots) p.lotCraft.add(lot.craftState());
         // The order's repair tally, so a resume goes on counting
         Stash.ActiveOrder a = stash.activeOrder;
+        if (ledger != null) a.craftLedger = ledger.toSaved().toString();
         RepairEstimate.Result r = repairTally.result();
         a.repairBottles = r == null ? 0 : r.bottlesUsed();
         a.repaired = r == null ? 0 : r.repaired();
@@ -1917,6 +2525,13 @@ final class OrderRunner {
         state = end;
         endCrafting("the order ended");
         owner.crafter().release();
+        if (ledger != null) {
+            // What is carried now is put back by the normal put-back; the report waits for that (CraftEnd) and says what went back
+            pruneTracking();
+            craftEnd = new CraftEnd(System.currentTimeMillis(), trackedCounts());
+            craftEndReason = end == State.Cancelled ? CraftOrder.CANCELLED : CraftOrder.INTERRUPTED;
+            owner.crafter().clearOrderKeep();
+        }
         if (craftedTotal > 0) text = (text.isEmpty() ? "" : text + "; ") + "crafted " + craftedTotal + " Shulker Box";
         String repairNote = repairTally.note();
         if (!repairNote.isEmpty() && !text.contains(repairNote)) text = text.isEmpty() ? repairNote : text + "; " + repairNote;

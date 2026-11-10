@@ -14,6 +14,8 @@ public final class Message {
     private long sentAt;
     /** An outgoing message whose copy from the server (the "to X: ..." line) was seen. Not saved. */
     private boolean echoed;
+    /** Public chat only: true for a console line (system, death, join, notice), false for player chat, null when not known (loaded from a file). Not saved. */
+    private Boolean console;
 
     public Message(Direction direction, String text, long time, State state) {
         this.direction = direction;
@@ -58,5 +60,14 @@ public final class Message {
 
     public void echoed(boolean echoed) {
         this.echoed = echoed;
+    }
+
+    /** Whether this is a console line, or null when unknown. */
+    public Boolean console() {
+        return console;
+    }
+
+    public void console(Boolean console) {
+        this.console = console;
     }
 }

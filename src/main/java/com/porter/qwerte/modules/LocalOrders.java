@@ -203,7 +203,7 @@ public final class LocalOrders {
         Stash st = stash();
         if (s == null || st == null) return null;
         StashManager m = manager();
-        return new Setup(st.name, xyz(st.deliveryPos), xyz(st.anvilPos), xyz(st.craftingTablePos), s.anvilSource(), s.craftingTableSource(),
+        return new Setup(st.name, xyz(st.deliveryPos), xyz(st.anvilPos), xyz(s.craftingTablePos()), s.anvilSource(), s.craftingTableSource(),
             m != null && m.craftingEnabled(), m == null || m.useNamedShulkers(), m != null && m.autoExpandDelivery(), s.xpLevels());
     }
 

@@ -6,6 +6,7 @@ import com.porter.qwerte.modules.AutoDirt;
 import com.porter.qwerte.modules.AutoTill;
 import com.porter.qwerte.modules.ContainerTweaks;
 import com.porter.qwerte.modules.Messenger;
+import com.porter.qwerte.modules.OrderNotifications;
 import com.porter.qwerte.modules.Printer;
 import com.porter.qwerte.modules.ResetPearl;
 import com.porter.qwerte.modules.StashManager;
@@ -14,6 +15,7 @@ import com.porter.qwerte.modules.StashSorter;
 import com.porter.qwerte.modules.StashWindow;
 import meteordevelopment.meteorclient.addons.GithubRepo;
 import meteordevelopment.meteorclient.addons.MeteorAddon;
+import meteordevelopment.meteorclient.MeteorClient;
 import meteordevelopment.meteorclient.commands.Commands;
 import meteordevelopment.meteorclient.systems.modules.Category;
 import meteordevelopment.meteorclient.systems.modules.Modules;
@@ -38,6 +40,14 @@ public class QwerteAddon extends MeteorAddon {
         Modules.get().add(new Messenger());
         Modules.get().add(new ContainerTweaks());
         Modules.get().add(new Printer());
+
+        // On by default; a saved state (loaded after the addons start) overrides it, so turning it off sticks
+        OrderNotifications notifications = new OrderNotifications();
+        Modules.get().add(notifications);
+        notifications.toggle();
+
+        // The stash area draft in the world (follows the draft of the Stash window; not a module)
+        MeteorClient.EVENT_BUS.subscribe(new com.porter.qwerte.manager.gui.AreaOutline());
 
         // Commands
         Commands.add(new StashWindowCommand());

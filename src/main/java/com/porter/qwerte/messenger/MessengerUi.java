@@ -56,6 +56,21 @@ public final class MessengerUi {
 
         /** Meteor's command prefix (a chat text starting with it runs a Meteor command), or null. */
         String meteorPrefix();
+
+        /** A theme colour, 0xAARRGGBB. */
+        int color(ThemeColor color);
+
+        /** The text scale follows the window size. */
+        boolean autoFontScale();
+
+        /** The text scale used when {@link #autoFontScale} is off. */
+        float fontScale();
+
+        /** How opaque console lines (system messages, notices) are drawn in Global, 0 to 1. Player chat is always full. */
+        float consoleOpacity();
+
+        /** Draw the sender's head in front of a public chat line. */
+        boolean showHeads();
     }
 
     private record Rect(int x1, int y1, int x2, int y2) {
@@ -72,7 +87,7 @@ public final class MessengerUi {
         }
     }
 
-    private record Block(Message message, List<TextLayout.Line> lines, int height) {
+    private record Block(Message message, List<TextLayout.Line> lines, int height, boolean console, String head) {
     }
 
     private enum Drag {
@@ -97,23 +112,10 @@ public final class MessengerUi {
     private static final int EMOJI_ADVANCE = 10;
     private static final String GLOBAL_DRAFT = "#global";
     private static final long WRAP_SETTLE_MS = 100;
+    private static final int HEAD = 8;
+    private static final int HEAD_ADVANCE = 10;
 
 
-    private static final int C_PANEL = 0x0E1218;
-    private static final int C_TITLE = 0x1B2430;
-    private static final int C_LIST = 0x131A22;
-    private static final int C_SELECT = 0x24456B;
-    private static final int C_HOVER = 0x1E2C3B;
-    private static final int C_ACCENT = 0x4FA3FF;
-    private static final int C_TEXT = 0xFFE6EAF0;
-    private static final int C_DIM = 0xFF8A94A0;
-    private static final int C_FRIEND = 0xFFFFD866;
-    private static final int C_IN = 0xFFDCEBFF;
-    private static final int C_OUT = 0xFFD2F5D8;
-    private static final int C_BAR_IN = 0xFF4FA3FF;
-    private static final int C_BAR_OUT = 0xFF5BD16E;
-    private static final int C_WARN = 0xFFE0C060;
-    private static final int C_ERROR = 0xFFE06868;
 
     private final Host host;
     private final EmojiSet emoji = EmojiSet.bundled();
@@ -147,6 +149,12 @@ public final class MessengerUi {
     private String confirmName;
 
     private Geometry geo;
+    /**
+     * The scale the window is drawn with (see {@link MessengerScale}). Everything inside is laid out in logical pixels:
+     * the window's real size divided by this, drawn through a pose scale about the window's corner. The geometry
+     * ({@link #geo}), the screen size and the dragging stay in real GUI pixels.
+     */
+    private float scale = 1f;
     private Drag drag = Drag.NONE;
     private int dragDx;
     private int dragDy;
@@ -177,6 +185,8 @@ public final class MessengerUi {
     private int blocksSize;
     private Message blocksLast;
     private int blocksWidth;
+    private float blocksScale;
+    private boolean blocksHeads;
     private Map<Message, Block> blockCache = new IdentityHashMap<>();
     private List<Message> scrollSrc;
     private int scrollTotal;
@@ -188,6 +198,16 @@ public final class MessengerUi {
     private int orderedVersion;
     private int orderedFriends;
     private long friendsCheckedAt;
+    // Online/offline dots: the tab list names, refreshed about every 10 ticks (500 ms)
+    private static final int DOT = 5;
+    private static final int DOT_GAP = 3;
+    private final OnlineStatus onlineStatus = new OnlineStatus();
+    /** Lowercase of each name shown, so a lookup per frame allocates nothing. */
+    private final java.util.HashMap<String, String> lowerNames = new java.util.HashMap<>();
+    private long onlineAt;
+    private String dotTip;
+    private int dotTipX;
+    private int dotTipY;
     private List<Conversation> ordered = List.of();
 
     public MessengerUi(Host host) {
@@ -325,24 +345,58 @@ public final class MessengerUi {
             geo = saved != null ? saved : Geometry.initial(sw, sh);
         }
         geo = geo.clamp(sw, sh);
+        scale = MessengerScale.effective(host.autoFontScale(), host.fontScale(), geo.w(), geo.h());
         return geo;
     }
 
-    private int alpha(int rgb) {
-        int a = Math.round(255f * Math.max(0.2f, Math.min(1f, host.opacity())));
-        return (a << 24) | (rgb & 0xFFFFFF);
+    /** A real GUI x as a logical one (the window's corner stays where it is). */
+    private double lx(double x) {
+        return geo == null ? x : geo.x() + (x - geo.x()) / scale;
+    }
+
+    private double ly(double y) {
+        return geo == null ? y : geo.y() + (y - geo.y()) / scale;
+    }
+
+    /** A theme colour as it is (its own alpha). */
+    private int col(ThemeColor c) {
+        return host.color(c);
+    }
+
+    /** A background colour: its own alpha times the window opacity (at least 20%). */
+    private int bg(ThemeColor c) {
+        float o = Math.max(0.2f, Math.min(1f, host.opacity()));
+        return MessengerTheme.scaleAlpha(host.color(c), o);
     }
 
     // ---------- drawing ----------
 
+    /** Draws the window at its text scale. {@code mx}, {@code my} are real GUI pixels (negative: no mouse). */
     public void render(GuiGraphics g, int sw, int sh, int mx, int my, boolean focus) {
         if (sw <= 0 || sh <= 0) return;
+        Geometry real = current(sw, sh);
+        int lmx = mx < 0 ? mx : (int) Math.floor(lx(mx));
+        int lmy = my < 0 ? my : (int) Math.floor(ly(my));
+        PoseScale.push(g, real.x(), real.y(), scale);
+        try {
+            renderLogical(g, sw, sh, lmx, lmy, focus);
+        } finally {
+            PoseScale.pop(g);
+        }
+    }
+
+    private void renderLogical(GuiGraphics g, int sw, int sh, int mx, int my, boolean focus) {
         Font font = mc.font;
         Geometry w = current(sw, sh);
         MessengerCore core = host.core();
         ConversationStore store = core.store();
         textures.newFrame();
         long nowMs = System.currentTimeMillis();
+        if (nowMs - onlineAt > 500) {
+            onlineAt = nowMs;
+            onlineStatus.update(host.onlineNames());
+        }
+        dotTip = null;
         if (nowMs - friendsCheckedAt > 1000) {
             friendsCheckedAt = nowMs;
             int stamp = host.friendsStamp();
@@ -376,20 +430,20 @@ public final class MessengerUi {
         layout(w, focus, font);
 
         // Frame, title, panes
-        g.fill(winRect.x1, winRect.y1, winRect.x2, winRect.y2, alpha(C_PANEL));
-        g.fill(titleRect.x1, titleRect.y1, titleRect.x2, titleRect.y2, alpha(C_TITLE));
+        g.fill(winRect.x1, winRect.y1, winRect.x2, winRect.y2, bg(ThemeColor.WINDOW));
+        g.fill(titleRect.x1, titleRect.y1, titleRect.x2, titleRect.y2, bg(ThemeColor.HEADER));
         int total = store.totalUnread();
         String title = "Messenger" + (shown != null ? " - " + shown.name() : globalShown ? " - Global" : "")
             + (globalShown && core.globalQueued() ? " (sending...)" : "") + (total > 0 ? " (" + total + ")" : "");
         int titleMax = (focus ? btnNew.x1 : titleRect.x2) - titleRect.x1 - 8;
-        g.drawString(font, font.plainSubstrByWidth(title, Math.max(10, titleMax)), titleRect.x1 + 4, titleRect.y1 + 3, C_TEXT, true);
+        g.drawString(font, font.plainSubstrByWidth(title, Math.max(10, titleMax)), titleRect.x1 + 4, titleRect.y1 + 3, col(ThemeColor.TEXT), true);
         if (focus) {
             button(g, font, btnNew, contactOpen ? "Cancel" : "New", mx, my, contactOpen);
             button(g, font, btnEmoji, "Emoji", mx, my, pickerOpen);
             button(g, font, btnDelete, sel == null ? "Clear" : "Delete", mx, my, confirm != Confirm.NONE);
         }
 
-        g.fill(listRect.x1, listRect.y1, listRect.x2, listRect.y2, alpha(C_LIST));
+        g.fill(listRect.x1, listRect.y1, listRect.x2, listRect.y2, bg(ThemeColor.LEFT_PANE));
         drawList(g, font, list, focus, mx, my, shown == null ? null : shown.key(), globalShown);
         if (focus && contactOpen) drawContacts(g, font, mx, my);
         else drawHistory(g, font, shown, globalShown, store);
@@ -402,17 +456,18 @@ public final class MessengerUi {
             // grip
             for (int i = 0; i < 3; i++) {
                 int o = 2 + i * 3;
-                g.fill(gripRect.x2 - o - 1, gripRect.y2 - 2, gripRect.x2 - o, gripRect.y2 - 1, 0xFF8A94A0);
-                g.fill(gripRect.x2 - 2, gripRect.y2 - o - 1, gripRect.x2 - 1, gripRect.y2 - o, 0xFF8A94A0);
+                g.fill(gripRect.x2 - o - 1, gripRect.y2 - 2, gripRect.x2 - o, gripRect.y2 - 1, col(ThemeColor.DIM));
+                g.fill(gripRect.x2 - 2, gripRect.y2 - o - 1, gripRect.x2 - 1, gripRect.y2 - o, col(ThemeColor.DIM));
             }
         } else {
-            g.fill(inputRect.x1, inputRect.y1, inputRect.x2, inputRect.y2, alpha(C_TITLE));
-            g.drawString(font, font.plainSubstrByWidth(host.hint(), Math.max(10, inputRect.w() - 8)), inputRect.x1 + 4, inputRect.y1 + 4, C_DIM, false);
+            g.fill(inputRect.x1, inputRect.y1, inputRect.x2, inputRect.y2, bg(ThemeColor.INPUT));
+            g.drawString(font, font.plainSubstrByWidth(host.hint(), Math.max(10, inputRect.w() - 8)), inputRect.x1 + 4, inputRect.y1 + 4, col(ThemeColor.DIM), false);
         }
+        if (dotTip != null) drawDotTip(g, font, (int) Math.floor(lx(0)), (int) Math.floor(ly(0)), (int) Math.ceil(lx(sw)), (int) Math.ceil(ly(sh))); // last, so nothing covers it
     }
 
     private void layout(Geometry w, boolean focus, Font font) {
-        winRect = new Rect(w.x(), w.y(), w.x() + w.w(), w.y() + w.h());
+        winRect = new Rect(w.x(), w.y(), w.x() + MessengerScale.logical(w.w(), scale), w.y() + MessengerScale.logical(w.h(), scale));
         titleRect = new Rect(winRect.x1, winRect.y1, winRect.x2, winRect.y1 + TITLE_H);
         // Buttons, right to left
         int bx = winRect.x2 - 3;
@@ -455,8 +510,8 @@ public final class MessengerUi {
 
     private void button(GuiGraphics g, Font font, Rect r, String label, int mx, int my, boolean active) {
         boolean hover = r.contains(mx, my);
-        g.fill(r.x1, r.y1, r.x2, r.y2, hover ? 0xFF3A5A80 : active ? 0xFF2D4C70 : 0xFF2A3644);
-        g.drawString(font, label, r.x1 + (r.w() - font.width(label)) / 2, r.y1 + (r.h() - 8) / 2, C_TEXT, false);
+        g.fill(r.x1, r.y1, r.x2, r.y2, col(hover ? ThemeColor.BUTTON_HOVER : active ? ThemeColor.BUTTON_ACTIVE : ThemeColor.BUTTON));
+        g.drawString(font, label, r.x1 + (r.w() - font.width(label)) / 2, r.y1 + (r.h() - 8) / 2, col(ThemeColor.TEXT), false);
     }
 
     private void drawList(GuiGraphics g, Font font, List<Conversation> list, boolean focus, int mx, int my, String shownKey, boolean globalShown) {
@@ -470,35 +525,77 @@ public final class MessengerUi {
             Conversation c = i == 0 ? null : list.get(i - 1);
             Rect row = new Rect(listRect.x1, y, listRect.x2, y + ROW_H);
             boolean isSel = c == null ? globalShown : c.key().equals(shownKey);
-            if (isSel) g.fill(row.x1, row.y1, row.x2, row.y2, alpha(C_SELECT));
-            else if (focus && row.contains(mx, my)) g.fill(row.x1, row.y1, row.x2, row.y2, alpha(C_HOVER));
+            if (isSel) g.fill(row.x1, row.y1, row.x2, row.y2, bg(ThemeColor.SELECTED));
+            else if (focus && row.contains(mx, my)) g.fill(row.x1, row.y1, row.x2, row.y2, bg(ThemeColor.HOVER));
             if (c == null) {
-                g.drawString(font, "Global", row.x1 + 4, row.y1 + 2, 0xFF000000 | C_ACCENT, false);
+                g.drawString(font, "Global", row.x1 + 4, row.y1 + 2, col(ThemeColor.ACCENT), false);
                 continue;
             }
             boolean friend = host.isFriend(c.name());
-            int badgeW = 0;
+            int dotX = row.x1 + 4;
+            drawDot(g, dotX, row.y1 + (ROW_H - DOT) / 2, online(c.name()), focus ? listRect : null, mx, my);
+            int badgeW = DOT + DOT_GAP;
             if (c.unread() > 0) {
                 String n = c.unread() > 99 ? "99+" : String.valueOf(c.unread());
-                badgeW = font.width(n) + 6;
-                g.fill(row.x2 - badgeW - 2, row.y1 + 2, row.x2 - 2, row.y2 - 2, 0xFF000000 | C_ACCENT);
-                g.drawString(font, n, row.x2 - badgeW + 1, row.y1 + 2, 0xFF0B1118, false);
-                badgeW += 3;
+                int bw = font.width(n) + 6;
+                g.fill(row.x2 - bw - 2, row.y1 + 2, row.x2 - 2, row.y2 - 2, col(ThemeColor.BADGE));
+                g.drawString(font, n, row.x2 - bw + 1, row.y1 + 2, MessengerTheme.textOn(col(ThemeColor.BADGE)), false);
+                badgeW += bw + 3;
             }
             String name = font.plainSubstrByWidth(c.name(), Math.max(8, row.w() - badgeW - 8));
-            g.drawString(font, name, row.x1 + 4, row.y1 + 2, friend ? C_FRIEND : C_TEXT, false);
+            g.drawString(font, name, dotX + DOT + DOT_GAP, row.y1 + 2, friend ? col(ThemeColor.FRIEND) : col(online(c.name()) ? ThemeColor.ONLINE_NAME : ThemeColor.TEXT), false);
         }
         if (list.isEmpty()) {
             int y = listRect.y1 + (1 - listScroll) * ROW_H + 3;
-            if (y < listRect.y2) g.drawString(font, "No whispers yet", listRect.x1 + 5, y, C_DIM, false);
+            if (y < listRect.y2) g.drawString(font, "No whispers yet", listRect.x1 + 5, y, col(ThemeColor.DIM), false);
         }
         g.disableScissor();
+    }
+
+    private boolean online(String name) {
+        String key = lowerNames.get(name);
+        if (key == null) {
+            if (lowerNames.size() > 4000) lowerNames.clear();
+            key = name.toLowerCase(java.util.Locale.ROOT);
+            lowerNames.put(name, key);
+        }
+        return onlineStatus.isOnlineKey(key);
+    }
+
+    /** Filled round dot when online, hollow ring when offline (so the state does not rest on colour alone). */
+    private void drawDot(GuiGraphics g, int x, int y, boolean online, Rect area, int mx, int my) {
+        int c = col(online ? ThemeColor.ONLINE_DOT : ThemeColor.OFFLINE_DOT);
+        if (online) {
+            g.fill(x + 1, y, x + 4, y + 1, c);
+            g.fill(x, y + 1, x + 5, y + 4, c);
+            g.fill(x + 1, y + 4, x + 4, y + 5, c);
+        } else {
+            g.fill(x + 1, y, x + 4, y + 1, c);
+            g.fill(x, y + 1, x + 1, y + 4, c);
+            g.fill(x + 4, y + 1, x + 5, y + 4, c);
+            g.fill(x + 1, y + 4, x + 4, y + 5, c);
+        }
+        boolean covered = confirm != Confirm.NONE || (pickerOpen && pickRect.contains(mx, my));
+        if (!covered && area != null && area.contains(mx, my) && mx >= x - 1 && mx < x + DOT + 1 && my >= y - 2 && my < y + DOT + 2) {
+            dotTip = online ? "online (in tab list)" : "not in tab list";
+            dotTipX = mx;
+            dotTipY = my;
+        }
+    }
+
+    private void drawDotTip(GuiGraphics g, Font font, int left, int top, int right, int bottom) {
+        int w = font.width(dotTip) + 6;
+        int x = Math.max(left, Math.min(dotTipX + 8, right - w));
+        int y = Math.max(top, Math.min(dotTipY + 10, bottom - 12));
+        g.fill(x, y, x + w, y + 12, 0xF0101820);
+        g.fill(x, y, x + w, y + 1, col(ThemeColor.ACCENT));
+        g.drawString(font, dotTip, x + 3, y + 2, col(ThemeColor.TEXT), false);
     }
 
     private void drawHistory(GuiGraphics g, Font font, Conversation sel, boolean global, ConversationStore store) {
         g.enableScissor(histRect.x1, histRect.y1, histRect.x2, histRect.y2);
         if (sel == null && !global) { // the overlay, with no whisper yet
-            g.drawString(font, "No whispers yet.", histRect.x1 + 6, histRect.y1 + 6, C_DIM, false);
+            g.drawString(font, "No whispers yet.", histRect.x1 + 6, histRect.y1 + 6, col(ThemeColor.DIM), false);
             g.disableScissor();
             return;
         }
@@ -507,7 +604,7 @@ public final class MessengerUi {
         int innerW = histRect.w() - 2 * PAD - 8;
         List<Block> bl = blocks(msgs, global, innerW, font);
         if (msgs.isEmpty() && global) {
-            g.drawString(font, "Public chat shows up here.", histRect.x1 + 6, histRect.y1 + 6, C_DIM, false);
+            g.drawString(font, "Public chat shows up here.", histRect.x1 + 6, histRect.y1 + 6, col(ThemeColor.DIM), false);
         }
         int total = 0;
         for (Block b : bl) total += b.height + gap;
@@ -543,31 +640,33 @@ public final class MessengerUi {
         g.enableScissor(histRect.x1, histRect.y1, histRect.x2, histRect.y2);
         String s = font.plainSubstrByWidth(status, histRect.w() - 8);
         g.fill(histRect.x1, histRect.y2 - 11, histRect.x2, histRect.y2, 0xC0200C0C);
-        g.drawString(font, s, histRect.x1 + 4, histRect.y2 - 10, C_ERROR, false);
+        g.drawString(font, s, histRect.x1 + 4, histRect.y2 - 10, col(ThemeColor.ERROR), false);
         g.disableScissor();
     }
 
     private void drawBlock(GuiGraphics g, Font font, Block b, int top, boolean global) {
         Message m = b.message;
         Direction d = m.direction();
-        int color = d == Direction.IN ? C_IN : d == Direction.OUT ? C_OUT : C_DIM;
-        if (global && d == Direction.IN) color = C_TEXT; // public chat is plain text, no bubbles
+        int color = d == Direction.IN ? col(ThemeColor.INCOMING) : d == Direction.OUT ? col(ThemeColor.OWN) : col(ThemeColor.DIM);
+        if (global && d == Direction.IN) color = col(ThemeColor.TEXT); // public chat is plain text, no bubbles
         if (m.state() == Message.State.SENDING) color = 0xFF9FB3A5;
         if (m.state() == Message.State.FAILED) color = 0xFFB07070;
+        if (b.console) color = MessengerTheme.scaleAlpha(color, host.consoleOpacity());
         int left = histRect.x1 + PAD;
         int right = histRect.x2 - PAD - 6;
         if (!global) {
-            if (d == Direction.IN) g.fill(left, top, left + 1, top + b.height, C_BAR_IN);
-            else if (d == Direction.OUT) g.fill(right - 1, top, right, top + b.height, C_BAR_OUT);
+            if (d == Direction.IN) g.fill(left, top, left + 1, top + b.height, col(ThemeColor.INCOMING_BAR));
+            else if (d == Direction.OUT) g.fill(right - 1, top, right, top + b.height, col(ThemeColor.OWN_BAR));
         }
         int y = top;
         boolean first = true;
         for (TextLayout.Line line : b.lines) {
             int x = switch (d) {
-                case IN -> left + (global ? 1 : 4);
+                case IN -> left + (global ? 1 : 4) + (b.head != null ? HEAD_ADVANCE : 0);
                 case OUT -> right - 4 - line.width();
                 case NOTE -> (left + right - line.width()) / 2;
             };
+            if (first && b.head != null) PlayerHeads.draw(g, b.head, left + 1, y + 1, HEAD);
             for (TextLayout.Piece p : line.pieces()) {
                 if (p.emojiFile() != null) {
                     if (!textures.draw(g, p.emojiFile(), x, y + 1, EMOJI_DRAW)) g.drawString(font, p.text(), x, y + 1, color, true);
@@ -578,11 +677,19 @@ public final class MessengerUi {
             }
             if (first && d == Direction.OUT && m.state() != Message.State.SENT) {
                 boolean failed = m.state() == Message.State.FAILED;
-                g.drawString(font, failed ? "not sent" : "sending...", left + 2, y + 1, failed ? C_ERROR : C_WARN, false);
+                g.drawString(font, failed ? "not sent" : "sending...", left + 2, y + 1, failed ? col(ThemeColor.ERROR) : col(ThemeColor.WARNING), false);
             }
             first = false;
             y += LINE_H;
         }
+    }
+
+    /** A public chat line that is not player chat: dimmed in Global. Known from the chat tag when it arrived, else guessed from the text. */
+    private static boolean isConsole(Message m) {
+        if (m.direction() == Direction.NOTE) return true; // our own notices
+        if (m.direction() != Direction.IN) return false;
+        Boolean known = m.console();
+        return known != null ? known : LineKind.guessConsole(m.text(), LineKind.NOTICE_PREFIXES);
     }
 
     /**
@@ -591,10 +698,11 @@ public final class MessengerUi {
      */
     private List<Block> blocks(List<Message> msgs, boolean global, int width, Font font) {
         Message last = msgs.isEmpty() ? null : msgs.get(msgs.size() - 1);
-        if (msgs == blocksSrc && msgs.size() == blocksSize && last == blocksLast && width == blocksWidth) return blocks;
+        boolean heads = global && host.showHeads(); // what the blocks are made with (whisper views never have heads)
+        if (msgs == blocksSrc && msgs.size() == blocksSize && last == blocksLast && BlockCacheKey.same(width, scale, heads, blocksWidth, blocksScale, blocksHeads)) return blocks;
         // While the window is being resized the old wrapping is drawn; it is redone once the width has been still a moment
         long nowMs = System.currentTimeMillis();
-        if (msgs == blocksSrc && width != blocksWidth && !blocks.isEmpty()) {
+        if (msgs == blocksSrc && !BlockCacheKey.same(width, scale, heads, blocksWidth, blocksScale, blocksHeads) && !blocks.isEmpty()) {
             if (width != pendingWidth) {
                 pendingWidth = width;
                 pendingSince = nowMs;
@@ -613,7 +721,7 @@ public final class MessengerUi {
                 return EMOJI_ADVANCE;
             }
         };
-        if (width != blocksWidth || msgs != blocksSrc) blockCache = new IdentityHashMap<>();
+        if (!BlockCacheKey.same(width, scale, heads, blocksWidth, blocksScale, blocksHeads) || msgs != blocksSrc) blockCache = new IdentityHashMap<>();
         Map<Message, Block> used = new IdentityHashMap<>();
         List<Block> out = new ArrayList<>(msgs.size());
         int bubble = global ? width : Math.max(40, width * 85 / 100);
@@ -621,8 +729,10 @@ public final class MessengerUi {
             Block b = blockCache.get(m);
             if (b == null) {
                 int wrap = m.direction() == Direction.NOTE ? width : bubble;
-                List<TextLayout.Line> lines = TextLayout.wrap(m.text(), wrap, emoji, measure);
-                b = new Block(m, lines, lines.size() * LINE_H);
+                boolean console = global && isConsole(m);
+                String head = heads && !console && m.direction() == Direction.IN ? LineKind.sender(m.text()) : null;
+                List<TextLayout.Line> lines = TextLayout.wrap(m.text(), head != null ? wrap - HEAD_ADVANCE : wrap, emoji, measure);
+                b = new Block(m, lines, lines.size() * LINE_H, console, head);
             }
             used.put(m, b);
             out.add(b);
@@ -633,6 +743,8 @@ public final class MessengerUi {
         blocksSize = msgs.size();
         blocksLast = last;
         blocksWidth = width;
+        blocksScale = scale;
+        blocksHeads = heads;
         return out;
     }
 
@@ -657,7 +769,7 @@ public final class MessengerUi {
 
     private void drawContacts(GuiGraphics g, Font font, int mx, int my) {
         ensureSearch();
-        g.fill(histRect.x1, histRect.y1, histRect.x2, histRect.y2, alpha(C_PANEL));
+        g.fill(histRect.x1, histRect.y1, histRect.x2, histRect.y2, bg(ThemeColor.WINDOW));
         search.render(g, mx, my, 0f);
         List<ContactPicker.Entry> list = contacts();
         drawn = list;
@@ -667,15 +779,15 @@ public final class MessengerUi {
         g.enableScissor(contactRect.x1, contactRect.y1, contactRect.x2, contactRect.y2);
         if (list.isEmpty()) {
             String q = search.getValue().strip();
-            g.drawString(font, q.isEmpty() ? "Nobody to list yet. Type a player name." : "No match, and not a player name.", contactRect.x1 + 6, contactRect.y1 + 4, C_DIM, false);
+            g.drawString(font, q.isEmpty() ? "Nobody to list yet. Type a player name." : "No match, and not a player name.", contactRect.x1 + 6, contactRect.y1 + 4, col(ThemeColor.DIM), false);
         }
         for (int i = contactScroll; i < list.size(); i++) {
             int y = contactRect.y1 + (i - contactScroll) * ROW_H;
             if (y >= contactRect.y2) break;
             ContactPicker.Entry e = list.get(i);
             Rect row = new Rect(contactRect.x1 + 1, y, contactRect.x2 - 1, y + ROW_H);
-            if (i == contactSel) g.fill(row.x1, row.y1, row.x2, row.y2, alpha(C_SELECT));
-            else if (row.contains(mx, my)) g.fill(row.x1, row.y1, row.x2, row.y2, alpha(C_HOVER));
+            if (i == contactSel) g.fill(row.x1, row.y1, row.x2, row.y2, bg(ThemeColor.SELECTED));
+            else if (row.contains(mx, my)) g.fill(row.x1, row.y1, row.x2, row.y2, bg(ThemeColor.HOVER));
             String tag = switch (e.source()) {
                 case FRIEND -> "friend";
                 case ONLINE -> "online";
@@ -683,10 +795,16 @@ public final class MessengerUi {
                 case TYPED -> "";
             };
             int tagW = tag.isEmpty() ? 0 : font.width(tag) + 8;
+            boolean typed = e.source() == ContactPicker.Source.TYPED;
+            int textX = row.x1 + 4;
+            if (!typed) {
+                drawDot(g, textX, row.y1 + (ROW_H - DOT) / 2, online(e.name()), contactRect, mx, my);
+                textX += DOT + DOT_GAP;
+            }
             String label = e.source() == ContactPicker.Source.TYPED ? "Message " + e.name() : e.name();
-            int color = e.source() == ContactPicker.Source.TYPED ? 0xFF000000 | C_ACCENT : e.source() == ContactPicker.Source.FRIEND ? C_FRIEND : C_TEXT;
-            g.drawString(font, font.plainSubstrByWidth(label, Math.max(8, row.w() - tagW - 8)), row.x1 + 4, row.y1 + 2, color, false);
-            if (tagW > 0) g.drawString(font, tag, row.x2 - tagW + 2, row.y1 + 2, C_DIM, false);
+            int color = e.source() == ContactPicker.Source.TYPED ? col(ThemeColor.ACCENT) : e.source() == ContactPicker.Source.FRIEND ? col(ThemeColor.FRIEND) : col(ThemeColor.TEXT);
+            g.drawString(font, font.plainSubstrByWidth(label, Math.max(8, row.w() - tagW - 8 - (textX - row.x1 - 4))), textX, row.y1 + 2, color, false);
+            if (tagW > 0) g.drawString(font, tag, row.x2 - tagW + 2, row.y1 + 2, col(ThemeColor.DIM), false);
         }
         g.disableScissor();
     }
@@ -735,9 +853,9 @@ public final class MessengerUi {
         int bw = Math.max(font.width(yes), font.width(no)) + 12;
         dlgYes = new Rect(x1 + w / 2 - bw - 3, y1 + h - 17, x1 + w / 2 - 3, y1 + h - 4);
         dlgNo = new Rect(x1 + w / 2 + 3, y1 + h - 17, x1 + w / 2 + 3 + bw, y1 + h - 4);
-        g.fill(dlgRect.x1 - 1, dlgRect.y1 - 1, dlgRect.x2 + 1, dlgRect.y2 + 1, 0xFF4FA3FF);
+        g.fill(dlgRect.x1 - 1, dlgRect.y1 - 1, dlgRect.x2 + 1, dlgRect.y2 + 1, col(ThemeColor.ACCENT));
         g.fill(dlgRect.x1, dlgRect.y1, dlgRect.x2, dlgRect.y2, 0xF0101820);
-        g.drawString(font, font.plainSubstrByWidth(question, w - 8), x1 + 5, y1 + 6, C_TEXT, false);
+        g.drawString(font, font.plainSubstrByWidth(question, w - 8), x1 + 5, y1 + 6, col(ThemeColor.TEXT), false);
         button(g, font, dlgYes, yes, mx, my, false);
         button(g, font, dlgNo, no, mx, my, false);
     }
@@ -759,7 +877,7 @@ public final class MessengerUi {
     }
 
     private void drawPicker(GuiGraphics g, int mx, int my) {
-        g.fill(pickRect.x1, pickRect.y1, pickRect.x2, pickRect.y2, alpha(C_LIST));
+        g.fill(pickRect.x1, pickRect.y1, pickRect.x2, pickRect.y2, bg(ThemeColor.LEFT_PANE));
         List<String> files = emoji.files();
         int rowsTotal = (files.size() + pickCols - 1) / pickCols;
         pickScroll = Math.max(0, Math.min(pickScroll, Math.max(0, rowsTotal - PICK_ROWS)));
@@ -770,7 +888,7 @@ public final class MessengerUi {
                 if (idx >= files.size()) break;
                 int x = pickRect.x1 + PAD + c * CELL;
                 int y = pickRect.y1 + 2 + r * CELL;
-                if (mx >= x && mx < x + CELL && my >= y && my < y + CELL) g.fill(x, y, x + CELL, y + CELL, alpha(C_HOVER));
+                if (mx >= x && mx < x + CELL && my >= y && my < y + CELL) g.fill(x, y, x + CELL, y + CELL, bg(ThemeColor.HOVER));
                 textures.draw(g, files.get(idx), x + 1, y + 1, CELL - 2);
             }
         }
@@ -785,8 +903,10 @@ public final class MessengerUi {
 
     // ---------- mouse and keys (called by MessengerScreen) ----------
 
-    public boolean mouseClicked(double x, double y, int button, int sw, int sh) {
+    public boolean mouseClicked(double realX, double realY, int button, int sw, int sh) {
         Geometry w = current(sw, sh);
+        double x = lx(realX);
+        double y = ly(realY);
         layout(w, true, mc.font);
         if (!winRect.contains(x, y)) {
             if (button == 0) close(); // a click outside lets go of the window
@@ -805,8 +925,8 @@ public final class MessengerUi {
         }
         if (gripRect.contains(x, y)) {
             drag = Drag.RESIZE;
-            dragDx = winRect.x2 - (int) x;
-            dragDy = winRect.y2 - (int) y;
+            dragDx = w.x() + w.w() - (int) realX; // dragging works in real pixels
+            dragDy = w.y() + w.h() - (int) realY;
             return true;
         }
         if (btnNew.contains(x, y)) {
@@ -831,8 +951,8 @@ public final class MessengerUi {
         }
         if (titleRect.contains(x, y)) {
             drag = Drag.MOVE;
-            dragDx = (int) x - winRect.x1;
-            dragDy = (int) y - winRect.y1;
+            dragDx = (int) realX - w.x();
+            dragDy = (int) realY - w.y();
             return true;
         }
         if (listRect.contains(x, y)) {
@@ -903,7 +1023,9 @@ public final class MessengerUi {
         return true;
     }
 
-    public boolean mouseScrolled(double x, double y, double dy) {
+    public boolean mouseScrolled(double realX, double realY, double dy) {
+        double x = lx(realX);
+        double y = ly(realY);
         int step = dy > 0 ? 1 : dy < 0 ? -1 : 0;
         if (step == 0) return false;
         if (listRect.contains(x, y)) {
