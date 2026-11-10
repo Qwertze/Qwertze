@@ -547,7 +547,8 @@ class KitRoutesTest {
         assertEquals("rule", row(v, "pvp kit").get("targetSource").getAsString());
         assertEquals(A, row(v, "pvp kit").get("target").getAsString());
         assertEquals("full", row(v, "kit b").get("status").getAsString(), "stored in A, target B is full");
-        assertEquals("kitsChest", row(v, "kit b").get("targetSource").getAsString());
+        assertTrue(row(v, "kit b").get("target").isJsonNull(), "v2: the target is the first usable chain entry, and none is");
+        assertEquals("kitsChest", row(v, "kit b").getAsJsonArray("chain").get(0).getAsJsonObject().get("source").getAsString());
         assertEquals("home", row(v, "kit c").get("status").getAsString());
         assertEquals("full", row(v, "kit d").get("status").getAsString(), "carried, target B is full");
         assertEquals(1, row(v, "kit d").get("carried").getAsInt());
@@ -557,7 +558,9 @@ class KitRoutesTest {
         // A rule to a container the new report no longer has: missing. A rule to a non-pickable one is refused.
         sendReport(report("Bob", '2', cont(B, null, 54, 10, true) + "," + cont(C, null, 27, 5, false), stored("pvp kit", "PvP Kit", B, 2), ""));
         v = ok(get(owner, q()));
-        assertEquals("missing", row(v, "pvp kit").get("status").getAsString(), "A is gone from the report");
+        // v2 chain: the rule's chest is missing, the kits chest B (where the kit is) is fine: home, via the fallback.
+        assertEquals("home", row(v, "pvp kit").get("status").getAsString(), "A is gone from the report");
+        assertEquals("missing", row(v, "pvp kit").getAsJsonArray("chain").get(0).getAsJsonObject().get("status").getAsString());
         assertEquals("ok", v.get("kitsChestStatus").getAsString());
         ok(post(owner, "/api/v1/kits/rule", "{" + KEY + ",\"key\":\"pvp kit\",\"container\":\"" + B + "\"}"));
         v = ok(get(owner, q()));

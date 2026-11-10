@@ -76,6 +76,31 @@ final class Http {
     /** The uncompressed body of the response being sent (byte[]), when it is sent gzip-compressed. */
     private static final String PLAIN_BODY = "stashmanager.plainBody";
 
+    /** The same with a wall-clock limit for the whole read (an IOException when a client drips its body too slowly). */
+    static byte[] readBody(HttpExchange ex, long max, long timeoutMs) throws IOException {
+        if (Http.attr(ex, BODY) instanceof byte[]) return readBody(ex, max);
+        String length = ex.getRequestHeaders().getFirst("Content-Length");
+        if (length != null) {
+            try {
+                if (Long.parseLong(length.trim()) > max) throw new TooLarge();
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        long end = System.nanoTime() + timeoutMs * 1_000_000;
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        long total = 0;
+        int n;
+        InputStream in = ex.getRequestBody();
+        while ((n = in.read(buf)) != -1) {
+            total += n;
+            if (total > max) throw new TooLarge();
+            if (System.nanoTime() - end > 0) throw new IOException("the request body took too long to arrive");
+            out.write(buf, 0, n);
+        }
+        return out.toByteArray();
+    }
+
     static byte[] readBody(HttpExchange ex, long max) throws IOException {
         if (Http.attr(ex, BODY) instanceof byte[] cached) {
             if (cached.length > max) throw new TooLarge();

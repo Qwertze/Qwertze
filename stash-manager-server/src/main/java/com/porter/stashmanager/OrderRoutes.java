@@ -142,8 +142,14 @@ final class OrderRoutes {
                 String type = AddonRoutes.string(l, "type");
                 String key = AddonRoutes.string(l, "key");
                 long count = positiveInt(l.get("count"));
-                if (!"item".equals(type) && !"shulker".equals(type)) problem = "type must be item or shulker";
-                else if (key == null || key.isEmpty() || key.length() > MAX_KEY) problem = "key must be a non-empty string";
+                if (!"item".equals(type) && !"shulker".equals(type) && !"craft".equals(type) && !"kit".equals(type)) problem = "type must be item, shulker, craft or kit";
+                else if ("kit".equals(type) && (key == null || !KitTemplate.ID.matcher(key).matches())) {
+                    problem = "key of a kit line must be a kit id like t-3f2a9c1d";
+                } else if ("kit".equals(type) && (count < 1 || count > KitOrders.MAX_PER_LINE)) {
+                    problem = "count of a kit line must be a whole number from 1 to " + KitOrders.MAX_PER_LINE;
+                } else if ("craft".equals(type) && (key == null || key.length() > MAX_KEY || !CraftStore.ITEM_ID.matcher(key).matches())) {
+                    problem = "key of a craft line must be an item id like minecraft:stick";
+                } else if (key == null || key.isEmpty() || key.length() > MAX_KEY) problem = "key must be a non-empty string";
                 else if (count < 1) problem = "count must be a whole number from 1 to " + Integer.MAX_VALUE;
                 else {
                     JsonElement r = l.get("repair");
@@ -167,7 +173,7 @@ final class OrderRoutes {
             out.add("order", shown(ex, order.toJson()));
             Http.json(ex, 200, out);
         } catch (OrderStore.OrderException e) {
-            lineError(ex, e.status, e.getMessage(), e.line);
+            lineError(ex, e);
         }
     }
 
@@ -206,7 +212,7 @@ final class OrderRoutes {
     }
 
     /** An order as this user may see it (forced streamer mode: other users' names and position-like text hidden). */
-    private static JsonObject shown(HttpExchange ex, JsonObject order) {
+    static JsonObject shown(HttpExchange ex, JsonObject order) {
         if (Redact.on(ex)) Redact.order(order, Router.user(ex).id());
         return order;
     }
@@ -250,7 +256,7 @@ final class OrderRoutes {
             out.add("order", shown(ex, order.toJson()));
             Http.json(ex, 200, out);
         } catch (OrderStore.OrderException e) {
-            if (e.status == 400) lineError(ex, e.status, e.getMessage(), e.line);
+            if (e.status == 400 || e.craft != null || e.kit != null) lineError(ex, e);
             else Http.error(ex, e.status, e.getMessage());
         }
     }
@@ -290,7 +296,11 @@ final class OrderRoutes {
             AddonRoutes.conflict(ex, owner);
             return;
         }
-        OrderStore.Order order = orders.claim(server, stash);
+        // craftOrders >= 1: the bot carries out craft orders (CRAFT-CONTRACT.md). Absent or anything else: an older bot.
+        boolean craftOrders = o.get("craftOrders") instanceof JsonPrimitive cp && cp.isNumber() && positiveInt(cp) >= 1;
+        // kitOrders >= 1: the bot builds kits (KIT-CONTRACT-v2). Without it a held kit order fails and pending ones are skipped.
+        boolean kitOrders = o.get("kitOrders") instanceof JsonPrimitive kp && kp.isNumber() && positiveInt(kp) >= 1;
+        OrderStore.Order order = orders.claim(server, stash, craftOrders, kitOrders);
         if (order == null) {
             Http.send(ex, 204, null, null, "no-store");
             return;
@@ -351,11 +361,32 @@ final class OrderRoutes {
     // ---------- validation helpers ----------
 
     private static void lineError(HttpExchange ex, int status, String message, int line) throws IOException {
+        lineError(ex, status, message, line, null);
+    }
+
+    /** The same; craft is the code of a 409 from the craft checks (CRAFT-CONTRACT.md, "Bot capability and routing"). */
+    private static void lineError(HttpExchange ex, int status, String message, int line, String craft) throws IOException {
         JsonObject o = new JsonObject();
         o.addProperty("ok", false);
         o.addProperty("error", message);
         o.addProperty("line", line >= 0 ? line : null);
+        if (craft != null) o.addProperty("craft", craft);
         Http.json(ex, status, o);
+    }
+
+    /** The error of a refused order: line, the craft code (409), the kit code (409 no_bot / disabled, deleted) and the short items of a kit order. */
+    private static void lineError(HttpExchange ex, OrderStore.OrderException e) throws IOException {
+        JsonObject o = new JsonObject();
+        o.addProperty("ok", false);
+        String message = e.getMessage();
+        // A kit name is text a user typed; a forced streamer's copy calls the (first) kit "Kit <n>", n being its place in the template list, like everywhere else.
+        if (e.kitName != null && Redact.on(ex)) message = message.replace(e.kitName, e.kitNumber > 0 ? "Kit " + e.kitNumber : "Kit");
+        o.addProperty("error", message);
+        o.addProperty("line", e.line >= 0 ? e.line : null);
+        if (e.craft != null) o.addProperty("craft", e.craft);
+        if (e.kit != null) o.addProperty("kit", e.kit);
+        if (e.shortItems != null) o.add("short", e.shortItems);
+        Http.json(ex, e.status, o);
     }
 
     /** A whole number 1..2^31-1 (1.0 is fine, 1.5 isn't), or -1. */
@@ -431,6 +462,170 @@ final class OrderRoutes {
         out.add("lines", outLines);
         JsonObject repair = repairResult(r.get("repair"));
         if (repair != null) out.add("repair", repair);
+        JsonObject craft = craftResult(r.get("craft"));
+        if (craft != null) out.add("craft", craft);
+        JsonObject kit = kitResult(r.get("kit"));
+        if (kit != null) out.add("kit", kit);
+        return out;
+    }
+
+    private static final int MAX_KIT_LIST = 200;
+
+    /**
+     * result.kit (KIT-CONTRACT-v2, "Bot execution" 5): {made: [{template, name, wanted, ready, built, delivered}], short: [{template,
+     * kits, items: [{key, match, count}], stored, reason}], notes: [text]}. Template ids and item keys are checked, names cleaned and
+     * cut to 50, reasons must be the contract's, lists cut at 200. A wrong shape is an error. Null/absent = none.
+     */
+    static JsonObject kitResult(JsonElement e) {
+        if (e == null || e.isJsonNull()) return null;
+        if (!e.isJsonObject()) throw new IllegalArgumentException("result.kit must be an object or null");
+        JsonObject r = e.getAsJsonObject();
+        JsonObject out = new JsonObject();
+        JsonArray made = new JsonArray();
+        JsonElement me = r.get("made");
+        if (me != null && !me.isJsonNull()) {
+            if (!me.isJsonArray()) throw new IllegalArgumentException("result.kit.made must be an array");
+            int n = 0;
+            for (JsonElement x : me.getAsJsonArray()) {
+                if (n++ >= MAX_KIT_LIST) break;
+                if (!x.isJsonObject()) throw new IllegalArgumentException("result.kit.made entries must be objects");
+                JsonObject in = x.getAsJsonObject();
+                JsonObject o = new JsonObject();
+                o.addProperty("template", kitTemplate(in, "result.kit.made"));
+                String name = AddonRoutes.string(in, "name");
+                o.addProperty("name", name == null ? "" : KitReports.clean(name, OrderStore.MAX_NAME));
+                for (String num : new String[]{"wanted", "ready", "built", "delivered"}) {
+                    long v = nonNegativeInt(in.get(num));
+                    if (v < 0) throw new IllegalArgumentException("result.kit.made." + num + " must be a whole number >= 0");
+                    o.addProperty(num, v);
+                }
+                made.add(o);
+            }
+        }
+        out.add("made", made);
+        JsonArray shorts = new JsonArray();
+        JsonElement se = r.get("short");
+        if (se != null && !se.isJsonNull()) {
+            if (!se.isJsonArray()) throw new IllegalArgumentException("result.kit.short must be an array");
+            int n = 0;
+            for (JsonElement x : se.getAsJsonArray()) {
+                if (n++ >= MAX_KIT_LIST) break;
+                if (!x.isJsonObject()) throw new IllegalArgumentException("result.kit.short entries must be objects");
+                JsonObject in = x.getAsJsonObject();
+                JsonObject o = new JsonObject();
+                o.addProperty("template", kitTemplate(in, "result.kit.short"));
+                long kits = nonNegativeInt(in.get("kits"));
+                if (kits < 0) throw new IllegalArgumentException("result.kit.short.kits must be a whole number >= 0");
+                o.addProperty("kits", kits);
+                String reason = AddonRoutes.string(in, "reason");
+                if (reason == null || !KitOrders.SHORT_REASONS.contains(reason)) {
+                    throw new IllegalArgumentException("result.kit.short.reason must be one of " + new java.util.TreeSet<>(KitOrders.SHORT_REASONS));
+                }
+                o.addProperty("reason", reason);
+                if (in.has("stored") && !in.get("stored").isJsonNull()) {
+                    String stored = AddonRoutes.string(in, "stored");
+                    if (stored == null || !KitOrders.STORED.contains(stored)) throw new IllegalArgumentException("result.kit.short.stored must be incomplete or returned");
+                    o.addProperty("stored", stored);
+                }
+                JsonArray items = new JsonArray();
+                JsonElement ie = in.get("items");
+                if (ie != null && !ie.isJsonNull()) {
+                    if (!ie.isJsonArray()) throw new IllegalArgumentException("result.kit.short.items must be an array");
+                    int k = 0;
+                    for (JsonElement y : ie.getAsJsonArray()) {
+                        if (k++ >= MAX_KIT_LIST) break;
+                        if (!y.isJsonObject()) throw new IllegalArgumentException("result.kit.short.items entries must be objects");
+                        JsonObject item = y.getAsJsonObject();
+                        JsonObject io = new JsonObject();
+                        String key = AddonRoutes.string(item, "key");
+                        String match = item.has("match") && !item.get("match").isJsonNull() ? AddonRoutes.string(item, "match") : null;
+                        if (key == null) key = match;
+                        if (key == null || !KitTemplate.KEY.matcher(key).matches() || (match != null && !KitTemplate.KEY.matcher(match).matches())) {
+                            throw new IllegalArgumentException("result.kit.short.items entries need an item key");
+                        }
+                        io.addProperty("key", key);
+                        if (match != null) io.addProperty("match", match);
+                        long c = nonNegativeInt(item.get("count"));
+                        if (c < 0) throw new IllegalArgumentException("result.kit.short.items.count must be a whole number >= 0");
+                        io.addProperty("count", c);
+                        items.add(io);
+                    }
+                }
+                o.add("items", items);
+                shorts.add(o);
+            }
+        }
+        out.add("short", shorts);
+        JsonArray notes = new JsonArray();
+        JsonElement ne = r.get("notes");
+        if (ne != null && !ne.isJsonNull()) {
+            if (!ne.isJsonArray()) throw new IllegalArgumentException("result.kit.notes must be an array");
+            int n = 0;
+            for (JsonElement x : ne.getAsJsonArray()) {
+                if (n++ >= 20) break;
+                if (!(x instanceof JsonPrimitive p) || !p.isString() || !p.getAsString().matches("^[a-z_]{1,32}$")) {
+                    throw new IllegalArgumentException("result.kit.notes must be codes like colour_substituted");
+                }
+                notes.add(p.getAsString());
+            }
+        }
+        out.add("notes", notes);
+        return out;
+    }
+
+    private static String kitTemplate(JsonObject in, String where) {
+        String id = AddonRoutes.string(in, "template");
+        if (id == null || !KitTemplate.ID.matcher(id).matches()) throw new IllegalArgumentException(where + " entries need a template id like t-3f2a9c1d");
+        return id;
+    }
+
+    private static final int MAX_CRAFT_LIST = 200;
+
+    /**
+     * result.craft (CRAFT-CONTRACT.md, "Result from the bot"): {fills, made: [{key, wanted, made}], short: [{key, count,
+     * reason}], used: [{id, count}], returned: [{id, count}]}. Whole numbers >= 0, at most 200 entries per list (more are
+     * dropped), keys cut to 256 characters. A wrong shape is an error. Null/absent = none.
+     */
+    static JsonObject craftResult(JsonElement e) {
+        if (e == null || e.isJsonNull()) return null;
+        if (!e.isJsonObject()) throw new IllegalArgumentException("result.craft must be an object or null");
+        JsonObject r = e.getAsJsonObject();
+        JsonObject out = new JsonObject();
+        long fills = r.has("fills") && !r.get("fills").isJsonNull() ? nonNegativeInt(r.get("fills")) : 0;
+        if (fills < 0) throw new IllegalArgumentException("result.craft.fills must be a whole number >= 0");
+        out.addProperty("fills", fills);
+        out.add("made", craftList(r.get("made"), "made", "key", new String[]{"wanted", "made"}, false));
+        out.add("short", craftList(r.get("short"), "short", "key", new String[]{"count"}, true));
+        out.add("used", craftList(r.get("used"), "used", "id", new String[]{"count"}, false));
+        out.add("returned", craftList(r.get("returned"), "returned", "id", new String[]{"count"}, false));
+        return out;
+    }
+
+    private static JsonArray craftList(JsonElement e, String name, String keyField, String[] numbers, boolean reason) {
+        JsonArray out = new JsonArray();
+        if (e == null || e.isJsonNull()) return out;
+        if (!e.isJsonArray()) throw new IllegalArgumentException("result.craft." + name + " must be an array");
+        int n = 0;
+        for (JsonElement x : e.getAsJsonArray()) {
+            if (n++ >= MAX_CRAFT_LIST) break;
+            if (!x.isJsonObject()) throw new IllegalArgumentException("result.craft." + name + " entries must be objects");
+            JsonObject in = x.getAsJsonObject();
+            String key = AddonRoutes.string(in, keyField);
+            if (key == null || key.isEmpty()) throw new IllegalArgumentException("result.craft." + name + " entries need " + keyField);
+            JsonObject o = new JsonObject();
+            o.addProperty(keyField, Http.truncate(key, MAX_KEY));
+            for (String num : numbers) {
+                long v = nonNegativeInt(in.get(num));
+                if (v < 0) throw new IllegalArgumentException("result.craft." + name + "." + num + " must be a whole number >= 0");
+                o.addProperty(num, v);
+            }
+            if (reason) {
+                String why = AddonRoutes.string(in, "reason");
+                if (why == null) throw new IllegalArgumentException("result.craft.short entries need a reason");
+                o.addProperty("reason", Http.truncate(why, Repair.MAX_REASON));
+            }
+            out.add(o);
+        }
         return out;
     }
 

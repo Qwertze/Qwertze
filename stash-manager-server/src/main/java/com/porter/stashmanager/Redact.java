@@ -26,7 +26,7 @@ final class Redact {
     /** Activity sources shown as they are (the plugin's own subsystems); any other source reads "(hidden)". */
     static final java.util.Set<String> SOURCES = java.util.Set.of("Stash sorter", "Stash order", "Pathfinder", "Pearl loader",
         "Queue", "Stash manager", "Dashboard", "Auto eat", "Auto totem", "Delivery");
-    private static final java.util.regex.Pattern SAFE_KEY = java.util.regex.Pattern.compile("[a-z0-9_.:/-]+(#[0-9a-f]+)?");
+    private static final java.util.regex.Pattern SAFE_KEY = java.util.regex.Pattern.compile("[a-z0-9_.:/-]+(#([0-9a-f]+|[*]))?");
     private static final SecureRandom RANDOM = new SecureRandom();
     /** The viewer offset's range per axis, in chunks (uniform in -2^20..2^20). */
     static final int OFFSET_CHUNKS = 1 << 20;
@@ -153,6 +153,9 @@ final class Redact {
                 if (reason == null || !Repair.SKIP_REASONS.contains(reason)) s.getAsJsonObject().addProperty("reason", HIDDEN);
             }
         }
+        craftResult(o);
+        kitResult(o);
+        kitNames(o);
         // Keys are item keys; anything else (free text) is hidden.
         for (String list : new String[]{"partial", "skipped"}) {
             JsonElement arr = repair == null ? null : repair.get(list);
@@ -161,6 +164,93 @@ final class Redact {
                 if (!s.isJsonObject()) continue;
                 String key = text(s.getAsJsonObject(), "key");
                 if (key == null || !SAFE_KEY.matcher(key).matches()) s.getAsJsonObject().addProperty("key", HIDDEN);
+            }
+        }
+    }
+
+    /**
+     * result.craft is numbers and item ids; only a short entry's reason is bot text, so one that is not a code of the
+     * contract (CraftService.SHORT_REASONS) is hidden, and a key that is not an item key too.
+     */
+    static void craftResult(JsonObject order) {
+        JsonObject craft = obj(obj(order, "result"), "craft");
+        if (craft == null) return;
+        JsonElement shorts = craft.get("short");
+        if (shorts != null && shorts.isJsonArray()) {
+            for (JsonElement s : shorts.getAsJsonArray()) {
+                if (!s.isJsonObject()) continue;
+                String reason = text(s.getAsJsonObject(), "reason");
+                if (reason == null || !CraftService.SHORT_REASONS.contains(reason)) s.getAsJsonObject().addProperty("reason", HIDDEN);
+            }
+        }
+        for (String list : new String[]{"made", "short", "used", "returned"}) {
+            JsonElement arr = craft.get(list);
+            if (arr == null || !arr.isJsonArray()) continue;
+            for (JsonElement s : arr.getAsJsonArray()) {
+                if (!s.isJsonObject()) continue;
+                JsonObject so = s.getAsJsonObject();
+                for (String field : new String[]{"key", "id"}) {
+                    String v = text(so, field);
+                    if (so.has(field) && (v == null || !SAFE_KEY.matcher(v).matches())) so.addProperty(field, HIDDEN);
+                }
+            }
+        }
+    }
+
+    /**
+     * The snapshot's kit names are text a user typed: "Kit 1", "Kit 2" ... (in order) instead, and a custom category id (a slug of the
+     * category's name) becomes "custom".
+     */
+    interface KitNumbers {
+        /** The template's 1-based position in the stash's current template list (the order the templates body lists them), 0 if it is gone. */
+        int of(String server, String stash, String templateId);
+    }
+
+    /** Set when the server starts (StashManagerServer): where the kit numbers come from. */
+    static volatile KitNumbers kitNumbers = (s, t, id) -> 0;
+
+    static void kitNames(JsonObject order) {
+        JsonObject kit = obj(order, "kit");
+        JsonElement lines = kit == null ? null : kit.get("lines");
+        if (lines == null || !lines.isJsonArray()) return;
+        String server = text(order, "server"), stash = text(order, "stash");
+        for (JsonElement l : lines.getAsJsonArray()) {
+            JsonObject t = l.isJsonObject() ? obj(l.getAsJsonObject(), "template") : null;
+            if (t == null) continue;
+            String id = text(t, "id");
+            int n = server == null || stash == null || id == null ? 0 : kitNumbers.of(server, stash, id);
+            t.addProperty("name", n > 0 ? "Kit " + n : "Kit");
+            String cat = text(t, "category");
+            if (cat != null && cat.startsWith("c:")) t.addProperty("category", "custom");
+        }
+    }
+
+    /**
+     * result.kit is template ids, numbers and item keys, and the names the bot gave the kits (text): those are hidden, and
+     * so is a key that is not an item key. Reasons are a closed set (checked when the bot reported them).
+     */
+    static void kitResult(JsonObject order) {
+        JsonObject kit = obj(obj(order, "result"), "kit");
+        if (kit == null) return;
+        JsonElement made = kit.get("made");
+        if (made != null && made.isJsonArray()) {
+            for (JsonElement s : made.getAsJsonArray()) if (s.isJsonObject()) scrubField(s.getAsJsonObject(), "name");
+        }
+        JsonElement shorts = kit.get("short");
+        if (shorts != null && shorts.isJsonArray()) {
+            for (JsonElement s : shorts.getAsJsonArray()) {
+                if (!s.isJsonObject()) continue;
+                String reason = text(s.getAsJsonObject(), "reason");
+                if (reason == null || !KitOrders.SHORT_REASONS.contains(reason)) s.getAsJsonObject().addProperty("reason", HIDDEN);
+                JsonElement items = s.getAsJsonObject().get("items");
+                if (items == null || !items.isJsonArray()) continue;
+                for (JsonElement i : items.getAsJsonArray()) {
+                    if (!i.isJsonObject()) continue;
+                    for (String field : new String[]{"key", "match"}) {
+                        String v = text(i.getAsJsonObject(), field);
+                        if (i.getAsJsonObject().has(field) && (v == null || !SAFE_KEY.matcher(v).matches())) i.getAsJsonObject().addProperty(field, HIDDEN);
+                    }
+                }
             }
         }
     }

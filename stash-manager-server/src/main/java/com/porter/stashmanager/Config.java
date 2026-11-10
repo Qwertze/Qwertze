@@ -39,6 +39,8 @@ public final class Config {
     public final String iconSource;
     /** iconDownload=: download the official client jar once to render the full icon set when none is found locally. */
     public boolean iconDownload = true;
+    /** recipeDownload=: the same for the crafting recipes (default: whatever iconDownload is). */
+    public boolean recipeDownload = true;
     /** allowBearer=: accept the old Authorization: Bearer header on index/heartbeat/order requests (never on bot/*). */
     public final boolean allowBearer;
     /**
@@ -164,6 +166,7 @@ public final class Config {
         Config config = new Config(file, port, bind, apiKey, allowRemote, allowedHosts, generated, minecraftJar, iconSource, allowBearer,
             trustedProxies);
         config.iconDownload = parseIconDownload(props.getProperty("iconDownload"));
+        config.recipeDownload = parseRecipeDownload(props.getProperty("recipeDownload"), config.iconDownload);
         String password = props.getProperty(PASSWORD_KEY, "").trim();
         if (!password.isEmpty()) {
             if (!Auth.wellFormed(password)) {
@@ -182,6 +185,16 @@ public final class Config {
         if (v.equals("true")) return true;
         if (v.equals("false")) return false;
         System.err.println("config.properties: iconDownload must be true or false, got '" + clean(v) + "'. Treating it as false (no download).");
+        return false;
+    }
+
+    /** Absent or blank = the value of iconDownload; "true"/"false" exactly; anything else warns and means false. */
+    static boolean parseRecipeDownload(String raw, boolean iconDownload) {
+        if (raw == null || raw.isBlank()) return iconDownload;
+        String v = raw.trim().toLowerCase(Locale.ROOT);
+        if (v.equals("true")) return true;
+        if (v.equals("false")) return false;
+        System.err.println("config.properties: recipeDownload must be true or false, got '" + clean(v) + "'. Treating it as false (no download).");
         return false;
     }
 
@@ -268,12 +281,20 @@ public final class Config {
         iconDownload=true
         """;
 
+    private static final String RECIPE_BLOCK = """
+        # Same as iconDownload, for the crafting recipes the planner and the bots use (<data>/recipes/<version>/).
+        # Leave empty to follow iconDownload; true or false to decide separately. They are built in the same
+        # one-time pass as the icons, from the same client jar.
+        recipeDownload=
+        """;
+
     /** Adds settings introduced after the file was created, with their comments, leaving every existing line alone. */
     private static void appendMissing(Path file, Properties props) throws IOException {
         StringBuilder add = new StringBuilder();
         if (!props.containsKey("minecraftJar")) add.append('\n').append(JAR_BLOCK);
         if (!props.containsKey("iconSource")) add.append('\n').append(SOURCE_BLOCK);
         if (!props.containsKey("iconDownload")) add.append('\n').append(DOWNLOAD_BLOCK);
+        if (!props.containsKey("recipeDownload")) add.append('\n').append(RECIPE_BLOCK);
         if (!props.containsKey("allowBearer")) add.append('\n').append(BEARER_BLOCK);
         if (!props.containsKey("trustedProxies")) add.append('\n').append(PROXY_BLOCK);
         if (add.isEmpty()) return;
@@ -304,7 +325,7 @@ public final class Config {
             # Extra host names (comma separated) the browser may use to reach this server,
             # e.g. a DNS name on your LAN. IP addresses, localhost and this machine's name always work.
             allowedHosts=%s
-            """ + "\n" + JAR_BLOCK + "\n" + SOURCE_BLOCK + "\n" + DOWNLOAD_BLOCK + "\n" + BEARER_BLOCK + "\n" + PROXY_BLOCK).formatted(port, clean(bind), clean(apiKey), allowRemote, clean(allowedHosts));
+            """ + "\n" + JAR_BLOCK + "\n" + SOURCE_BLOCK + "\n" + DOWNLOAD_BLOCK + "\n" + RECIPE_BLOCK + "\n" + BEARER_BLOCK + "\n" + PROXY_BLOCK).formatted(port, clean(bind), clean(apiKey), allowRemote, clean(allowedHosts));
         AtomicFiles.write(file, text.getBytes(StandardCharsets.UTF_8), true);
     }
 

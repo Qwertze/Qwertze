@@ -474,4 +474,14 @@ class IconPacksTest {
             assertEquals(IconService.CACHE_UNKNOWN, icons.get("minecraft", "never_allowed", null).cacheControl());
         }
     }
+
+    @Test
+    void versionsAreStrictlyNumericWithDots() {
+        for (String ok : new String[]{"1.21.4", "1.21.11", "26.2", "1.2.3.4", "1.99.9"}) assertTrue(IconService.MC_VERSION.matcher(ok).matches(), ok);
+        for (String bad : new String[]{"1", "1.21.", "1.21..4", "1.21.4.", ".1.2", "1.2.3.4.5", "1.21.4 ", "1.21.4/../x", "1.21.4:x", "1.21.4\n",
+            "1.2a", "", "1." + "1".repeat(40)}) {
+            assertFalse(IconService.MC_VERSION.matcher(bad).matches(), "'" + bad + "'");
+        }
+    }
+
 }

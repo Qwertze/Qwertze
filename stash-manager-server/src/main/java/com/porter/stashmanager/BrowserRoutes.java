@@ -21,6 +21,12 @@ final class BrowserRoutes {
     private final DeliveryContents delivery;
     private final KitStore kits;
     private final KitReports kitReports;
+    private final CraftService craft; // null: no crafting support (craft: null in the stash list)
+    private volatile AreaRoutes areaRoutes; // null: no stash area (area: null in the stash list)
+
+    void areas(AreaRoutes areaRoutes) {
+        this.areaRoutes = areaRoutes;
+    }
 
     BrowserRoutes(IndexStore store, Config config, LinkState link, List<String> urls, OrderStore orders, Owners owners,
                   SessionStore sessions, AuditLog audit) {
@@ -34,6 +40,13 @@ final class BrowserRoutes {
 
     BrowserRoutes(IndexStore store, Config config, LinkState link, List<String> urls, OrderStore orders, Owners owners,
                   SessionStore sessions, AuditLog audit, DeliveryContents delivery, KitStore kits, KitReports kitReports) {
+        this(store, config, link, urls, orders, owners, sessions, audit, delivery, kits, kitReports, null);
+    }
+
+    BrowserRoutes(IndexStore store, Config config, LinkState link, List<String> urls, OrderStore orders, Owners owners,
+                  SessionStore sessions, AuditLog audit, DeliveryContents delivery, KitStore kits, KitReports kitReports,
+                  CraftService craft) {
+        this.craft = craft;
         this.kits = kits;
         this.kitReports = kitReports;
         this.delivery = delivery;
@@ -104,6 +117,9 @@ final class BrowserRoutes {
             DeliveryContents.Snapshot dc = delivery.get(server, stash);
             o.add("deliveryContents", dc == null ? com.google.gson.JsonNull.INSTANCE : dc.summary());
             o.add("kits", kitSummary(server, stash));
+            AreaRoutes ar = areaRoutes;
+            o.add("area", ar == null ? com.google.gson.JsonNull.INSTANCE : ar.summaryJson(server, stash)); // no positions
+            o.add("craft", craft == null ? com.google.gson.JsonNull.INSTANCE : craft.summaryJson(server, stash)); // no positions
             if (forced) Redact.stash(o);
         }
         // "Server 1": what a page in streamer mode shows instead of the address (numbered over the visible stashes).

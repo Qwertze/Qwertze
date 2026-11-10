@@ -69,6 +69,7 @@ final class PlannerRoutes {
     private final OrderStore orders;
     private final PlanStore plans;
     private final AuditLog audit;
+    private final CraftService craft; // null: no crafting (rows carry no craft fields)
     private final ExecutorService parsers = Executors.newFixedThreadPool(PARSERS, r -> {
         Thread t = new Thread(r, "stash-manager-planner-" + THREADS.incrementAndGet());
         t.setDaemon(true);
@@ -80,6 +81,11 @@ final class PlannerRoutes {
     private final Map<String, Deque<Long>> uploads = new HashMap<>();
 
     PlannerRoutes(IndexStore index, OrderStore orders, PlanStore plans, AuditLog audit) {
+        this(index, orders, plans, audit, null);
+    }
+
+    PlannerRoutes(IndexStore index, OrderStore orders, PlanStore plans, AuditLog audit, CraftService craft) {
+        this.craft = craft;
         this.index = index;
         this.orders = orders;
         this.plans = plans;
@@ -98,11 +104,16 @@ final class PlannerRoutes {
     // ---------- options ----------
 
     /** What the view and the order are computed with. exclude is sorted, so key() is the same for the same choices. */
-    record Options(int multiplier, Set<String> exclude, boolean fluids, boolean containerItems, String round) {
-        static final Options DEFAULT = new Options(1, Set.of(), false, false, "none");
+    record Options(int multiplier, Set<String> exclude, boolean fluids, boolean containerItems, String round, boolean craft) {
+        static final Options DEFAULT = new Options(1, Set.of(), false, false, "none", false);
+
+        /** Without the craft option (an older page): the order has no craft lines. */
+        Options(int multiplier, Set<String> exclude, boolean fluids, boolean containerItems, String round) {
+            this(multiplier, exclude, fluids, containerItems, round, false);
+        }
 
         String key(String server, String stash) {
-            return multiplier + "|" + exclude + "|" + fluids + "|" + containerItems + "|" + round + "|" + server.length() + ":" + server + "|" + stash;
+            return multiplier + "|" + exclude + "|" + fluids + "|" + containerItems + "|" + round + "|" + craft + "|" + server.length() + ":" + server + "|" + stash;
         }
 
         static Options fromQuery(Map<String, String> q) {
@@ -118,7 +129,7 @@ final class PlannerRoutes {
             Set<String> exclude = new TreeSet<>();
             String ex = q.get("exclude");
             if (ex != null && !ex.isEmpty()) for (String id : ex.split(",")) if (!id.isBlank()) exclude.add(id.trim());
-            return check(m, exclude, flag(q.get("fluids")), flag(q.get("containerItems")), q.getOrDefault("round", "none"));
+            return check(m, exclude, flag(q.get("fluids")), flag(q.get("containerItems")), q.getOrDefault("round", "none"), flag(q.get("craft")));
         }
 
         static Options fromJson(JsonObject o) {
@@ -139,15 +150,15 @@ final class PlannerRoutes {
             }
             JsonElement re = o.get("round");
             String round = re == null || re.isJsonNull() ? "none" : re instanceof JsonPrimitive p && p.isString() ? p.getAsString() : "?";
-            return check(m, exclude, bool(o, "fluids"), bool(o, "containerItems"), round);
+            return check(m, exclude, bool(o, "fluids"), bool(o, "containerItems"), round, bool(o, "craft"));
         }
 
-        private static Options check(int multiplier, Set<String> exclude, boolean fluids, boolean containers, String round) {
+        private static Options check(int multiplier, Set<String> exclude, boolean fluids, boolean containers, String round, boolean craft) {
             if (multiplier < 1 || multiplier > MAX_MULTIPLIER) throw new IllegalArgumentException("multiplier must be a whole number from 1 to " + MAX_MULTIPLIER);
             if (exclude.size() > MAX_EXCLUDE) throw new IllegalArgumentException("at most " + MAX_EXCLUDE + " excluded items");
             for (String id : exclude) if (id.length() > MAX_ID) throw new IllegalArgumentException("excluded item ids are at most " + MAX_ID + " characters");
             if (!ROUNDS.contains(round)) throw new IllegalArgumentException("round must be none, stack or shulker");
-            return new Options(multiplier, java.util.Collections.unmodifiableSet(new TreeSet<>(exclude)), fluids, containers, round);
+            return new Options(multiplier, java.util.Collections.unmodifiableSet(new TreeSet<>(exclude)), fluids, containers, round, craft);
         }
 
         private static boolean flag(String v) {
@@ -231,7 +242,11 @@ final class PlannerRoutes {
     // ---------- splitting into orders ----------
 
     /** One order's worth: at most 54 shulkers (OrderStore.shulkersNeeded) and 200 lines. */
-    record Part(List<OrderStore.Line> lines, long shulkers, long slots) {
+    record Part(List<OrderStore.Line> lines, long shulkers, long slots, JsonObject craft) {
+        Part(List<OrderStore.Line> lines, long shulkers, long slots) {
+            this(lines, shulkers, slots, null);
+        }
+
         long items() {
             long n = 0;
             for (OrderStore.Line l : lines) n += l.count();
@@ -299,12 +314,27 @@ final class PlannerRoutes {
      * that doesn't fit is split at the part's remaining room (whole stacks) and the rest starts the next part.
      */
     static List<Part> split(List<OrderStore.Line> lines, IndexStore.OrderCounts counts) {
-        List<Part> parts = new ArrayList<>();
-        List<OrderStore.Line> cur = new ArrayList<>();
+        return splitAfter(new ArrayList<>(), List.of(), null, lines, counts);
+    }
+
+    /**
+     * The same, continuing: parts already made (done), then the lines of an open part (init, with its craft summary) that
+     * item lines may still fill up, then the item lines. Used to put the craft lines first.
+     */
+    static List<Part> splitAfter(List<Part> done, List<OrderStore.Line> init, JsonObject initCraft, List<OrderStore.Line> lines,
+                                 IndexStore.OrderCounts counts) {
+        List<Part> parts = new ArrayList<>(done);
+        List<OrderStore.Line> cur = new ArrayList<>(init);
         long[] used = new long[2]; // slots, shulker units
+        for (OrderStore.Line l : init) {
+            if (l.type().equals("craft") || !counts.isShulkerBoxKey(l.key())) used[0] += ceilDiv(l.count(), Math.max(1, stackOf(counts, l)));
+            else used[1] += l.count();
+        }
+        JsonObject[] craftOfCur = {initCraft};
         Runnable flush = () -> {
             if (cur.isEmpty()) return;
-            parts.add(new Part(List.copyOf(cur), OrderStore.shulkersNeeded(cur, counts), used[0]));
+            parts.add(new Part(List.copyOf(cur), OrderStore.shulkersNeeded(cur, counts), used[0], craftOfCur[0]));
+            craftOfCur[0] = null;
             cur.clear();
             used[0] = 0;
             used[1] = 0;
@@ -342,10 +372,211 @@ final class PlannerRoutes {
         return (a + b - 1) / b;
     }
 
+    private static int stackOf(IndexStore.OrderCounts counts, OrderStore.Line l) {
+        return l.type().equals("craft") ? CraftService.maxStack(counts, l.key()) : counts.maxStack(l.key());
+    }
+
     private static List<OrderStore.Line> wantLines(List<Row> rows) {
         List<OrderStore.Line> out = new ArrayList<>();
         for (Row r : rows) if (r.want > 0) out.add(new OrderStore.Line("item", r.id, r.want));
         return out;
+    }
+
+    // ---------- crafting ----------
+
+    /**
+     * What the craft planner made of a build against a stash (cached on the plan). parts: set only when ordering with
+     * crafting. truncated: the plan or the split ran out of its budget (such a result is never cached).
+     */
+    record Crafted(CraftPlanner.Plan plan, Map<String, CraftPlanner.RowResult> byId, List<Part> parts, boolean truncated) {
+    }
+
+    /** counts is the index data the plan was made from (compared by identity, so a new index is always planned again). */
+    record CraftCacheEntry(String key, IndexStore.OrderCounts counts, Crafted crafted, long at) {
+    }
+
+    /** status is read fresh every time; crafted is null when the recipes (or the settings) aren't there. */
+    record CraftView(CraftService.Status status, Crafted crafted) {
+        List<Part> parts() {
+            return crafted == null ? null : crafted.parts();
+        }
+    }
+
+    static final int MAX_PART_RUNS = 600;
+    static final int PLANS_PER_MINUTE = 30;
+
+    /**
+     * The craft view of a plan for a stash: null without crafting or a stash. The planner's numbers (and the parts when the
+     * option is on and the stash can take craft orders) are cached on the plan until the index, the reservations, the
+     * settings, the recipes or the options change. Identical requests at once wait for one computation (single flight); a
+     * computation needs a planning slot (503 when all are taken) and counts against the user's 30 a minute (429); one
+     * deadline of about 3 s covers the planner and the split together.
+     */
+    private CraftView craftView(PlanStore.Plan p, String server, String stash, Options opt, List<Row> rows, IndexStore.OrderCounts counts) {
+        if (craft == null || server == null || counts == null) return null;
+        CraftService.Status st = craft.status(server, stash);
+        if (st.recipes() == null || st.settings() == null) return new CraftView(st, null);
+        java.util.Set<String> never = st.settings().neverUse();
+        boolean ordering = opt.craft() && st.canOrder();
+        Map<String, Long> reserved = orders.reservedFor(server, stash);
+        String key = p.id + "|" + opt.key(server, stash) + "|" + new TreeMap<>(reserved) + "|"
+            + st.recipes().tableHash() + "|" + never + "|" + ordering + "|" + (ordering ? st.maxFills() : 0);
+        synchronized (p.craftLock) {
+            CraftCacheEntry cached = p.craftCache;
+            // A complete plan is reused as long as nothing changed; a truncated one only for a few seconds (a negative cache), so
+            // the requests waiting behind the one that ran out of time don't each spend the whole budget again.
+            if (cached != null && cached.counts() == counts && cached.key().equals(key)
+                && (!cached.crafted().truncated() || System.currentTimeMillis() - cached.at() < craft.truncatedTtlMs)) {
+                return new CraftView(st, cached.crafted());
+            }
+            Crafted crafted;
+            try (CraftService.Permit permit = craft.acquire()) {
+                craft.rateLimit("plan|" + p.owner, PLANS_PER_MINUTE); // only once a slot is held: a 503 costs no quota
+                long deadline = System.nanoTime() + craft.planNanos;
+                CraftPlanner.Eligible e = craft.eligible(st.recipes(), never);
+                Map<String, Long> stock = CraftService.stock(counts, reserved);
+                Map<String, Long> direct = new HashMap<>();
+                List<CraftPlanner.Row> crows = new ArrayList<>();
+                for (Row r : rows) {
+                    if (!r.excluded) direct.merge(r.id, r.want, Long::sum);
+                    crows.add(new CraftPlanner.Row(r.id, Math.max(0, r.need - Math.min(r.need, r.available)), r.excluded));
+                }
+                CraftPlanner.Plan plan = craft.planner(e).plan(stock, direct, crows, deadline);
+                Map<String, CraftPlanner.RowResult> byId = new HashMap<>();
+                for (CraftPlanner.RowResult rr : plan.rows()) byId.put(rr.id(), rr);
+                boolean[] cut = {plan.truncated()};
+                List<Part> parts = ordering ? craftParts(e, stock, direct, rows, byId, st.maxFills(), counts, deadline, cut) : null;
+                crafted = new Crafted(plan, byId, parts, cut[0]);
+            }
+            p.craftCache = new CraftCacheEntry(key, counts, crafted, System.currentTimeMillis());
+            return new CraftView(st, crafted);
+        }
+    }
+
+    private static long slotsOf(List<OrderStore.Line> lines, IndexStore.OrderCounts counts) {
+        long n = 0;
+        for (OrderStore.Line l : lines) n += ceilDiv(l.count(), Math.max(1, stackOf(counts, l)));
+        return n;
+    }
+
+    private static JsonObject craftSummary(List<OrderStore.Line> lines, CraftPlanner.Plan plan) {
+        JsonObject o = new JsonObject();
+        o.addProperty("lines", lines.size());
+        o.addProperty("fills", plan.fills());
+        o.add("take", CraftService.countsJson(plan.take()));
+        return o;
+    }
+
+    /**
+     * The split with craft lines first (CRAFT-CONTRACT.md, "Planner additions"): the rows' craftable amounts become craft
+     * lines in plan order, packed into parts that stay within the shulker and line limits and the bot's grid-fill cap, each part
+     * planned with what the earlier parts take. Item lines then fill the last craft part and go on in parts of their own.
+     * Every try counts against MAX_PART_RUNS and the one shared deadline; when either runs out the rest of the craft lines
+     * are left out ("plan too large": cut[0] is set), never added unchecked.
+     */
+    private List<Part> craftParts(CraftPlanner.Eligible e, Map<String, Long> stock, Map<String, Long> direct, List<Row> rows,
+                                  Map<String, CraftPlanner.RowResult> byId, int maxFills, IndexStore.OrderCounts counts,
+                                  long deadline, boolean[] cut) {
+        List<OrderStore.Line> candidates = new ArrayList<>();
+        for (Row r : rows) {
+            CraftPlanner.RowResult rr = byId.get(r.id);
+            if (!r.excluded && rr != null && rr.craftable() > 0) candidates.add(new OrderStore.Line("craft", r.id, rr.craftable()));
+        }
+        List<Part> done = new ArrayList<>();
+        Map<String, Long> used = new HashMap<>();
+        List<OrderStore.Line> cur = new ArrayList<>();
+        CraftPlanner.Plan[] curPlan = {null};
+        int[] runs = {0};
+        Runnable flush = () -> {
+            if (cur.isEmpty()) return;
+            List<OrderStore.Line> lines = List.copyOf(cur);
+            done.add(new Part(lines, OrderStore.shulkersNeeded(lines, counts), slotsOf(lines, counts), craftSummary(lines, curPlan[0])));
+            for (CraftPlanner.Count c : curPlan[0].take()) used.merge(c.id(), c.count(), Long::sum);
+            cur.clear();
+            curPlan[0] = null;
+        };
+        outer:
+        for (OrderStore.Line c : candidates) {
+            long remaining = c.count();
+            while (remaining > 0) {
+                CraftPlanner.Plan whole = fits(e, stock, direct, used, cur, c.key(), remaining, maxFills, counts, runs, deadline, cut);
+                long k;
+                CraftPlanner.Plan best;
+                if (whole != null) {
+                    k = remaining;
+                    best = whole;
+                } else {
+                    long lo = 0, hi = remaining - 1;
+                    CraftPlanner.Plan found = null;
+                    while (lo < hi && !cut[0]) {
+                        long mid = lo + (hi - lo + 1) / 2;
+                        CraftPlanner.Plan t = fits(e, stock, direct, used, cur, c.key(), mid, maxFills, counts, runs, deadline, cut);
+                        if (t != null) {
+                            lo = mid;
+                            found = t;
+                        } else {
+                            hi = mid - 1;
+                        }
+                    }
+                    k = lo;
+                    best = found; // the plan of the last amount that fitted, which is lo
+                }
+                if (k > 0 && best != null) {
+                    cur.add(new OrderStore.Line("craft", c.key(), k));
+                    curPlan[0] = best;
+                    remaining -= k;
+                } else if (!cut[0]) {
+                    if (cur.isEmpty()) break; // not even one fits a part of its own: left out
+                    flush.run();
+                    continue;
+                }
+                if (cut[0]) break outer;
+            }
+        }
+        JsonObject lastSummary = null;
+        List<OrderStore.Line> init = List.of();
+        if (!cur.isEmpty()) {
+            init = List.copyOf(cur);
+            lastSummary = craftSummary(init, curPlan[0]);
+        }
+        return splitAfter(done, init, lastSummary, wantLines(rows), counts);
+    }
+
+    /**
+     * The plan of the open part plus one more craft line, or null when that does not fit or is not fully craftable. Sets
+     * cut[0] (and returns null) when the try budget or the shared deadline is used up, or the planner itself ran out.
+     */
+    private CraftPlanner.Plan fits(CraftPlanner.Eligible e, Map<String, Long> stock, Map<String, Long> direct, Map<String, Long> used,
+                                   List<OrderStore.Line> cur, String key, long count, int maxFills, IndexStore.OrderCounts counts,
+                                   int[] runs, long deadline, boolean[] cut) {
+        if (++runs[0] > MAX_PART_RUNS || System.nanoTime() - deadline > 0) {
+            cut[0] = true;
+            return null;
+        }
+        List<OrderStore.Line> trial = new ArrayList<>(cur);
+        trial.add(new OrderStore.Line("craft", key, count));
+        if (trial.size() > OrderStore.MAX_LINES || OrderStore.shulkersNeeded(trial, counts) > OrderStore.MAX_SHULKERS) return null;
+        Map<String, Long> pool = new HashMap<>();
+        stock.forEach((id, n) -> {
+            long left = n - used.getOrDefault(id, 0L);
+            if (left > 0) pool.put(id, left);
+        });
+        List<CraftPlanner.Row> rs = new ArrayList<>();
+        for (OrderStore.Line l : trial) rs.add(new CraftPlanner.Row(l.key(), l.count(), false));
+        CraftPlanner.Plan plan = craft.planner(e).plan(pool, direct, rs, deadline);
+        if (plan.truncated()) {
+            cut[0] = true;
+            return null;
+        }
+        for (int i = 0; i < trial.size(); i++) if (plan.rows().get(i).craftable() < trial.get(i).count()) return null;
+        if (plan.fills() > maxFills || plan.steps().size() > CraftService.MAX_STEPS || plan.take().size() > CraftService.MAX_TAKE) return null;
+        return plan;
+    }
+
+    /** The parts of an order: with crafting when the view has them, else the item lines only. */
+    private static List<Part> parts(CraftView cv, List<Row> rows, IndexStore.OrderCounts counts) {
+        List<Part> crafted = cv == null ? null : cv.parts();
+        return crafted != null ? crafted : split(wantLines(rows), counts);
     }
 
     // ---------- routes ----------
@@ -377,6 +608,21 @@ final class PlannerRoutes {
         Http.json(ex, 429, o);
     }
 
+    /** Wall-clock limit for receiving an upload body, and for draining one that is refused. */
+    static final long UPLOAD_READ_MS = 30_000;
+
+    private static void drain(HttpExchange ex, long max, long timeoutMs) {
+        long end = System.nanoTime() + timeoutMs * 1_000_000;
+        try (java.io.InputStream in = ex.getRequestBody()) {
+            byte[] buf = new byte[65536];
+            long total = 0;
+            int n;
+            while (total < max && System.nanoTime() - end < 0 && (n = in.read(buf)) != -1) total += n;
+        } catch (IOException ignored) {
+            // the client went away: nothing to drain
+        }
+    }
+
     /** POST /api/v1/planner/upload?server=..&stash=..&name=..: the raw schematic as the body. */
     private void upload(HttpExchange ex) throws IOException {
         Users.Principal who = Router.user(ex);
@@ -403,10 +649,13 @@ final class PlannerRoutes {
         }
         byte[] body;
         try {
-            body = Http.readBody(ex, MAX_UPLOAD);
+            body = Http.readBody(ex, MAX_UPLOAD, UPLOAD_READ_MS);
         } catch (Http.TooLarge e) {
             // The rest of the body is never read, so the connection is closed, and a reply body could be cut off by that:
             // only the status (the page says "larger than 8 MiB" for 413).
+            // Take (and drop) some of what the client is still sending before answering and closing: closing with unread data
+            // makes the TCP stack reset the connection, and the client would see a reset instead of the 413. Bounded.
+            drain(ex, 12L * 1024 * 1024, UPLOAD_READ_MS);
             ex.getResponseHeaders().set("Connection", "close");
             Http.send(ex, 413, null, null, "no-store");
             return;
@@ -625,6 +874,7 @@ final class PlannerRoutes {
             return;
         }
         List<Row> rows = rows(p, opt, counts, orders.reservedFor(server, stash), index.tabOrder(server, stash));
+        CraftView cv = craftView(p, server, stash, opt, rows, counts);
         String key = opt.key(server, stash);
         synchronized (p) {
             Split split = p.split;
@@ -634,7 +884,7 @@ final class PlannerRoutes {
             }
             // Same options with parts placed: the confirmed split. Otherwise a fresh one from the stash as it is now.
             if (split == null || !split.key.equals(key) || split.placed.isEmpty()) {
-                split = new Split(key, opt, server, stash, split(wantLines(rows), counts));
+                split = new Split(key, opt, server, stash, parts(cv, rows, counts));
                 p.split = split;
             }
             if (dryRun) {
@@ -646,7 +896,8 @@ final class PlannerRoutes {
                 out.addProperty("partsTotal", split.parts.size());
                 out.add("remaining", ints(split.remaining()));
                 out.add("again", ints(split.again(orders)));
-                addShortfalls(out, rows);
+                addShortfalls(out, rows, cv);
+                if (cv != null) out.add("craft", craft.statusJson(cv.status(), cv.crafted() != null && cv.crafted().truncated()));
                 Http.json(ex, 200, out);
                 return;
             }
@@ -689,7 +940,7 @@ final class PlannerRoutes {
             audit.add(who, "planner.order", p.fileName + ": part " + part + "/" + split.parts.size() + " as " + order.id
                 + (before != null ? " (again, was " + before + ")" : "") + " (" + server + " / " + stash + ")", AuthRoutes.address(ex));
             JsonObject out = Http.ok();
-            out.add("order", order.toJson());
+            out.add("order", OrderRoutes.shown(ex, order.toJson()));
             out.addProperty("part", part);
             out.addProperty("partsTotal", split.parts.size());
             out.add("remaining", ints(split.remaining()));
@@ -742,6 +993,8 @@ final class PlannerRoutes {
         IndexStore.OrderCounts counts = server == null ? null : index.orderCounts(server, stash);
         List<Row> rows = rows(p, opt, counts, server == null ? Map.of() : orders.reservedFor(server, stash),
             server == null ? Map.of() : index.tabOrder(server, stash));
+        CraftView cv = craftView(p, server, stash, opt, rows, counts);
+        Crafted crafted = cv == null ? null : cv.crafted();
         if (server == null) {
             o.add("stash", null);
         } else {
@@ -754,7 +1007,7 @@ final class PlannerRoutes {
         }
         JsonArray items = new JsonArray();
         String stashMc = server == null ? null : index.mcVersion(server, stash);
-        long need = 0, have = 0, missing = 0, want = 0;
+        long need = 0, have = 0, missing = 0, want = 0, craftable = 0, craftKinds = 0, missingAfterCraft = 0;
         for (Row r : rows) {
             JsonObject ro = new JsonObject();
             ro.addProperty("id", r.id);
@@ -779,8 +1032,23 @@ final class PlannerRoutes {
             ro.addProperty("maxStack", r.maxStack);
             ro.addProperty("variants", r.variants);
             ro.addProperty("excluded", r.excluded);
+            CraftPlanner.RowResult rr = crafted == null ? null : crafted.byId().get(r.id);
+            long rowCraftable = rr == null ? 0 : rr.craftable();
+            long rowMissingAfter = Math.max(0, r.need - r.available - rowCraftable);
+            if (rr != null) {
+                ro.addProperty("craftable", rowCraftable);
+                ro.addProperty("missingAfterCraft", rowMissingAfter);
+                ro.addProperty("craftStatus", rr.status());
+                ro.addProperty("craftReason", rr.reason());
+                ro.add("craftUses", CraftService.countsJson(rr.uses().size() > 32 ? rr.uses().subList(0, 32) : rr.uses()));
+                ro.add("craftSteps", CraftService.stepsJson(rr.steps().size() > 16 ? rr.steps().subList(0, 16) : rr.steps(), false));
+                ro.add("craftLeftovers", CraftService.countsJson(rr.leftovers()));
+            }
             items.add(ro);
             if (r.excluded) continue;
+            craftable = sat(craftable, rowCraftable);
+            if (rowCraftable > 0) craftKinds++;
+            missingAfterCraft = sat(missingAfterCraft, rowMissingAfter);
             need = sat(need, r.need);
             have = sat(have, Math.min(r.need, r.available));
             missing = sat(missing, r.missing);
@@ -792,13 +1060,21 @@ final class PlannerRoutes {
         totals.addProperty("available", have);
         totals.addProperty("missing", missing);
         totals.addProperty("want", want);
+        if (crafted != null) {
+            totals.addProperty("craftable", craftable);
+            totals.addProperty("craftKinds", craftKinds);
+            totals.addProperty("missingAfterCraft", missingAfterCraft);
+            totals.addProperty("craftFills", crafted.plan().fills());
+            totals.addProperty("wantWithCraft", sat(want, craftable)); // want (item lines) plus the craft lines
+        }
+        o.add("craft", cv == null ? com.google.gson.JsonNull.INSTANCE : craft.statusJson(cv.status(), crafted != null && crafted.truncated()));
         Split frozen;
         synchronized (p) {
             frozen = server != null && p.split != null && !p.split.placed.isEmpty() && p.split.key.equals(opt.key(server, stash)) ? p.split : null;
         }
         if (frozen != null || counts != null) {
             // Once a part is placed, the confirmed split (what "Order next part" works through), else a fresh one.
-            List<Part> parts = frozen != null ? frozen.parts : split(wantLines(rows), counts);
+            List<Part> parts = frozen != null ? frozen.parts : parts(cv, rows, counts);
             long lines = 0;
             for (Part part : parts) lines += part.lines.size();
             if (frozen != null) {
@@ -850,6 +1126,7 @@ final class PlannerRoutes {
         opts.addProperty("fluids", opt.fluids());
         opts.addProperty("containerItems", opt.containerItems());
         opts.addProperty("round", opt.round());
+        opts.addProperty("craft", opt.craft());
         return opts;
     }
 
@@ -886,10 +1163,12 @@ final class PlannerRoutes {
         o.addProperty("slots", p.slots);
         o.addProperty("items", p.items());
         o.addProperty("order", orderId);
+        o.add("craft", p.craft == null ? com.google.gson.JsonNull.INSTANCE : p.craft.deepCopy()); // never share the cached object
         return o;
     }
 
-    private static void addShortfalls(JsonObject out, List<Row> rows) {
+    private static void addShortfalls(JsonObject out, List<Row> rows, CraftView cv) {
+        Map<String, CraftPlanner.RowResult> byId = cv == null || cv.crafted() == null ? Map.of() : cv.crafted().byId();
         JsonArray notAvailable = new JsonArray();
         JsonArray missing = new JsonArray();
         for (Row r : rows) {
@@ -904,6 +1183,8 @@ final class PlannerRoutes {
                 JsonObject e = new JsonObject();
                 e.addProperty("id", r.id);
                 e.addProperty("missing", r.missing);
+                CraftPlanner.RowResult rr = byId.get(r.id);
+                if (rr != null) e.addProperty("missingAfterCraft", Math.max(0, r.need - r.available - rr.craftable()));
                 missing.add(e);
             }
         }

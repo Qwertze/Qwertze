@@ -20,6 +20,8 @@ import java.util.function.LongSupplier;
  */
 final class KitRoutes {
     static final int MAX_POST = 4096;
+    /** A template body: 27 slots with keys. */
+    static final int MAX_TEMPLATE_POST = 16 * 1024;
     static final int WRITES_PER_MINUTE = 60;
     private static final long WINDOW_MS = 60_000;
 
@@ -50,7 +52,14 @@ final class KitRoutes {
             .exact(Router.POST, "/api/v1/kits/chest", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::chest)
             .exact(Router.POST, "/api/v1/kits/rule", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::rule)
             .exact(Router.POST, "/api/v1/kits/rule/delete", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::deleteRule)
-            .exact(Router.POST, "/api/v1/kits/scoring", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::scoring);
+            .exact(Router.POST, "/api/v1/kits/scoring", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::scoring)
+            .exact(Router.POST, "/api/v1/kits/typeChest", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::typeChest)
+            .exact(Router.POST, "/api/v1/kits/treatAs", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::treatAs)
+            .exact(Router.GET, "/api/v1/kits/templates", Router.Guard.SESSION, Router.Perm.VIEW, this::templates)
+            .exact(Router.POST, "/api/v1/kits/template", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::template)
+            .exact(Router.POST, "/api/v1/kits/template/delete", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::deleteTemplate)
+            .exact(Router.POST, "/api/v1/kits/category", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::category)
+            .exact(Router.POST, "/api/v1/kits/category/delete", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::deleteCategory);
     }
 
     // ---------- the bot ----------
@@ -77,7 +86,7 @@ final class KitRoutes {
         }
         KitReports.Report r;
         try {
-            r = reports.parse(o);
+            r = reports.parse(o, customCategories(server, stash));
         } catch (IllegalArgumentException e) {
             Http.error(ex, 400, e.getMessage());
             return;
@@ -96,6 +105,15 @@ final class KitRoutes {
         Http.json(ex, 200, Http.ok());
     }
 
+    /** The stash's custom category ids (a report may name them as a type); none when the settings can't be read. */
+    private java.util.Set<String> customCategories(String server, String stash) {
+        try {
+            return java.util.Set.copyOf(store.get(server, stash).types().categories().keySet());
+        } catch (KitStore.DisabledException e) {
+            return java.util.Set.of();
+        }
+    }
+
     // ---------- the website ----------
 
     /** A forced streamer user is refused (403 streamer). True when the request may go on. */
@@ -106,7 +124,11 @@ final class KitRoutes {
     }
 
     private static JsonObject body(HttpExchange ex) throws IOException {
-        JsonElement json = AddonRoutes.readJson(ex, MAX_POST); // 413 above 4 KiB
+        return body(ex, MAX_POST);
+    }
+
+    private static JsonObject body(HttpExchange ex, int max) throws IOException {
+        JsonElement json = AddonRoutes.readJson(ex, max); // 413 above the limit
         if (json == null || !json.isJsonObject()) {
             Http.error(ex, 400, "body must be a JSON object");
             return null;
@@ -144,13 +166,17 @@ final class KitRoutes {
     }
 
     private Write begin(HttpExchange ex) throws IOException {
+        return begin(ex, MAX_POST);
+    }
+
+    private Write begin(HttpExchange ex, int maxBody) throws IOException {
         if (!notForced(ex)) return null;
         Users.Principal who = Router.user(ex);
         if (!who.perms().view()) {
             Router.forbid(ex, "view stashes", "view");
             return null;
         }
-        JsonObject o = body(ex);
+        JsonObject o = body(ex, maxBody);
         if (o == null) return null;
         String server = AddonRoutes.string(o, "server");
         String stash = AddonRoutes.string(o, "stash");
@@ -340,5 +366,225 @@ final class KitRoutes {
         }
         audit.add(Router.user(ex), "kits.rule.delete", w.stash() + ": " + key + " -> " + removed.previous(), AuthRoutes.address(ex));
         respond(ex, w.server(), w.stash());
+    }
+
+    // ---------- v2: type chests, overrides, templates, categories ----------
+
+    private static final String DAMAGED = "kit settings can't be read (the server's kits.json is damaged)";
+
+    /** Answers a change that failed: false when it was none of the known refusals (the caller rethrows). */
+    private static void refused(HttpExchange ex, RuntimeException e) throws IOException {
+        if (e instanceof KitStore.LimitException) Http.error(ex, 400, e.getMessage());
+        else if (e instanceof KitStore.RefusedException r) Http.error(ex, r.status, r.getMessage());
+        else if (e instanceof KitStore.DisabledException) Http.error(ex, 503, DAMAGED);
+        else if (e instanceof IllegalArgumentException) Http.error(ex, 400, e.getMessage());
+        else throw e;
+    }
+
+    private void typeChest(HttpExchange ex) throws IOException {
+        Write w = begin(ex);
+        if (w == null) return;
+        String type = AddonRoutes.string(w.body(), "type");
+        if (type == null || type.isEmpty() || type.length() > 40) {
+            Http.error(ex, 400, "type must be a kit type or a category id");
+            return;
+        }
+        String id;
+        try {
+            id = container(w.body(), true);
+        } catch (IllegalArgumentException e) {
+            Http.error(ex, 400, e.getMessage());
+            return;
+        }
+        if (id != null && !pickable(ex, w.server(), w.stash(), id)) return;
+        try {
+            store.setTypeChest(w.server(), w.stash(), type, id);
+        } catch (RuntimeException e) {
+            refused(ex, e);
+            return;
+        }
+        audit.add(Router.user(ex), "kits.typeChest", w.stash() + ": " + type + " -> " + (id == null ? "(none)" : id), AuthRoutes.address(ex));
+        respond(ex, w.server(), w.stash());
+    }
+
+    private void treatAs(HttpExchange ex) throws IOException {
+        Write w = begin(ex);
+        if (w == null) return;
+        String key = AddonRoutes.string(w.body(), "key");
+        if (!KitNames.validKey(key)) {
+            Http.error(ex, 400, "key must be a normalised kit name (as the bot reports it), at most " + KitNames.MAX_KEY + " characters");
+            return;
+        }
+        String type = null;
+        JsonElement te = w.body().get("type");
+        if (te != null && !te.isJsonNull()) {
+            type = AddonRoutes.string(w.body(), "type");
+            if (type == null || type.isEmpty() || type.length() > 40) {
+                Http.error(ex, 400, "type must be a kit type, a category id, \"none\" or null");
+                return;
+            }
+        }
+        try {
+            store.setTreatAs(w.server(), w.stash(), key, type);
+        } catch (RuntimeException e) {
+            refused(ex, e);
+            return;
+        }
+        audit.add(Router.user(ex), "kits.treatAs", w.stash() + ": " + key + " -> " + (type == null ? "(auto)" : type), AuthRoutes.address(ex));
+        respond(ex, w.server(), w.stash());
+    }
+
+    /** GET /api/v1/kits/templates: for a forced streamer every container id is "hidden"; everything else as for anyone. */
+    private void templates(HttpExchange ex) throws IOException {
+        Map<String, String> q = Http.query(ex);
+        String server = q.get("server");
+        String stash = q.get("stash");
+        if (server == null || server.isEmpty() || stash == null || stash.isEmpty()) {
+            Http.error(ex, 400, "server and stash are required");
+            return;
+        }
+        server = OrderRoutes.scoped(ex, server, stash);
+        if (server == null) return;
+        respondTemplates(ex, server, stash, null);
+    }
+
+    private void respondTemplates(HttpExchange ex, String server, String stash, String id) throws IOException {
+        KitStore.Settings s;
+        try {
+            s = store.get(server, stash);
+        } catch (KitStore.DisabledException e) {
+            Http.error(ex, 503, DAMAGED);
+            return;
+        }
+        JsonObject body = KitView.templates(server, stash, s, reports.get(server, stash), reports.beat(server, stash), index.orderCounts(server, stash));
+        if (id != null) body.addProperty("id", id);
+        if (Redact.on(ex)) KitView.hideContainers(body);
+        Http.json(ex, 200, body);
+    }
+
+    private void template(HttpExchange ex) throws IOException {
+        Write w = begin(ex, MAX_TEMPLATE_POST);
+        if (w == null) return;
+        JsonElement te = w.body().get("template");
+        if (te == null || !te.isJsonObject()) {
+            Http.error(ex, 400, "template must be an object");
+            return;
+        }
+        JsonObject t = te.getAsJsonObject();
+        String id = null;
+        if (t.has("id") && !t.get("id").isJsonNull()) {
+            id = AddonRoutes.string(t, "id");
+            if (id == null || !KitTemplate.ID.matcher(id).matches()) {
+                Http.error(ex, 400, "id looks like t-3f2a9c1d");
+                return;
+            }
+        }
+        IndexStore.OrderCounts counts = index.orderCounts(w.server(), w.stash());
+        KitTemplate.Items items = new KitTemplate.Items() {
+            @Override
+            public String matchOf(String key) {
+                return counts == null ? null : counts.matchOf(key);
+            }
+
+            @Override
+            public int maxStack(String key) {
+                if (counts == null) return 0;
+                if (counts.items().containsKey(key)) return counts.maxStack(key);
+                if (key.endsWith("#*")) {
+                    // Any variant: the stack size of the item (its plain key, else any variant of it).
+                    String base = key.substring(0, key.length() - 2);
+                    if (counts.items().containsKey(base)) return counts.maxStack(base);
+                    for (String k : counts.items().keySet()) if (IndexStore.OrderCounts.baseOf(k).equals(base)) return counts.maxStack(k);
+                }
+                try {
+                    return Math.max(1, com.porter.stashmanager.planner.BlockItems.latest().maxStack(IndexStore.OrderCounts.baseOf(key)));
+                } catch (RuntimeException e) {
+                    return 0;
+                }
+            }
+        };
+        String chest = null;
+        if (t.has("chest") && !t.get("chest").isJsonNull()) {
+            chest = AddonRoutes.string(t, "chest");
+            if (chest == null || !KitNames.validId(chest)) {
+                Http.error(ex, 400, "chest must be an id like \"120,64,-33\" or null");
+                return;
+            }
+            if (!pickable(ex, w.server(), w.stash(), chest)) return;
+        }
+        String[] used = new String[1];
+        try {
+            store.putTemplate(w.server(), w.stash(), id, useId -> KitTemplate.parse(t, useId, items), used);
+        } catch (RuntimeException e) {
+            refused(ex, e);
+            return;
+        }
+        audit.add(Router.user(ex), "kits.template", w.stash() + ": " + used[0] + (id == null ? " (new)" : ""), AuthRoutes.address(ex));
+        respondTemplates(ex, w.server(), w.stash(), used[0]);
+    }
+
+    private void deleteTemplate(HttpExchange ex) throws IOException {
+        Write w = begin(ex);
+        if (w == null) return;
+        String id = AddonRoutes.string(w.body(), "id");
+        if (id == null || !KitTemplate.ID.matcher(id).matches()) {
+            Http.error(ex, 400, "id looks like t-3f2a9c1d");
+            return;
+        }
+        try {
+            store.deleteTemplate(w.server(), w.stash(), id);
+        } catch (RuntimeException e) {
+            refused(ex, e);
+            return;
+        }
+        audit.add(Router.user(ex), "kits.template.delete", w.stash() + ": " + id, AuthRoutes.address(ex));
+        respondTemplates(ex, w.server(), w.stash(), id);
+    }
+
+    private void category(HttpExchange ex) throws IOException {
+        Write w = begin(ex);
+        if (w == null) return;
+        String id = null;
+        if (w.body().has("id") && !w.body().get("id").isJsonNull()) {
+            id = AddonRoutes.string(w.body(), "id");
+            if (id == null || !KitTemplate.CATEGORY.matcher(id).matches()) {
+                Http.error(ex, 400, "id looks like c:shop");
+                return;
+            }
+        }
+        String name;
+        try {
+            name = KitTemplate.checkName(AddonRoutes.string(w.body(), "name"), KitTemplate.MAX_CATEGORY_NAME, "name");
+        } catch (IllegalArgumentException e) {
+            Http.error(ex, 400, e.getMessage());
+            return;
+        }
+        String[] used = new String[1];
+        try {
+            store.putCategory(w.server(), w.stash(), id, name, used);
+        } catch (RuntimeException e) {
+            refused(ex, e);
+            return;
+        }
+        audit.add(Router.user(ex), "kits.category", w.stash() + ": " + (used[0] == null ? id : used[0]), AuthRoutes.address(ex));
+        respondTemplates(ex, w.server(), w.stash(), used[0] == null ? id : used[0]);
+    }
+
+    private void deleteCategory(HttpExchange ex) throws IOException {
+        Write w = begin(ex);
+        if (w == null) return;
+        String id = AddonRoutes.string(w.body(), "id");
+        if (id == null || !KitTemplate.CATEGORY.matcher(id).matches()) {
+            Http.error(ex, 400, "id looks like c:shop");
+            return;
+        }
+        try {
+            store.deleteCategory(w.server(), w.stash(), id);
+        } catch (RuntimeException e) {
+            refused(ex, e);
+            return;
+        }
+        audit.add(Router.user(ex), "kits.category.delete", w.stash() + ": " + id, AuthRoutes.address(ex));
+        respondTemplates(ex, w.server(), w.stash(), id);
     }
 }

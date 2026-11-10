@@ -72,6 +72,7 @@ public final class StashManagerServer {
             if (info == null && UiIcons.NAMES.containsKey(id)) info = new IndexStore.IconInfo(UiIcons.NAMES.get(id), store.anyMcVersion());
             return info;
         };
+        RecipePacks recipePacks = new RecipePacks(dataDir);
         IconService icons = new IconService(dataDir, known, store::hasMcVersion, game, wikiOn);
         System.out.println("  Icon source: " + config.iconSource + (config.minecraftJar != null ? " (minecraftJar=" + config.minecraftJar + ")" : ""));
         LinkState link = new LinkState(config.keyState().generation());
@@ -97,7 +98,8 @@ public final class StashManagerServer {
         if (!config.trustedProxies.isEmpty()) System.out.println("  Trusted proxies (client address from X-Forwarded-For): " + String.join(", ", config.trustedProxies));
         Auth.dummyHash(); // so the first login for an unknown name isn't slower than the rest
         BotHub hub = new BotHub();
-        Routes built = routes(config, store, orders, owners, icons, link, urls, sessions, users, audit, hub, new LoginLimiter());
+        Routes built = routes(config, store, orders, owners, icons, link, urls, sessions, users, audit, hub, new LoginLimiter(), new PlanStore(),
+            null, recipePacks);
         Router router = built.router();
         AuthRoutes authRoutes = built.auth();
         if (!users.list().isEmpty()) System.out.println("  Website users: the owner and " + users.list().size() + " sub-user(s).");
@@ -115,15 +117,25 @@ public final class StashManagerServer {
         // Up to 8 bot long-polls and up to 8 live viewer streams (ViewerHub.MAX_STREAMS) hold a thread each.
         ExecutorService pool = Executors.newFixedThreadPool(32, daemonThreads());
         server.setExecutor(pool);
-        if (gameOn) {
-            // Only now that the port is ours: the constructor sweeps leftovers, which must not hit a live instance's build.
-            IconPacks packs = new IconPacks(dataDir, config.minecraftJar, config.iconDownload ? new ClientJarFetcher() : null, GameIcons.SIZE,
+        // Only now that the port is ours: the constructor sweeps leftovers, which must not hit a live instance's build.
+        // One pass per version builds the icon set (when the game is an icon source) and the recipe set from one jar.
+        final IconPacks packs;
+        {
+            ClientJarFetcher fetcher = config.iconDownload || config.recipeDownload ? new ClientJarFetcher() : null;
+            packs = new IconPacks(dataDir, config.minecraftJar, config.iconDownload ? fetcher : null, GameIcons.SIZE,
                 30_000, 120_000);
-            game.attachPacks(packs);
-            store.setPackItems(packs::knownItems);
-            System.out.println("  Icon download: " + (config.iconDownload
-                ? "on (if no client jar is found, the official one is fetched once from piston-meta.mojang.com / piston-data.mojang.com)"
-                : "off (iconDownload=false)"));
+            packs.iconsEnabled(gameOn);
+            packs.attachRecipes(recipePacks, config.recipeDownload ? fetcher : null);
+            if (gameOn) {
+                game.attachPacks(packs);
+                store.setPackItems(packs::knownItems);
+                System.out.println("  Icon download: " + (config.iconDownload
+                    ? "on (if no client jar is found, the official one is fetched once from piston-meta.mojang.com / piston-data.mojang.com)"
+                    : "off (iconDownload=false)"));
+            }
+            System.out.println("  Recipe download: " + (config.recipeDownload
+                ? "on (crafting recipes come from the same client jar as the icons; fetched once if none is found)"
+                : "off (recipeDownload=false)"));
         }
         server.createContext("/", router);
         server.start();
@@ -131,7 +143,10 @@ public final class StashManagerServer {
         // Only once the port is ours: clean up the old icon cache, then queue every missing icon.
         int migrated = icons.migrateCache();
         if (migrated > 0) System.out.println("Icon cache: removed " + migrated + " stale file(s); they will be fetched again.");
-        for (String v : store.mcVersions()) game.requestPack(v); // background: check the disk set, download+render once if missing
+        for (String v : store.mcVersions()) {
+            recipePacks.request(v); // background: one pass per version for the icon set and the recipe set
+            game.requestPack(v);
+        }
         icons.prefetch(store.allIconIds());
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -139,6 +154,7 @@ public final class StashManagerServer {
             built.viewer().close();
             server.stop(1);
             icons.close();
+            packs.close();
             pool.shutdown();
             try {
                 pool.awaitTermination(3, TimeUnit.SECONDS);
@@ -150,10 +166,7 @@ public final class StashManagerServer {
         System.out.println("  Data directory: " + dataDir);
         System.out.println("  Loaded " + store.size() + " stash index(es).");
         for (String url : urls) System.out.println("  Open: " + url);
-        System.out.println("  Link the addon from the website's \"Link addon\" button, or paste this API key");
-        System.out.println("  into the stash-manager module's api-key setting:");
-        System.out.println("    " + config.apiKey());
-        if (config.generatedKey) System.out.println("  (new key generated and saved in config.properties)");
+        printKeyNotice(System.out, config.generatedKey, config.apiKey());
         if (config.allowRemote) System.out.println("  WARNING: allowRemote=true, non-LAN addresses are not blocked.");
         if (config.allowBearer) {
             System.out.println("  WARNING: allowBearer=true: the API key is sent in clear text by old bots (Bearer). Update every bot, then set allowBearer=false.");
@@ -166,7 +179,21 @@ public final class StashManagerServer {
         }
     }
 
-    record Routes(Router router, AuthRoutes auth, PlanStore plans, ViewerHub viewer, DeliveryContents delivery) {
+    /**
+     * What the start-up output says about the bots' API key. The key itself is printed only on the run that generated it (the
+     * output of a service ends up in a journal that more people can read than the data folder); every other start only says
+     * that a key is set. The key stays in config.properties and in the website's Link addon panel.
+     */
+    static void printKeyNotice(java.io.PrintStream out, boolean generated, String apiKey) {
+        if (generated) {
+            out.println("  API key (first setup: copy it now; it won't be shown again): " + apiKey);
+            out.println("  It is saved in config.properties; the website's \"Link addon\" button links a bot without typing it.");
+        } else {
+            out.println("  API key: set (use the website's \"Link addon\" button to link a bot)");
+        }
+    }
+
+    record Routes(Router router, AuthRoutes auth, PlanStore plans, ViewerHub viewer, DeliveryContents delivery, CraftService craft) {
     }
 
     /** Every route, in order (the static files last). Shared with the tests, so they check the real registrations. */
@@ -183,10 +210,41 @@ public final class StashManagerServer {
             new ViewerHub(hub, audit));
     }
 
+    /** The same, with the recipe source of the crafting features (tests give it a fake; null viewer = a new one). */
+    static Routes routes(Config config, IndexStore store, OrderStore orders, Owners owners, IconService icons, LinkState link,
+                         List<String> urls, SessionStore sessions, Users users, AuditLog audit, BotHub hub, LoginLimiter limiter,
+                         PlanStore plans, ViewerHub viewer, RecipeSource recipes) {
+        return routes(config, store, orders, owners, icons, link, urls, sessions, users, audit, hub, limiter, plans,
+            viewer == null ? new ViewerHub(hub, audit) : viewer, recipes, null);
+    }
+
     /** The same, with the live viewer's hub (tests give it short rotate and heartbeat times). */
     static Routes routes(Config config, IndexStore store, OrderStore orders, Owners owners, IconService icons, LinkState link,
                          List<String> urls, SessionStore sessions, Users users, AuditLog audit, BotHub hub, LoginLimiter limiter,
                          PlanStore plans, ViewerHub viewer) {
+        return routes(config, store, orders, owners, icons, link, urls, sessions, users, audit, hub, limiter, plans, viewer,
+            RecipeSource.NONE, null);
+    }
+
+    /** The same with the crafting parts: the recipe source, and the craft settings folder (null: the data folder). */
+    static Routes routes(Config config, IndexStore store, OrderStore orders, Owners owners, IconService icons, LinkState link,
+                         List<String> urls, SessionStore sessions, Users users, AuditLog audit, BotHub hub, LoginLimiter limiter,
+                         PlanStore plans, ViewerHub viewer, RecipeSource recipes, CraftBots bots) {
+        return routes(config, store, orders, owners, icons, link, urls, sessions, users, audit, hub, limiter, plans, viewer, recipes, bots, null);
+    }
+
+    /** The same with the area reports (tests give it their own clock). */
+    static Routes routes(Config config, IndexStore store, OrderStore orders, Owners owners, IconService icons, LinkState link,
+                         List<String> urls, SessionStore sessions, Users users, AuditLog audit, BotHub hub, LoginLimiter limiter,
+                         PlanStore plans, ViewerHub viewer, RecipeSource recipes, CraftBots bots, AreaBots areaBotsIn) {
+        return routes(config, store, orders, owners, icons, link, urls, sessions, users, audit, hub, limiter, plans, viewer, recipes, bots,
+            areaBotsIn, null);
+    }
+
+    /** The same with the kit reports (tests give them their own clock; null: a new one). */
+    static Routes routes(Config config, IndexStore store, OrderStore orders, Owners owners, IconService icons, LinkState link,
+                         List<String> urls, SessionStore sessions, Users users, AuditLog audit, BotHub hub, LoginLimiter limiter,
+                         PlanStore plans, ViewerHub viewer, RecipeSource recipes, CraftBots bots, AreaBots areaBotsIn, KitReports kitReportsIn) {
         // A user's plans end with their last session, whatever ended it (logout, expiry, a reset).
         plans.sessionCheck(id -> sessions.countByUser().getOrDefault(id, 0) > 0);
         Router router = new Router(new AccessControl(config), sessions, config, users);
@@ -199,20 +257,57 @@ public final class StashManagerServer {
         DeliveryContents delivery = new DeliveryContents(); // in memory only
         KitStore kits = new KitStore(config.dataDir());
         kits.load();
-        KitReports kitReports = new KitReports(); // in memory only
-        new AddonRoutes(store, link, icons, orders, owners, delivery, kits, kitReports).register(router);
-        new BrowserRoutes(store, config, link, urls, orders, owners, sessions, audit, delivery, kits, kitReports).register(router);
+        KitReports kitReports = kitReportsIn != null ? kitReportsIn : new KitReports(); // in memory only
+        CraftStore craftStore = new CraftStore(config.dataDir());
+        craftStore.load();
+        CraftService craft = new CraftService(craftStore, bots == null ? new CraftBots() : bots, recipes, store);
+        AreaStore areaStore = new AreaStore(config.dataDir());
+        areaStore.load();
+        AreaBots areaBots = areaBotsIn != null ? areaBotsIn : new AreaBots();
+        craft.areas(areaStore);
+        orders.craft(craft);
+        craft.kits(kits);
+        orders.kits(new KitOrders(kits, kitReports));
+        Redact.kitNumbers = (srv, st, id) -> {
+            try {
+                return new java.util.ArrayList<>(kits.get(srv, st).types().templates().keySet()).indexOf(id) + 1;
+            } catch (RuntimeException e) {
+                return 0;
+            }
+        };
+        store.onForget((srv, stashName) -> {
+            try {
+                craftStore.forget(srv, stashName);
+            } catch (IOException e) {
+                System.err.println("Could not drop the craft settings of a forgotten stash: " + e.getMessage());
+            }
+            craft.bots().forget(srv, stashName);
+            try {
+                areaStore.forget(srv, stashName);
+            } catch (IOException e) {
+                System.err.println("Could not drop the area of a forgotten stash: " + e.getMessage());
+            }
+            areaBots.forget(srv, stashName);
+        });
+        AreaGuard areaGuard = new AreaGuard(areaStore, store, kitReports);
+        AreaRoutes areaRoutes = new AreaRoutes(areaStore, areaBots, store, audit, areaGuard, kitReports, sessions);
+        new AddonRoutes(store, link, icons, orders, owners, delivery, kits, kitReports, craft, areaStore, areaBots, audit, areaGuard).register(router);
+        BrowserRoutes browserRoutes = new BrowserRoutes(store, config, link, urls, orders, owners, sessions, audit, delivery, kits, kitReports, craft);
+        browserRoutes.areas(areaRoutes);
+        browserRoutes.register(router);
+        areaRoutes.register(router);
+        new CraftRoutes(craft, orders, audit, store).register(router);
         new KitRoutes(kits, kitReports, owners, audit, store).register(router);
         new DeliveryRoutes(delivery, owners).register(router);
         new OrderRoutes(orders, owners, audit).register(router);
         new BotRoutes(hub).register(router);
         new DashboardRoutes(hub, store, owners, sessions, audit).register(router);
         new UserRoutes(users, sessions, audit, plans).register(router);
-        new PlannerRoutes(store, orders, plans, audit).register(router);
+        new PlannerRoutes(store, orders, plans, audit, craft).register(router);
         new ViewerRoutes(viewer).register(router);
         new IconRoutes(icons).register(router);
         new StaticRoutes().register(router); // last: the catch-all
-        return new Routes(router, authRoutes, plans, viewer, delivery);
+        return new Routes(router, authRoutes, plans, viewer, delivery, craft);
     }
 
     private static void setDefault(String key, String value) {

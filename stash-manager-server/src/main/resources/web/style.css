@@ -626,13 +626,26 @@ html[data-theme="classic"] .auth-screen {
 .kits-sc-field { display: flex; flex-direction: column; gap: 2px; font-size: 13px; color: var(--text); }
 .kits-sc-field .mc-input { width: 5.5em; flex: 0 0 auto; }
 .kit-score { color: var(--muted); font-size: 12px; font-weight: 400; }
-.kits-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.kits-table th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px 8px; white-space: nowrap; }
-.kits-table td { padding: 4px 8px; border-top: 1px solid var(--border); vertical-align: middle; overflow-wrap: anywhere; }
 .kit-count { text-align: right; width: 4em; }
 .kit-name { font-weight: 700; }
 .kit-assign { width: 100%; min-width: 12em; }
 .kit-pill { white-space: nowrap; }
+.kits-note.ok { background: var(--ok-bg); color: var(--ok-fg); }
+.kits-note .mc-button { margin-left: 8px; }
+.craft-set, .area-set { display: flex; flex-direction: column; gap: 8px; }
+.area-set .kits-sc-field .mc-input[readonly] { opacity: 0.8; }
+.v-area { position: absolute; left: 8px; bottom: 8px; z-index: 3; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 4px 8px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius, 4px); font-size: 13px; }
+.v-area[hidden] { display: none; }
+.craft-seen { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.craft-seen[hidden] { display: none; }
+.craft-seen-list { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.craft-never { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); padding-top: 8px; }
+.craft-never .kits-chest-row .mc-input { flex: 1 1 260px; min-width: 0; }
+.craft-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.craft-chip { display: inline-flex; align-items: center; gap: 4px; padding: 1px 4px 1px 8px; font-size: 13px; color: var(--text); background: var(--chip-bg); border-radius: var(--pill); }
+.craft-chip button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; padding: 0 4px; border-radius: var(--pill); }
+.craft-chip button:hover:not(:disabled), .craft-chip button:focus-visible { background: var(--danger-bg); color: var(--danger-fg); }
+.craft-chip button:disabled { cursor: default; opacity: 0.5; }
 .status-chip.warn { background: var(--warn-bg); color: var(--warn-fg); }
 .order-list, .bot-strip { grid-column: 1 / -1; }
 
@@ -1878,7 +1891,7 @@ html.streamer .sv-hidden { display: inline; color: var(--muted); font-style: ita
   .toast { bottom: calc(var(--bnav-h) + env(safe-area-inset-bottom) + 12px); }
 
   /* Pages scroll with the document (no inner scroll areas). */
-  .inventory, .dash-page, .grid-wrap, .view-orders, .view-kits, .proxy-page, .proxy-side, .proxy-body { overflow: visible; }
+  .inventory, .dash-page, .grid-wrap, .view-orders, .view-kits, .view-kb, .proxy-page, .proxy-side, .proxy-body { overflow: visible; }
   .inventory, .dash-page, .grid-wrap { flex: none; min-height: 0; }
   .proxy-cols { flex: none; }
   .console-log { flex: none; height: 55vh; min-height: 240px; }
@@ -2620,3 +2633,144 @@ html[data-theme="mac"] .conn-online::before {
   background: var(--mac-green);
   vertical-align: 1px;
 }
+
+/* ---------- crafting from the stash (Build Planner, Orders) ---------- */
+
+.pl-craft-banner { display: flex; flex-direction: column; gap: 4px; }
+.pl-craft-banner[hidden] { display: none; }
+.pl-craft-row[hidden], #pl-craft-row[hidden] { display: none; }
+.pl-table th.pl-c-craft[hidden] { display: none; }
+.pl-craftable { color: var(--text); cursor: help; }
+.pl-craft-covered { color: var(--muted); font-style: italic; font-weight: 400; }
+.pl-craft-plus { display: block; color: var(--muted); font-size: 11px; font-weight: 400; }
+.pl-missing .pl-craft-plus { color: inherit; }
+.pl-excluded .pl-craft-plus { color: var(--muted); }
+.pl-tile.craft { border-color: var(--ok-fg); }
+.pl-tile.craft .pl-tile-value { color: var(--ok-fg); }
+.order-craft { color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
+.order-craft-short { background: var(--warn-bg); color: var(--warn-fg); border-radius: var(--radius); padding: 1px 6px; }
+.order-craft-details { color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
+.order-craft-details summary { cursor: pointer; }
+
+/* ---------- kits v2: chests, groups, rows; the Kit Builder ---------- */
+
+.view-kb { overflow-y: auto; align-content: start; }
+.view-kb[hidden] { display: none; }
+.kits-adv > summary { cursor: pointer; }
+.kits-adv[hidden] { display: none; }
+.kits-lines, .kits-groups { display: flex; flex-direction: column; gap: 8px; }
+.kits-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  padding: 4px 0;
+  border-top: 1px solid var(--border);
+}
+.kits-line:first-child { border-top: none; }
+.kits-line-head { display: flex; align-items: center; gap: 8px; flex: 1 1 220px; min-width: 0; }
+.kits-line-head .icon { image-rendering: pixelated; flex: 0 0 auto; }
+.kits-line-text { min-width: 0; }
+.kits-line-name { font-weight: 700; color: var(--text); }
+.kits-line-ctl { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; flex: 2 1 340px; min-width: 0; }
+.kits-line-ctl .mc-select { flex: 1 1 220px; min-width: 0; }
+.kits-line-count { color: var(--muted); font-size: 13px; white-space: nowrap; }
+.kits-group { display: flex; flex-direction: column; gap: 6px; }
+.kits-group-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  padding: 2px 6px;
+  font-weight: 700;
+  color: var(--text);
+  background: var(--chip-bg);
+  border-radius: var(--radius);
+}
+.kits-group-chest { font-weight: 400; font-size: 13px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+.kit-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-size: 13px;
+  color: var(--text);
+  min-width: 0;
+}
+.kit-row-top { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.kit-row-top .kit-name { font-size: 14px; overflow-wrap: anywhere; }
+.kit-count-badge { color: var(--muted); }
+.kit-why { color: var(--text); overflow-wrap: anywhere; }
+.kit-where, .kit-goes { color: var(--muted); overflow-wrap: anywhere; }
+.kit-fallback { color: var(--warn-fg); background: var(--warn-bg); border-radius: var(--radius); padding: 0 6px; display: inline-block; }
+.kit-row-ctl { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 6px 14px; margin-top: 2px; }
+.kit-row-ctl .kits-sc-field { flex: 1 1 200px; min-width: 0; }
+.kit-row-ctl .kits-sc-field .mc-select { width: 100%; }
+
+.kb-toolbar { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+.kb-card {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border: var(--border-w) solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+}
+.kb-prev {
+  display: grid;
+  grid-template-columns: repeat(9, 26px);
+  grid-auto-rows: 26px;
+  gap: 1px;
+  padding: 2px;
+  background: var(--slot-dark);
+  flex: 0 0 auto;
+}
+.kb-cell { position: relative; display: block; background: var(--slot); width: 26px; height: 26px; }
+.kb-cell .icon { position: absolute; left: 1px; top: 1px; image-rendering: pixelated; }
+.kb-cell-n { position: absolute; right: 0; bottom: -1px; z-index: 2; font-size: 9px; line-height: 1; color: #fff; text-shadow: 1px 1px 0 #3f3f3f; }
+.kb-cell.any::after { content: "*"; position: absolute; left: 1px; top: -2px; z-index: 2; font-size: 12px; font-weight: 700; color: #fff; text-shadow: 1px 1px 0 #3f3f3f; }
+.kb-info { display: flex; flex-direction: column; gap: 3px; flex: 1 1 240px; min-width: 0; }
+.kb-actions { display: flex; flex-direction: column; gap: 6px; flex: 0 0 auto; }
+.kb-act-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.kb-act-row .qty-input { width: 64px; }
+.kb-stock, .kb-restock, .kb-chest { overflow-wrap: anywhere; }
+.kb-restock, .kb-chest { color: var(--muted); }
+
+.kb-fields { align-items: flex-end; }
+.kb-fields .mc-input, .kb-fields .mc-select { width: auto; max-width: 100%; }
+.kb-f-name { flex: 1 1 220px; }
+.kb-f-name .mc-input { width: 100%; }
+.kb-restock-field { display: flex; gap: 6px; align-items: center; }
+.kb-restock-field .qty-input { width: 64px; }
+.kb-cols { display: flex; flex-wrap: wrap; gap: 12px 18px; align-items: flex-start; }
+.kb-left, .kb-right { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.kb-right { flex: 1 1 320px; }
+.kb-grid {
+  display: grid;
+  grid-template-columns: repeat(9, var(--slot-size));
+  grid-auto-rows: var(--slot-size);
+  width: max-content;
+  max-width: 100%;
+}
+.kb-slot { padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer; text-align: left; }
+.kb-slot.selected { outline: 2px solid var(--accent); outline-offset: -2px; z-index: 2; }
+.kb-slot.bad { background: var(--danger-bg); border-color: var(--danger-fg); }
+.kb-slot:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; z-index: 3; }
+.kb-any { display: none; position: absolute; left: 1px; top: -3px; z-index: 4; font-size: 14px; font-weight: 700; color: #fff; text-shadow: 1px 1px 0 #3f3f3f; pointer-events: none; }
+.kb-slot.any .kb-any { display: block; }
+.kb-sel { display: flex; flex-direction: column; gap: 6px; padding: 6px; background: var(--surface); border: var(--border-w) solid var(--border); border-radius: var(--radius); }
+.kb-sel-name { font-weight: 700; color: var(--text); overflow-wrap: anywhere; }
+.kb-any-label { align-self: flex-end; display: inline-flex; align-items: center; gap: 4px; }
+.kb-pick { max-height: 40vh; }
+.kb-pick .slot { padding: 0; font: inherit; cursor: pointer; }
+.kb-checks { margin-top: 2px; }
+.order-kit { color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
+.order-kit-short { background: var(--warn-bg); color: var(--warn-fg); border-radius: var(--radius); padding: 1px 6px; }
+.view-kb [hidden], .kits-groups [hidden] { display: none !important; }

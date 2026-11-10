@@ -53,6 +53,10 @@ final class PlanStore {
         long lastUsed;
         /** The order split the last dry run or order used (see PlannerRoutes), or null. Guarded by the plan. */
         PlannerRoutes.Split split;
+        /** The craft planner's last answer for this plan (see PlannerRoutes.craftView), or null. */
+        volatile PlannerRoutes.CraftCacheEntry craftCache;
+        /** One craft computation per plan at a time (identical requests wait for it and then use its result). */
+        final Object craftLock = new Object();
 
         Plan(String id, String owner, String fileName, String format, int formatVersion, int dataVersion, long size,
              int sizeX, int sizeY, int sizeZ, int regions, long blocks, String tableVersion, int tableDataVersion,

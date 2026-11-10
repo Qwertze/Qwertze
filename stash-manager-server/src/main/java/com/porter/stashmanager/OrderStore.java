@@ -12,6 +12,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HexFormat;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -40,7 +41,10 @@ final class OrderStore {
     static final Set<String> FINISHED = Set.of("delivered", "failed", "cancelled");
     private static final SecureRandom RANDOM = new SecureRandom();
 
-    /** repair: the line's "Repair" toggle (PROTOCOL.md, "Additions: repair with XP bottles"). */
+    /**
+     * type is item, shulker, craft (CRAFT-CONTRACT.md: a craft line makes the item from stash materials) or kit
+     * (KIT-CONTRACT-v2: a finished kit of a template; key is the template id). repair: the
+     * line's "Repair" toggle (PROTOCOL.md, "Additions: repair with XP bottles"). */
     record Line(String type, String key, long count, boolean repair) {
         Line(String type, String key, long count) {
             this(type, key, count, false);
@@ -51,15 +55,37 @@ final class OrderStore {
         }
     }
 
-    /** A rejected request: HTTP status, message, and the index of the offending line (or -1). */
+    /**
+     * A rejected request: HTTP status, message, and the index of the offending line (or -1). craft is the code of a 409
+     * from the craft checks (no_recipes, no_bot, recipes_differ, no_table, table_bad), else null.
+     */
     static final class OrderException extends Exception {
         final int status;
         final int line;
+        final String craft;
+        /** The code of a 409 from the kit checks (no_bot, disabled) or "deleted" (the kit's template is gone), else null. */
+        final String kit;
+        /** The items a kit order is short of ([{key, count}]), or null. */
+        JsonArray shortItems;
+        /** The name of the first kit of a kit order's error text, so a forced streamer's copy can leave it out. */
+        String kitName;
+        /** That kit's number in the stash's template list (what a forced streamer sees instead of its name), 0 if unknown. */
+        int kitNumber;
 
         OrderException(int status, String message, int line) {
+            this(status, message, line, null, null);
+        }
+
+        OrderException(int status, String message, int line, String craft) {
+            this(status, message, line, craft, null);
+        }
+
+        OrderException(int status, String message, int line, String craft, String kit) {
             super(message);
             this.status = status;
             this.line = line;
+            this.craft = craft;
+            this.kit = kit;
         }
     }
 
@@ -71,6 +97,8 @@ final class OrderStore {
         JsonObject names; // normalized (see normalizeNames), or null for no naming
         boolean repairAll; // the cart-wide "Repair all items" switch
         JsonObject repairEstimate; // computed at placement; null when no line is wanted for repair
+        JsonObject craft; // the craft plan, computed at placement and not changed later; null when there are no craft lines
+        JsonObject kit; // the kit snapshot ({v, lines, take}), made at placement; null when there are no kit lines
         long createdAt;
         long updatedAt;
         String status;
@@ -78,6 +106,13 @@ final class OrderStore {
         JsonObject progress;
         String message;
         boolean cancelRequested;
+        /** First claim without the craftOrders flag while this order was held (0 = none), and how many came since. Memory only. */
+        long flaglessSince;
+        /** When the last flagless claim came (0 = none): a long gap starts a new episode with a fresh grace. */
+        long lastFlagless;
+        /** How many earlier episodes of flagless claims this order has had (a bot claiming once in a while without the flag). Memory only. */
+        int flaglessEpisodes;
+        int flaglessClaims;
         long cancelRequestedAt; // 0 when unknown (orders from before this field)
         JsonObject result;
         String placedById; // Users.OWNER_ID or a sub-user's id; null for orders from before accounts (the owner's)
@@ -102,6 +137,8 @@ final class OrderStore {
             o.add("names", names == null ? null : names.deepCopy());
             o.addProperty("repairAll", repairAll);
             o.add("repairEstimate", repairEstimate == null ? com.google.gson.JsonNull.INSTANCE : repairEstimate.deepCopy());
+            o.add("craft", craft == null ? com.google.gson.JsonNull.INSTANCE : craft.deepCopy());
+            if (kit != null) o.add("kit", kit.deepCopy());
             o.addProperty("createdAt", createdAt);
             o.addProperty("updatedAt", updatedAt);
             o.addProperty("status", status);
@@ -136,6 +173,8 @@ final class OrderStore {
             }
             r.repairAll = o.has("repairAll") && o.get("repairAll").isJsonPrimitive() && o.get("repairAll").getAsBoolean();
             r.repairEstimate = o.has("repairEstimate") && o.get("repairEstimate").isJsonObject() ? o.getAsJsonObject("repairEstimate") : null;
+            r.craft = o.has("craft") && o.get("craft").isJsonObject() ? o.getAsJsonObject("craft") : null;
+            r.kit = o.has("kit") && o.get("kit").isJsonObject() ? o.getAsJsonObject("kit") : null;
             // "note" from orders stored before notes were removed is dropped here and never written again.
             try {
                 r.names = normalizeNames(o.get("names"));
@@ -172,6 +211,8 @@ final class OrderStore {
         final String server;
         final String stash;
         final List<Order> orders = new ArrayList<>();
+        /** Counts every save, so a craft plan made outside the lock can tell whether the orders changed meanwhile. */
+        long version;
 
         Book(String server, String stash) {
             this.server = server;
@@ -181,12 +222,41 @@ final class OrderStore {
 
     private final Path dir;
     private final IndexStore index;
+    private volatile CraftService craftService; // null: this server plans no craft lines
+    private volatile KitOrders kitOrders; // null: this server takes no kit lines
     private final Map<IndexStore.StashKey, Book> books = new ConcurrentHashMap<>();
     private final Map<String, Book> byOrderId = new ConcurrentHashMap<>();
 
     OrderStore(Path dataDir, IndexStore index) {
         this.dir = dataDir.resolve("orders");
         this.index = index;
+    }
+
+    private volatile java.util.function.LongSupplier clock = System::currentTimeMillis;
+    /** When this process started (the claim grace after a restart counts from here). */
+    private volatile long startedAt = System.currentTimeMillis();
+    /** Test hook: runs after a craft plan is made and before the order book is locked again. */
+    volatile Runnable afterPlan;
+
+    /** The clock of the claim rules (tests move it); the start time is taken from it now. */
+    void clock(java.util.function.LongSupplier clock) {
+        this.clock = clock;
+        this.startedAt = clock.getAsLong();
+    }
+
+    /** A held craft order claimed without the flag is failed only after this long, and not before the third such claim. */
+    static final long DOWNGRADE_GRACE_MS = 120_000;
+    /** Flagless claims that go on this long since the first fail the order whatever the heartbeats say: the claim flag is what counts. */
+    static final long DOWNGRADE_ABSOLUTE_MS = 10 * 60_000;
+
+    /** Gives the store the craft planner (set once at start). Without it a craft line is refused. */
+    void craft(CraftService service) {
+        this.craftService = service;
+    }
+
+    /** Gives the store the kit planner (set once at start). Without it a kit line is refused. */
+    void kits(KitOrders kits) {
+        this.kitOrders = kits;
     }
 
     void load() throws IOException {
@@ -216,6 +286,7 @@ final class OrderStore {
     }
 
     private void save(Book b) throws IOException {
+        b.version++;
         JsonObject root = new JsonObject();
         root.addProperty("server", b.server);
         root.addProperty("stash", b.stash);
@@ -245,6 +316,9 @@ final class OrderStore {
         for (Order o : b.orders) {
             if (!OPEN.contains(o.status)) continue;
             for (Line l : o.lines) out.merge(l.ref(), l.count, Long::sum);
+            // The ingredients of a craft order are taken from the stash like item lines (CRAFT-CONTRACT.md, "The pool").
+            CraftService.take(o.craft).forEach((id, n) -> out.merge("item:" + id, n, Long::sum));
+            KitOrders.reservations(o, out);
         }
         return out;
     }
@@ -297,12 +371,80 @@ final class OrderStore {
         }
 
         Book b = book(server, stash);
-        synchronized (b) {
+        Line firstCraft = merged.values().stream().filter(l -> l.type.equals("craft")).findFirst().orElse(null);
+        Line firstKit = merged.values().stream().filter(l -> l.type.equals("kit")).findFirst().orElse(null);
+        JsonObject craftPlan = null;
+        KitOrders.Plan kitPlan = null;
+        long planVersion = -1;
+        // A craft plan can take seconds: it is made outside the lock, against the orders as they were (the book's version),
+        // and made again if they changed before the order is stored. The lock is never held for a full plan.
+        for (int attempt = 0; ; attempt++) {
+            boolean planned = firstCraft != null || firstKit != null;
+            if (planned) {
+                CraftService cs = craftService;
+                if (firstCraft != null && cs == null) throw new OrderException(400, "this server can't craft orders", firstIndex.get(firstCraft.ref()));
+                KitOrders ko = kitOrders;
+                if (firstKit != null && ko == null) throw new OrderException(400, "this server can't build kits", firstIndex.get(firstKit.ref()));
+                Map<String, Long> snapshot;
+                synchronized (b) {
+                    snapshot = reserved(b);
+                    planVersion = b.version;
+                }
+                kitPlan = firstKit == null ? null : ko.plan(server, stash, counts, snapshot, merged.values(), firstIndex, cs != null, Redact::prettyId);
+                // The kits' plain direct takes and shortfalls join the order's own lines for the craft planner.
+                Collection<Line> forCraft = merged.values();
+                Map<String, Integer> craftIndex = firstIndex;
+                boolean anyCraft = firstCraft != null || (kitPlan != null && !kitPlan.craftLines().isEmpty());
+                if (kitPlan != null && anyCraft) {
+                    Map<String, Line> all = new LinkedHashMap<>(merged);
+                    for (Line d : kitPlan.directLines()) {
+                        Line prev = all.get(d.ref());
+                        all.put(d.ref(), prev == null ? d : new Line(d.type, d.key, prev.count + d.count, prev.repair));
+                    }
+                    for (Line c : kitPlan.craftLines()) {
+                        Line prev = all.get(c.ref());
+                        all.put(c.ref(), prev == null ? c : new Line(c.type, c.key, prev.count + c.count, prev.repair));
+                    }
+                    forCraft = all.values();
+                    craftIndex = new HashMap<>(firstIndex);
+                    kitPlan.craftAt().forEach(craftIndex::putIfAbsent);
+                }
+                if (anyCraft) {
+                    try {
+                        craftPlan = cs.planOrder(server, stash, counts, snapshot, forCraft, craftIndex);
+                    } catch (OrderException e) {
+                        if (kitPlan != null && !kitPlan.craftLines().isEmpty() && kitPlan.craftFailed() != null) throw kitPlan.craftFailed();
+                        throw e;
+                    }
+                }
+                Runnable hook = afterPlan;
+                if (hook != null) hook.run();
+            }
+            synchronized (b) {
+                if ((firstCraft != null || firstKit != null) && b.version != planVersion) {
+                    if (attempt >= 2) throw new OrderException(409, "other orders changed while this one was being planned; try again", -1);
+                    continue;
+                }
+                return storeLocked(b, server, stash, merged, firstIndex, names, repairAll, byId, byName, counts, craftPlan,
+                    kitPlan == null ? null : kitPlan.kit());
+            }
+        }
+    }
+
+    private Order storeLocked(Book b, String server, String stash, Map<String, Line> merged, Map<String, Integer> firstIndex,
+                              JsonObject names, boolean repairAll, String byId, String byName, IndexStore.OrderCounts counts,
+                              JsonObject craftPlan, JsonObject kitPlan) throws OrderException, IOException {
+        {
             long open = b.orders.stream().filter(o -> OPEN.contains(o.status)).count();
             if (open >= MAX_OPEN) throw new OrderException(400, "too many open orders for this stash (limit " + MAX_OPEN + ")", -1);
             Map<String, Long> reserved = reserved(b);
             for (Line l : merged.values()) {
                 int at = firstIndex.get(l.ref());
+                if (l.type.equals("craft")) {
+                    if (l.count > Integer.MAX_VALUE) throw new OrderException(400, "count too large", at);
+                    continue; // planned below, with the item lines as the direct takes
+                }
+                if (l.type.equals("kit")) continue; // planned with the kit's template, before the lock
                 long total = counts.total(l.type, l.key);
                 if (total < 0) throw new OrderException(400, "not in the stash: " + l.key, at);
                 long available = Math.max(0, total - reserved.getOrDefault(l.ref(), 0L));
@@ -325,6 +467,8 @@ final class OrderStore {
             o.names = names == null ? null : names.deepCopy();
             o.repairAll = repairAll;
             o.repairEstimate = repairEstimate(o.lines, repairAll, counts, bottlesAvailable(counts, reserved));
+            o.craft = craftPlan;
+            o.kit = kitPlan;
             o.createdAt = now;
             o.updatedAt = now;
             o.status = "pending";
@@ -414,6 +558,9 @@ final class OrderStore {
         } catch (OrderException | IOException | RuntimeException e) {
             synchronized (b) {
                 if (PENDING.equals(old.retriedAs)) old.retriedAs = null;
+            }
+            if (e instanceof OrderException oe && "deleted".equals(oe.kit)) {
+                throw new OrderException(409, "that kit was deleted; the order can't be placed again", oe.line, null, "deleted");
             }
             throw e;
         }
@@ -519,7 +666,12 @@ final class OrderStore {
         long slots = 0;
         long units = 0;
         for (Line l : lines) {
-            if (l.type.equals("shulker") || counts.isShulkerBoxKey(l.key)) {
+            if (l.type.equals("craft")) {
+                long max = CraftService.maxStack(counts, l.key);
+                slots += (l.count + max - 1) / max;
+            } else if (l.type.equals("kit")) {
+                units += l.count; // one shulker per kit
+            } else if (l.type.equals("shulker") || counts.isShulkerBoxKey(l.key)) {
                 units += l.count;
             } else {
                 long max = counts.maxStack(l.key);
@@ -705,8 +857,33 @@ final class OrderStore {
 
     // ---------- addon ----------
 
+    /** Whether the bot must carry out craft orders for this one: a craft line, or craft steps planned for a kit's shortfalls. */
+    private static boolean hasCraft(Order o) {
+        if (o.craft != null) return true;
+        for (Line l : o.lines) if (l.type.equals("craft")) return true;
+        return false;
+    }
+
+    private static boolean hasKit(Order o) {
+        for (Line l : o.lines) if (l.type.equals("kit")) return true;
+        return false;
+    }
+
     /** { pending: n, cancel: [ids of held orders with a cancel requested] } for the heartbeat reply. */
     JsonObject heartbeatJson(String server, String stash) {
+        return heartbeatJson(server, stash, true);
+    }
+
+    /**
+     * The same; with craftCapable false (a bot that did not say it carries out craft orders) the pending orders with craft
+     * lines are not counted, so an older bot is not told to claim what it will not be given.
+     */
+    JsonObject heartbeatJson(String server, String stash, boolean craftCapable) {
+        return heartbeatJson(server, stash, craftCapable, true);
+    }
+
+    /** The same; with kitCapable false the pending orders with kit lines are not counted either. */
+    JsonObject heartbeatJson(String server, String stash, boolean craftCapable, boolean kitCapable) {
         JsonObject out = new JsonObject();
         JsonArray cancel = new JsonArray();
         int pending = 0;
@@ -714,8 +891,9 @@ final class OrderStore {
         if (b != null) {
             synchronized (b) {
                 for (Order o : b.orders) {
-                    if (o.status.equals("pending")) pending++;
-                    else if (o.cancelRequested && (o.status.equals("accepted") || o.status.equals("in_progress"))) cancel.add(o.id);
+                    if (o.status.equals("pending")) {
+                        if ((craftCapable || !hasCraft(o)) && (kitCapable || !hasKit(o))) pending++;
+                    } else if (o.cancelRequested && (o.status.equals("accepted") || o.status.equals("in_progress"))) cancel.add(o.id);
                 }
             }
         }
@@ -726,14 +904,77 @@ final class OrderStore {
 
     /** The held (accepted/in_progress) order if there is one, else the oldest pending one, now accepted. Null = none. */
     Order claim(String server, String stash) throws IOException {
+        return claim(server, stash, true);
+    }
+
+    static final String DOWNGRADED = "the bot can no longer craft (was it downgraded?); retry the order";
+
+    /**
+     * The same. craftOrders is the claim's flag (craftOrders >= 1): without it (an older bot) a held order with craft lines
+     * becomes failed, which releases its reservations, and pending orders with craft lines are skipped and stay pending.
+     */
+    Order claim(String server, String stash, boolean craftOrders) throws IOException {
+        return claim(server, stash, craftOrders, true);
+    }
+
+    static final String KIT_DOWNGRADED = "the bot can no longer build kits; retry the order";
+
+    /**
+     * The same, with the claim's kitOrders flag: without it a held order with kit lines becomes failed (which releases its
+     * reservations) and pending orders with kit lines are skipped and stay pending.
+     */
+    Order claim(String server, String stash, boolean craftOrders, boolean kitFlag) throws IOException {
         Book b = books.get(new IndexStore.StashKey(server, stash));
         if (b == null) return null;
         synchronized (b) {
-            for (Order o : b.orders) {
-                if (o.status.equals("accepted") || o.status.equals("in_progress")) return o;
+            boolean changed = false;
+            long now = clock.getAsLong();
+            try {
+                for (Order o : b.orders) {
+                    if (!(o.status.equals("accepted") || o.status.equals("in_progress"))) continue;
+                    boolean needCraft = hasCraft(o) && !craftOrders;
+                    boolean needKit = hasKit(o) && !kitFlag;
+                    if (!needCraft && !needKit) {
+                        o.flaglessSince = 0;
+                        o.flaglessClaims = 0;
+                        o.lastFlagless = 0;
+                        o.flaglessEpisodes = 0;
+                        return o;
+                    }
+                    // A bot that restarted (its recipe fetch may have got a 503 or 429, or its kit settings not loaded yet) must not lose a
+                    // held order that needs a capability the claim lacks. It is failed only when the third or a later flagless claim comes
+                    // more than 120 s after the first one, this server has been up for more than 120 s (a restart gives the bots that long
+                    // to come back), and no heartbeat with the missing capability(ies) came since the first. Until then the claim answers
+                    // 204 and the order stays held. Craft and kit orders (and the two combined) follow the same rule.
+                    // Flagless claims more than 10 minutes apart are not one episode (a bot that restarted gets a fresh grace).
+                    if (o.lastFlagless != 0 && now - o.lastFlagless > DOWNGRADE_ABSOLUTE_MS) {
+                        o.flaglessEpisodes++;
+                        o.flaglessSince = 0;
+                        o.flaglessClaims = 0;
+                    }
+                    o.lastFlagless = now;
+                    if (o.flaglessSince == 0) o.flaglessSince = now;
+                    o.flaglessClaims++;
+                    CraftService cs = craftService;
+                    KitOrders ko = kitOrders;
+                    long window = now - o.flaglessSince;
+                    boolean alive = (!needCraft || (cs != null && cs.capableWithin(server, stash, window)))
+                        && (!needKit || (ko != null && ko.capableWithin(server, stash, window)));
+                    boolean expired = o.flaglessClaims >= 3 && window > DOWNGRADE_GRACE_MS && now - startedAt > DOWNGRADE_GRACE_MS
+                        && (!alive || window > DOWNGRADE_ABSOLUTE_MS);
+                    // A claim every 11 minutes would restart the episode each time: the third such claim fails it.
+                    if (o.flaglessEpisodes >= 2 && now - startedAt > DOWNGRADE_GRACE_MS) expired = true;
+                    if (!expired) return null;
+                    o.status = "failed";
+                    o.message = needKit && !needCraft ? KIT_DOWNGRADED : DOWNGRADED;
+                    o.updatedAt = System.currentTimeMillis();
+                    changed = true;
+                }
+            } finally {
+                if (changed) save(b);
             }
             for (Order o : b.orders) {
-                if (o.status.equals("pending")) {
+                if (o.status.equals("pending") && (craftOrders || !hasCraft(o)) && (kitFlag || !hasKit(o))) {
                     o.status = "accepted";
                     o.updatedAt = System.currentTimeMillis();
                     save(b);

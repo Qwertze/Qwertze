@@ -56,7 +56,7 @@ import java.util.stream.Stream;
  */
 public final class IconService implements AutoCloseable {
     public static final Pattern ID_PART = Pattern.compile("^[a-z0-9_][a-z0-9_.-]{0,127}$");
-    public static final Pattern MC_VERSION = Pattern.compile("^[0-9][0-9.]{0,31}$");
+    public static final Pattern MC_VERSION = Pattern.compile("^(?=.{1,32}$)[0-9]+(\\.[0-9]+){1,3}$");
     public static final String DEFAULT_MC = "1.21.11";
 
     private static final String USER_AGENT = "QwerteStashManager/1.0 (local stash viewer)";

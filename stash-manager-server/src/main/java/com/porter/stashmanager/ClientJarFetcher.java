@@ -31,7 +31,7 @@ import java.util.regex.Pattern;
  */
 class ClientJarFetcher {
     /** A failure that retrying will not fix (version not listed, no client download, bad entry). */
-    static final class PermanentException extends IOException {
+    static class PermanentException extends IOException {
         PermanentException(String m) {
             super(m);
         }

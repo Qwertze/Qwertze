@@ -33,6 +33,16 @@ final class KitReports {
     static final int MAX_STASHES = 64;
     static final int MAX_FIELD = 256;
     static final Pattern HASH = Pattern.compile("^[0-9a-f]{40}$");
+    static final Pattern TABLE = Pattern.compile("^[0-9a-f]{64}$");
+    static final Pattern ITEM_ID = Pattern.compile("^[a-z0-9_.-]{1,64}:[a-z0-9_./-]{1,128}$");
+    static final Pattern WORD = Pattern.compile("^[a-z]{1,32}$");
+    static final int MAX_OTHERS = 1024;
+    static final int MAX_STOCK = 100;
+    static final java.util.Set<String> KIT_CODES = java.util.Set.of("assortment", "named_assortment", "override", "template", "template_incomplete");
+    static final java.util.Set<String> NOT_KIT_CODES = java.util.Set.of("empty", "stock", "stock_neutral", "no_purpose", "few_kinds", "mixed", "override_none");
+    static final java.util.Set<String> RESTOCK_STATES = java.util.Set.of("off", "idle", "building", "waiting", "blocked");
+    static final java.util.Set<String> RESTOCK_REASONS = java.util.Set.of("orders", "items_short", "bottle_reserve", "no_shulker", "chest_full",
+        "chest_missing", "cap", "naming", "topping_up");
 
     record Container(String id, String label, int size, int free, boolean pickable, long readAt) {
     }
@@ -50,22 +60,128 @@ final class KitReports {
         }
     }
 
-    /** key and name are null for unnamed kits; score is the highest-total box of the entry, minTotal the lowest total. */
-    record Stored(String key, String name, String container, int count, Score score, int minTotal) {
+    /** One item the box lacks for its template (at most 8 in a why, 27 in a stock entry). */
+    record Missing(String key, String match, int count) {
+        JsonObject toJson() {
+            JsonObject o = new JsonObject();
+            o.addProperty("key", key);
+            if (match != null) o.addProperty("match", match);
+            o.addProperty("count", count);
+            return o;
+        }
     }
 
-    record Carried(String key, String name, int count, Score score) {
+    /** The classifier's reason for a box (KIT-CONTRACT-v2, "Result"). Optional numbers are null when the contract leaves them out. */
+    record Why(String code, String type, int slots, Integer covered, Integer kinds, Integer need, Integer minKinds,
+               List<String> items, List<String> words, String template, List<Missing> missing) {
+        boolean kit() {
+            return KIT_CODES.contains(code);
+        }
+
+        JsonObject toJson() {
+            JsonObject o = new JsonObject();
+            o.addProperty("code", code);
+            o.addProperty("type", type);
+            o.addProperty("slots", slots);
+            if (covered != null) o.addProperty("covered", covered);
+            if (kinds != null) o.addProperty("kinds", kinds);
+            if (need != null) o.addProperty("need", need);
+            if (minKinds != null) o.addProperty("minKinds", minKinds);
+            JsonArray it = new JsonArray();
+            items.forEach(it::add);
+            o.add("items", it);
+            JsonArray w = new JsonArray();
+            words.forEach(w::add);
+            o.add("words", w);
+            if (template != null) o.addProperty("template", template);
+            if (missing != null && !missing.isEmpty()) {
+                JsonArray m = new JsonArray();
+                missing.forEach(x -> m.add(x.toJson()));
+                o.add("missing", m);
+            }
+            return o;
+        }
     }
 
-    record Report(String hash, long receivedAt, long readAt, List<Container> containers, List<Stored> kits, List<Carried> carried) {
+    /** One kit type (or category) of a kits or carried entry: how many of its boxes, and why. template is why.template (a box of a template). */
+    record TypeCount(String type, int count, Why why, String template) {
+    }
+
+    /** key and name are null for unnamed kits; score is the highest-total box of the entry, minTotal the lowest total. types is empty for a v1 bot. */
+    record Stored(String key, String name, String container, int count, Score score, int minTotal, List<TypeCount> types) {
+        Stored(String key, String name, String container, int count, Score score, int minTotal) {
+            this(key, name, container, count, score, minTotal, List.of());
+        }
+    }
+
+    record Carried(String key, String name, int count, Score score, List<TypeCount> types) {
+        Carried(String key, String name, int count, Score score) {
+            this(key, name, count, score, List.of());
+        }
+    }
+
+    /** A named box that is not a kit (one per key and container). */
+    record Other(String key, String name, String container, int count, Why why) {
+    }
+
+    /** What the bot has of one template (KIT-CONTRACT-v2, revision 4, "Report templates"). */
+    record Stock(String id, int complete, int incomplete, int elsewhere, int carried, List<Missing> missing) {
+        JsonObject toJson() {
+            JsonObject o = new JsonObject();
+            o.addProperty("complete", complete);
+            o.addProperty("incomplete", incomplete);
+            o.addProperty("elsewhere", elsewhere);
+            o.addProperty("carried", carried);
+            JsonArray m = new JsonArray();
+            missing.forEach(x -> m.add(x.toJson()));
+            o.add("missing", m);
+            return o;
+        }
+    }
+
+    record Restock(String state, String template, String reason) {
+        JsonObject toJson() {
+            JsonObject o = new JsonObject();
+            o.addProperty("state", state);
+            o.addProperty("template", template);
+            o.addProperty("reason", reason);
+            return o;
+        }
+    }
+
+    /** The report's classifier: version 2 and the fingerprint of the type table the bot used. */
+    record Classifier(int version, String table) {
+    }
+
+    record Report(String hash, long receivedAt, long readAt, List<Container> containers, List<Stored> kits, List<Carried> carried,
+                  Classifier classifier, List<Other> others, List<Stock> templates, Restock restock) {
+        Report(String hash, long receivedAt, long readAt, List<Container> containers, List<Stored> kits, List<Carried> carried) {
+            this(hash, receivedAt, readAt, containers, kits, carried, null, List.of(), List.of(), null);
+        }
+
         Container container(String id) {
             for (Container c : containers) if (c.id().equals(id)) return c;
             return null;
         }
+
+        Stock stock(String templateId) {
+            for (Stock t : templates) if (t.id().equals(templateId)) return t;
+            return null;
+        }
     }
 
-    /** What a stash's latest heartbeat said: whether it had a kitsHash key, which hash, and when. */
-    record Beat(boolean supports, String hash, long at) {
+    /** What a bot says about kit orders in a heartbeat (kitOrders): it carries them out, may restock, may craft shortfalls, may import local kits. */
+    record KitCap(int v, boolean enabled, boolean restock, boolean craft, boolean importer) {
+    }
+
+    /**
+     * What a stash's latest heartbeat said: whether it had a kitsHash key, which hash, and when; whether it had a kitsHash2
+     * key (a v2 bot) and which hash; and its kitOrders capability (null: none this run).
+     */
+    record Beat(boolean supports, String hash, long at, boolean types, String hash2, KitCap cap, long capAt, String reportHash) {
+        Beat(boolean supports, String hash, long at) {
+            this(supports, hash, at, false, null, null, 0, null);
+        }
     }
 
     private final LongSupplier clock;
@@ -96,11 +212,59 @@ final class KitReports {
     }
 
     synchronized void beat(String server, String stash, boolean supports, String hash) {
-        beats.put(new IndexStore.StashKey(server, stash), new Beat(supports, hash, clock.getAsLong()));
+        beat(server, stash, supports, hash, false, null, false, null);
+    }
+
+    /**
+     * A heartbeat. hasHash2 says the body had a kitsHash2 key (a v2 bot; hash2 may be null); hasCap that it had a kitOrders key
+     * (cap null: the bot says it can't); an absent kitOrders keeps what was stored, like craftOrders.
+     */
+    synchronized void beat(String server, String stash, boolean supports, String hash, boolean hasHash2, String hash2, boolean hasCap, KitCap cap) {
+        beat(server, stash, supports, hash, hasHash2, hash2, hasCap, cap, false, null);
+    }
+
+    /**
+     * The same with the bot's kitsReportHash (the hash of the kit report it holds): hasReportHash says the body had the key (null: the
+     * bot has none); an absent key keeps the stored one.
+     */
+    synchronized void beat(String server, String stash, boolean supports, String hash, boolean hasHash2, String hash2, boolean hasCap, KitCap cap,
+                           boolean hasReportHash, String reportHash) {
+        IndexStore.StashKey key = new IndexStore.StashKey(server, stash);
+        Beat old = beats.get(key);
+        KitCap c = hasCap ? cap : old == null ? null : old.cap();
+        long now = clock.getAsLong();
+        // capAt: when a heartbeat last carried an enabled kitOrders (a flagless claim is only believed to be a downgrade after that goes quiet).
+        long capAt = hasCap ? (cap != null && cap.v() >= 1 && cap.enabled() ? now : 0) : old == null ? 0 : old.capAt();
+        String rh = hasReportHash ? reportHash : old == null ? null : old.reportHash();
+        beats.put(key, new Beat(supports, hash, now, hasHash2, hash2, c, capAt, rh));
         if (beats.size() > 1024) {
-            long now = clock.getAsLong();
             beats.values().removeIf(b -> now - b.at() > 60 * 60 * 1000L);
         }
+    }
+
+    /** A report older than this since the bot's last heartbeat says nothing: the bot has gone quiet. */
+    static final long LIVE_MS = 10 * 60 * 1000L;
+
+    /**
+     * Whether the stash's report still describes what the bot holds: the bot's latest heartbeat carries the report's hash
+     * (kitsReportHash) and is no more than 10 minutes old. A bot sends a report only when its kit state changes, so the age of
+     * the report itself does not matter.
+     */
+    synchronized boolean current(String server, String stash, Report r) {
+        Beat b = beats.get(new IndexStore.StashKey(server, stash));
+        return r != null && b != null && r.hash().equals(b.reportHash()) && clock.getAsLong() - b.at() <= LIVE_MS;
+    }
+
+    /** Whether a heartbeat carried an enabled kitOrders within the last ms milliseconds. */
+    synchronized boolean kitCapableWithin(String server, String stash, long ms) {
+        Beat b = beats.get(new IndexStore.StashKey(server, stash));
+        return b != null && b.cap() != null && b.cap().v() >= 1 && b.cap().enabled() && b.capAt() > 0 && clock.getAsLong() - b.capAt() < ms;
+    }
+
+    /** Whether the stash's last kitOrders (this run) says the bot builds kits. */
+    synchronized boolean kitCapable(String server, String stash) {
+        Beat b = beats.get(new IndexStore.StashKey(server, stash));
+        return b != null && b.cap() != null && b.cap().v() >= 1 && b.cap().enabled();
     }
 
     synchronized Beat beat(String server, String stash) {
@@ -120,8 +284,13 @@ final class KitReports {
 
     // ---------- validation ----------
 
-    /** Checks a POST /api/v1/kits/report body and returns it cleaned, or throws with the reason. */
+    /** Checks a POST /api/v1/kits/report body (a stash without custom categories) and returns it cleaned, or throws with the reason. */
     Report parse(JsonObject o) {
+        return parse(o, java.util.Set.of());
+    }
+
+    /** The same; custom are the stash's custom category ids (a v2 report may name them as a kit's type). */
+    Report parse(JsonObject o, java.util.Set<String> custom) {
         whole(o.get("version"), "version", 1, 1);
         String hash = text(o, "hash", 40, true);
         if (!HASH.matcher(hash).matches()) throw bad("hash must be 40 lowercase hex digits");
@@ -163,7 +332,8 @@ final class KitReports {
             Score score = score(k.get("score"));
             int minTotal = (int) whole(k.get("minTotal"), "kit minTotal", 0, 40);
             if (minTotal > score.total()) throw bad("kit minTotal can't be above the score total");
-            kits.add(new Stored(key, key == null ? null : name(k, key), container, (int) count, score, minTotal));
+            List<TypeCount> tcs = typeCounts(k.get("types"), (int) count, true, custom);
+            kits.add(new Stored(key, key == null ? null : name(k, key), container, (int) count, score, minTotal, tcs));
         }
         JsonElement re = o.get("carried");
         List<Carried> carried = new ArrayList<>();
@@ -176,12 +346,163 @@ final class KitReports {
                 JsonObject k = e.getAsJsonObject();
                 String key = key(k);
                 if (!keys.add(key == null ? "\u0000" : key)) throw bad("a carried kit appears twice");
-                carried.add(new Carried(key, key == null ? null : name(k, key), (int) whole(k.get("count"), "carried count", 1, MAX_CARRIED),
-                    score(k.get("score"))));
+                int ccount = (int) whole(k.get("count"), "carried count", 1, MAX_CARRIED);
+                carried.add(new Carried(key, key == null ? null : name(k, key), ccount, score(k.get("score")),
+                    typeCounts(k.get("types"), ccount, true, custom)));
             }
         }
         containers.sort((a, b) -> KitNames.compareIds(a.id(), b.id()));
-        return new Report(hash, clock.getAsLong(), readAt, List.copyOf(containers), List.copyOf(kits), List.copyOf(carried));
+        Classifier classifier = null;
+        JsonElement cl = o.get("classifier");
+        if (cl != null && !cl.isJsonNull()) {
+            if (!cl.isJsonObject()) throw bad("classifier must be {version, table}");
+            JsonObject co = cl.getAsJsonObject();
+            long version = whole(co.get("version"), "classifier version", 2, 2);
+            String table = text(co, "table", 64, true);
+            if (!TABLE.matcher(table).matches()) throw bad("classifier table must be 64 lowercase hex digits");
+            classifier = new Classifier((int) version, table);
+        }
+        List<Other> others = new ArrayList<>();
+        JsonElement oe = o.get("others");
+        if (oe != null && !oe.isJsonNull()) {
+            if (!oe.isJsonArray()) throw bad("others must be a list");
+            if (oe.getAsJsonArray().size() > MAX_OTHERS) throw bad("at most " + MAX_OTHERS + " others");
+            Set<String> seenOthers = new HashSet<>();
+            for (JsonElement e : oe.getAsJsonArray()) {
+                if (!e.isJsonObject()) throw bad("every others entry must be an object");
+                JsonObject x = e.getAsJsonObject();
+                String key = key(x);
+                if (key == null) throw bad("an others entry needs a key");
+                String container = text(x, "container", 40, true);
+                if (!byId.containsKey(container)) throw bad("an others entry's container must be in containers");
+                if (!seenOthers.add(key + "\t" + container)) throw bad("an others entry appears twice in one container");
+                int count = (int) whole(x.get("count"), "others count", 1, 54);
+                Why why = why(x.get("why"), custom, false);
+                if (why.kit()) throw bad("an others entry can't have the reason of a kit");
+                others.add(new Other(key, name(x, key), container, count, why));
+            }
+        }
+        List<Stock> templates = new ArrayList<>();
+        JsonElement te = o.get("templates");
+        if (te != null && !te.isJsonNull()) {
+            if (!te.isJsonArray()) throw bad("templates must be a list");
+            if (te.getAsJsonArray().size() > MAX_STOCK) throw bad("at most " + MAX_STOCK + " templates");
+            Set<String> ids = new HashSet<>();
+            for (JsonElement e : te.getAsJsonArray()) {
+                if (!e.isJsonObject()) throw bad("every templates entry must be an object");
+                JsonObject x = e.getAsJsonObject();
+                String id = text(x, "id", 16, true);
+                if (!KitTemplate.ID.matcher(id).matches()) throw bad("a template id looks like t-3f2a9c1d");
+                if (!ids.add(id)) throw bad("a template appears twice");
+                templates.add(new Stock(id, (int) whole(x.get("complete"), "templates complete", 0, 4096),
+                    (int) whole(x.get("incomplete"), "templates incomplete", 0, 4096), (int) whole(x.get("elsewhere"), "templates elsewhere", 0, 4096),
+                    (int) whole(x.get("carried"), "templates carried", 0, 4096), missing(x.get("missing"), 27)));
+            }
+        }
+        Restock restock = null;
+        JsonElement re2 = o.get("restock");
+        if (re2 != null && !re2.isJsonNull()) {
+            if (!re2.isJsonObject()) throw bad("restock must be {state, template, reason}");
+            JsonObject x = re2.getAsJsonObject();
+            String state = text(x, "state", 16, true);
+            if (!RESTOCK_STATES.contains(state)) throw bad("restock state must be off, idle, building, waiting or blocked");
+            String tpl = x.has("template") && !x.get("template").isJsonNull() ? text(x, "template", 16, true) : null;
+            if (tpl != null && !KitTemplate.ID.matcher(tpl).matches()) throw bad("restock template looks like t-3f2a9c1d");
+            String reason = x.has("reason") && !x.get("reason").isJsonNull() ? text(x, "reason", 32, true) : null;
+            if (reason != null && !RESTOCK_REASONS.contains(reason)) throw bad("restock reason is not one of the contract's");
+            restock = new Restock(state, tpl, reason);
+        }
+        return new Report(hash, clock.getAsLong(), readAt, List.copyOf(containers), List.copyOf(kits), List.copyOf(carried), classifier,
+            List.copyOf(others), List.copyOf(templates), restock);
+    }
+
+    /** A kits or carried entry's types: one per category (and template), counts summing to the entry's count; absent for a v1 bot. */
+    private List<TypeCount> typeCounts(JsonElement e, int total, boolean requireKit, Set<String> custom) {
+        if (e == null || e.isJsonNull()) return List.of();
+        if (!e.isJsonArray()) throw bad("types must be a list");
+        JsonArray a = e.getAsJsonArray();
+        if (a.size() > 64) throw bad("a kit has at most 64 types");
+        List<TypeCount> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        long sum = 0;
+        for (JsonElement x : a) {
+            if (!x.isJsonObject()) throw bad("every types entry must be an object");
+            JsonObject t = x.getAsJsonObject();
+            String type = text(t, "type", 40, true);
+            if (!KitTypes.isType(type) && !custom.contains(type)) throw bad("a kit's type must be one of the kit types or a category of the stash");
+            int count = (int) whole(t.get("count"), "types count", 1, 54);
+            Why why = why(t.get("why"), custom, true);
+            if (requireKit && !why.kit()) throw bad("a kit's why must have the code of a kit");
+            if (!type.equals(why.type())) throw bad("a types entry's why.type must be its type");
+            String template = t.has("template") && !t.get("template").isJsonNull() ? text(t, "template", 16, true) : why.template();
+            if (template != null && !KitTemplate.ID.matcher(template).matches()) throw bad("a template id looks like t-3f2a9c1d");
+            if (!seen.add(type + "\t" + template)) throw bad("a type appears twice in one kit");
+            sum += count;
+            out.add(new TypeCount(type, count, why, template));
+        }
+        if (!out.isEmpty() && sum != total) throw bad("the counts of a kit's types must add up to its count");
+        return List.copyOf(out);
+    }
+
+    private Why why(JsonElement e, Set<String> custom, boolean kitTypeRequired) {
+        if (!(e instanceof JsonObject w)) throw bad("why must be an object");
+        String code = text(w, "code", 32, true);
+        if (!KIT_CODES.contains(code) && !NOT_KIT_CODES.contains(code)) throw bad("why.code is not one of the contract's");
+        String type = w.has("type") && !w.get("type").isJsonNull() ? text(w, "type", 40, true) : null;
+        if (type != null && !KitTypes.isType(type) && !custom.contains(type)) throw bad("why.type must be a kit type or a category of the stash");
+        if (kitTypeRequired && KIT_CODES.contains(code) && type == null) throw bad("a kit's why needs a type");
+        int slots = (int) whole(w.get("slots"), "why slots", 0, 27);
+        Integer covered = optWhole(w, "covered"), kinds = optWhole(w, "kinds"), need = optWhole(w, "need"), minKinds = optWhole(w, "minKinds");
+        List<String> items = new ArrayList<>();
+        JsonElement ie = w.get("items");
+        if (ie != null && !ie.isJsonNull()) {
+            if (!ie.isJsonArray() || ie.getAsJsonArray().size() > 3) throw bad("why.items must be a list of at most 3 item ids");
+            for (JsonElement i : ie.getAsJsonArray()) {
+                if (!(i instanceof JsonPrimitive p) || !p.isString() || !ITEM_ID.matcher(p.getAsString()).matches()) throw bad("why.items must be item ids like minecraft:bread");
+                items.add(p.getAsString());
+            }
+        }
+        List<String> words = new ArrayList<>();
+        JsonElement we = w.get("words");
+        if (we != null && !we.isJsonNull()) {
+            if (!we.isJsonArray() || we.getAsJsonArray().size() > 4) throw bad("why.words must be a list of at most 4 words");
+            for (JsonElement i : we.getAsJsonArray()) {
+                if (!(i instanceof JsonPrimitive p) || !p.isString() || !WORD.matcher(p.getAsString()).matches()) throw bad("why.words must be lowercase words");
+                words.add(p.getAsString());
+            }
+        }
+        String template = null;
+        if (w.has("template") && !w.get("template").isJsonNull()) {
+            template = text(w, "template", 16, true);
+            if (!KitTemplate.ID.matcher(template).matches()) throw bad("why.template looks like t-3f2a9c1d");
+        }
+        if ((code.equals("template") || code.equals("template_incomplete")) && template == null) throw bad("a template reason needs a template id");
+        List<Missing> missing = missing(w.get("missing"), 8);
+        return new Why(code, type, slots, covered, kinds, need, minKinds, List.copyOf(items), List.copyOf(words), template, missing);
+    }
+
+    private static Integer optWhole(JsonObject o, String field) {
+        JsonElement e = o.get(field);
+        if (e == null || e.isJsonNull()) return null;
+        return (int) whole(e, "why " + field, 0, 27);
+    }
+
+    /** A list of at most max {key, count} (and an optional match key) items. */
+    private static List<Missing> missing(JsonElement e, int max) {
+        if (e == null || e.isJsonNull()) return List.of();
+        if (!e.isJsonArray() || e.getAsJsonArray().size() > max) throw bad("missing must be a list of at most " + max + " items");
+        List<Missing> out = new ArrayList<>();
+        for (JsonElement x : e.getAsJsonArray()) {
+            if (!x.isJsonObject()) throw bad("every missing entry must be an object");
+            JsonObject m = x.getAsJsonObject();
+            String key = text(m, "key", 256, false);
+            String match = m.has("match") && !m.get("match").isJsonNull() ? text(m, "match", 256, true) : null;
+            if (key == null) key = match;
+            if (key == null || !KitTemplate.KEY.matcher(key).matches()) throw bad("a missing key must be an item key");
+            if (match != null && !KitTemplate.KEY.matcher(match).matches()) throw bad("a missing match must be an item key");
+            out.add(new Missing(key, match, (int) whole(m.get("count"), "missing count", 1, 100_000)));
+        }
+        return List.copyOf(out);
     }
 
     /** A kit's key: a normalised name, or null for an unnamed kit. */
@@ -251,163 +572,24 @@ final class KitReports {
 
     // ---------- the page's view ----------
 
-    /** One row of the kit table. */
-    private static final class Row {
-        String key;
-        String name;
-        int stored;
-        int carried;
-        Score score;      // the highest total across the row's entries
-        int minTotal = Integer.MAX_VALUE;
-        /** The row's name is the smallest name among its entries (String order). */
-        void seeName(String n) {
-            if (n != null && (name == null || n.compareTo(name) < 0)) name = n;
-        }
-
-        void see(Score sc, int min) {
-            if (score == null || sc.total() > score.total()) score = sc;
-            minTotal = Math.min(minTotal, Math.min(min, sc.total()));
-        }
-        final TreeMap<String, Integer> locations = new TreeMap<>(KitNames::compareIds);
-    }
-
-    /** "full" or "missing" count of the stash's rows (GET /api/v1/stashes kits.flagged). */
+    /** "full" or "missing" rows of the stash and set chests of the categories (GET /api/v1/stashes kits.flagged). */
     static int flagged(JsonObject view) {
         int n = 0;
         for (JsonElement e : view.getAsJsonArray("rows")) {
             String s = e.getAsJsonObject().get("status").getAsString();
             if (s.equals("full") || s.equals("missing")) n++;
         }
+        if (view.has("types")) {
+            for (JsonElement e : view.getAsJsonArray("types")) {
+                String s = e.getAsJsonObject().get("chestStatus").getAsString();
+                if (s.equals("full") || s.equals("missing")) n++;
+            }
+        }
         return n;
     }
 
-    /** The GET /api/v1/kits body (KIT-CONTRACT.md). report may be null; beat may be null. */
+    /** The GET /api/v1/kits body (KIT-CONTRACT.md and KIT-CONTRACT-v2). report may be null; beat may be null. */
     JsonObject view(String server, String stash, KitStore.Settings s, Report report, Beat beat) {
-        JsonObject o = new JsonObject();
-        o.addProperty("server", server);
-        o.addProperty("stash", stash);
-        o.addProperty("rev", s.rev());
-        o.addProperty("hash", s.hash());
-        o.addProperty("kitsChest", s.kitsChest());
-        JsonObject sc = s.scoring().toJson();
-        sc.addProperty("max", s.scoring().max());
-        o.add("scoring", sc);
-        JsonArray rules = new JsonArray();
-        s.rules().forEach((k, c) -> {
-            JsonObject r = new JsonObject();
-            r.addProperty("key", k);
-            r.addProperty("container", c);
-            rules.add(r);
-        });
-        o.add("rules", rules);
-        JsonObject bot = new JsonObject();
-        boolean supports = beat != null && beat.supports();
-        bot.addProperty("supports", supports);
-        bot.addProperty("synced", supports && s.hash().equals(beat.hash()));
-        bot.addProperty("online", beat != null && clock.getAsLong() - beat.at() < IndexStore.ONLINE_WINDOW_MS);
-        o.add("bot", bot);
-        if (report == null) {
-            o.add("report", com.google.gson.JsonNull.INSTANCE);
-        } else {
-            JsonObject r = new JsonObject();
-            r.addProperty("receivedAt", report.receivedAt());
-            r.addProperty("readAt", report.readAt());
-            o.add("report", r);
-        }
-        Map<String, Container> byId = new HashMap<>();
-        JsonArray containers = new JsonArray();
-        if (report != null) {
-            for (Container c : report.containers()) {
-                byId.put(c.id(), c);
-                JsonObject co = new JsonObject();
-                co.addProperty("id", c.id());
-                co.addProperty("label", c.label());
-                co.addProperty("size", c.size());
-                co.addProperty("free", c.free());
-                co.addProperty("pickable", c.pickable());
-                co.addProperty("full", c.free() == 0);
-                containers.add(co);
-            }
-        }
-        o.add("containers", containers);
-        o.addProperty("kitsChestStatus", chestStatus(s.kitsChest(), byId));
-
-        TreeMap<String, Row> rows = new TreeMap<>(java.util.Comparator.nullsLast(java.util.Comparator.<String>naturalOrder()));
-        if (report != null) {
-            for (Stored k : report.kits()) {
-                Row r = rows.computeIfAbsent(k.key(), x -> row(k.key(), k.name()));
-                r.stored += k.count();
-                r.seeName(k.name());
-                r.see(k.score(), k.minTotal());
-                r.locations.merge(k.container(), k.count(), Integer::sum);
-            }
-            for (Carried k : report.carried()) {
-                Row r = rows.computeIfAbsent(k.key(), x -> row(k.key(), k.name()));
-                r.carried += k.count();
-                r.seeName(k.name());
-                r.see(k.score(), k.score().total());
-            }
-        }
-        for (String key : s.rules().keySet()) rows.computeIfAbsent(key, x -> row(key, key));
-        JsonArray out = new JsonArray();
-        for (Row r : rows.values()) {
-            String rule = r.key == null ? null : s.rules().get(r.key); // an unnamed kit can't have a rule
-            String target = rule != null ? rule : s.kitsChest();
-            JsonObject ro = new JsonObject();
-            ro.addProperty("key", r.key);
-            ro.addProperty("name", r.name);
-            ro.addProperty("count", r.stored + r.carried);
-            ro.addProperty("carried", r.carried);
-            if (r.score == null) {
-                ro.add("score", com.google.gson.JsonNull.INSTANCE); // a rule for a kit that isn't in the stash
-                ro.add("minTotal", com.google.gson.JsonNull.INSTANCE);
-            } else {
-                ro.add("score", r.score.toJson());
-                ro.addProperty("minTotal", r.minTotal);
-            }
-            JsonArray locs = new JsonArray();
-            r.locations.forEach((c, n) -> {
-                JsonObject l = new JsonObject();
-                l.addProperty("container", c);
-                l.addProperty("count", n);
-                locs.add(l);
-            });
-            ro.add("locations", locs);
-            ro.addProperty("rule", rule);
-            ro.addProperty("target", target);
-            ro.addProperty("targetSource", rule != null ? "rule" : target != null ? "kitsChest" : null);
-            ro.addProperty("status", status(r, rule != null, target, byId));
-            out.add(ro);
-        }
-        o.add("rows", out);
-        JsonObject limits = new JsonObject();
-        limits.addProperty("maxRules", KitStore.MAX_RULES);
-        limits.addProperty("maxKey", KitNames.MAX_KEY);
-        o.add("limits", limits);
-        return o;
-    }
-
-    private static Row row(String key, String name) {
-        Row r = new Row();
-        r.key = key;
-        r.name = name;
-        return r;
-    }
-
-    private static String chestStatus(String chest, Map<String, Container> byId) {
-        if (chest == null) return "unset";
-        Container c = byId.get(chest);
-        if (c == null || !c.pickable()) return "missing";
-        return c.free() == 0 ? "full" : "ok";
-    }
-
-    private static String status(Row r, boolean hasRule, String target, Map<String, Container> byId) {
-        if (hasRule && r.stored + r.carried == 0) return "absent";
-        if (target == null) return "none";
-        Container c = byId.get(target);
-        if (c == null || !c.pickable()) return "missing";
-        if (r.carried == 0 && r.locations.size() == 1 && r.locations.containsKey(target)) return "home";
-        if (c.free() == 0) return "full";
-        return "pending";
+        return KitView.build(clock.getAsLong(), server, stash, s, report, beat);
     }
 }

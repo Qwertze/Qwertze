@@ -35,6 +35,11 @@
     return typeof me === "object" && !me.owner && !!me.perms && me.perms.streamer === true;
   }
 
+  /** A server's error text for display: in streamer mode it may carry names or positions, so a generic line is shown instead. */
+  function safeServerText(text, generic) {
+    return streamerOn() ? generic : text;
+  }
+
   function hide(node) {
     node.setAttribute("data-sensitive", "");
     return node;
@@ -73,6 +78,7 @@
     viewItems: $("view-items"),
     viewOrders: $("view-orders"),
     viewKits: $("view-kits"),
+    viewKb: $("view-kb"),
     crumbs: $("crumbs"),
     pickerBody: $("picker-body"),
     cartLines: $("cart-lines"),
@@ -982,7 +988,8 @@
     order: $("pl-order"), next: $("pl-next"), again: $("pl-again"), locked: $("pl-locked"), csv: $("pl-csv"), txt: $("pl-txt"), copy: $("pl-copy"),
     orderStatus: $("pl-order-status"), filter: $("pl-filter"), onlyMissing: $("pl-only-missing"), rows: $("pl-rows"),
     table: $("pl-table"), unknownBox: $("pl-unknown-box"), unknown: $("pl-unknown"), chestBox: $("pl-chest-box"),
-    chest: $("pl-chest"), dismiss: $("pl-dismiss")
+    chest: $("pl-chest"), dismiss: $("pl-dismiss"), craft: $("pl-craft"), craftRow: $("pl-craft-row"), craftText: $("pl-craft-text"),
+    craftNote: $("pl-craft-note"), craftBanner: $("pl-craft-banner"), thCraft: $("pl-th-craft")
   };
   var planner = {
     plan: null,           // the last plan JSON from the server (null: nothing uploaded)
@@ -998,6 +1005,8 @@
     names: true,          // the confirmation's "name the shulkers" choice, kept for the next parts
     ordered: null,        // { partsTotal, placed: { "1": "o-..." }, remaining: [2, 3] } for the current options
     orderStatus: {},      // order id -> status, from GET /api/v1/orders
+    craftPref: null,      // the user's choice for "Craft what the stash can make": null = not chosen yet (on when the stash can take craft orders)
+    names2: null,         // id -> display name of the current plan's rows (built on every render)
     ordersTimer: 0,
     loadTimer: 0
   };
@@ -1087,6 +1096,7 @@
       round: pl.round.value === "stack" || pl.round.value === "shulker" ? pl.round.value : "none",
       fluids: pl.fluids.checked,
       containerItems: pl.containers.checked,
+      craft: pl.craft.checked && !pl.craftRow.hidden,
       exclude: Array.from(planner.exclude).sort()
     };
   }
@@ -1110,6 +1120,7 @@
     pl.round.value = opt.round === "stack" || opt.round === "shulker" ? opt.round : "none";
     pl.fluids.checked = opt.fluids === true;
     pl.containers.checked = opt.containerItems === true;
+    pl.craft.checked = opt.craft === true;
     planner.exclude = new Set(Array.isArray(opt.exclude) ? opt.exclude.filter(function (x) { return typeof x === "string"; }) : []);
     if (typeof o.server === "string" && typeof o.stash === "string") planner.stash = stashKey({ server: o.server, stash: o.stash });
     plannerLoad();
@@ -1120,7 +1131,10 @@
   function plannerApplyLock() {
     var locked = plannerLocked();
     [pl.mult, pl.round, pl.fluids, pl.containers].forEach(function (c) { c.disabled = locked; });
-    if (locked) pl.stash.disabled = true;
+    if (locked) {
+      pl.stash.disabled = true;
+      pl.craft.disabled = true;
+    }
     pl.locked.hidden = !locked;
   }
 
@@ -1139,6 +1153,7 @@
       o.id = p.id;
       o.stash = planner.stash;
       o.names = planner.names;
+      o.craftPref = planner.craftPref;
       window.sessionStorage.setItem(PL_SAVE_KEY, JSON.stringify(o));
     } catch (e) {
       // storage blocked: a reload starts from the defaults
@@ -1160,6 +1175,7 @@
     planner.exclude = new Set(Array.isArray(o.exclude) ? o.exclude.filter(function (x) { return typeof x === "string"; }) : []);
     if (typeof o.stash === "string") planner.stash = o.stash;
     planner.names = o.names !== false;
+    planner.craftPref = typeof o.craftPref === "boolean" ? o.craftPref : null;
   }
 
   function plannerResetOptions() {
@@ -1171,6 +1187,8 @@
     pl.round.value = "none";
     pl.fluids.checked = false;
     pl.containers.checked = false;
+    pl.craft.checked = false;
+    planner.craftPref = null;
   }
 
   /** The page was opened: pick up a plan made earlier in this session (after a reload), or show the current one. */
@@ -1208,6 +1226,8 @@
 
   function plannerFail(e, what) {
     var b = e && e.body;
+    var craftText = craftConflictText(e);
+    if (craftText) return craftText;
     if (e && e.status === 413) return "That file is larger than 8 MiB.";
     if (e && e.status === 429) return b && b.error ? sentence(str(b.error)) : "Too many uploads; try again later.";
     if (b && b.error) return sentence(str(b.error));
@@ -1253,7 +1273,8 @@
   }
 
   /** Asks for the plan against the chosen stash and options. */
-  function plannerLoad() {
+  function plannerLoad(retried) {
+    retried = retried === true;
     window.clearTimeout(planner.loadTimer);
     var p = planner.plan;
     var s = plannerStash();
@@ -1274,6 +1295,13 @@
       plannerSave();
       plannerRender();
       plannerPollOrders();
+      // The first answer says whether this stash can take craft orders (the box is then on by default): ask again with
+      // that option. Recipes still loading: look again in a few seconds.
+      if (plannerOptions().craft !== body.craft) plannerScheduleLoad();
+      else if (plannerCraftInfo(r.plan).mode === "building" && planner.open) {
+        window.clearTimeout(planner.loadTimer);
+        planner.loadTimer = window.setTimeout(plannerLoad, 4000);
+      }
     }, function (e) {
       if (seq !== planner.seq) return;
       if (e && e.status === 404 && e.body && e.body.error === "no such stash") {
@@ -1284,6 +1312,15 @@
         plannerRender();
         plannerSave();
         plStatus("This material list has ended (30 minutes unused, 2 hours at most, or you logged out). Upload the file again.", true);
+      } else if (e && (e.status === 503 || e.status === 429) && e.body && typeof e.body.retryAfter === "number") {
+        var wait = Math.max(1, Math.min(60, Math.ceil(e.body.retryAfter)));
+        plOrderStatus("Busy, retrying in " + wait + " s.", true);
+        if (!retried) {
+          window.clearTimeout(planner.loadTimer);
+          planner.loadTimer = window.setTimeout(function () {
+            if (planner.plan && planner.plan.id === p.id) plannerLoad(true);
+          }, wait * 1000);
+        }
       } else {
         plOrderStatus(plannerFail(e, "Could not update the list"), true);
       }
@@ -1293,6 +1330,285 @@
   function plannerScheduleLoad() {
     window.clearTimeout(planner.loadTimer);
     planner.loadTimer = window.setTimeout(plannerLoad, 250);
+  }
+
+  // ---------- build planner: crafting from the stash ----------
+  // The server decides what is craftable (CRAFT-CONTRACT.md); this only shows it. With an older server there is no
+  // "craft" in the answer and nothing here shows.
+
+  /** mode: "none" (old server, or no crafting info at all), "off" (no recipes for this version), "building", "on". */
+  function plannerCraftInfo(p) {
+    var c = p && p.craft && typeof p.craft === "object" ? p.craft : null;
+    if (!c) return { mode: "none", c: null };
+    if (c.available === true) return { mode: "on", c: c };
+    var rec = c.recipes && typeof c.recipes === "object" ? c.recipes : {};
+    return { mode: rec.state === "building" ? "building" : "off", c: c };
+  }
+
+  function plItemName(id) {
+    var m = planner.names2;
+    if (m && m.has(id)) return m.get(id);
+    var it = itemByKey(id);
+    return it ? it.name : plPretty(id);
+  }
+
+  /** "6 Spruce Log, 12 Birch Log, and 2 more" for a list of { id, count }. */
+  function plCountsText(list, max) {
+    var arr = Array.isArray(list) ? list.filter(function (e) {
+      return e && typeof e === "object" && typeof e.id === "string" && num(e.count, 0) > 0;
+    }) : [];
+    var shown = arr.slice(0, max || 6).map(function (e) { return grouped(e.count) + " " + plItemName(e.id); });
+    if (arr.length > shown.length) shown.push("and " + (arr.length - shown.length) + " more");
+    return shown.join(", ");
+  }
+
+  /** The planner's own wording for why something can't be made, in plainer words where it is terse. */
+  function plReasonText(reason) {
+    var t = str(reason);
+    if (t === "too deep") return "the recipe chain is too long";
+    if (t === "a recipe loop") return "its recipes only lead back to each other";
+    if (t === "plan too large") return "the crafting plan got too large to finish";
+    return t;
+  }
+
+  /** Why the bot can't use a table (craftOrders.tableWhy), as a sentence. */
+  var CRAFT_WHY_WORDS = {
+    no_area: "No stash area recorded yet, so the bot can't check the table's distance.",
+    no_dimension: "The stash's dimension isn't recorded yet, so the bot can't check the table.",
+    wrong_dimension: "The table is in a different dimension than the stash.",
+    too_far: "The table is more than 64 blocks from the stash.",
+    not_table: "There is no crafting table at that spot.",
+    no_stand: "The bot can't find a spot to stand next to the table.",
+    path_failed: "The bot can't find a path to the table.",
+    not_loaded: "The table's chunk isn't loaded, so the bot can't check it yet.",
+    no_material: "The bot found no crafting table nearby and the stash has no crafting table, planks or logs to make one."
+  };
+
+  function craftWhyText(why) {
+    return typeof why === "string" && Object.prototype.hasOwnProperty.call(CRAFT_WHY_WORDS, why) ? CRAFT_WHY_WORDS[why] : "";
+  }
+
+  var PL_TABLE_WORDS = {
+    auto: "the bot will find, place or craft one",
+    unset: "no crafting table is set",
+    unloaded: "the bot hasn't checked it yet",
+    not_table: "there is no crafting table at that spot",
+    unreachable: "the bot can't reach it",
+    other_dimension: "it is in a different dimension than the stash",
+    unknown: "the bot hasn't reported on it yet"
+  };
+
+  /** Why this stash can't take craft orders, as a sentence (from the code the server gives). */
+  function plCraftReasonText(c) {
+    var rec = c.recipes && typeof c.recipes === "object" ? c.recipes : {};
+    var bot = c.bot && typeof c.bot === "object" ? c.bot : {};
+    switch (str(c.reason)) {
+      case "no_recipes": return "Crafting info isn't available for " + (str(rec.mc) || "this Minecraft version") + ".";
+      case "no_bot":
+        return bot.supports === true
+          ? "The bot has crafting turned off. Turn on crafting and craft orders in its settings."
+          : "This stash's bot can't craft orders (needs StashSorter 1.15.0+).";
+      case "recipes_differ": return "The bot's recipe table differs from the server's. Update or restart the bot so they match.";
+      case "no_table":
+        if (/^Waiting for the bot/.test(str(c.message))) return "Waiting for the bot to pick up the latest settings.";
+        if (craftWhyText(c.tableWhy)) return craftWhyText(c.tableWhy);
+        return "Set a crafting table for this stash to order crafted items, or use a bot that can find, place or craft one.";
+      case "table_bad":
+        if (craftWhyText(c.tableWhy)) return "The crafting table isn't usable. " + craftWhyText(c.tableWhy);
+        if (str(c.tableStatus) === "unloaded") return "The bot hasn't checked the crafting table yet.";
+        return "The crafting table isn't usable: " + (PL_TABLE_WORDS[str(c.tableStatus)] || "the bot can't use it") + ".";
+      default: return str(c.message) ? sentence(str(c.message)) : "Crafting orders aren't available for this stash.";
+    }
+  }
+
+  /** Goes to the Kits tab of the planner's stash, where the crafting table is set. */
+  function plannerOpenCraftSettings() {
+    var s = plannerStash();
+    if (s) selectStash(stashKey(s));
+    showPage("stash");
+    selectTab("kits");
+  }
+
+  function plNote(box, text, kind, linkText) {
+    var d = kitNote(box, text, kind);
+    if (linkText) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "mc-button small";
+      b.textContent = linkText;
+      b.addEventListener("click", plannerOpenCraftSettings);
+      d.appendChild(b);
+    }
+  }
+
+  /** What the rows take from the stash in all, biggest first. */
+  function plCraftTake(p) {
+    var m = new Map();
+    p.items.forEach(function (r) {
+      if (r.excluded || !Array.isArray(r.craftUses)) return;
+      r.craftUses.forEach(function (u) {
+        if (u && typeof u.id === "string") m.set(u.id, (m.get(u.id) || 0) + num(u.count, 0));
+      });
+    });
+    return Array.from(m.entries()).sort(function (a, b) { return b[1] - a[1]; }).map(function (e) { return { id: e[0], count: e[1] }; });
+  }
+
+  /** The banners, the craft box and the Craftable header for the plan's craft state (the table cells are in the rows). */
+  function plannerRenderCraft(p) {
+    var info = plannerCraftInfo(p);
+    var c = info.c;
+    var names = new Map();
+    p.items.forEach(function (r) { names.set(str(r.id), plName(r)); });
+    planner.names2 = names;
+    pl.thCraft.hidden = info.mode !== "on" && info.mode !== "building";
+    var box = pl.craftBanner;
+    box.replaceChildren();
+    var canLink = can("view") && !forcedStreamer();
+    var canOrder = info.mode === "on" && c.canOrder === true;
+    if (info.mode === "off" && c) {
+      plNote(box, plCraftReasonText(c), "");
+    } else if (info.mode === "building") {
+      var rec = c.recipes && typeof c.recipes === "object" ? c.recipes : {};
+      plNote(box, "Loading recipes for " + (str(rec.mc) || "this version") + "…", "");
+    } else if (info.mode === "on") {
+      if (!canOrder) {
+        var why = str(c.reason);
+        plNote(box, plCraftReasonText(c), why === "no_table" || why === "table_bad" ? "warn" : "",
+          (why === "no_table" || why === "table_bad") && canLink ? "Open the crafting table setting" : "");
+      }
+      if (c.truncated === true) plNote(box, "The crafting plan was cut short; some items show as missing.", "warn");
+    }
+    box.hidden = !box.firstChild;
+    // The craft box: only with recipes. On by default when the stash can take craft orders.
+    var show = info.mode === "on";
+    pl.craftRow.hidden = !show;
+    pl.craftNote.hidden = true;
+    if (!show) {
+      pl.craft.checked = false;
+      return;
+    }
+    var locked = plannerLocked();
+    var on;
+    if (locked && planner.ordered.options && typeof planner.ordered.options === "object") on = planner.ordered.options.craft === true;
+    else on = canOrder && planner.craftPref !== false;
+    pl.craft.checked = on;
+    pl.craft.disabled = locked || !canOrder;
+    var t = p.totals && typeof p.totals === "object" ? p.totals : {};
+    var n = num(t.craftable, 0);
+    if (!canOrder) {
+      pl.craftText.textContent = "Craft what the stash can make";
+      pl.craftNote.textContent = "Not available: " + plCraftReasonText(c).replace(/^./, function (ch) { return ch.toLowerCase(); });
+      pl.craftNote.hidden = false;
+    } else {
+      var take = plCraftTake(p);
+      pl.craftText.textContent = "Craft what the stash can make (" + (n > 0
+        ? grouped(n) + " " + (n === 1 ? "item" : "items") + " from " + plCountsText(take, 3)
+        : "nothing to craft here") + ")";
+      pl.craftNote.textContent = "The bot takes the ingredients from the stash, crafts them at the crafting table and delivers the result with the order.";
+      pl.craftNote.hidden = false;
+    }
+  }
+
+  /** The missing amount the page shows: after crafting when the server says (older servers: as before). */
+  function plMissing(r) {
+    return typeof r.missingAfterCraft === "number" ? r.missingAfterCraft : num(r.missing, 0);
+  }
+
+  /** The hover text of a Craft cell: what it uses, what it makes, what goes back. */
+  function plCraftTip(r) {
+    var st = str(r.craftStatus);
+    if (r.excluded) return "";
+    if (st === "none") return "Nothing to make: the stash already has enough.";
+    if (st === "no_recipe") return "No crafting-table recipe makes this.";
+    if (st === "station") return "Can't be made at a crafting table: " + plReasonText(r.craftReason) + ".";
+    var lines = [];
+    if (st === "short") lines.push("Can't make any: " + (plReasonText(r.craftReason) || "not enough ingredients") + ".");
+    var uses = plCountsText(r.craftUses, 8);
+    if (uses) lines.push("Uses from the stash: " + uses);
+    var steps = Array.isArray(r.craftSteps) ? r.craftSteps.filter(function (s) { return s && typeof s === "object" && typeof s.result === "string"; }) : [];
+    if (steps.length) {
+      lines.push("Makes: " + steps.map(function (s) {
+        var fills = num(s.fills, 0);
+        var from = plCountsText(s.inputs, 4);
+        return grouped(num(s.made, 0)) + " " + plItemName(s.result) +
+          (from ? " from " + from : fills > 1 ? " (" + fills + " crafts)" : "");
+      }).join("; "));
+    }
+    var left = plCountsText(r.craftLeftovers, 6);
+    if (left) lines.push("Back to the stash: " + left);
+    if (st === "partial" && str(r.craftReason)) lines.push("Can't make the rest: " + plReasonText(r.craftReason) + ".");
+    return lines.join("\n");
+  }
+
+  /** The Craftable cell (only when the Craftable column is shown). */
+  function plCraftCell(r, mode) {
+    var td = document.createElement("td");
+    td.className = "pl-c-num";
+    if (mode === "building") {
+      td.textContent = "…";
+      td.title = "Loading recipes";
+      return td;
+    }
+    var st = str(r.craftStatus);
+    var n = num(r.craftable, 0);
+    if (r.excluded || !st || st === "none" || st === "no_recipe" || st === "station" || st === "excluded") {
+      td.textContent = "–";
+    } else if (n > 0) {
+      td.textContent = plStacks(n, r.maxStack);
+      td.classList.add("pl-craftable");
+    } else {
+      td.textContent = "0";
+    }
+    td.title = plCraftTip(r);
+    return td;
+  }
+
+  /** The Missing cell: "craftable" when the stash can make all of it, the rest in red with "+N craftable" when part. */
+  function plMissingCell(r, ms) {
+    var missing = num(r.missing, 0);
+    if (typeof r.missingAfterCraft !== "number" || r.excluded || missing <= 0) {
+      return plNumCell(typeof r.missingAfterCraft === "number" && !r.excluded ? r.missingAfterCraft : r.missing, ms,
+        num(r.missing, 0) > 0 && !r.excluded ? "pl-missing" : "");
+    }
+    var after = r.missingAfterCraft;
+    var made = Math.max(0, missing - after);
+    var td = document.createElement("td");
+    td.className = "pl-c-num";
+    if (after === 0) {
+      td.textContent = "craftable";
+      td.classList.add("pl-craft-covered");
+      td.title = grouped(missing) + " missing from the stash; all of it can be crafted";
+      return td;
+    }
+    td.classList.add("pl-missing");
+    td.appendChild(document.createTextNode(plStacks(after, ms)));
+    if (made > 0) {
+      td.appendChild(line("pl-craft-plus", "+" + grouped(made) + " craftable"));
+      td.title = grouped(after) + " still missing after crafting (" + grouped(missing) + " missing, " + grouped(made) + " can be crafted)";
+    } else {
+      td.title = grouped(after);
+    }
+    return td;
+  }
+
+  /** The sentence for a 409 { craft: code } from placing an order, or "". */
+  function craftConflictText(e) {
+    var kitCode = e && e.body && typeof e.body.kit === "string" ? e.body.kit : "";
+    if (kitCode === "no_bot") return "This stash's bot can't build kits yet (it needs a bot with kit orders). Remove the kit lines or wait for the bot to be updated.";
+    if (kitCode === "disabled") return "Kit orders are turned off on the bot. Turn them on, or remove the kit lines.";
+    if (kitCode === "deleted") return "That kit was deleted, so the order can't be placed. Remove the kit line.";
+    var code = e && e.status === 409 && e.body && typeof e.body.craft === "string" ? e.body.craft : "";
+    var tail = " Untick “Craft what the stash can make” to order only what the stash holds.";
+    switch (code) {
+      case "no_recipes": return "Crafting info isn't available for this stash's Minecraft version." + tail;
+      case "no_bot": return "This stash's bot can't craft orders (it needs StashSorter 1.15.0+ with crafting turned on)." + tail;
+      case "recipes_differ": return "The bot's recipe table differs from the server's, so it can't craft orders yet." + tail;
+      case "no_table":
+        if (/Waiting for the bot/.test(str(e.body.error))) return "Waiting for the bot to pick up the latest settings. Try again in a moment." + tail;
+        return "No crafting table is set for this stash. Set one in the Kits tab, under Crafting table." + tail;
+      case "table_bad": return "The crafting table isn't usable right now: the bot can't find or reach it." + tail;
+      default: return "";
+    }
   }
 
   // ---------- build planner: rendering ----------
@@ -1305,6 +1621,7 @@
     if (!full) return;
     plannerFillStashes();
     plannerRenderFacts(p);
+    plannerRenderCraft(p);
     plannerRenderTiles(p);
     plannerRenderRows(p);
     plannerRenderSimple(pl.unknownBox, pl.unknown, Array.isArray(p.unknown) ? p.unknown : [], num(p.unknownOmitted, 0), false);
@@ -1361,10 +1678,25 @@
     var frag = document.createDocumentFragment();
     frag.appendChild(plTile("Needed", grouped(num(t.need, 0)), plural(String(p.items.filter(function (r) { return !r.excluded; }).length), "kind")));
     frag.appendChild(plTile("Available", grouped(num(t.available, 0)), "in the stash, after open orders", "ok"));
-    frag.appendChild(plTile("Missing", grouped(num(t.missing, 0)), num(t.missing, 0) > 0 ? "not in the stash" : "nothing missing",
-      num(t.missing, 0) > 0 ? "bad" : "ok"));
+    var cinfo = plannerCraftInfo(p);
+    var withCraft = cinfo.mode === "on" && typeof t.craftable === "number";
+    var missing = withCraft && typeof t.missingAfterCraft === "number" ? t.missingAfterCraft : num(t.missing, 0);
+    var missingSub = "nothing missing";
+    if (missing > 0) missingSub = withCraft && num(t.craftable, 0) > 0 ? "still missing after crafting" : "not in the stash";
+    else if (withCraft && num(t.missing, 0) > 0) missingSub = "nothing missing after crafting";
+    frag.appendChild(plTile("Missing", grouped(missing), missingSub, missing > 0 ? "bad" : "ok"));
+    if (withCraft) {
+      var kinds = num(t.craftKinds, 0);
+      var sub = cinfo.c.canOrder === true ? plural(String(kinds), "kind") + ", from the stash" : "can't be ordered yet (see above)";
+      frag.appendChild(plTile("Craftable", grouped(num(t.craftable, 0)), sub, num(t.craftable, 0) > 0 ? "craft" : ""));
+    } else if (cinfo.mode === "building") {
+      frag.appendChild(plTile("Craftable", "…", "loading recipes"));
+    }
     if (st && st.indexed && typeof t.shulkers === "number") {
-      frag.appendChild(plTile("To order", grouped(num(t.want, 0)), plural(String(num(t.lines, 0)), "line")));
+      // With the craft box ticked the crafted items are ordered too.
+      var withCraftOn = pl.craft.checked && !pl.craftRow.hidden && !plannerLocked();
+      var toOrder = withCraftOn ? (typeof t.wantWithCraft === "number" ? t.wantWithCraft : num(t.want, 0) + num(t.craftable, 0)) : num(t.want, 0);
+      frag.appendChild(plTile("To order", grouped(toOrder), plural(String(num(t.lines, 0)), "line")));
       frag.appendChild(plTile("Shulkers", grouped(t.shulkers), plural(String(num(t.parts, 0)), "order") + " of up to 54"));
     } else {
       frag.appendChild(plTile("To order", "–", "this stash has no index yet"));
@@ -1374,13 +1706,14 @@
 
   function plSortValue(r, key) {
     if (key === "name") return plName(r).toLowerCase();
+    if (key === "missing") return plMissing(r);
     return num(r[key], 0);
   }
 
   function plannerVisibleRows(p) {
     var f = planner.filter.trim().toLowerCase();
     var rows = p.items.filter(function (r) {
-      if (planner.onlyMissing && !(num(r.missing, 0) > 0 && !r.excluded)) return false;
+      if (planner.onlyMissing && !(plMissing(r) > 0 && !r.excluded)) return false;
       if (!f) return true;
       return plName(r).toLowerCase().indexOf(f) >= 0 || str(r.id).toLowerCase().indexOf(f) >= 0;
     });
@@ -1435,6 +1768,7 @@
 
   function plannerRenderRows(p) {
     var rows = plannerVisibleRows(p);
+    var craftMode = plannerCraftInfo(p).mode;
     var frag = document.createDocumentFragment();
     rows.forEach(function (r) {
       var tr = document.createElement("tr");
@@ -1475,13 +1809,14 @@
       tr.appendChild(plNumCell(r.need, ms));
       tr.appendChild(plNumCell(r.inStash, ms, "", r.inIndex !== true));
       tr.appendChild(plNumCell(r.available, ms, "", r.inIndex !== true));
-      tr.appendChild(plNumCell(r.missing, ms, num(r.missing, 0) > 0 && !r.excluded ? "pl-missing" : ""));
+      if (craftMode === "on" || craftMode === "building") tr.appendChild(plCraftCell(r, craftMode));
+      tr.appendChild(plMissingCell(r, ms));
       frag.appendChild(tr);
     });
     if (!rows.length) {
       var tr = document.createElement("tr");
       var td = document.createElement("td");
-      td.colSpan = 7;
+      td.colSpan = craftMode === "on" || craftMode === "building" ? 8 : 7;
       td.className = "pl-empty";
       td.textContent = p.items.length ? "Nothing matches." : "The schematic has no blocks that are items.";
       tr.appendChild(td);
@@ -1528,7 +1863,8 @@
     // Placed parts of the split for the options shown (other options can only be previewed while it is locked).
     var started = !!(o && o.placed && Object.keys(o.placed).length && (o.sameOptions !== false || o.locked === true));
     pl.order.hidden = !mayOrder || started;
-    pl.order.disabled = !st || !st.indexed || !(num(t.want, 0) > 0);
+    var craftLines = pl.craft.checked && !pl.craftRow.hidden && num(t.lines, 0) > 0;
+    pl.order.disabled = !st || !st.indexed || !(num(t.want, 0) > 0 || craftLines);
     pl.next.hidden = true;
     pl.again.hidden = true;
     if (!mayOrder || !started) return;
@@ -1597,7 +1933,7 @@
 
   function plannerMissingRows() {
     var p = planner.plan;
-    return p && p.items ? p.items.filter(function (r) { return !r.excluded && num(r.missing, 0) > 0; }) : [];
+    return p && p.items ? p.items.filter(function (r) { return !r.excluded && plMissing(r) > 0; }) : [];
   }
 
   function plCsvField(v) {
@@ -1612,13 +1948,13 @@
     if (kind === "csv") {
       var out = ["item,name,missing,stacks"];
       rows.forEach(function (r) {
-        out.push([plCsvField(str(r.id)), plCsvField(plName(r)), num(r.missing, 0), plCsvField(plStacks(r.missing, r.maxStack))].join(","));
+        out.push([plCsvField(str(r.id)), plCsvField(plName(r)), plMissing(r), plCsvField(plStacks(plMissing(r), r.maxStack))].join(","));
       });
       return out.join("\r\n") + "\r\n";
     }
-    var lines = ["Missing materials (" + plural(String(rows.length), "kind") + ")"];
+    var lines = ["Missing materials" + (plannerCraftInfo(planner.plan).mode === "on" ? " after crafting" : "") + " (" + plural(String(rows.length), "kind") + ")"];
     rows.forEach(function (r) {
-      lines.push("- " + plName(r) + ": " + grouped(num(r.missing, 0)) + " (" + plStacks(r.missing, r.maxStack) + ")");
+      lines.push("- " + plName(r) + ": " + grouped(plMissing(r)) + " (" + plStacks(plMissing(r), r.maxStack) + ")");
     });
     return lines.join("\n") + "\n";
   }
@@ -1739,12 +2075,41 @@
       for (var i = 0; i < p.items.length; i++) if (p.items[i].id === id) return plName(p.items[i]);
       return plPretty(id);
     };
+    var craftLinesOf = function (pt) { return Array.isArray(pt.lines) ? pt.lines.filter(function (l) { return l && l.type === "craft"; }) : []; };
+    var craftOn = parts.some(function (pt) { return craftLinesOf(pt).length > 0; });
+    var rowOf = function (id) {
+      for (var i = 0; i < p.items.length; i++) if (p.items[i].id === id) return p.items[i];
+      return null;
+    };
     var na = Array.isArray(dry.notAvailable) ? dry.notAvailable : [];
+    if (craftOn) {
+      // What the stash can make is ordered as craft lines, so it is not left out.
+      na = na.filter(function (e) { var row = rowOf(str(e.id)); return !(row && num(row.craftable, 0) > 0); });
+      var made = new Map();
+      var takes = new Map();
+      var fillsTotal = 0;
+      parts.forEach(function (pt) {
+        craftLinesOf(pt).forEach(function (l) { made.set(str(l.key), (made.get(str(l.key)) || 0) + num(l.count, 0)); });
+        var cr = pt.craft && typeof pt.craft === "object" ? pt.craft : null;
+        if (!cr) return;
+        fillsTotal += num(cr.fills, 0);
+        (Array.isArray(cr.take) ? cr.take : []).forEach(function (u) {
+          if (u && typeof u.id === "string") takes.set(u.id, (takes.get(u.id) || 0) + num(u.count, 0));
+        });
+      });
+      var madeList = Array.from(made.entries()).map(function (e) { return { id: e[0], count: e[1] }; });
+      var takeList = Array.from(takes.entries()).map(function (e) { return { id: e[0], count: e[1] }; });
+      body.appendChild(line("note", "Crafted from the stash by the bot: " + plCountsText(madeList, 8) +
+        (takeList.length ? ". It uses " + plCountsText(takeList, 8) : "") +
+        (fillsTotal > 0 ? " (about " + plural(grouped(fillsTotal), "craft") + " at the table)" : "") + "."));
+    }
     if (na.length) {
       var names = na.slice(0, 12).map(function (e) { return nameOf(str(e.id)) + " × " + grouped(num(e.need, 0)); });
       body.appendChild(line("note warn", "Not available in this stash, left out: " + names.join(", ") + (na.length > 12 ? " and " + (na.length - 12) + " more." : ".")));
     }
-    var miss = Array.isArray(dry.missing) ? dry.missing : [];
+    var miss = (Array.isArray(dry.missing) ? dry.missing : []).filter(function (e) {
+      return typeof e.missingAfterCraft !== "number" || e.missingAfterCraft > 0;
+    });
     if (miss.length) body.appendChild(line("note", plural(String(miss.length), "kind") + " of material will still be missing (see the list; Export missing)."));
     var check = checkField("", planner.names);
     check.node.replaceChildren(check.input, document.createTextNode(" Name the shulkers “"), hiddenSpan(PLANNER_NAME_PREFIX + str(p.fileName)),
@@ -1888,6 +2253,13 @@
     planner.ordered = null;
     plOrderStatus("", false);
     plannerLoad();
+  });
+  pl.craft.addEventListener("change", function () {
+    planner.craftPref = pl.craft.checked;
+    plannerSave();
+    plannerRenderTiles(planner.plan);
+    plannerRenderActions();
+    plannerScheduleLoad();
   });
   pl.mult.addEventListener("input", function () {
     if (pl.mult.value !== "") plannerScheduleLoad();
@@ -2974,6 +3346,7 @@
   var TAB_SHULKERS = { id: "shulkers", name: "Shulkers", icon: "minecraft:shulker_box" };
   var TAB_ORDERS = { id: "orders", name: "Orders", icon: "minecraft:writable_book" };
   var TAB_KITS = { id: "kits", name: "Kits", icon: "minecraft:purple_shulker_box" };
+  var TAB_KB = { id: "kitbuilder", name: "Kit Builder", icon: "minecraft:crafting_table" };
   var TAB_INDEX = {};
   CREATIVE_TABS.forEach(function (t, i) { TAB_INDEX[t.id] = i; });
 
@@ -2992,6 +3365,7 @@
     if (id === "shulkers") return TAB_SHULKERS;
     if (id === "orders") return TAB_ORDERS;
     if (id === "kits") return TAB_KITS;
+    if (id === "kitbuilder") return TAB_KB;
     return CREATIVE_TABS[TAB_INDEX[id]] || TAB_ALL;
   }
 
@@ -3006,6 +3380,8 @@
     if (state.shulkers.length) out.push(TAB_SHULKERS);
     // Kits shows positions and names players typed: not for a user the owner forced into streamer mode (the server says 403).
     if (can("view") && !forcedStreamer()) out.push(TAB_KITS);
+    // The Kit Builder shows kit names and designs, no positions: a forced streamer sees it (the server hides the chests).
+    if (can("view")) out.push(TAB_KB);
     out.push(TAB_ORDERS);
     return out;
   }
@@ -3013,7 +3389,7 @@
   /** The entries a tab shows (before search). */
   function tabEntries(id) {
     if (id === "shulkers") return state.shulkers;
-    if (id === "all" || id === "orders" || id === "kits") return state.items;
+    if (id === "all" || id === "orders" || id === "kits" || id === "kitbuilder") return state.items;
     return state.items.filter(function (e) { return e.item.tab === id; });
   }
 
@@ -3045,11 +3421,13 @@
     var ids = tabs.map(function (t) { return t.id; });
     if (ids.indexOf(state.tab) < 0) {
       state.tab = "all";
-      if (el.viewKits && !el.viewKits.hidden) {
+      if ((el.viewKits && !el.viewKits.hidden) || (el.viewKb && !el.viewKb.hidden)) {
         // The Kits tab went away under the user (their permissions changed): back to the items.
         el.viewKits.hidden = true;
+        el.viewKb.hidden = true;
         el.viewItems.hidden = false;
         kitsSync();
+        kbSync();
       }
     }
     var signature = ids.join(",") + "|" + state.mc;
@@ -3060,14 +3438,15 @@
       tabs.forEach(function (t) {
         var b = document.createElement("button");
         b.type = "button";
-        b.className = "tab" + (t.id === "orders" || t.id === "kits" ? " tab-orders" : "");
+        var rightTab = t.id === "orders" || t.id === "kits" || t.id === "kitbuilder";
+        b.className = "tab" + (rightTab ? " tab-orders" : "");
         b.setAttribute("role", "tab");
         b.dataset.tab = t.id;
         b.title = t.name;
         b.setAttribute("aria-label", t.name);
         b.appendChild(iconImg(t.icon, 32));
         b.addEventListener("click", function () { selectTab(t.id); });
-        (t.id === "orders" || t.id === "kits" ? right : left).appendChild(b);
+        (rightTab ? right : left).appendChild(b);
       });
       el.tabs.replaceChildren(left);
       el.tabsRight.replaceChildren(right);
@@ -3092,12 +3471,19 @@
     hideTooltip();
     var orders = id === "orders";
     var kitsTab = id === "kits";
-    el.viewItems.hidden = orders || kitsTab;
+    var kbTab = id === "kitbuilder";
+    el.viewItems.hidden = orders || kitsTab || kbTab;
     el.viewOrders.hidden = !orders;
     el.viewKits.hidden = !kitsTab;
+    el.viewKb.hidden = !kbTab;
     kitsSync();
+    kbSync();
     if (kitsTab) {
       kitsRender();
+      craftSetRender();
+      areaSetRender();
+    } else if (kbTab) {
+      kbRender();
     } else if (!orders) {
       el.sort.value = isCreativeTab(id) ? state.sortTab : state.sortAll;
       el.gridWrap.scrollTop = 0;
@@ -3506,6 +3892,8 @@
 
   function toast(text) {
     el.toast.textContent = text;
+    if (streamerOn()) el.toast.setAttribute("data-sensitive", "");
+    else el.toast.removeAttribute("data-sensitive");
     el.toast.hidden = false;
     window.clearTimeout(toastTimer);
     toastTimer = window.setTimeout(function () { el.toast.hidden = true; }, 2500);
@@ -3523,6 +3911,7 @@
     retryErrors: new Map() // order id -> why the last retry was refused
   };
   var cart = { lines: [], badLine: -1, repairAll: false };
+  var KB_ID = /^t-[0-9a-z]{8}$/; // a Kit Builder kit's id (a kit line's key)
   var picker = { level: "types", type: null, entry: null, search: "", slots: [], qtyHost: null };
 
   function clampInt(v, lo, hi) {
@@ -3533,6 +3922,7 @@
 
   /** What the server says can still be ordered (index count minus open orders), before this cart. */
   function availableTotal(type, key) {
+    if (type === "kit") return MAX_SHULKERS; // the server checks the stock at placement and answers with the shortfall
     var a = orders.available;
     var map = a ? (type === "shulker" ? a.shulkers : a.items) : null;
     if (map && typeof map[key] === "number") return map[key];
@@ -3561,6 +3951,7 @@
   }
 
   function lineItem(type, key) {
+    if (type === "kit") return kbLineItem(key);
     if (type === "shulker") {
       var g = state.shulkerByKey && state.shulkerByKey.get(key);
       return g ? g.item : null;
@@ -3569,6 +3960,7 @@
   }
 
   function displayName(type, item) {
+    if (type === "kit") return "Kit: " + item.name;
     if (type === "shulker") return item.name + " (packed)";
     if (isShulkerBoxId(item.id)) return "Empty " + item.name;
     return item.name;
@@ -3593,7 +3985,7 @@
       var raw = JSON.parse(window.localStorage.getItem(k) || "[]");
       if (Array.isArray(raw)) {
         raw.forEach(function (l) {
-          if (l && (l.type === "item" || l.type === "shulker") && typeof l.key === "string" && num(l.count, 0) >= 1) {
+          if (l && (l.type === "item" || l.type === "shulker" || (l.type === "kit" && KB_ID.test(str(l.key)))) && typeof l.key === "string" && num(l.count, 0) >= 1) {
             var cl = { type: l.type, key: l.key, count: Math.floor(l.count) };
             if (l.type === "item" && l.repair === true) cl.repair = true;
             cart.lines.push(cl);
@@ -3643,7 +4035,7 @@
     var units = 0;
     var slots = 0;
     lines.forEach(function (l) {
-      if (l.type === "shulker" || isEmptyShulkerLine(l)) units += l.count;
+      if (l.type === "shulker" || l.type === "kit" || isEmptyShulkerLine(l)) units += l.count;
       else slots += Math.ceil(l.count / lineMaxStack(l.key));
     });
     return units + Math.ceil(slots / SHULKER_SLOTS);
@@ -3654,12 +4046,15 @@
     if (shulkersNeeded(lines) > MAX_SHULKERS) return null;
     var shulkerUnits = [];
     var emptyUnits = [];
+    var kitUnits = [];
     var byKey = {};
     var keys = [];
     lines.forEach(function (l) {
       var i;
       if (l.type === "shulker") {
         for (i = 0; i < l.count; i++) shulkerUnits.push({ kind: "shulker", key: l.key });
+      } else if (l.type === "kit") {
+        for (i = 0; i < l.count; i++) kitUnits.push({ kind: "kit", key: l.key });
       } else if (isEmptyShulkerLine(l)) {
         for (i = 0; i < l.count; i++) emptyUnits.push({ kind: "empty", key: l.key });
       } else {
@@ -3682,7 +4077,8 @@
         bins[bins.length - 1].lots.push(lot);
       });
     });
-    return shulkerUnits.concat(emptyUnits, bins);
+    // The server's delivery order: packed shulkers, empty shulkers, kits, then the packed bins.
+    return shulkerUnits.concat(emptyUnits, kitUnits, bins);
   }
 
   function capMessage(n) {
@@ -3783,6 +4179,7 @@
     renderOrderList();
     scheduleOrdersPoll(0);
     kitsReset();
+    kbReset();
   }
 
   /** Re-renders the parts of the Orders tab that depend on the index (after every index refresh). */
@@ -3863,6 +4260,10 @@
       var g = state.shulkerByKey && state.shulkerByKey.get(u.key);
       return "Packed shulker: " + (g ? g.item.name : u.key);
     }
+    if (u.kind === "kit") {
+      var kt = kbTemplate(u.key);
+      return "Kit: " + (streamerOn() ? "a kit" : kt ? kt.name : u.key) + " (named after the kit)";
+    }
     if (u.kind === "empty") {
       var it = itemByKey(u.key);
       var colour = (it ? it.id : "").replace(/^minecraft:/, "").replace(/_?shulker_box$/, "").replace(/_/g, " ");
@@ -3919,11 +4320,18 @@
       units.forEach(function (u, i) {
         var text = unitSummary(u);
         var r = names.rows[i];
-        if (r.text !== text) {
-          r.text = text;
+        var blur = u.kind === "kit" && streamerOn();
+        var shownKey = text + "|" + blur;
+        if (r.text !== shownKey) {
+          r.text = shownKey;
           r.what.textContent = text;
-          r.what.title = text;
+          r.what.title = blur ? "" : text;
+          if (blur) r.what.setAttribute("data-sensitive", "");
+          else r.what.removeAttribute("data-sensitive");
         }
+        // A kit is named with its template's name: what is typed for it is ignored by the bot.
+        r.input.disabled = u.kind === "kit";
+        r.input.placeholder = u.kind === "kit" ? "named after the kit" : "unnamed";
       });
       var hint = el.namesRows.querySelector(".names-empty");
       if (!units.length && !hint) el.namesRows.appendChild(line("note names-empty", "Add items to the cart to name its shulkers."));
@@ -3938,7 +4346,7 @@
     if (names.mode === "all") return names.all.trim() ? n : 0;
     if (names.mode !== "each") return 0;
     var c = 0;
-    for (var i = 0; i < n; i++) if (names.each[i] && names.each[i].trim()) c++;
+    for (var i = 0; i < n; i++) if (names.each[i] && names.each[i].trim() && plan.units[i].kind !== "kit") c++;
     return c;
   }
 
@@ -3948,7 +4356,7 @@
     if (names.mode !== "each") return null;
     var list = [];
     // At most 54 (the server's cap): a bigger cart is refused for its size anyway, and that error should be the one shown
-    for (var i = 0; i < Math.min(plan.units.length, 54); i++) list.push((names.each[i] || "").trim());
+    for (var i = 0; i < Math.min(plan.units.length, 54); i++) list.push(plan.units[i].kind === "kit" ? "" : (names.each[i] || "").trim());
     return list.some(function (v) { return v; }) ? { mode: "each", names: list } : null;
   }
 
@@ -4149,7 +4557,7 @@
             plan.selected = ui;
             renderPlan();
           } else {
-            removeFromCart(u.kind === "shulker" ? "shulker" : "item", u.key, 1);
+            removeFromCart(u.kind === "shulker" ? "shulker" : u.kind === "kit" ? "kit" : "item", u.key, 1);
           }
         };
         plan.chest.push(p);
@@ -4187,6 +4595,17 @@
         contents: gi ? gi.contents : [],
         title: (gi ? gi.name : u.key) + " (packed, as it is)",
         details: [where, "Right-click to remove it"]
+      };
+    }
+    if (u.kind === "kit") {
+      var kt = kbTemplate(u.key);
+      var kcontents = kt ? kbContents(kt) : [];
+      return {
+        id: kt ? kbShulkerId(kt.color) : "minecraft:shulker_box",
+        used: kcontents.length,
+        contents: kcontents,
+        title: "Kit: " + (streamerOn() ? "a kit" : kt ? kt.name : u.key),
+        details: [where, "A finished kit, named after the template", "Right-click to remove it"]
       };
     }
     if (u.kind === "empty") {
@@ -4318,12 +4737,12 @@
         continue;
       }
       var base = itemByKey(c.key) ||
-        { key: c.key, id: c.key.split("#")[0], name: c.key, englishName: c.key, maxStack: 64, details: [], enchanted: false };
+        { key: c.key, id: c.key.split("#")[0], name: kbItemLabel(c.key), englishName: kbItemLabel(c.key), maxStack: 64, details: [], enchanted: false };
       var shownItem = Object.assign({}, base, { count: c.count });
       if (su.kind === "bin") shownItem.details = base.details.concat(["Right-click to remove this stack"]);
       fillSlot(plan.bin[j], base.id, shownItem, c.count === 1 ? "" : String(c.count));
     }
-    var kind = su ? (su.kind === "bin" ? "" : su.kind === "empty" ? "empty · " : "packed · ") : "";
+    var kind = su ? (su.kind === "bin" ? "" : su.kind === "empty" ? "empty · " : su.kind === "kit" ? "kit · " : "packed · ") : "";
     el.binTitle.textContent = sinfo
       ? "Shulker " + (shown + 1) + " of " + units.length + " · " + kind + sinfo.used + "/" + SHULKER_SLOTS + " slots"
       : "Shulker Box · nothing planned yet";
@@ -4410,7 +4829,9 @@
     var frag = document.createDocumentFragment();
     var packed = 0;
     var empties = 0;
+    var kitCount = 0;
     var totalItems = 0;
+    kbWantCartNames();
     if (!cart.lines.length) {
       var empty = document.createElement("div");
       empty.className = "note";
@@ -4421,7 +4842,7 @@
       var item = lineItem(l.type, l.key);
       var row = document.createElement("div");
       row.className = "cart-line" + (i === cart.badLine ? " bad" : "");
-      var cartIcon = item ? iconWithContents(item.id, l.type === "shulker" ? item.contents : null, 32) : iconImg("minecraft:barrier", 32);
+      var cartIcon = item ? iconWithContents(item.id, l.type === "shulker" || l.type === "kit" ? item.contents : null, 32) : iconImg("minecraft:barrier", 32);
       if (item && durabilityLeft(item) >= 0) {
         if (!cartIcon.classList.contains("icon-wrap")) {
           var wrapIcon = document.createElement("span");
@@ -4434,7 +4855,8 @@
       row.appendChild(cartIcon);
       var name = document.createElement("span");
       name.className = "cart-name";
-      name.textContent = item ? displayName(l.type, item) : l.key + " (no longer in the stash)";
+      name.textContent = item ? displayName(l.type, item) : l.type === "kit" ? "Kit: " + l.key + " (not loaded or deleted)" : l.key + " (no longer in the stash)";
+      if (l.type === "kit" && streamerOn()) hide(name);
       row.appendChild(name);
       var input = document.createElement("input");
       input.type = "number";
@@ -4480,6 +4902,7 @@
       row.appendChild(rm);
       frag.appendChild(row);
       if (l.type === "shulker") packed += l.count;
+      else if (l.type === "kit") kitCount += l.count;
       else if (isEmptyShulkerLine(l)) empties += l.count;
       else totalItems += l.count;
     });
@@ -4500,6 +4923,7 @@
     if (totalItems) parts.push(grouped(totalItems) + (totalItems === 1 ? " item" : " items"));
     if (packed) parts.push(plural(String(packed), "packed shulker"));
     if (empties) parts.push(plural(String(empties), "empty shulker"));
+    if (kitCount) parts.push(plural(String(kitCount), "kit"));
     el.cartTotals.textContent = cart.lines.length
       ? parts.join(" + ") + " · " + plural(String(need), "shulker") + " to deliver" + (units ? "" : ". Too many: one order can fill at most " + MAX_SHULKERS + " (one double chest).")
       : "";
@@ -4617,6 +5041,17 @@
     updatePickerCounts();
   });
 
+  /** The text of a refused order. In streamer mode the kit shortfall is built from the structured list (item names only), other texts are generic. */
+  function orderErrorText(e, body) {
+    var fallback = "Could not place the order" + (e && e.status ? " (HTTP " + e.status + ")" : "") + ".";
+    if (!(body && body.error)) return fallback;
+    if (!streamerOn()) return body.error;
+    if (Array.isArray(body.short) && body.short.length) {
+      return "Not enough items to make those kits. Short: " + kitItemsText(body.short) + ".";
+    }
+    return "The order was refused (details are hidden in streamer mode).";
+  }
+
   el.cartPlace.addEventListener("click", function () {
     var s = currentStash();
     if (!s || !cart.lines.length) return;
@@ -4643,7 +5078,9 @@
     }, function (e) {
       var body = e && e.body;
       cart.badLine = body && typeof body.line === "number" ? body.line : -1;
-      el.cartStatus.textContent = body && body.error ? body.error : "Could not place the order" + (e && e.status ? " (HTTP " + e.status + ")" : "") + ".";
+      el.cartStatus.textContent = craftConflictText(e) || orderErrorText(e, body);
+      if (streamerOn()) el.cartStatus.setAttribute("data-sensitive", "");
+      else el.cartStatus.removeAttribute("data-sensitive");
       el.cartStatus.classList.add("warn");
       renderCart();
       scheduleOrdersPoll(0);
@@ -5129,12 +5566,170 @@
 
   function linesSummary(o) {
     return o.lines.map(function (l) {
+      if (l.type === "kit") return "Kit: " + grouped(l.count) + " × " + kbOrderKitName(o, str(l.key));
       var item = lineItem(l.type, l.key);
+      // A craft line: made by the bot from stash materials ("Craft: 8 Spruce Stairs").
+      if (l.type === "craft") return "Craft: " + grouped(l.count) + " " + (item ? item.name : plPretty(str(l.key)));
       return grouped(l.count) + " × " + (item ? displayName(l.type, item) : l.key);
     });
   }
 
+  var CRAFT_SHORT_WHY = {
+    no_table: "no crafting table was set",
+    table_missing: "there was no crafting table at the set spot",
+    table_blocked: "the bot couldn't reach or open the table",
+    ingredients_short: "the ingredients ran short",
+    inventory_full: "the bot's inventory was full",
+    recipe_mismatch: "the bot's recipes didn't match the server's",
+    grid_stuck: "the crafting grid got stuck",
+    timeout: "it took too long",
+    interrupted: "a player got in the way",
+    cap: "the bot reached its crafting limit",
+    cancelled: "the order was cancelled"
+  };
+
+  /** "6 Spruce Log, 3 Stick" for a list of { id|key, count } (the order's craft lists). */
+  function craftListText(list, idField, numField) {
+    var arr = Array.isArray(list) ? list.filter(function (e) { return e && typeof e === "object" && num(e[numField], 0) > 0; }) : [];
+    var shown = arr.slice(0, 8).map(function (e) {
+      var item = itemByKey(str(e[idField]));
+      return grouped(e[numField]) + " " + (item ? item.name : plPretty(str(e[idField])));
+    });
+    if (arr.length > shown.length) shown.push("and " + (arr.length - shown.length) + " more");
+    return shown.join(", ");
+  }
+
+  /** What the bot is to craft for an order, and once it is done what it made, what fell short and what went back. */
+  function appendCraftInfo(card, o) {
+    var plan = o.craft && typeof o.craft === "object" ? o.craft : null;
+    var res = FINISHED_STATUS[o.status] && o.result && typeof o.result === "object" && o.result.craft && typeof o.result.craft === "object"
+      ? o.result.craft : null;
+    if (res) {
+      var made = Array.isArray(res.made) ? res.made.filter(function (m) { return m && typeof m === "object"; }) : [];
+      var short = Array.isArray(res.short) ? res.short.filter(function (m) { return m && typeof m === "object"; }) : [];
+      if (made.length) {
+        card.appendChild(line("order-craft", "Crafted: " + made.map(function (m) {
+          var item = itemByKey(str(m.key));
+          var name = item ? item.name : plPretty(str(m.key));
+          return num(m.made, 0) >= num(m.wanted, 0) ? grouped(num(m.made, 0)) + " " + name
+            : grouped(num(m.made, 0)) + " of " + grouped(num(m.wanted, 0)) + " " + name;
+        }).join(", ") + "."));
+      }
+      if (short.length) {
+        card.appendChild(line("order-craft order-craft-short", "Not crafted: " + short.map(function (m) {
+          var item = itemByKey(str(m.key));
+          var why = str(m.reason);
+          return grouped(num(m.count, 0)) + " " + (item ? item.name : plPretty(str(m.key))) + " (" +
+            (CRAFT_SHORT_WHY[why] || (why && why !== "(hidden)" ? why : "reason hidden")) + ")";
+        }).join(", ") + "."));
+      }
+      var used = craftListText(res.used, "id", "count");
+      var back = craftListText(res.returned, "id", "count");
+      if (used || back || num(res.fills, 0) > 0) {
+        var d = document.createElement("details");
+        d.className = "order-craft-details";
+        var openKey = "craft:" + o.id;
+        d.open = orders.expanded.has(openKey);
+        d.addEventListener("toggle", function () {
+          if (d.open) orders.expanded.add(openKey);
+          else orders.expanded.delete(openKey);
+        });
+        var sum = document.createElement("summary");
+        sum.textContent = "Crafting details";
+        d.appendChild(sum);
+        if (used) d.appendChild(line("order-line", "Used from the stash: " + used));
+        if (back) d.appendChild(line("order-line", "Returned to the stash: " + back));
+        if (num(res.fills, 0) > 0) d.appendChild(line("order-line", plural(grouped(num(res.fills, 0)), "craft") + " at the table"));
+        card.appendChild(d);
+      }
+      return;
+    }
+    if (plan && OPEN_STATUS[o.status]) {
+      var take = craftListText(plan.take, "id", "count");
+      var fills = num(plan.fills, 0);
+      card.appendChild(line("order-craft", "Crafts from the stash: " + (take ? "uses " + take : "nothing extra") +
+        (fills > 0 ? " (about " + plural(grouped(fills), "craft") + " at the table)" : "") + "."));
+    }
+  }
+
   var FINISHED_STATUS = { delivered: true, failed: true, cancelled: true };
+
+  var KIT_SHORT_WHY = {
+    items_short: "the items ran short",
+    no_shulker: "there was no empty shulker box left",
+    inventory_full: "the bot's inventory was full",
+    template_mismatch: "the kit didn't match what the bot knows (it was edited?)",
+    interrupted: "a player got in the way",
+    timeout: "it took too long",
+    cancelled: "the order was cancelled",
+    cap: "the bot reached its limit"
+  };
+  var KIT_NOTE_WORDS = {
+    colour_substituted: "No empty shulker of the chosen colour was left, so another colour was used."
+  };
+
+  /** A line of text where some parts (kit names) are blurred in streamer mode. parts: strings, or { h: text } for a hidden one. */
+  function kitLineNode(cls, parts) {
+    var d = document.createElement("div");
+    d.className = cls;
+    parts.forEach(function (p) {
+      if (typeof p === "string") d.appendChild(document.createTextNode(p));
+      else d.appendChild(hiddenSpan(p.h));
+    });
+    return d;
+  }
+
+  function kitItemsText(list) {
+    var arr = Array.isArray(list) ? list.filter(function (e) { return e && typeof e === "object" && num(e.count, 0) > 0; }) : [];
+    var shown = arr.slice(0, 6).map(function (e) { return kbItemLabel(str(e.key) || str(e.match)) + " ×" + grouped(num(e.count, 0)); });
+    if (arr.length > shown.length) shown.push("and " + (arr.length - shown.length) + " more");
+    return shown.join(", ");
+  }
+
+  /** The kit part of an order: what was planned, then what the bot made, what fell short and the notes. */
+  function appendKitInfo(card, o) {
+    var plan = o.kit && typeof o.kit === "object" ? o.kit : null;
+    var res = FINISHED_STATUS[o.status] && o.result && typeof o.result === "object" && o.result.kit && typeof o.result.kit === "object"
+      ? o.result.kit : null;
+    if (res) {
+      var made = Array.isArray(res.made) ? res.made.filter(function (m) { return m && typeof m === "object"; }) : [];
+      var short = Array.isArray(res.short) ? res.short.filter(function (m) { return m && typeof m === "object"; }) : [];
+      made.forEach(function (m) {
+        var del = num(m.delivered, 0);
+        var wanted = num(m.wanted, 0);
+        var how = [];
+        if (num(m.ready, 0) > 0) how.push(num(m.ready, 0) + " already made");
+        if (num(m.built, 0) > 0) how.push(num(m.built, 0) + " built");
+        card.appendChild(kitLineNode("order-kit", ["Kit: ", { h: kbOrderKitName(o, str(m.template), str(m.name)) },
+          " – " + grouped(del) + (del >= wanted ? "" : " of " + grouped(wanted)) + " delivered" + (how.length ? " (" + how.join(", ") + ")" : "") + "."]));
+      });
+      short.forEach(function (m) {
+        var why = str(m.reason);
+        var stored = str(m.stored);
+        var items = kitItemsText(m.items);
+        var tail = (items ? " Short: " + items + "." : "") +
+          (stored === "incomplete" ? " Kept as an incomplete kit in its chest, to be topped up; it was not delivered."
+            : stored === "returned" ? " Not delivered; the items were put back." : " Not delivered.");
+        card.appendChild(kitLineNode("order-kit order-kit-short", ["Not made: " + grouped(num(m.kits, 0)) + " × ",
+          { h: kbOrderKitName(o, str(m.template)) }, " (" + (KIT_SHORT_WHY[why] || (why && why !== "(hidden)" ? why : "reason hidden")) + ")." + tail]));
+      });
+      (Array.isArray(res.notes) ? res.notes : []).forEach(function (n) {
+        if (typeof n !== "string") return;
+        card.appendChild(line("order-kit", KIT_NOTE_WORDS[n] || n.replace(/_/g, " ") + "."));
+      });
+      return;
+    }
+    if (plan && OPEN_STATUS[o.status]) {
+      var lines = Array.isArray(plan.lines) ? plan.lines : [];
+      lines.forEach(function (l) {
+        if (!l || typeof l !== "object" || !l.template) return;
+        var ready = num(l.ready, 0);
+        var build = num(l.build, 0);
+        card.appendChild(kitLineNode("order-kit", ["Kit: ", { h: str(l.template.name) || str(l.template.id) },
+          " – " + grouped(num(l.count, 0)) + (ready > 0 ? ", " + ready + " already made" : "") + (build > 0 ? ", " + build + " to build" : "") + "."]));
+      });
+    }
+  }
 
   function finishedCount() {
     return orders.list.filter(function (o) { return o && FINISHED_STATUS[o.status]; }).length;
@@ -5227,7 +5822,7 @@
             toast("Order placed again");
             scheduleOrdersPoll(0);
           }, function (e) {
-            var why = e && e.body && e.body.error ? str(e.body.error) : "HTTP " + (e && e.status ? e.status : "error");
+            var why = craftConflictText(e) || (e && e.body && e.body.error ? str(e.body.error) : "HTTP " + (e && e.status ? e.status : "error"));
             orders.retryErrors.set(o.id, why);
             toast("Could not retry: " + why);
             renderOrderList();
@@ -5304,6 +5899,8 @@
         }
       }
       appendRepairInfo(card, o);
+      appendCraftInfo(card, o);
+      appendKitInfo(card, o);
       if (orders.retryErrors.has(o.id)) card.appendChild(line("note warn", "Retry refused: " + orders.retryErrors.get(o.id)));
 
       var lines = linesSummary(o);
@@ -5316,8 +5913,14 @@
       });
       var summary = document.createElement("summary");
       summary.textContent = lines.slice(0, 3).join(", ") + (lines.length > 3 ? ", +" + (lines.length - 3) + " more" : "");
+      var hasKitLine = o.lines.some(function (l) { return l && l.type === "kit"; });
+      if (hasKitLine && streamerOn()) hide(summary); // kit names are blurred in streamer mode
       details.appendChild(summary);
-      lines.forEach(function (t) { details.appendChild(line("order-line", t)); });
+      lines.forEach(function (t, li) {
+        var ln = line("order-line", t);
+        if (o.lines[li] && o.lines[li].type === "kit" && streamerOn()) hide(ln);
+        details.appendChild(ln);
+      });
       if (o.result && typeof o.result === "object") {
         details.appendChild(line("order-line note", "Delivered in " + plural(String(num(o.result.shulkers, 0)), "shulker")));
       }
@@ -5331,13 +5934,840 @@
     if (!document.hidden && state.tab === "orders") scheduleOrdersPoll(0);
   });
 
+  // ---------- crafting table settings (in the Kits tab: the stash's settings) ----------
+  // GET/POST /api/v1/craft*: where the stash's crafting table is, and what must never be used as an ingredient
+  // (CRAFT-CONTRACT.md). The coordinates are positions: blurred in streamer mode, and a user the owner forced into
+  // streamer mode gets 403 {permission: "streamer"} for all of it. Polled with the Kits tab.
+
+  var CRAFT_POLL_MS = 5000;
+  var CRAFT_DIMS = [["minecraft:overworld", "Overworld"], ["minecraft:the_nether", "The Nether"], ["minecraft:the_end", "The End"]];
+  var CRAFT_ID = /^[a-z0-9_.-]+:[a-z0-9_.\/-]{1,128}$/;
+  var CRAFT_MAX_NEVER = 200;
+  var CRAFT_TABLE_WORDS = {
+    auto: "No table is set: the bot will find, place or craft a crafting table.",
+    unset: "No crafting table is set.",
+    ok: "The bot found the crafting table and can reach it.",
+    unloaded: "The bot hasn't been near that spot yet, so it can't check the table. That is fine: it checks when it gets there.",
+    not_table: "The bot looked at that spot and there is no crafting table there.",
+    unreachable: "The bot can't reach the crafting table.",
+    other_dimension: "The table is in a different dimension than the stash.",
+    unknown: "The bot hasn't reported on the table yet."
+  };
+  var craftSet = { timer: 0, loading: false, writing: false, token: 0, data: null, error: "", sig: "", snap: null, listed: 0 };
+
+  function craftEl(id) {
+    return $("craft-" + id);
+  }
+
+  /** Starts or stops the polling to match what is on screen (the Kits tab). */
+  function craftSetSync() {
+    window.clearTimeout(craftSet.timer);
+    craftSet.timer = 0;
+    if (kitsVisible()) craftSetPoll();
+  }
+
+  function craftSetReset() {
+    craftSet.token++;
+    craftSet.data = null;
+    craftSet.error = "";
+    craftSet.sig = "";
+    craftSet.snap = null;
+    ["x", "y", "z"].forEach(function (f) { craftEl(f).value = ""; });
+    craftSetRender();
+    craftSetSync();
+  }
+
+  function craftSetPoll() {
+    if (craftSet.loading || craftSet.writing) return;
+    var s = currentStash();
+    if (!s) return;
+    craftSet.loading = true;
+    var token = craftSet.token;
+    api("/api/v1/craft?server=" + encodeURIComponent(s.server) + "&stash=" + encodeURIComponent(s.stash)).then(function (d) {
+      if (token !== craftSet.token) return;
+      craftSet.data = d && typeof d === "object" ? d : null;
+      craftSet.error = "";
+    }, function (e) {
+      if (token !== craftSet.token) return;
+      craftSet.data = null;
+      craftSet.error = craftError(e, "read");
+    }).then(function () {
+      craftSet.loading = false;
+      if (token !== craftSet.token) {
+        craftSetSync();
+        return;
+      }
+      craftSetRender();
+      window.clearTimeout(craftSet.timer);
+      craftSet.timer = kitsVisible() ? window.setTimeout(craftSetPoll, CRAFT_POLL_MS) : 0;
+    });
+  }
+
+  /** A failed request as a sentence. */
+  function craftError(e, what) {
+    var b = e && e.body && typeof e.body === "object" ? e.body : {};
+    if (e && e.status === 403 && b.permission === "streamer") return "Crafting settings are hidden while streamer mode is forced on for your account, because they show positions.";
+    if (e && e.status === 403) return what === "read" ? "You don't have permission to see the crafting settings." : "Changing the crafting settings needs the “settings” permission.";
+    if (e && e.status === 404) return "That stash isn't available.";
+    if (e && e.status === 429) return "Too many changes. Wait " + num(b.retryAfter, 1) + " s.";
+    if (e && e.status === 503) return "The server can't read its crafting settings (craft.json is damaged). Fix or remove the file and restart the server.";
+    if (e && e.network) return "Can't reach the server. Trying again.";
+    if (typeof b.error === "string" && b.error) return safeServerText(sentence(b.error), "The server refused that (details are hidden in streamer mode).");
+    return what === "read" ? "Couldn't load the crafting settings." : "Couldn't save that.";
+  }
+
+  /** The table the editor holds, { x, y, z, dimension }, or null when it is empty or not valid. */
+  function craftSetRead() {
+    var out = {};
+    var ok = true;
+    ["x", "y", "z"].forEach(function (f) {
+      var raw = craftEl(f).value.trim();
+      if (!/^-?[0-9]{1,8}$/.test(raw)) {
+        ok = false;
+        return;
+      }
+      out[f] = parseInt(raw, 10);
+    });
+    if (!ok) return null;
+    if (Math.abs(out.x) > 30000000 || Math.abs(out.z) > 30000000 || out.y < -64 || out.y > 320) return null;
+    out.dimension = craftEl("dim").value;
+    return CRAFT_ID.test(out.dimension) ? out : null;
+  }
+
+  function craftSetTouched() {
+    return ["x", "y", "z"].some(function (f) { return craftEl(f).value.trim() !== ""; });
+  }
+
+  function craftSetCan() {
+    return kitsCan() && !craftSet.writing;
+  }
+
+  /** The Save / Clear buttons and the hint under the fields, for what the editor holds right now. */
+  function craftSetUpdate() {
+    var d = craftSet.data;
+    var t = craftSetRead();
+    var st = d && d.table && typeof d.table === "object" ? d.table : null;
+    var same = !!t && !!st && st.x === t.x && st.y === t.y && st.z === t.z && st.dimension === t.dimension;
+    craftEl("save").disabled = !d || !t || same || !craftSetCan();
+    craftEl("clear").disabled = !d || !st || !craftSetCan();
+    var msg = craftEl("msg");
+    if (!d) msg.textContent = "";
+    else if (!craftSetTouched()) {
+      msg.textContent = "Type the crafting table's coordinates" + (Array.isArray(d.seen) && d.seen.length ? ", or pick one the bot saw." : ".") +
+        " It must be within 64 blocks of the kits chest, the delivery container or a table the bot saw; if none of those is set, it must be one the bot saw.";
+    }
+    else if (!t) msg.textContent = "Check the numbers: x and z up to 30,000,000, y from -64 to 320.";
+    else if (same) msg.textContent = "This is the table the bot uses.";
+    else msg.textContent = "Not saved yet.";
+  }
+
+  function craftDimName(id) {
+    for (var i = 0; i < CRAFT_DIMS.length; i++) if (CRAFT_DIMS[i][0] === id) return CRAFT_DIMS[i][1];
+    return id;
+  }
+
+  /** The dimension choices: the three vanilla ones, plus the stash's own and the saved one when they are other. */
+  function craftSetDims(extra, only) {
+    var sel = craftEl("dim");
+    var list = only ? [] : CRAFT_DIMS.slice();
+    extra.forEach(function (id) {
+      if (id && CRAFT_ID.test(id) && !list.some(function (e) { return e[0] === id; })) list.push([id, id]);
+    });
+    var key = list.map(function (e) { return e[0]; }).join(",");
+    if (sel.dataset.key === key) return;
+    var keep = sel.value;
+    sel.dataset.key = key;
+    sel.replaceChildren();
+    list.forEach(function (e) { sel.appendChild(kitOption(e[0], e[1] === e[0] ? craftDimName(e[0]) : e[1])); });
+    sel.value = keep && list.some(function (e) { return e[0] === keep; }) ? keep : list[0][0];
+  }
+
+  /** Shows the server's table in the editor, unless the user is in the middle of editing it. */
+  function craftSetFields(d) {
+    var disabled = !d || !craftSetCan();
+    ["x", "y", "z", "dim"].forEach(function (f) { craftEl(f).disabled = disabled; });
+    var idxDim = state.index && typeof state.index.dimension === "string" ? state.index.dimension : "";
+    var st = d && d.table && typeof d.table === "object" ? d.table : null;
+    // The server only takes a table in the stash's own dimension; without an index any of the three.
+    craftSetDims(CRAFT_ID.test(idxDim) ? [idxDim, st ? str(st.dimension) : ""] : [st ? str(st.dimension) : "", craftEl("dim").value], CRAFT_ID.test(idxDim));
+    if (!d) return;
+    var fallback = CRAFT_ID.test(idxDim) ? idxDim : "minecraft:overworld";
+    var server = st ? [String(st.x), String(st.y), String(st.z), str(st.dimension)] : ["", "", "", fallback];
+    var shown = [craftEl("x").value.trim(), craftEl("y").value.trim(), craftEl("z").value.trim(), craftEl("dim").value];
+    var same = function (a, b) { return a.join("|") === b.join("|"); };
+    if (same(shown, server)) {
+      craftSet.snap = server;
+    } else if (!craftSet.snap || same(shown, craftSet.snap)) {
+      craftEl("x").value = server[0];
+      craftEl("y").value = server[1];
+      craftEl("z").value = server[2];
+      craftEl("dim").value = server[3];
+      craftSet.snap = server;
+    }
+  }
+
+  /** The bot's state in plain words, as notes above the fields. */
+  function craftSetBanner(box, d) {
+    var bot = d.bot && typeof d.bot === "object" ? d.bot : {};
+    var rec = d.recipes && typeof d.recipes === "object" ? d.recipes : {};
+    var mc = str(rec.mc) || "this Minecraft version";
+    var auto = !d.table && d.tableStatus === "auto";
+    var tableOk = d.tableStatus === "ok" || d.tableStatus === "unloaded";
+    var notes = [];
+    if (bot.supports !== true) {
+      notes.push(["warn", "This stash's bot can't craft orders yet (update the plugin or addon). Your settings are saved and apply once it can."]);
+    } else {
+      if (bot.enabled !== true) notes.push(["warn", "The bot has crafting turned off. Turn on crafting and craft orders in its settings."]);
+      if (bot.online !== true) notes.push(["warn", "The bot is offline. It picks the settings up when it is back."]);
+      else if (bot.synced !== true) notes.push(["", "The bot hasn't picked up the latest table yet. This takes a few seconds."]);
+    }
+    if (rec.state === "building") notes.push(["", "The server is still loading the recipes for " + mc + "."]);
+    else if (rec.state !== "ready") notes.push(["warn", "The server has no crafting recipes for " + mc + ", so crafted items can't be ordered."]);
+    else if (bot.supports === true && bot.recipesMatch !== true) notes.push(["warn", "The bot's recipe table differs from the server's. Update or restart the bot so they match."]);
+    if (d.table) {
+      var word = CRAFT_TABLE_WORDS[str(d.tableStatus)] || CRAFT_TABLE_WORDS.unknown;
+      notes.push([d.tableStatus === "ok" ? "ok" : d.tableStatus === "unloaded" || d.tableStatus === "unknown" ? "" : "off", word]);
+      if (d.tableStatus !== "ok" && craftWhyText(d.tableWhy)) notes.push(["off", craftWhyText(d.tableWhy)]);
+    } else if (auto) {
+      notes.push(["ok", CRAFT_TABLE_WORDS.auto]);
+    } else if (bot.supports === true && bot.enabled === true && bot.synced !== true && bot.online === true) {
+      notes.push(["", "Waiting for the bot to pick up the latest settings."]);
+    } else {
+      if (craftWhyText(d.tableWhy)) notes.push(["off", craftWhyText(d.tableWhy)]);
+      notes.push(["warn", CRAFT_TABLE_WORDS.unset + " This bot can't find, place or craft one by itself, so set a table here to order crafted items."]);
+    }
+    var bt = d.botTable && typeof d.botTable === "object" && typeof d.botTable.pos === "string" && /^-?[0-9]+,-?[0-9]+,-?[0-9]+$/.test(d.botTable.pos) ? d.botTable : null;
+    var sameAsWebsite = bt && d.table && typeof d.table === "object" && [d.table.x, d.table.y, d.table.z].join(",") === bt.pos;
+    if (bt && (!d.table || !sameAsWebsite)) {
+      var how = bt.source === "placed" ? "placed by the bot" : bt.source === "crafted" ? "crafted by the bot" : "found by the bot";
+      // A position: hidden in streamer mode.
+      notes.push(["", "Bot's table: " + (streamerOn() ? "(hidden)" : kitCoords(bt.pos).replace(/,\s*/g, " ")) + " (" + how + ")"]);
+    }
+    if (bot.supports === true && bot.enabled === true && bot.online === true && bot.synced === true && bot.recipesMatch === true && rec.state === "ready" && ((d.table && tableOk) || auto)) {
+      notes.push(["ok", "Ready: the bot can craft orders" + (num(bot.maxFills, 0) > 0 ? ", up to " + plural(grouped(bot.maxFills), "craft") + " at the table per order." : ".")]);
+    } else if (bot.supports === true && num(bot.maxFills, 0) > 0) {
+      notes.push(["", "The bot makes up to " + plural(grouped(bot.maxFills), "craft") + " at the table per order."]);
+    }
+    if (!kitsCan()) notes.push(["", "You can look, but changing the crafting table needs the “settings” permission."]);
+    box.replaceChildren();
+    notes.forEach(function (n) { kitNote(box, n[1], n[0]); });
+    box.hidden = !notes.length;
+  }
+
+  function craftSetRender() {
+    if (!craftEl("banner")) return;
+    var d = craftSet.data;
+    var sig = JSON.stringify([d, craftSet.error, craftSet.writing, kitsCan(), streamerOn(), !!currentStash(), state.items.length,
+      state.index && state.index.dimension]);
+    if (sig === craftSet.sig) return;
+    var a = document.activeElement;
+    if (a && craftEl("dim") === a && !craftSet.writing) return; // not under an open dropdown; the next poll draws it
+    craftSet.sig = sig;
+    var banner = craftEl("banner");
+    var seen = craftEl("seen");
+    var chips = craftEl("never-list");
+    if (!currentStash()) {
+      banner.replaceChildren();
+      kitNote(banner, "No stash selected.");
+      banner.hidden = false;
+    } else if (!d) {
+      banner.replaceChildren();
+      kitNote(banner, craftSet.error || "Loading…", craftSet.error ? "off" : "");
+      banner.hidden = false;
+    } else {
+      craftSetBanner(banner, d);
+    }
+    craftSetFields(d);
+    craftSetUpdate();
+    // Tables the bot saw: positions, so blurred in streamer mode.
+    var list = d && Array.isArray(d.seen) ? d.seen.filter(function (v) { return typeof v === "string" && /^-?[0-9]+,-?[0-9]+,-?[0-9]+$/.test(v); }) : [];
+    var frag = document.createDocumentFragment();
+    list.forEach(function (v) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "mc-button small";
+      b.appendChild(hiddenSpan(kitCoords(v)));
+      b.disabled = !craftSetCan();
+      b.setAttribute("aria-label", "Use the crafting table the bot saw" + (streamerOn() ? "" : " at " + kitCoords(v)));
+      b.addEventListener("click", function () {
+        var p = v.split(",");
+        craftEl("x").value = p[0];
+        craftEl("y").value = p[1];
+        craftEl("z").value = p[2];
+        craftSetUpdate();
+      });
+      frag.appendChild(b);
+    });
+    craftEl("seen-list").replaceChildren(frag);
+    seen.hidden = !list.length;
+    // Never-use list.
+    var never = d && Array.isArray(d.neverUse) ? d.neverUse.filter(function (v) { return typeof v === "string"; }) : [];
+    var cf = document.createDocumentFragment();
+    never.forEach(function (id) {
+      var chip = document.createElement("span");
+      chip.className = "craft-chip";
+      var item = itemByKey(id);
+      var label = document.createElement("span");
+      label.textContent = item ? item.name : plPretty(id);
+      label.title = id;
+      chip.appendChild(label);
+      var x = document.createElement("button");
+      x.type = "button";
+      x.textContent = "×";
+      x.setAttribute("aria-label", "Allow using " + (item ? item.name : plPretty(id)) + " again");
+      x.title = "Allow using it again";
+      x.disabled = !craftSetCan();
+      x.addEventListener("click", function () {
+        craftWrite("/api/v1/craft/never-use", { ids: never.filter(function (v) { return v !== id; }) });
+      });
+      chip.appendChild(x);
+      cf.appendChild(chip);
+    });
+    if (!never.length && d) cf.appendChild(line("hint", "Nothing is excluded."));
+    chips.replaceChildren(cf);
+    craftEl("never-add").disabled = !d || !craftSetCan();
+    craftEl("never-btn").disabled = !d || !craftSetCan() || never.length >= CRAFT_MAX_NEVER;
+    // Item suggestions for the add box: plain items of this stash.
+    var dl = craftEl("never-ids");
+    if (dl && craftSet.listed !== state.items.length) {
+      craftSet.listed = state.items.length;
+      var opts = document.createDocumentFragment();
+      var done = new Set();
+      state.items.forEach(function (e) {
+        var it = e.item;
+        if (!it || it.key !== it.id || !CRAFT_ID.test(it.id) || done.has(it.id) || done.size >= 2000) return;
+        done.add(it.id);
+        var o = document.createElement("option");
+        o.value = it.id;
+        o.label = it.name;
+        opts.appendChild(o);
+      });
+      dl.replaceChildren(opts);
+    }
+  }
+
+  /** A write; the answer is the same body as GET, so it is drawn straight away. */
+  function craftWrite(path, body, done) {
+    var s = currentStash();
+    if (!s || craftSet.writing) return;
+    craftSet.writing = true;
+    var token = ++craftSet.token;
+    body.server = s.server;
+    body.stash = s.stash;
+    craftSet.sig = "";
+    craftSetRender();
+    api(path, { method: "POST", body: body }).then(function (d) {
+      if (token !== craftSet.token) return;
+      craftSet.data = d && typeof d === "object" ? d : craftSet.data;
+      craftSet.error = "";
+      toast("Saved. The bot picks it up in a few seconds.");
+      if (done) done();
+    }, function (e) {
+      toast(craftError(e, "write"));
+    }).then(function () {
+      craftSet.writing = false;
+      craftSet.token++;
+      craftSet.sig = "";
+      craftSetRender();
+      craftSetSync();
+    });
+  }
+
+  ["x", "y", "z"].forEach(function (f) {
+    craftEl(f).addEventListener("input", craftSetUpdate);
+  });
+  craftEl("dim").addEventListener("change", craftSetUpdate);
+  craftEl("save").addEventListener("click", function () {
+    var t = craftSetRead();
+    if (t) craftWrite("/api/v1/craft/table", { table: t });
+  });
+  craftEl("clear").addEventListener("click", function () {
+    craftWrite("/api/v1/craft/table", { table: null }, function () {
+      craftSet.snap = null;
+      ["x", "y", "z"].forEach(function (f) { craftEl(f).value = ""; });
+    });
+  });
+
+  // ---------- stash area ----------
+  // GET/POST /api/v1/area (AREA-CONTRACT.md): the box the bots keep the stash in. The draft lives only in the page (the six
+  // fields) until Save. The numbers are positions: blurred in streamer mode; a user forced into streamer mode gets 403.
+
+  var AREA_POLL_MS = 5000;
+  var AREA_FIELDS = ["minx", "miny", "minz", "maxx", "maxy", "maxz"];
+  var AREA_LIMITS = { maxW: 256, maxH: 128, maxD: 256, yMin: -64, yMax: 319 };
+  var AREA_WHY = {
+    busy: "The bot will apply the new area between tasks.",
+    far: "The bot is more than 128 blocks from the new area, so it hasn't applied it yet. It does once it is nearer.",
+    dimension: "The bot is in another dimension, so it hasn't applied the new area yet."
+  };
+  var areaSet = { timer: 0, loading: false, writing: false, token: 0, data: null, error: "", sig: "", dirty: false, mapOn: false };
+
+  function areaEl(id) {
+    return $("area-" + id);
+  }
+
+  /** Polled while the Kits tab or the Live page is on screen (the map draws the area). */
+  function areaWanted() {
+    var live = dash.page === "viewer" && vw && vw.open;
+    return (kitsVisible() || live) && !document.hidden && !auth.blocked && !!currentStash() && !forcedStreamer();
+  }
+
+  function areaSetSync() {
+    window.clearTimeout(areaSet.timer);
+    areaSet.timer = 0;
+    if (areaWanted()) areaSetPoll();
+    else areaMapRender();
+  }
+
+  function areaSetReset() {
+    areaSet.token++;
+    areaSet.data = null;
+    areaSet.error = "";
+    areaSet.sig = "";
+    areaSet.dirty = false;
+    areaSet.mapOn = false;
+    AREA_FIELDS.forEach(function (f) { areaEl(f).value = ""; });
+    areaSetRender();
+    areaSetSync();
+  }
+
+  function areaSetPoll() {
+    if (areaSet.loading || areaSet.writing) return;
+    var s = currentStash();
+    if (!s) return;
+    areaSet.loading = true;
+    var token = areaSet.token;
+    api("/api/v1/area?server=" + encodeURIComponent(s.server) + "&stash=" + encodeURIComponent(s.stash)).then(function (d) {
+      if (token !== areaSet.token) return;
+      areaSet.data = d && typeof d === "object" ? d : null;
+      areaSet.error = "";
+    }, function (e) {
+      if (token !== areaSet.token) return;
+      areaSet.data = null;
+      areaSet.error = areaError(e, "read");
+    }).then(function () {
+      areaSet.loading = false;
+      if (token !== areaSet.token) {
+        areaSetSync();
+        return;
+      }
+      areaSetRender();
+      window.clearTimeout(areaSet.timer);
+      areaSet.timer = areaWanted() ? window.setTimeout(areaSetPoll, AREA_POLL_MS) : 0;
+    });
+  }
+
+  function areaError(e, what) {
+    var b = e && e.body && typeof e.body === "object" ? e.body : {};
+    if (e && e.status === 403 && b.permission === "streamer") return "The stash area is hidden while streamer mode is forced on for your account, because it shows positions.";
+    if (e && e.status === 403) return what === "read" ? "You don't have permission to see the stash area." : "Changing the stash area needs the “settings” permission.";
+    if (e && e.status === 404) return "That stash isn't available.";
+    if (e && e.status === 409 && /changed meanwhile/.test(str(b.error))) return "The area changed meanwhile (on the website or in game). Your draft is kept: check it against the new area and save again.";
+    if (e && e.status === 429) return "Too many changes. Wait " + num(b.retryAfter, 1) + " s.";
+    if (e && e.status === 503) return "The server can't read its stash areas (area.json is damaged). Fix or remove the file and restart the server.";
+    if (e && e.network) return "Can't reach the server. Trying again.";
+    if (typeof b.error === "string" && b.error) return safeServerText(sentence(b.error), "The server refused that (details are hidden in streamer mode).");
+    return what === "read" ? "Couldn't load the stash area." : "Couldn't save that.";
+  }
+
+  function areaBoxOf(a) {
+    return a && typeof a === "object" && Array.isArray(a.box) && a.box.length === 6 && a.box.every(function (v) { return typeof v === "number"; }) ? a.box : null;
+  }
+
+  /** The six fields: null when all are empty, a box when they are six whole numbers, "bad" otherwise. */
+  function areaSetRead() {
+    var raw = AREA_FIELDS.map(function (f) { return areaEl(f).value.trim(); });
+    if (raw.every(function (v) { return v === ""; })) return null;
+    var out = [];
+    for (var i = 0; i < 6; i++) {
+      if (!/^-?[0-9]{1,8}$/.test(raw[i])) return "bad";
+      out.push(parseInt(raw[i], 10));
+    }
+    return out;
+  }
+
+  function areaSetWrite(box) {
+    AREA_FIELDS.forEach(function (f, i) { areaEl(f).value = box ? String(box[i]) : ""; });
+  }
+
+  /** The Y range of a dimension (the contract's table). */
+  function areaYRange(dim) {
+    var d = str(dim).replace(/^minecraft:/, "");
+    return d === "the_nether" || d === "the_end" ? [0, 255] : [AREA_LIMITS.yMin, AREA_LIMITS.yMax];
+  }
+
+  /** Why a box can't be saved (a sentence), or "". Pure: the same checks the server makes. */
+  function areaCheck(box, dim) {
+    if (box[0] > box[3] || box[1] > box[4] || box[2] > box[5]) return "Each minimum must be at most its maximum.";
+    if ([box[0], box[2], box[3], box[5]].some(function (v) { return Math.abs(v) > 30000000; })) return "X and Z must be within 30,000,000 blocks of the origin.";
+    var w = box[3] - box[0] + 1;
+    var h = box[4] - box[1] + 1;
+    var d = box[5] - box[2] + 1;
+    if (w > AREA_LIMITS.maxW || h > AREA_LIMITS.maxH || d > AREA_LIMITS.maxD) {
+      return "That area is " + w + "×" + h + "×" + d + "; the largest is " + AREA_LIMITS.maxW + "×" + AREA_LIMITS.maxH + "×" + AREA_LIMITS.maxD + ".";
+    }
+    var y = areaYRange(dim);
+    if (box[1] < y[0] || box[4] > y[1]) return "The height must be from " + y[0] + " to " + y[1] + " in this dimension.";
+    return "";
+  }
+
+  /**
+   * Expands (or, with a negative n, shrinks) a box by n on a side ("all", "-x", "+x", "-z", "+z", "down", "up"). Shrinking
+   * never goes below one block on an axis. Returns a new box.
+   */
+  function areaExpand(box, side, n) {
+    var b = box.slice();
+    var all = side === "all";
+    if (all || side === "-x") b[0] = Math.min(b[0] - n, b[3]);
+    if (all || side === "+x") b[3] = Math.max(b[3] + n, b[0]);
+    if (all || side === "down") b[1] = Math.min(b[1] - n, b[4]);
+    if (all || side === "up") b[4] = Math.max(b[4] + n, b[1]);
+    if (all || side === "-z") b[2] = Math.min(b[2] - n, b[5]);
+    if (all || side === "+z") b[5] = Math.max(b[5] + n, b[2]);
+    return b;
+  }
+
+  function areaSetCan() {
+    return kitsCan() && !areaSet.writing;
+  }
+
+  function areaDim() {
+    var d = areaSet.data;
+    // The server answers the namespaced form; a bare name is read as minecraft:<name>.
+    if (!d || typeof d.dimension !== "string" || !d.dimension) return "";
+    return d.dimension.indexOf(":") < 0 ? "minecraft:" + d.dimension : d.dimension;
+  }
+
+  function areaSetUpdate() {
+    var d = areaSet.data;
+    var cur = areaSetRead();
+    var stored = d ? areaBoxOf(d.area) : null;
+    var dim = areaDim();
+    var msg = areaEl("msg");
+    var problem = "";
+    if (cur === "bad") problem = "Check the numbers: whole numbers only.";
+    else if (cur) problem = areaCheck(cur, dim);
+    var same = cur !== "bad" && (cur ? !!stored && stored.join(",") === cur.join(",") : !stored);
+    var size = areaEl("size");
+    if (cur && cur !== "bad") size.textContent = (cur[3] - cur[0] + 1) + " × " + (cur[4] - cur[1] + 1) + " × " + (cur[5] - cur[2] + 1) +
+      " blocks (the largest is " + AREA_LIMITS.maxW + " × " + AREA_LIMITS.maxH + " × " + AREA_LIMITS.maxD + ")";
+    else size.textContent = cur === "bad" ? "" : "No area: the bot works around itself.";
+    var canSave = !!d && cur !== "bad" && !problem && !same && areaSetCan() && (cur === null || !!dim);
+    areaEl("save").disabled = !canSave;
+    areaEl("cancel").disabled = !areaSet.dirty || areaSet.writing;
+    var bot = d && d.bot && typeof d.bot === "object" ? d.bot : {};
+    var cu = areaBoxOf(bot.applied) || (Array.isArray(bot.derived) && bot.derived.length === 6 ? bot.derived : null);
+    areaEl("bots").disabled = !d || !cu || !areaSetCan();
+    areaEl("clear").disabled = !d || !cur || !areaSetCan();
+    ["expand", "n", "side"].forEach(function (f) { areaEl(f).disabled = !d || !areaSetCan(); });
+    AREA_FIELDS.forEach(function (f) { areaEl(f).disabled = !d || !areaSetCan(); });
+    if (!d) msg.textContent = "";
+    else if (problem) msg.textContent = problem;
+    else if (cur && !dim) msg.textContent = "This stash's dimension isn't known yet (its bot has not sent an index), so an area can't be saved.";
+    else if (areaSet.dirty && !same) msg.textContent = "Not saved yet." + (bot.supports === true ? " If the bot's area is changed in game before you save, the later change wins." : "");
+    else msg.textContent = cur ? "This is the saved area." : "Type the box's corners, use the bot's current area, or drag on the Live map.";
+    areaMapRender();
+  }
+
+  function areaSetFields(d) {
+    if (!d || areaSet.dirty) return;
+    areaSetWrite(areaBoxOf(d.area));
+  }
+
+  function areaTimeText(d) {
+    var at = typeof d.updatedAt === "number" ? ago(d.updatedAt) : "";
+    if (!d.by) return "No area is saved on the server.";
+    if (d.by === "website") return "Set on the website" + (str(d.user) ? " by " + str(d.user) : "") + (at ? ", " + at : "") + ".";
+    return "Changed in game" + (at ? ", " + at : "") + ".";
+  }
+
+  function areaSetBanner(box, d) {
+    var bot = d.bot && typeof d.bot === "object" ? d.bot : {};
+    var notes = [];
+    if (bot.supports === null || bot.supports === undefined) {
+      notes.push(["", "Waiting for the bot to report its area… (it does with its next heartbeats)"]);
+    } else if (bot.supports !== true) {
+      notes.push(["warn", "This bot will keep its own area until it is updated. Your area is saved and applies once it can take it."]);
+    } else {
+      if (bot.online !== true) notes.push(["warn", "The bot is offline. It picks the area up when it is back."]);
+      if (bot.pending && typeof bot.pending === "object" && AREA_WHY[str(bot.pending.why)]) notes.push(["", AREA_WHY[str(bot.pending.why)]]);
+      else if (bot.synced === true && d.area) notes.push(["ok", "The bot uses this area."]);
+      else if (bot.synced !== true && bot.online === true) notes.push(["", "The bot hasn't picked up the latest area yet. This takes a few seconds."]);
+      var out = num(bot.containersOutside, 0);
+      if (out > 0) notes.push(["warn", plural(grouped(out), "container") + " the bot has read lie outside its current area."]);
+    }
+    var imp = d.impact && typeof d.impact === "object" ? d.impact : null;
+    if (imp && num(imp.outside, 0) > 0) notes.push(["warn", plural(grouped(num(imp.outside, 0)), "reported container") + " of " + grouped(num(imp.reported, 0)) + " would be outside the saved area."]);
+    notes.push(["", areaTimeText(d)]);
+    if (d.homeStale === true) notes.push(["warn", "The stash's dimension changed since its home point was set, so no new area can be saved until the owner resets the home point."]);
+    else if (d.homeSource === "bot") notes.push(["", "Home point from the bot's first report. It moves once, to the delivery container, when the bot has one."]);
+    else if (d.homeSource === "delivery") notes.push(["", "Home point at the delivery container. New areas must be within " + num(d.limits && d.limits.farBlocks, 256) + " blocks of it."]);
+    if (!kitsCan()) notes.push(["", "You can look, but changing the stash area needs the “settings” permission."]);
+    box.replaceChildren();
+    notes.forEach(function (n) { kitNote(box, n[1], n[0]); });
+    box.hidden = !notes.length;
+  }
+
+  function areaSetRender() {
+    if (!areaEl("banner")) return;
+    var d = areaSet.data;
+    $("area-set").hidden = forcedStreamer();
+    var sig = JSON.stringify([d, areaSet.error, areaSet.writing, areaSet.dirty, kitsCan(), streamerOn(), !!currentStash(), Math.floor(serverNow() / 15000)]);
+    if (sig === areaSet.sig) return;
+    areaSet.sig = sig;
+    var banner = areaEl("banner");
+    if (!currentStash()) {
+      banner.replaceChildren();
+      kitNote(banner, "No stash selected.");
+      banner.hidden = false;
+    } else if (!d) {
+      banner.replaceChildren();
+      kitNote(banner, areaSet.error || "Loading…", areaSet.error ? "off" : "");
+      banner.hidden = false;
+    } else {
+      areaSetBanner(banner, d);
+    }
+    areaSetFields(d);
+    areaEl("dim").value = d && d.dimension ? str(d.dimension) : "";
+    areaSetUpdate();
+  }
+
+  function areaSetDraft(box) {
+    areaSetWrite(box);
+    areaSet.dirty = true;
+    areaSet.sig = "";
+    areaSetUpdate();
+  }
+
+  function areaWrite(area) {
+    var s = currentStash();
+    if (!s || areaSet.writing) return;
+    areaSet.writing = true;
+    var token = ++areaSet.token;
+    areaSet.sig = "";
+    areaSetRender();
+    var body = { server: s.server, stash: s.stash, area: area };
+    if (areaSet.data && typeof areaSet.data.rev === "number") body.rev = areaSet.data.rev; // refused when someone else saved meanwhile
+    api("/api/v1/area", { method: "POST", body: body }).then(function (d) {
+      if (token !== areaSet.token) return;
+      areaSet.data = d && typeof d === "object" ? d : areaSet.data;
+      areaSet.error = "";
+      areaSet.dirty = false;
+      toast("Saved. The bot applies it between tasks.");
+    }, function (e) {
+      toast(areaError(e, "write"));
+    }).then(function () {
+      areaSet.writing = false;
+      areaSet.token++;
+      areaSet.sig = "";
+      areaSetRender();
+      areaSetSync();
+    });
+  }
+
+  function areaSave() {
+    var cur = areaSetRead();
+    if (cur === "bad") return;
+    if (cur === null) areaWrite(null);
+    else areaWrite({ box: cur, dimension: areaDim() });
+  }
+
+  function areaCancel() {
+    areaSet.dirty = false;
+    areaSet.sig = "";
+    areaSetRender();
+  }
+
+  AREA_FIELDS.forEach(function (f) {
+    areaEl(f).addEventListener("input", function () {
+      areaSet.dirty = true;
+      areaSetUpdate();
+    });
+  });
+  areaEl("save").addEventListener("click", areaSave);
+  areaEl("cancel").addEventListener("click", areaCancel);
+  areaEl("clear").addEventListener("click", function () { areaSetDraft(null); });
+  areaEl("bots").addEventListener("click", function () {
+    var bot = areaSet.data && areaSet.data.bot && typeof areaSet.data.bot === "object" ? areaSet.data.bot : {};
+    var box = areaBoxOf(bot.applied) || (Array.isArray(bot.derived) && bot.derived.length === 6 ? bot.derived : null);
+    if (box) areaSetDraft(box.slice());
+  });
+  areaEl("expand").addEventListener("click", function () {
+    var cur = areaSetRead();
+    if (!cur || cur === "bad") {
+      areaEl("msg").textContent = "Start with an area: use the bot's current area or type the corners.";
+      return;
+    }
+    var raw = areaEl("n").value.trim();
+    if (!/^-?[0-9]{1,3}$/.test(raw) || Math.abs(parseInt(raw, 10)) > 255) {
+      areaEl("msg").textContent = "Expand by a whole number from -255 to 255 (negative shrinks).";
+      return;
+    }
+    var next = areaExpand(cur, areaEl("side").value, parseInt(raw, 10));
+    var why = areaCheck(next, areaDim());
+    if (why) {
+      areaEl("msg").textContent = why + " The draft is unchanged.";
+      return;
+    }
+    areaSetDraft(next);
+  });
+
+  // ---------- stash area on the live map ----------
+
+  var areaDrag = { start: null, now: null };
+
+  /** The map may show the area when the stash's area is loaded and the viewer's world is that dimension. */
+  function areaMapDim() {
+    var d = areaSet.data;
+    if (!d || !vw || !vw.world || streamerOn()) return false;
+    var a = str(d.dimension).replace(/^minecraft:/, "");
+    var w = str(vw.world.dim).replace(/^minecraft:/, "");
+    // Only when the viewer shows this stash's own bot.
+    var b = currentBot();
+    var s = currentStash();
+    return !!a && a === w && !!b && !!s && !!str(s.player) && str(b.player) === str(s.player);
+  }
+
+  function areaMapActive() {
+    return areaSet.mapOn && areaMapDim() && kitsCan();
+  }
+
+  function areaMapRender() {
+    if (!vw || !vel || !vel.areaBtn) return;
+    var show = areaMapDim() && kitsCan();
+    vel.areaBtn.hidden = !show;
+    if (!show) areaSet.mapOn = false;
+    vel.areaBtn.setAttribute("aria-pressed", areaSet.mapOn ? "true" : "false");
+    var cur = areaSetRead();
+    var box = show && areaSet.dirty && cur && cur !== "bad" ? cur : null;
+    vel.areaBox.hidden = !(show && (areaSet.mapOn || areaSet.dirty));
+    if (!vel.areaBox.hidden) {
+      vel.areaText.textContent = box ? "Area draft " + (box[3] - box[0] + 1) + "×" + (box[4] - box[1] + 1) + "×" + (box[5] - box[2] + 1) + (areaCheck(box, areaDim()) ? " — " + areaCheck(box, areaDim()) : "")
+        : areaSet.mapOn ? "Drag a rectangle on the map to set the area's X and Z." : "";
+      vel.areaSave.disabled = !areaSet.dirty || !!areaEl("save").disabled;
+      vel.areaCancel.disabled = !areaSet.dirty;
+    }
+    if (vDirty) vDirty();
+  }
+
+  function areaMapBlock(e) {
+    var p = vLocal(e);
+    return { x: Math.floor(vw.cx + (p.x - vw.w / 2) / vw.zoom), z: Math.floor(vw.cz + (p.y - vw.h / 2) / vw.zoom) };
+  }
+
+  function areaMapDown(e) {
+    vel.canvas.setPointerCapture(e.pointerId);
+    areaDrag.start = areaMapBlock(e);
+    areaDrag.now = areaDrag.start;
+    vDirty();
+  }
+
+  function areaMapMove(e) {
+    areaDrag.now = areaMapBlock(e);
+    vDirty();
+  }
+
+  function areaMapUp(e) {
+    var a = areaDrag.start;
+    var b = areaMapBlock(e);
+    areaDrag.start = null;
+    areaDrag.now = null;
+    if (Math.max(Math.abs(a.x - b.x), Math.abs(a.z - b.z)) < 2) {
+      vDirty();
+      return; // a click, not a drag
+    }
+    var cur = areaSetRead();
+    var y0;
+    var y1;
+    if (cur && cur !== "bad") {
+      y0 = cur[1];
+      y1 = cur[4];
+    } else {
+      var st = areaBoxOf(areaSet.data && areaSet.data.area);
+      var bot = areaSet.data && areaSet.data.bot ? areaSet.data.bot : {};
+      var base = st || areaBoxOf(bot.applied) || (Array.isArray(bot.derived) && bot.derived.length === 6 ? bot.derived : null);
+      var py = vw.self ? Math.floor(num(vw.self.y, 64)) : 64;
+      y0 = base ? base[1] : Math.max(areaYRange(areaDim())[0], py - 16);
+      y1 = base ? base[4] : Math.min(areaYRange(areaDim())[1], py + 32);
+    }
+    var box = [Math.min(a.x, b.x), y0, Math.min(a.z, b.z), Math.max(a.x, b.x), y1, Math.max(a.z, b.z)];
+    areaSetDraft(box);
+  }
+
+  /** Draws the saved area and the draft (and the rectangle being dragged) on the live map. */
+  function areaMapDraw(ctx, toX, toY, dpr, c) {
+    if (!areaMapDim()) return;
+    var rect = function (box, color, dash, fill) {
+      var x0 = toX(box[0]);
+      var y0 = toY(box[2]);
+      var x1 = toX(box[3] + 1);
+      var y1 = toY(box[5] + 1);
+      ctx.save();
+      ctx.lineWidth = 2 * dpr;
+      ctx.strokeStyle = color;
+      ctx.setLineDash(dash ? [6 * dpr, 4 * dpr] : []);
+      if (fill) {
+        ctx.globalAlpha = 0.12;
+        ctx.fillStyle = color;
+        ctx.fillRect(x0, y0, x1 - x0, y1 - y0);
+        ctx.globalAlpha = 1;
+      }
+      ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+      ctx.restore();
+    };
+    var stored = areaBoxOf(areaSet.data && areaSet.data.area);
+    if (stored) rect(stored, c.accent, false, true);
+    var cur = areaSetRead();
+    if (areaSet.dirty && cur && cur !== "bad") rect(cur, c.item, true, true);
+    if (areaDrag.start && areaDrag.now) {
+      var a = areaDrag.start;
+      var b = areaDrag.now;
+      rect([Math.min(a.x, b.x), 0, Math.min(a.z, b.z), Math.max(a.x, b.x), 0, Math.max(a.z, b.z)], c.item, true, true);
+    }
+  }
+
+  function craftNeverAdd() {
+    var d = craftSet.data;
+    var input = craftEl("never-add");
+    var raw = input.value.trim().toLowerCase().replace(/\s+/g, "_");
+    if (!d || !raw) return;
+    var id = raw.indexOf(":") < 0 ? "minecraft:" + raw : raw;
+    if (!CRAFT_ID.test(id)) {
+      toast("That isn't an item. Use a name like iron_block or minecraft:iron_block.");
+      return;
+    }
+    var list = Array.isArray(d.neverUse) ? d.neverUse.filter(function (v) { return typeof v === "string"; }) : [];
+    if (list.indexOf(id) >= 0) {
+      toast("That item is already on the list.");
+      return;
+    }
+    if (list.length >= CRAFT_MAX_NEVER) {
+      toast("The list is full (" + CRAFT_MAX_NEVER + " items).");
+      return;
+    }
+    list.push(id);
+    craftWrite("/api/v1/craft/never-use", { ids: list }, function () { input.value = ""; });
+  }
+
+  craftEl("never-btn").addEventListener("click", craftNeverAdd);
+  craftEl("never-add").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      craftNeverAdd();
+    }
+  });
+
   // ---------- kits ----------
-  // The Kits tab (KIT-CONTRACT.md v1.1): where every kit shulker is (the bots score them), a kits chest for all of them,
-  // a chest per kit name, and the scoring settings. The server computes the rows and statuses; this only draws them. Polled every 5 s while the tab is open.
+  // The Kits tab (KIT-CONTRACT v2): the type chests and the general kits chest, every kit the bots found grouped by type
+  // with the reason it is one, the named boxes that are not kits, and (for older bots only) the v1 scoring. The bots
+  // classify boxes; the server computes the rows, chains and statuses; this only draws them. Polled every 5 s while the
+  // tab (or the Kit Builder) is open.
 
   var KIT_POLL_MS = 5000;
   var KIT_MAX_ROWS = 500;
   var kits = { timer: 0, loading: false, token: 0, data: null, error: "", writing: false, sig: "" };
+  // The Kit Builder's state (templates body, the open editor); declared here because the Kits tab reads its categories.
+  var kb = { timer: 0, loading: false, token: 0, data: null, error: "", writing: false, sig: "", ed: null, ui: null, qty: {}, cartTried: null };
   var KIT_STATUS = {
     pending: ["Waiting for the sorter", ""],
     home: ["In place", "ok"],
@@ -5346,16 +6776,48 @@
     none: ["Normal sorting", ""],
     absent: ["None in the stash", ""]
   };
+  // The seven kit types of the contract (fixed, in tie-break order). noun is the word the reason texts use.
+  var KIT_TYPES = [
+    { id: "pvp", name: "PvP / Crystal", noun: "PvP", icon: "minecraft:end_crystal", what: "Armour, weapons, totems, crystals, obsidian" },
+    { id: "travel", name: "Travel", noun: "travel", icon: "minecraft:elytra", what: "Elytra, rockets, pearls, gunpowder" },
+    { id: "redstone", name: "Redstone", noun: "redstone", icon: "minecraft:redstone", what: "Redstone parts, pistons, rails, TNT" },
+    { id: "farming", name: "Farming / Food", noun: "farming or food", icon: "minecraft:wheat", what: "Cooked food, crops, seeds, bone meal" },
+    { id: "building", name: "Building", noun: "building", icon: "minecraft:bricks", what: "Concrete, wool, glass, terracotta, dyes" },
+    { id: "starter", name: "Starter / Base", noun: "starter", icon: "minecraft:crafting_table", what: "Basic tools, armour, a crafting table, a bed" },
+    { id: "other", name: "Other kit", noun: "collectible", icon: "minecraft:nether_star", what: "Valuables: beacons, books, heads, discs" }
+  ];
+  var KIT_SOURCE_WORDS = { rule: "its own chest", template: "the kit's chest", typeChest: "type chest", category: "type chest", kitsChest: "kits chest" };
+  var KIT_TYPE_WHY_CODES = { few_kinds: true, mixed: true, no_purpose: true, override_none: true };
+  var KIT_TYPE_SOURCE = {
+    override: "Set by hand",
+    template: "Kit Builder kit",
+    template_incomplete: "Incomplete Kit Builder kit"
+  };
+
+  function kitEl(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
 
   function kitsVisible() {
     return state.tab === "kits" && dash.page === "stash" && !document.hidden && !auth.blocked && !!currentStash() && !forcedStreamer();
+  }
+
+  /** The kits body is read while the Kits tab or the Kit Builder is open (the Builder needs the chests and the types). */
+  function kitsDataWanted() {
+    return (state.tab === "kits" || state.tab === "kitbuilder") && dash.page === "stash" && !document.hidden && !auth.blocked &&
+      !!currentStash() && !forcedStreamer();
   }
 
   /** Starts or stops the polling to match what is on screen. */
   function kitsSync() {
     window.clearTimeout(kits.timer);
     kits.timer = 0;
-    if (kitsVisible()) kitsPoll();
+    if (kitsDataWanted()) kitsPoll();
+    craftSetSync();
+    areaSetSync();
   }
 
   function kitsReset() {
@@ -5366,6 +6828,8 @@
     kits.sig = "";
     kitsRender();
     kitsSync();
+    craftSetReset();
+    areaSetReset();
   }
 
   function kitsPoll() {
@@ -5383,7 +6847,7 @@
       kits.data = null;
       if (e && e.status === 503) kits.error = "The server can't read its kit settings (kits.json is damaged), so kit sorting is off. Fix or remove the file and restart the server.";
       else if (e && e.status === 404) kits.error = "That stash isn't available.";
-      else if (e && e.status === 403) kits.error = "Kits are hidden in streamer mode.";
+      else if (e && e.status === 403) kits.error = "Kit settings are hidden in streamer mode (enforced by the owner).";
       else kits.error = "Can't reach the server. Trying again.";
     }).then(function () {
       kits.loading = false;
@@ -5393,8 +6857,9 @@
         return;
       }
       kitsRender();
+      if (state.tab === "kitbuilder") kbRender();
       window.clearTimeout(kits.timer);
-      kits.timer = kitsVisible() ? window.setTimeout(kitsPoll, KIT_POLL_MS) : 0;
+      kits.timer = kitsDataWanted() ? window.setTimeout(kitsPoll, KIT_POLL_MS) : 0;
     });
   }
 
@@ -5415,6 +6880,7 @@
 
   /** The label and position of a container, as one hidden (streamer-blurred) text. */
   function kitPlace(id) {
+    if (id === "hidden") return hiddenSpan("hidden");
     var c = kitContainer(id);
     var label = c && str(c.label) ? str(c.label) + " (" + kitCoords(id) + ")" : kitCoords(id);
     return hiddenSpan(label);
@@ -5438,6 +6904,116 @@
     return d;
   }
 
+  // ----- categories, item names and the reason texts (the wording is the contract's) -----
+
+  /** The custom categories known to the page: from the kits body, else the Kit Builder's. [{ id, name }] */
+  function kitCustomCats() {
+    var out = [];
+    var seen = {};
+    var add = function (id, name) {
+      if (typeof id === "string" && !seen[id] && !KIT_TYPES.some(function (t) { return t.id === id; })) {
+        seen[id] = true;
+        out.push({ id: id, name: str(name) || id });
+      }
+    };
+    if (kits.data && Array.isArray(kits.data.types)) kits.data.types.forEach(function (t) { if (t && t.custom === true) add(t.id, t.name); });
+    if (kb.data && Array.isArray(kb.data.categories)) kb.data.categories.forEach(function (c) { if (c) add(c.id, c.name); });
+    return out;
+  }
+
+  /** All categories in order: the seven types, then the custom ones. [{ id, name, custom }] */
+  function kitAllCats() {
+    return KIT_TYPES.map(function (t) { return { id: t.id, name: t.name, custom: false }; })
+      .concat(kitCustomCats().map(function (c) { return { id: c.id, name: c.name, custom: true }; }));
+  }
+
+  function kitCatName(id) {
+    var all = kitAllCats();
+    for (var i = 0; i < all.length; i++) if (all[i].id === id) return all[i].name;
+    return str(id);
+  }
+
+  function kitCatNoun(id) {
+    for (var i = 0; i < KIT_TYPES.length; i++) if (KIT_TYPES[i].id === id) return KIT_TYPES[i].noun;
+    return kitCatName(id).toLowerCase();
+  }
+
+  var kbNames = { src: null, byId: new Map(), matchSrc: null, match: new Map() };
+
+  /** { name, maxStack } of an item id as the stash index knows it, or null. */
+  function kbIdInfo(id) {
+    if (kbNames.src !== state.items) {
+      kbNames.src = state.items;
+      kbNames.byId = new Map();
+      state.items.forEach(function (e) {
+        var cur = kbNames.byId.get(e.item.id);
+        // The plain stack's name is the item's usual name; a variant may carry a longer one.
+        if (!cur || (e.item.key.indexOf("#") < 0 && cur.variant)) {
+          kbNames.byId.set(e.item.id, { name: e.item.name, maxStack: e.item.maxStack, variant: e.item.key.indexOf("#") >= 0 });
+        }
+      });
+    }
+    return kbNames.byId.get(id) || null;
+  }
+
+  /** The page's usual name for an item id, else the path with spaces ("end crystal"). */
+  function kitPlainName(id) {
+    var info = kbIdInfo(str(id));
+    return info ? info.name : splitId(str(id))[1].replace(/_/g, " ");
+  }
+
+  /** A name for a slot or item key: "Totem of Undying", "Netherite Sword" for an "any variant" key too. */
+  function kbItemLabel(key) {
+    key = str(key);
+    var i = key.indexOf("#");
+    var base = i < 0 ? key : key.slice(0, i);
+    var exact = i >= 0 && key.charAt(i + 1) !== "*" ? state.byKey.get(key) : null;
+    if (exact) return exact.item.name;
+    var info = kbIdInfo(base);
+    return info ? info.name : plPretty(base);
+  }
+
+  /** The reason text of a why object as parts: strings, and { h } for a kit name (blurred in streamer mode). */
+  function kitReasonParts(why, tplName) {
+    if (!why || typeof why !== "object") return [];
+    var T = why.type ? kitCatName(why.type) : "";
+    var noun = why.type ? kitCatNoun(why.type) : "";
+    var items = (Array.isArray(why.items) ? why.items : []).map(kitPlainName);
+    var item = items[0] || "";
+    var slots = num(why.slots, 0);
+    var covered = num(why.covered, 0);
+    var kinds = num(why.kinds, 0);
+    var words = Array.isArray(why.words) ? why.words : [];
+    var assort = T + " kit: " + covered + " of " + slots + " slots are " + noun + " items, " + kinds + " kinds (mostly " + items.join(", ") + ").";
+    switch (str(why.code)) {
+      case "assortment": return [assort];
+      case "named_assortment": return [assort + (words.length ? " The name says “" + str(words[0]) + "”, so half is enough." : "")];
+      case "override": return [T + " kit: set by hand for this name."];
+      case "template": return [T + " kit: matches the kit “", { h: tplName || str(why.template) }, "”."];
+      case "template_incomplete": {
+        var miss = (Array.isArray(why.missing) ? why.missing : []).map(function (m) { return kbItemLabel(str(m && m.key)) + " ×" + num(m && m.count, 0); });
+        return [T + " kit: an incomplete “", { h: tplName || str(why.template) }, "” (short " + miss.join(", ") +
+          "). It is kept and topped up, but not delivered until complete."];
+      }
+      case "empty": return ["Not a kit: the box is empty."];
+      case "stock":
+      case "stock_neutral": return ["Not a kit: it only holds " + item + ". A box of one kind of item is stock and goes to the " + item + " chest."];
+      case "no_purpose": return ["Not a kit: none of its items has a kit purpose."];
+      case "few_kinds": return ["Not a kit: " + covered + " of " + slots + " slots are " + noun + " items, but only " + kinds + " kind(s). A " + T +
+        " kit needs " + num(why.minKinds, 0) + "."];
+      case "mixed": return ["Not a kit: no common purpose. The closest is " + T + ", with " + covered + " of " + slots + " slots; a kit needs " +
+        num(why.need, 0) + "."];
+      case "override_none": return ["Not a kit: set by hand for this name."];
+      default: return [];
+    }
+  }
+
+  function kitReasonNode(why, tplName) {
+    var parts = kitReasonParts(why, tplName);
+    if (!parts.length) return null;
+    return kitLineNode("kit-why", parts);
+  }
+
   /** The reasons things may not work yet, from the server's view of the bot. */
   function kitsBanner(box, d) {
     var bot = d.bot && typeof d.bot === "object" ? d.bot : {};
@@ -5446,11 +7022,12 @@
       notes.push(["warn", "This stash's bot doesn't know about kits yet (update the plugin or addon). Your settings are saved and apply once it does."]);
     } else {
       if (bot.online !== true) notes.push(["warn", "The bot is offline. It picks the settings up when it is back."]);
-      else if (bot.synced !== true) notes.push(["", "The bot hasn't picked up the latest settings yet. This takes a few seconds."]);
+      else if ((bot.types === true ? bot.typesSynced : bot.synced) !== true) notes.push(["", "The bot hasn't picked up the latest settings yet. This takes a few seconds."]);
+      if (bot.types !== true) {
+        notes.push(["warn", "This bot is too old for kit types: until it's updated, kits go only to the general kits chest or their own chest, and the type chests may get other items."]);
+      }
     }
-    if (!d.report) notes.push(["warn", "The bot hasn't reported its containers yet, so no chest can be picked. This needs a bot that supports kits and a stash it has read."]);
-    if (d.kitsChestStatus === "missing" && d.report) notes.push(["off", "The kits chest isn't among the bot's containers any more, or can't take kits. Pick another one."]);
-    if (d.kitsChestStatus === "full") notes.push(["warn", "The kits chest is full. Kits that go there wait until it has room."]);
+    if (!d.report) notes.push(["warn", "Waiting for the bot's report."]);
     if (!kitsCan()) notes.push(["", "You can look, but changing kit settings needs the “settings” permission."]);
     box.replaceChildren();
     notes.forEach(function (n) { kitNote(box, n[1], n[0]); });
@@ -5468,33 +7045,377 @@
   function kitOptions(select, current, first) {
     select.replaceChildren();
     if (first) select.appendChild(kitOption("", first));
-    var list = Array.isArray(kits.data.containers) ? kits.data.containers : [];
+    var list = kits.data && Array.isArray(kits.data.containers) ? kits.data.containers : [];
     var seen = false;
     list.forEach(function (c, i) {
       if (c.pickable !== true && c.id !== current) return;
       select.appendChild(kitOption(c.id, kitOptionText(c, i) + (c.pickable !== true ? " · can't take kits" : "")));
       if (c.id === current) seen = true;
     });
-    if (current && !seen) select.appendChild(kitOption(current, (streamerOn() ? "Chest" : kitCoords(current)) + " · not reported"));
+    if (current && !seen) select.appendChild(kitOption(current, (streamerOn() || current === "hidden" ? "Chest" : kitCoords(current)) + " · not reported"));
     select.value = current || "";
+  }
+
+  /** The category <option>s of a "type" picker: first (auto), the seven types, the custom categories, then optionally "not a kit". */
+  function kitTypeOptions(select, current, autoText, withNone) {
+    select.replaceChildren();
+    select.appendChild(kitOption("", autoText));
+    kitAllCats().forEach(function (c) { select.appendChild(kitOption(c.id, c.name)); });
+    if (withNone) select.appendChild(kitOption("none", "Not a kit"));
+    if (current && !Array.prototype.some.call(select.options, function (o) { return o.value === current; })) select.appendChild(kitOption(current, kitCatName(current)));
+    select.value = current || "";
+  }
+
+  // ----- the chests card -----
+
+  var KIT_CHEST_STATUS = {
+    unset: ["Not set", ""],
+    ok: ["Ready", "ok"],
+    full: ["Full", "warn"],
+    missing: ["Missing", "off"]
+  };
+
+  function kitChestLine(o) {
+    var row = kitEl("div", "kits-line");
+    var head = kitEl("div", "kits-line-head");
+    head.appendChild(iconImg(o.icon, 24));
+    var tx = kitEl("div", "kits-line-text");
+    tx.appendChild(kitEl("div", "kits-line-name", o.name));
+    tx.appendChild(kitEl("div", "hint", o.what));
+    head.appendChild(tx);
+    row.appendChild(head);
+    var ctl = kitEl("div", "kits-line-ctl");
+    var sel = document.createElement("select");
+    sel.className = "mc-select";
+    sel.setAttribute("aria-label", "Chest for " + o.name);
+    kitOptions(sel, o.current, o.current ? "" : "Pick a chest…");
+    sel.disabled = !o.can || !o.report;
+    sel.addEventListener("change", function () {
+      var v = sel.value;
+      sel.blur();
+      o.onPick(v);
+    });
+    ctl.appendChild(sel);
+    var clear = kitEl("button", "mc-button small", "Clear");
+    clear.type = "button";
+    clear.disabled = !o.can || !o.current;
+    clear.addEventListener("click", function () { o.onClear(); });
+    ctl.appendChild(clear);
+    var st = o.report || !o.current ? KIT_CHEST_STATUS[o.status] || [str(o.status), ""] : ["Waiting for the bot's report", ""];
+    ctl.appendChild(kitEl("span", "status-chip kit-pill" + (st[1] ? " " + st[1] : ""), st[0]));
+    ctl.appendChild(kitEl("span", "kits-line-count", o.count + (o.count === 1 ? " kit" : " kits")));
+    row.appendChild(ctl);
+    if (o.extra) row.appendChild(o.extra);
+    return row;
+  }
+
+  /** The "signed for other items" check before a chest becomes kit-only. True when the pick may go on. */
+  function kitChestSignOk(v) {
+    var c = kitContainer(v);
+    if (v && c && str(c.label) && !KIT_WORD.test(str(c.label))) {
+      return window.confirm((streamerOn() ? "This chest is signed for other items. " : "This chest is signed “" + str(c.label) + "”. ") +
+        "As a kit chest it only takes kits; nothing else is sorted into it.\n\nUse it anyway?");
+    }
+    return true;
+  }
+
+  function kitsRenderChests(box, d, can_) {
+    var frag = document.createDocumentFragment();
+    var types = Array.isArray(d.types) ? d.types : [];
+    var known = {};
+    types.forEach(function (t) { known[t.id] = t; });
+    var cats = KIT_TYPES.map(function (t) { return { id: t.id, name: t.name, what: t.what, icon: t.icon, custom: false }; });
+    types.forEach(function (t) {
+      if (t.custom === true) cats.push({ id: t.id, name: str(t.name) || t.id, what: "Kits you put in this category yourself", icon: "minecraft:chest", custom: true });
+    });
+    cats.forEach(function (c) {
+      var t = known[c.id] || {};
+      var extra = null;
+      if (c.custom) {
+        extra = kitEl("div", "kits-line-ctl");
+        var rn = kitEl("button", "mc-button small", "Rename category");
+        rn.type = "button";
+        rn.disabled = !can_;
+        rn.addEventListener("click", function () { kitRenameCategory(c.id, c.name); });
+        var del = kitEl("button", "mc-button small danger", "Delete category");
+        del.type = "button";
+        del.disabled = !can_;
+        del.addEventListener("click", function () { kitDeleteCategory(c.id, c.name); });
+        extra.appendChild(rn);
+        extra.appendChild(del);
+      }
+      frag.appendChild(kitChestLine({
+        icon: c.icon, name: c.name, what: c.what, current: typeof t.chest === "string" ? t.chest : "", status: str(t.chestStatus) || "unset",
+        count: num(t.count, 0), can: can_, report: !!d.report, extra: extra,
+        onPick: function (v) {
+          if (!v) return;
+          if (!kitChestSignOk(v)) {
+            kits.sig = "";
+            kitsRender();
+            return;
+          }
+          kitsWrite("/api/v1/kits/typeChest", { type: c.id, container: v });
+        },
+        onClear: function () {
+          if (!window.confirm("Stop using a chest for " + c.name + "?\n\nIts kits go to the general kits chest instead.")) return;
+          kitsWrite("/api/v1/kits/typeChest", { type: c.id, container: null });
+        }
+      }));
+    });
+    var chest = typeof d.kitsChest === "string" ? d.kitsChest : "";
+    var inGeneral = 0;
+    (Array.isArray(d.rows) ? d.rows : []).forEach(function (r) {
+      (Array.isArray(r.locations) ? r.locations : []).forEach(function (l) { if (chest && l.container === chest) inGeneral += num(l.count, 0); });
+    });
+    var info = null;
+    if (chest) {
+      var c0 = kitContainer(chest);
+      if (c0 && str(c0.label) && !KIT_WORD.test(str(c0.label))) {
+        info = kitEl("div", "hint", "Its sign doesn't say kit: while it is the kits chest, only kit shulkers go in it.");
+      }
+    }
+    frag.appendChild(kitChestLine({
+      icon: "minecraft:purple_shulker_box", name: "General kits chest", what: "Kits whose type chest is unset, full or missing",
+      current: chest, status: str(d.kitsChestStatus) || "unset", count: inGeneral, can: can_, report: !!d.report, extra: info,
+      onPick: function (v) {
+        if (!v) return;
+        if (!kitChestSignOk(v)) {
+          kits.sig = "";
+          kitsRender();
+          return;
+        }
+        kitsWrite("/api/v1/kits/chest", { container: v });
+      },
+      onClear: function () {
+        if (!window.confirm("Stop using a general kits chest?\n\nKits without a usable own or type chest go back to normal sorting.")) return;
+        kitsWrite("/api/v1/kits/chest", { container: null });
+      }
+    }));
+    box.replaceChildren(frag);
+  }
+
+  function kitRenameCategory(id, name) {
+    var next = window.prompt("New name for the category (up to 32 characters):", streamerOn() ? "" : name);
+    if (next == null || !next.trim() || next.trim() === name) return;
+    kitsWrite("/api/v1/kits/category", { id: id, name: next.trim() }, true);
+  }
+
+  function kitDeleteCategory(id, name) {
+    if (!window.confirm("Delete the category " + (streamerOn() ? "" : "“" + name + "” ") + "and its chest setting?\n\nThis only works while no kit or override uses it.")) return;
+    kitsWrite("/api/v1/kits/category/delete", { id: id }, true);
+  }
+
+  // ----- kit rows -----
+
+  /** A category's short name for a sentence: "PvP / Crystal" is "PvP", "Farming / Food" is "Farming". */
+  function kitShortCat(id) {
+    return kitCatName(id).split(" / ")[0];
+  }
+
+  function kitSourceName(source, r) {
+    switch (source) {
+      case "rule": return "Own chest";
+      case "template": return "Kit chest";
+      case "typeChest":
+      case "category": return (r.type ? kitShortCat(r.type) : "Type") + " chest";
+      default: return "Kits chest";
+    }
+  }
+
+  function kitSourceLower(source, r) {
+    switch (source) {
+      case "rule": return "own chest";
+      case "template": return "kit's chest";
+      case "typeChest":
+      case "category": return (r.type ? kitShortCat(r.type) : "type") + " chest";
+      default: return "kits chest";
+    }
+  }
+
+  /** "Own chest full, using the PvP chest": the first chain entry's problem and where the kit goes instead. */
+  function kitFallbackText(r, chain) {
+    var first = chain[0];
+    var text = kitSourceName(str(first.source), r) + " " + (first.status === "missing" ? "missing" : first.status === "full" ? "full" : str(first.status));
+    if (typeof r.target === "string") return text + ", using the " + kitSourceLower(str(r.targetSource), r);
+    return text + "; nothing else to use";
+  }
+
+  function kitWhereNode(r) {
+    var where = kitEl("div", "kit-where");
+    where.appendChild(document.createTextNode("Now in: "));
+    var locs = Array.isArray(r.locations) ? r.locations : [];
+    locs.forEach(function (l, i) {
+      if (i) where.appendChild(document.createTextNode(", "));
+      where.appendChild(kitPlace(str(l.container)));
+      where.appendChild(document.createTextNode(" ×" + num(l.count, 0)));
+    });
+    if (num(r.carried, 0) > 0) {
+      if (locs.length) where.appendChild(document.createTextNode(", "));
+      where.appendChild(document.createTextNode("carried ×" + num(r.carried, 0)));
+    }
+    if (!locs.length && !(num(r.carried, 0) > 0)) where.appendChild(document.createTextNode("not in the stash"));
+    return where;
+  }
+
+  function kitGoesNode(r) {
+    var goes = kitEl("div", "kit-goes");
+    goes.appendChild(document.createTextNode("Goes to: "));
+    var chain = Array.isArray(r.chain) ? r.chain : [];
+    if (typeof r.target === "string") {
+      goes.appendChild(kitPlace(r.target));
+      goes.appendChild(document.createTextNode(" (" + (KIT_SOURCE_WORDS[str(r.targetSource)] || "chest") + ")"));
+      if (r.fallback === true && chain.length) goes.appendChild(kitEl("div", "kit-fallback", kitFallbackText(r, chain)));
+    } else if (!chain.length) {
+      goes.appendChild(document.createTextNode("nowhere: sorted like any other shulker"));
+    } else {
+      // No entry is usable (all full or missing): name every chain entry and its state instead of a target.
+      goes.appendChild(document.createTextNode("no usable chest: " + chain.map(function (e) {
+        return kitSourceName(str(e.source), r) + " " + str(e.status);
+      }).join(", ")));
+    }
+    return goes;
+  }
+
+  function kitRow(r, d, can_) {
+    var row = kitEl("div", "kit-row");
+    var unnamed = typeof r.key !== "string";
+    var top = kitEl("div", "kit-row-top");
+    var title = kitEl("span", "kit-name", unnamed ? "(unnamed)" : str(r.name) || str(r.key));
+    if (streamerOn() && !unnamed) hide(title);
+    else if (!unnamed) title.title = str(r.key);
+    top.appendChild(title);
+    var cnt = num(r.count, 0);
+    // A template row merges complete and incomplete copies: the counts and the missing items come from the template's stock.
+    var stock = r.template && kb.data && kb.data.stock && kb.data.stock[r.template] ? kb.data.stock[r.template] : null;
+    var incomplete = stock ? num(stock.incomplete, 0) : 0;
+    top.appendChild(kitEl("span", "kit-count-badge", "×" + cnt + (incomplete > 0 ? " (" + incomplete + " incomplete)" : "")));
+    var st = d.report ? KIT_STATUS[r.status] || [str(r.status), ""] : ["Waiting for the bot's report", ""];
+    top.appendChild(kitEl("span", "status-chip kit-pill" + (st[1] ? " " + st[1] : ""), st[0]));
+    var src = KIT_TYPE_SOURCE[str(r.typeSource)];
+    if (src) top.appendChild(kitEl("span", "status-chip kit-pill", src));
+    row.appendChild(top);
+    var whyObj = r.why;
+    if (stock && whyObj && typeof whyObj === "object") {
+      // The row's own reason is the first box's: say what the stock says instead.
+      whyObj = Object.assign({}, whyObj, num(stock.complete, 0) === 0 && incomplete > 0
+        ? { code: "template_incomplete", missing: Array.isArray(stock.missing) ? stock.missing : [] } : { code: "template" });
+    }
+    var why = kitReasonNode(whyObj, str(r.templateName));
+    if (why) row.appendChild(why);
+    if (stock && incomplete > 0 && num(stock.complete, 0) > 0) {
+      var miss = (Array.isArray(stock.missing) ? stock.missing : []).filter(function (m) { return m && num(m.count, 0) > 0; })
+        .map(function (m) { return kbItemLabel(str(m.key) || str(m.match)) + " \u00d7" + num(m.count, 0); });
+      row.appendChild(kitEl("div", "kit-why", incomplete + " incomplete" + (miss.length ? " (short " + miss.join(", ") + ")" : "") +
+        ": kept and topped up, but not delivered until complete."));
+    }
+    if (!why && r.status === "absent") row.appendChild(kitEl("div", "hint", "None of this name in the stash right now. The setting is kept."));
+    else if (!why && r.type == null) row.appendChild(kitEl("div", "hint", "No type known: the bot is too old for kit types, or this is only a setting."));
+    row.appendChild(kitWhereNode(r));
+    row.appendChild(kitGoesNode(r));
+    var ctl = kitEl("div", "kit-row-ctl");
+    if (unnamed) {
+      ctl.appendChild(kitEl("span", "hint", "An unnamed kit can't have its own chest or a type by hand."));
+    } else {
+      var l1 = kitEl("label", "kits-sc-field", "Own chest");
+      var sel = document.createElement("select");
+      sel.className = "mc-select kit-assign";
+      sel.setAttribute("aria-label", "Own chest for " + (streamerOn() ? "this kit" : str(r.name) || str(r.key)));
+      kitOptions(sel, typeof r.rule === "string" ? r.rule : "", "No own chest");
+      sel.disabled = !can_ || !d.report;
+      sel.addEventListener("change", function () {
+        sel.blur();
+        kitAssign(str(r.key), str(r.name) || str(r.key), sel.value, typeof r.rule === "string" ? r.rule : "");
+      });
+      l1.appendChild(sel);
+      ctl.appendChild(l1);
+      var l2 = kitEl("label", "kits-sc-field", "Type");
+      l2.appendChild(kitTypeSelect(r, can_));
+      ctl.appendChild(l2);
+    }
+    row.appendChild(ctl);
+    return row;
+  }
+
+  /** The Type picker of a named kit or box: Auto, each category, Not a kit. Writes treatAs. */
+  function kitTypeSelect(r, can_) {
+    var sel = document.createElement("select");
+    sel.className = "mc-select kit-assign";
+    sel.setAttribute("aria-label", "Type for " + (streamerOn() ? "this kit" : str(r.name) || str(r.key)));
+    kitTypeOptions(sel, typeof r.treatAs === "string" ? r.treatAs : "", "Auto", true);
+    sel.disabled = !can_;
+    sel.addEventListener("change", function () {
+      var v = sel.value;
+      sel.blur();
+      kitsWrite("/api/v1/kits/treatAs", { key: str(r.key), type: v || null });
+    });
+    return sel;
+  }
+
+  function kitGroupNode(label, chestId, status, list, d, can_) {
+    var g = kitEl("div", "kits-group");
+    var h = kitEl("div", "kits-group-head");
+    var n = 0;
+    list.forEach(function (r) { n += num(r.count, 0); });
+    h.appendChild(kitEl("span", "kits-group-name", label + " · " + n + (n === 1 ? " kit" : " kits")));
+    if (chestId !== undefined) {
+      var ch = kitEl("span", "kits-group-chest");
+      if (chestId) {
+        ch.appendChild(document.createTextNode("Chest: "));
+        ch.appendChild(kitPlace(chestId));
+        if (status === "full" || status === "missing") ch.appendChild(kitEl("span", "status-chip kit-pill " + (status === "full" ? "warn" : "off"), status === "full" ? "Full" : "Missing"));
+      } else {
+        ch.textContent = "No chest set";
+      }
+      h.appendChild(ch);
+    }
+    g.appendChild(h);
+    list.forEach(function (r) { g.appendChild(kitRow(r, d, can_)); });
+    return g;
+  }
+
+  function kitOtherRow(o, d, can_) {
+    var row = kitEl("div", "kit-row");
+    var top = kitEl("div", "kit-row-top");
+    var title = kitEl("span", "kit-name", str(o.name) || str(o.key));
+    if (streamerOn()) hide(title);
+    else title.title = str(o.key);
+    top.appendChild(title);
+    top.appendChild(kitEl("span", "kit-count-badge", "×" + num(o.count, 0)));
+    if (o.status === "absent") top.appendChild(kitEl("span", "status-chip kit-pill", "None in the stash"));
+    row.appendChild(top);
+    var why = kitReasonNode(o.why, "");
+    if (why) row.appendChild(why);
+    else if (o.status === "absent") row.appendChild(kitEl("div", "hint", "Set by hand to “Not a kit”; no box of this name is in the stash right now."));
+    row.appendChild(kitWhereNode(o));
+    var code = o.why && typeof o.why === "object" ? str(o.why.code) : "";
+    // Multi-item boxes (and an override that was set by hand) get the picker; one-item boxes show only the reason.
+    if (KIT_TYPE_WHY_CODES[code] || (o.status === "absent" && !code)) {
+      var ctl = kitEl("div", "kit-row-ctl");
+      var lab = kitEl("label", "kits-sc-field", "Treat as");
+      lab.appendChild(kitTypeSelect(o, can_));
+      ctl.appendChild(lab);
+      row.appendChild(ctl);
+    }
+    return row;
   }
 
   function kitsRender() {
     var root = $("view-kits");
     if (!root) return;
     var d = kits.data;
-    var sig = JSON.stringify([d, kits.error, kits.writing, kitsCan(), streamerOn(), !!currentStash()]);
+    var sig = JSON.stringify([d, kits.error, kits.writing, kitsCan(), streamerOn(), !!currentStash(), kb.data && kb.data.categories, kb.data && kb.data.stock]);
     if (sig === kits.sig) return;
     var a = document.activeElement;
     if (a && root.contains(a) && a.tagName === "SELECT" && !kits.writing) return; // not under an open dropdown; the next poll draws it
     kits.sig = sig;
     var banner = $("kits-banner");
-    var chestSel = $("kits-chest");
-    var clear = $("kits-chest-clear");
-    var info = $("kits-chest-info");
-    var rows = $("kits-rows");
+    var chestBox = $("kits-chests");
+    var groups = $("kits-groups");
+    var othersBox = $("kits-others-box");
+    var others = $("kits-others");
     var empty = $("kits-empty");
     var count = $("kits-count");
+    var adv = $("kits-adv");
     if (!currentStash()) {
       banner.replaceChildren();
       kitNote(banner, "No stash selected.");
@@ -5505,136 +7426,56 @@
       banner.hidden = false;
     }
     if (!d) {
-      chestSel.replaceChildren();
-      chestSel.disabled = true;
-      clear.disabled = true;
-      info.textContent = "";
-      kitsScoringSync(null);
-      rows.replaceChildren();
+      chestBox.replaceChildren();
+      groups.replaceChildren();
+      others.replaceChildren();
+      othersBox.hidden = true;
       empty.hidden = true;
       count.textContent = "";
+      adv.hidden = true;
+      kitsScoringSync(null);
       return;
     }
     kitsBanner(banner, d);
     kitsScoringSync(d);
+    var bot = d.bot && typeof d.bot === "object" ? d.bot : {};
+    adv.hidden = !(bot.supports === true && bot.types !== true); // the v1 scoring matters only while an older bot reports
     var can_ = kitsCan() && !kits.writing;
-    var chest = typeof d.kitsChest === "string" ? d.kitsChest : "";
-    kitOptions(chestSel, chest, chest ? "" : "Pick a chest…");
-    chestSel.disabled = !can_ || !d.report;
-    clear.disabled = !can_ || !chest;
-    info.replaceChildren();
-    if (chest) {
-      var c = kitContainer(chest);
-      info.appendChild(document.createTextNode("Kits without their own chest go to "));
-      info.appendChild(kitPlace(chest));
-      info.appendChild(document.createTextNode(c ? " · " + num(c.free, 0) + " free." : " (not reported)."));
-      if (c && str(c.label) && !KIT_WORD.test(str(c.label))) {
-        info.appendChild(document.createTextNode(" Its sign doesn't say kit: while it is the kits chest, only kit shulkers go in it."));
-      }
-    } else {
-      info.textContent = "Kits are sorted like any other shulker until you pick a chest.";
-    }
+    kitsRenderChests(chestBox, d, can_);
 
-    var list = Array.isArray(d.rows) ? d.rows : [];
+    var list = Array.isArray(d.rows) ? d.rows.slice(0, KIT_MAX_ROWS) : [];
     var frag = document.createDocumentFragment();
-    list.slice(0, KIT_MAX_ROWS).forEach(function (r) {
-      var tr = document.createElement("tr");
-      var name = document.createElement("td");
-      name.className = "kit-name";
-      var unnamed = typeof r.key !== "string";
-      var title = document.createElement("span");
-      title.textContent = unnamed ? "(unnamed)" : str(r.name) || str(r.key);
-      if (streamerOn()) hide(title);
-      else if (!unnamed) title.title = str(r.key);
-      name.appendChild(title);
-      var points = kitScoreText(r, d);
-      if (points) {
-        var line = document.createElement("div");
-        line.className = "kit-score";
-        line.textContent = points;
-        name.appendChild(line);
-      }
-      tr.appendChild(name);
-      var cnt = document.createElement("td");
-      cnt.className = "kit-count";
-      cnt.textContent = String(num(r.count, 0));
-      tr.appendChild(cnt);
-      var where = document.createElement("td");
-      where.className = "kit-where";
-      var locs = Array.isArray(r.locations) ? r.locations : [];
-      locs.forEach(function (l, i) {
-        if (i) where.appendChild(document.createTextNode(", "));
-        where.appendChild(kitPlace(str(l.container)));
-        where.appendChild(document.createTextNode(" ×" + num(l.count, 0)));
-      });
-      if (num(r.carried, 0) > 0) {
-        if (locs.length) where.appendChild(document.createTextNode(", "));
-        where.appendChild(document.createTextNode("carried ×" + num(r.carried, 0)));
-      }
-      if (!where.firstChild) where.textContent = "–";
-      tr.appendChild(where);
-      var target = document.createElement("td");
-      target.className = "kit-target";
-      if (typeof r.target === "string") {
-        target.appendChild(kitPlace(r.target));
-        target.appendChild(document.createTextNode(r.targetSource === "rule" ? " (its chest)" : " (kits chest)"));
-      } else {
-        target.textContent = "–";
-      }
-      tr.appendChild(target);
-      var st = document.createElement("td");
-      var info2 = d.report ? KIT_STATUS[r.status] || [str(r.status), ""] : ["Waiting for the bot's report", ""];
-      var pill = document.createElement("span");
-      pill.className = "status-chip kit-pill" + (info2[1] ? " " + info2[1] : "");
-      pill.textContent = info2[0];
-      st.appendChild(pill);
-      tr.appendChild(st);
-      var assign = document.createElement("td");
-      if (unnamed) {
-        // An unnamed kit has no name to make a rule for: it always goes to the kits chest.
-        assign.textContent = "(kits chest)";
-        tr.appendChild(assign);
-        frag.appendChild(tr);
-        return;
-      }
-      var sel = document.createElement("select");
-      sel.className = "mc-select kit-assign";
-      sel.setAttribute("aria-label", "Chest for " + (str(r.name) || str(r.key)));
-      kitOptions(sel, typeof r.rule === "string" ? r.rule : "", "Kits chest (default)");
-      sel.disabled = !can_ || !d.report;
-      sel.addEventListener("change", function () {
-        sel.blur();
-        kitAssign(str(r.key), str(r.name) || str(r.key), sel.value, typeof r.rule === "string" ? r.rule : "");
-      });
-      assign.appendChild(sel);
-      tr.appendChild(assign);
-      frag.appendChild(tr);
+    var types = Array.isArray(d.types) ? d.types : [];
+    var byType = {};
+    list.forEach(function (r) {
+      var k = typeof r.type === "string" ? r.type : "";
+      (byType[k] = byType[k] || []).push(r);
     });
-    rows.replaceChildren(frag);
+    types.forEach(function (t) {
+      if (byType[t.id] && byType[t.id].length) {
+        frag.appendChild(kitGroupNode(str(t.name) || t.id, typeof t.chest === "string" ? t.chest : "", str(t.chestStatus), byType[t.id], d, can_));
+        delete byType[t.id];
+      }
+    });
+    Object.keys(byType).forEach(function (k) {
+      // Rows without a type (an older bot, or a setting for a kit that is not in the stash), or of a type the page does not list.
+      frag.appendChild(kitGroupNode(k ? kitCatName(k) : "No type known", undefined, "", byType[k], d, can_));
+    });
+    groups.replaceChildren(frag);
     empty.hidden = list.length > 0;
-    empty.textContent = d.report
-      ? "No kits found. A shulker box that scores enough points (see Kit scoring) counts as a kit."
-      : "Waiting for the bot's report.";
-    count.textContent = list.length > KIT_MAX_ROWS ? "Showing the first " + KIT_MAX_ROWS + " of " + list.length + " kits." : "";
+    empty.textContent = d.report ? "No kits found. Shulker boxes of several kinds of item that serve one purpose count as kits." : "Waiting for the bot's report.";
+    count.textContent = Array.isArray(d.rows) && d.rows.length > KIT_MAX_ROWS ? "Showing the first " + KIT_MAX_ROWS + " of " + d.rows.length + " kits." : "";
+
+    var oth = Array.isArray(d.others) ? d.others.slice(0, KIT_MAX_ROWS) : [];
+    var ofrag = document.createDocumentFragment();
+    oth.forEach(function (o) { ofrag.appendChild(kitOtherRow(o, d, can_)); });
+    others.replaceChildren(ofrag);
+    othersBox.hidden = !oth.length;
   }
 
   var KIT_SCORING_FIELDS = ["threshold", "name", "mix", "full", "op", "opMin"];
   var KIT_SCORING_POINTS = ["name", "mix", "full", "op"]; // what the highest possible score adds up
   var KIT_SCORING_DEFAULT = { threshold: 4, name: 2, mix: 3, full: 1, op: 4, opMin: 3 };
-
-  /** "10/10: name 2, mix 3, full 1, OP 4", plus "(lowest 8)" when the row's lowest total differs. */
-  function kitScoreText(r, d) {
-    var sc = r.score && typeof r.score === "object" ? r.score : null;
-    if (!sc) return "";
-    var max = d.scoring && typeof d.scoring === "object" ? num(d.scoring.max, 0) : 0;
-    var parts = [];
-    [["name", "name"], ["mix", "mix"], ["full", "full"], ["op", "OP"]].forEach(function (p) {
-      if (num(sc[p[0]], 0) > 0) parts.push(p[1] + " " + num(sc[p[0]], 0));
-    });
-    var text = num(sc.total, 0) + "/" + max + ": " + (parts.length ? parts.join(", ") : "no points");
-    if (typeof r.minTotal === "number" && r.minTotal !== num(sc.total, 0)) text += " (lowest " + r.minTotal + ")";
-    return text;
-  }
 
   function kitScoringInput(field) {
     return $("kits-sc-" + field);
@@ -5705,8 +7546,20 @@
     });
   });
 
-  /** A write to the server; the answer is the same body as GET, so it is drawn straight away. */
-  function kitsWrite(path, body) {
+  /** Why a kit write failed, in words. */
+  function kitFailText(e, dflt) {
+    if (e && e.status === 403 && e.body && e.body.permission === "streamer") return "Kit settings can't be changed in streamer mode (enforced by the owner).";
+    if (e && e.status === 429) return "Too many changes. Wait " + num(e.body && e.body.retryAfter, 1) + " s.";
+    if (e && e.network) return "Can't reach the server.";
+    if (e && e.body && typeof e.body.error === "string") return safeServerText(e.body.error, "The server refused that (details are hidden in streamer mode).");
+    return dflt;
+  }
+
+  /**
+   * A write to the server; the answer is the same body as GET, so it is drawn straight away. The category routes answer
+   * with the templates body instead (asTemplates): that one goes to the Kit Builder and the kits are read again.
+   */
+  function kitsWrite(path, body, asTemplates) {
     var s = currentStash();
     if (!s || kits.writing) return;
     kits.writing = true;
@@ -5716,26 +7569,25 @@
     kitsRender();
     api(path, { method: "POST", body: body }).then(function (d) {
       if (token !== kits.token) return;
-      kits.data = d && typeof d === "object" ? d : kits.data;
+      if (asTemplates) kb.data = d && typeof d === "object" ? d : kb.data;
+      else kits.data = d && typeof d === "object" ? d : kits.data;
       toast("Saved. The bot picks it up in a few seconds.");
     }, function (e) {
-      var msg = e && e.body && typeof e.body.error === "string" ? e.body.error : "Couldn't save that.";
-      if (e && e.status === 429) msg = "Too many changes. Wait " + num(e.body && e.body.retryAfter, 1) + " s.";
-      else if (e && e.network) msg = "Can't reach the server.";
-      toast(msg);
+      toast(kitFailText(e, "Couldn't save that."));
     }).then(function () {
       kits.writing = false;
       kits.token++; // a poll that started while the write ran may have seen the old state
       kits.sig = "";
       kitsRender();
       kitsSync();
+      if (state.tab === "kitbuilder") kbRender();
     });
   }
 
   function kitAssign(key, name, container, was) {
     if (container === was) return;
     if (!container) {
-      if (!window.confirm((streamerOn() ? "Send this kit to the kits chest again?" : "Send “" + name + "” to the kits chest again?") + "\n\nIts own chest rule is removed.")) {
+      if (!window.confirm((streamerOn() ? "Send this kit to its type chest again?" : "Send “" + name + "” to its type chest again?") + "\n\nIts own chest rule is removed.")) {
         kits.sig = "";
         kitsRender();
         return;
@@ -5746,32 +7598,1056 @@
     }
   }
 
-  $("kits-chest").addEventListener("change", function () {
-    var v = this.value;
-    this.blur();
-    var c = kitContainer(v);
-    if (v && c && str(c.label) && !KIT_WORD.test(str(c.label)) &&
-        !window.confirm((streamerOn() ? "This chest is signed for other items. " : "This chest is signed “" + str(c.label) + "”. ") + "As the kits chest it only takes kit shulkers; nothing else is sorted into it.\n\nUse it anyway?")) {
-      kits.sig = "";
-      kitsRender();
-      return;
-    }
-    if (v) {
-      kitsWrite("/api/v1/kits/chest", { container: v });
-    } else {
-      kits.sig = "";
-      kitsRender();
-    }
-  });
-
-  $("kits-chest-clear").addEventListener("click", function () {
-    if (!window.confirm("Stop using a kits chest?\n\nKits without their own chest go back to normal sorting.")) return;
-    kitsWrite("/api/v1/kits/chest", { container: null });
-  });
-
   document.addEventListener("visibilitychange", function () {
     kitsSync();
+    kbSync();
   });
+
+  // ---------- kit builder ----------
+  // The Kit Builder tab (KIT-CONTRACT v2, revisions 3 and 4): templates of 27 slots. The bot recognises boxes that match
+  // one, sorts them to its chest, keeps copies in stock (restock) and builds them for kit lines in orders. The server
+  // validates everything and fills the slots' match keys; this draws the list and the editor. The templates body (GET
+  // /api/v1/kits/templates) is also served to a forced streamer, with every container id "hidden".
+
+  var KB_POLL_MS = 5000;
+  var KB_COLORS = [["white", "White"], ["orange", "Orange"], ["magenta", "Magenta"], ["light_blue", "Light blue"], ["yellow", "Yellow"],
+    ["lime", "Lime"], ["pink", "Pink"], ["gray", "Gray"], ["light_gray", "Light gray"], ["cyan", "Cyan"], ["purple", "Purple"],
+    ["blue", "Blue"], ["brown", "Brown"], ["green", "Green"], ["red", "Red"], ["black", "Black"]];
+  var KB_UNRESOLVED = "This variant isn't in the stash any more: pick it again, or use any variant";
+  var KB_MATCH_HINT = "Matches boxes with the same items, enchantments and contents; item names, damage and repair cost don't matter.";
+  var KB_RESTOCK_WHY = {
+    orders: "waiting for orders to finish",
+    items_short: "waiting for items",
+    bottle_reserve: "keeping the XP bottle reserve",
+    no_shulker: "no empty shulker box left",
+    chest_full: "its chest is full",
+    chest_missing: "its chest is missing",
+    cap: "hourly limit reached",
+    naming: "the bot can't name kits",
+    topping_up: "topping up"
+  };
+
+  function kbVisible() {
+    // The Kits tab reads the stock of each template too (complete and incomplete copies), unless the user is a forced streamer.
+    return (state.tab === "kitbuilder" || (state.tab === "kits" && !forcedStreamer())) && dash.page === "stash" && !document.hidden && !auth.blocked && !!currentStash();
+  }
+
+  function kbSync() {
+    window.clearTimeout(kb.timer);
+    kb.timer = 0;
+    if (kbVisible()) kbPoll();
+  }
+
+  function kbReset() {
+    kb.token++;
+    kb.data = null;
+    kb.error = "";
+    kb.sig = "";
+    kb.ed = null;
+    kb.ui = null;
+    kb.cartTried = null;
+    kb.loading = false;
+    kbRender();
+    kbSync();
+  }
+
+  function kbCan() {
+    return can("settings") && !forcedStreamer();
+  }
+
+  function kbPoll() {
+    if (kb.loading || kb.writing) return;
+    var s = currentStash();
+    if (!s) return;
+    kb.loading = true;
+    var token = kb.token;
+    api("/api/v1/kits/templates?server=" + encodeURIComponent(s.server) + "&stash=" + encodeURIComponent(s.stash)).then(function (d) {
+      if (token !== kb.token) return;
+      kb.data = d && typeof d === "object" && Array.isArray(d.templates) ? d : null;
+      kb.error = kb.data ? "" : "The server sent something unexpected.";
+      if (!kb.data) kb.data = null;
+    }, function (e) {
+      if (token !== kb.token) return;
+      // A transient failure (network, server error) keeps the last good data and only shows the banner.
+      if (e && (e.status === 403 || e.status === 404 || e.status === 503)) kb.data = null;
+      if (e && e.status === 503) kb.error = "The server can't read its kit settings (kits.json is damaged), so kits are off. Fix or remove the file and restart the server.";
+      else if (e && e.status === 404) kb.error = "That stash isn't available.";
+      else if (e && e.status === 403) kb.error = "You can't see kits.";
+      else kb.error = "Can't reach the server. Trying again.";
+    }).then(function () {
+      kb.loading = false;
+      if (token !== kb.token) {
+        kbSync();
+        return;
+      }
+      kbRender();
+      if (state.tab === "kits") kitsRender();
+      if (state.tab === "orders" && !el.cartLines.contains(document.activeElement)) renderCart();
+      window.clearTimeout(kb.timer);
+      kb.timer = kbVisible() ? window.setTimeout(kbPoll, KB_POLL_MS) : 0;
+    });
+  }
+
+  /** The cart shows kit names from the templates: read them once when the cart holds a kit line and nothing was loaded yet. */
+  function kbWantCartNames() {
+    if (kb.data || kb.loading || kb.cartTried === state.selected) return;
+    if (!cart.lines.some(function (l) { return l.type === "kit"; })) return;
+    kb.cartTried = state.selected;
+    kbPoll();
+  }
+
+  function kbTemplate(id) {
+    var list = kb.data && Array.isArray(kb.data.templates) ? kb.data.templates : [];
+    for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i];
+    return null;
+  }
+
+  function kbShulkerId(color) {
+    return color && color !== "plain" ? "minecraft:" + color + "_shulker_box" : "minecraft:shulker_box";
+  }
+
+  /** The slots as shulker contents ({ slot, key, count }) for an icon or the delivery preview. */
+  function kbContents(t) {
+    var out = [];
+    (Array.isArray(t.slots) ? t.slots : []).forEach(function (s, i) {
+      if (s && typeof s === "object") out.push({ slot: i, key: str(s.key), count: num(s.count, 1) });
+    });
+    return out;
+  }
+
+  /** A cart line's stand-in for an item: the kit's shulker icon with its contents. */
+  function kbLineItem(key) {
+    var t = kbTemplate(key);
+    if (!t) return null;
+    return { key: key, id: kbShulkerId(t.color), name: str(t.name), englishName: str(t.name), count: MAX_SHULKERS, maxStack: 1, details: [],
+      enchanted: false, damage: 0, maxDamage: 0, contents: kbContents(t) };
+  }
+
+  /** A kit's name for an order: the order's own snapshot first (the template may be deleted since), then the templates. */
+  function kbOrderKitName(o, id, fallback) {
+    if (o && o.kit && Array.isArray(o.kit.lines)) {
+      for (var i = 0; i < o.kit.lines.length; i++) {
+        var l = o.kit.lines[i];
+        if (l && l.template && l.template.id === id && str(l.template.name)) return str(l.template.name);
+      }
+    }
+    var t = kbTemplate(id);
+    if (t) return str(t.name);
+    return fallback && fallback !== "(hidden)" ? fallback : id;
+  }
+
+  function kbStockText(t) {
+    var d = kb.data;
+    var st = d && d.stock && d.stock[t.id] && typeof d.stock[t.id] === "object" ? d.stock[t.id] : null;
+    if (!st) return "No report from the bot yet.";
+    var complete = num(st.complete, 0);
+    var incomplete = num(st.incomplete, 0);
+    var text = complete + " complete";
+    if (incomplete > 0) {
+      text += ", " + incomplete + " incomplete";
+      var miss = (Array.isArray(st.missing) ? st.missing : []).filter(function (m) { return m && num(m.count, 0) > 0; });
+      if (miss.length) {
+        text += ": short " + miss.slice(0, 4).map(function (m) { return kbItemLabel(str(m.key) || str(m.match)) + " ×" + grouped(num(m.count, 0)); }).join(", ") +
+          (miss.length > 4 ? ", …" : "");
+      }
+    }
+    var else_ = num(st.elsewhere, 0);
+    var carried = num(st.carried, 0);
+    if (else_ > 0) text += " (" + else_ + " elsewhere)";
+    if (carried > 0) text += " (" + carried + " carried)";
+    return text;
+  }
+
+  function kbRestockText(t) {
+    var d = kb.data;
+    var keep = num(t.keep, 0);
+    if (keep <= 0) return "Restock: off";
+    var cap = d && d.capability && typeof d.capability === "object" ? d.capability : {};
+    var base = "Restock: keeps " + keep;
+    if (cap.restock !== true) return base + " (this bot can't restock yet)";
+    var rs = d.restock && typeof d.restock === "object" && d.restock.template === t.id ? d.restock : null;
+    if (!rs) return base;
+    var reason = str(rs.reason);
+    var why = KB_RESTOCK_WHY[reason] || "";
+    switch (str(rs.state)) {
+      case "building": return base + ": building one now";
+      case "waiting": return base + ": " + (why || "waiting for items");
+      case "blocked": return base + ": blocked" + (why ? ", " + why : "");
+      default: return base + (why ? ": " + why : "");
+    }
+  }
+
+  function kbChestText(t) {
+    var src = str(t.chestSource);
+    var status = str(t.effectiveChestStatus);
+    var words = { rule: "its own chest rule", template: "its own chest", typeChest: "the category's chest", category: "the category's chest", kitsChest: "the general kits chest" };
+    var wrap = kitEl("span", "");
+    wrap.appendChild(document.createTextNode("Kept in: "));
+    if (typeof t.effectiveChest === "string" && t.effectiveChest) {
+      wrap.appendChild(kitPlace(t.effectiveChest));
+      wrap.appendChild(document.createTextNode(" (" + (words[src] || "chest") + ")"));
+      if (status === "full") wrap.appendChild(kitEl("span", "status-chip kit-pill warn", "Full"));
+      if (status === "missing") wrap.appendChild(kitEl("span", "status-chip kit-pill off", "Missing"));
+    } else {
+      wrap.appendChild(document.createTextNode("no chest set: sorted like any other shulker"));
+    }
+    // With the kits body loaded: the row's real target ("X is full, using Y").
+    var row = null;
+    if (kits.data && Array.isArray(kits.data.rows)) kits.data.rows.forEach(function (r) { if (r && r.template === t.id && !row) row = r; });
+    if (row && Array.isArray(row.chain) && row.chain.length) {
+      if (typeof row.target === "string" && row.fallback === true) wrap.appendChild(kitEl("div", "kit-fallback", kitFallbackText(row, row.chain)));
+      else if (typeof row.target !== "string") wrap.appendChild(kitEl("div", "kit-fallback", "No usable chest: " + row.chain.map(function (e) {
+        return kitSourceName(str(e.source), row) + " " + str(e.status);
+      }).join(", ")));
+    }
+    return wrap;
+  }
+
+  /** A 9x3 preview of the kit's slots, with the item icons. */
+  function kbPreview(t) {
+    var g = kitEl("div", "kb-prev");
+    var slots = Array.isArray(t.slots) ? t.slots : [];
+    for (var i = 0; i < 27; i++) {
+      var s = slots[i];
+      var c = kitEl("span", "kb-cell");
+      if (s && typeof s === "object") {
+        var any = str(s.key).slice(-2) === "#*";
+        c.appendChild(iconImg(str(s.key).split("#")[0], 24));
+        if (num(s.count, 1) > 1) c.appendChild(kitEl("span", "kb-cell-n", compact(num(s.count, 1))));
+        if (any) c.classList.add("any");
+        c.title = kbItemLabel(s.key) + " ×" + num(s.count, 1) + (any ? " (any variant)" : "");
+      }
+      g.appendChild(c);
+    }
+    return g;
+  }
+
+  function kbBanner() {
+    var box = $("kb-banner");
+    box.replaceChildren();
+    var d = kb.data;
+    if (!currentStash()) {
+      kitNote(box, "No stash selected.");
+    } else if (!d) {
+      kitNote(box, kb.error || "Loading…", kb.error ? "off" : "");
+    } else {
+      var cap = d.capability && typeof d.capability === "object" ? d.capability : {};
+      if (cap.kitOrders !== true) {
+        kitNote(box, "This bot can't build kits yet: the kit is saved and sorted, but can't be ordered or restocked.", "warn");
+      } else if (cap.craft !== true) {
+        kitNote(box, "Short items won't be crafted.");
+      }
+      if (kb.error) kitNote(box, kb.error, "off");
+      if (forcedStreamer()) kitNote(box, "Kit settings can't be changed in streamer mode (enforced by the owner). You can still order kits.");
+      else if (!can("settings")) kitNote(box, "You can look and order, but changing kits needs the “settings” permission.");
+    }
+    box.hidden = !box.firstChild;
+  }
+
+  function kbRender() {
+    var main = $("kb-main");
+    if (!main) return;
+    kbBanner();
+    if (kb.ed) {
+      kbEdUpdate();
+      return;
+    }
+    var d = kb.data;
+    var sig = JSON.stringify([d, kb.error, kb.writing, kbCan(), can("order"), streamerOn(), !!currentStash(), kits.data && kits.data.containers]);
+    if (sig === kb.sig) return;
+    var a = document.activeElement;
+    if (a && main.contains(a) && (a.tagName === "INPUT" || a.tagName === "SELECT") && !kb.writing) return;
+    kb.sig = sig;
+    if (!d) {
+      main.replaceChildren(kitEl("div", "hint", kb.error || "Loading…"));
+      return;
+    }
+    var frag = document.createDocumentFragment();
+    frag.appendChild(kbToolbar(d));
+    var cap = d.capability && typeof d.capability === "object" ? d.capability : {};
+    var cats = kitAllCats();
+    var by = {};
+    d.templates.forEach(function (t) { (by[str(t.category)] = by[str(t.category)] || []).push(t); });
+    var any = false;
+    cats.forEach(function (c) {
+      if (!by[c.id]) return;
+      any = true;
+      frag.appendChild(kbGroup(c.name, by[c.id], cap));
+      delete by[c.id];
+    });
+    Object.keys(by).forEach(function (k) {
+      any = true;
+      frag.appendChild(kbGroup(kitCatName(k), by[k], cap));
+    });
+    if (!any) frag.appendChild(kitEl("div", "hint", "No kits yet. Start one from a preset, or from an empty shulker."));
+    main.replaceChildren(frag);
+  }
+
+  function kbToolbar(d) {
+    var bar = kitEl("div", "kb-toolbar");
+    var lab = kitEl("label", "kits-sc-field", "New kit from");
+    var sel = document.createElement("select");
+    sel.className = "mc-select";
+    sel.id = "kb-preset";
+    sel.appendChild(kitOption("", "An empty kit"));
+    var presets = Array.isArray(d.presets) ? d.presets : [];
+    var groups = {};
+    presets.forEach(function (p) {
+      if (!p || typeof p !== "object") return;
+      (groups[str(p.category)] = groups[str(p.category)] || []).push(p);
+    });
+    kitAllCats().forEach(function (c) {
+      if (!groups[c.id]) return;
+      var og = document.createElement("optgroup");
+      og.label = c.name;
+      groups[c.id].forEach(function (p) { og.appendChild(kitOption(str(p.id), str(p.name))); });
+      sel.appendChild(og);
+    });
+    sel.disabled = !kbCan();
+    lab.appendChild(sel);
+    bar.appendChild(lab);
+    var btn = kitEl("button", "mc-button", "New kit");
+    btn.type = "button";
+    btn.disabled = !kbCan() || d.templates.length >= num(d.limits && d.limits.maxTemplates, 50);
+    btn.title = kbCan() ? "" : "Changing kits needs the settings permission";
+    btn.addEventListener("click", function () {
+      var id = sel.value;
+      var preset = null;
+      presets.forEach(function (p) { if (p && p.id === id) preset = p; });
+      kbOpenEditor(preset ? { name: str(preset.name), category: str(preset.category), color: preset.color || null, keep: 0, chest: null, slots: preset.slots } : null, true);
+    });
+    bar.appendChild(btn);
+    return bar;
+  }
+
+  function kbGroup(name, list, cap) {
+    var g = kitEl("div", "kits-group");
+    g.appendChild(kitEl("div", "kits-group-head", name + " · " + list.length + (list.length === 1 ? " kit" : " kits")));
+    list.forEach(function (t) { g.appendChild(kbCard(t, cap)); });
+    return g;
+  }
+
+  function kbCard(t, cap) {
+    var card = kitEl("div", "kb-card");
+    card.appendChild(kbPreview(t));
+    var info = kitEl("div", "kb-info");
+    var top = kitEl("div", "kit-row-top");
+    var title = kitEl("span", "kit-name", str(t.name));
+    if (streamerOn()) hide(title);
+    top.appendChild(title);
+    top.appendChild(kitEl("span", "status-chip kit-pill", t.color ? (t.color === "plain" ? "Plain shulker" : (KB_COLORS.filter(function (c) { return c[0] === t.color; })[0] || [0, t.color])[1] + " shulker") : "Any colour"));
+    info.appendChild(top);
+    info.appendChild(kitEl("div", "kb-stock", kbStockText(t)));
+    info.appendChild(kitEl("div", "kb-restock", kbRestockText(t)));
+    var chest = kitEl("div", "kb-chest");
+    chest.appendChild(kbChestText(t));
+    info.appendChild(chest);
+    if (Array.isArray(t.slots) && t.slots.some(function (s) { return s && kbSlotBad(s); })) {
+      info.appendChild(kitEl("div", "kits-note warn", "Some items aren't in the stash any more. Edit the kit to pick them again, or use any variant."));
+    }
+    card.appendChild(info);
+    var act = kitEl("div", "kb-actions");
+    var qty = document.createElement("input");
+    qty.type = "number";
+    qty.className = "mc-input qty-input";
+    qty.min = "1";
+    qty.max = String(MAX_SHULKERS);
+    qty.value = String(kb.qty[t.id] || 1);
+    qty.setAttribute("aria-label", "How many kits to order");
+    qty.addEventListener("input", function () { kb.qty[t.id] = clampInt(qty.value, 1, MAX_SHULKERS); });
+    var order = kitEl("button", "mc-button small", "Order");
+    order.type = "button";
+    var canOrder = can("order") && cap.kitOrders === true;
+    qty.disabled = !canOrder;
+    order.disabled = !canOrder;
+    order.title = !can("order") ? "You don't have the order permission" : cap.kitOrders !== true ? "This bot can't build kits yet" : "Add this kit to the order cart";
+    order.addEventListener("click", function () {
+      var n = clampInt(qty.value, 1, MAX_SHULKERS);
+      kb.qty[t.id] = n;
+      if (addToCart("kit", t.id, n)) toast("Added " + n + " × Kit: " + (streamerOn() ? "a kit" : str(t.name)) + ". Place the order in the Orders tab.");
+    });
+    var edit = kitEl("button", "mc-button small", "Edit");
+    edit.type = "button";
+    edit.disabled = !kbCan();
+    edit.addEventListener("click", function () { kbOpenEditor(t, false); });
+    var dup = kitEl("button", "mc-button small", "Duplicate");
+    dup.type = "button";
+    dup.disabled = !kbCan() || (kb.data && kb.data.templates.length >= num(kb.data.limits && kb.data.limits.maxTemplates, 50));
+    dup.addEventListener("click", function () {
+      kbOpenEditor({ name: str(t.name).slice(0, 44) + " (2)", category: t.category, color: t.color, keep: 0, chest: t.chest === "hidden" ? null : t.chest, slots: t.slots }, true);
+    });
+    var del = kitEl("button", "mc-button small danger", "Delete");
+    del.type = "button";
+    del.disabled = !kbCan();
+    del.addEventListener("click", function () {
+      if (!window.confirm("Delete " + (streamerOn() ? "this kit" : "the kit “" + str(t.name) + "”") + "?\n\nBoxes that match it are then sorted by type like any other box. Open orders keep their own copy.")) return;
+      kbWrite("/api/v1/kits/template/delete", { id: t.id }, "Deleted.");
+    });
+    var ordRow = kitEl("div", "kb-act-row");
+    ordRow.appendChild(qty);
+    ordRow.appendChild(order);
+    act.appendChild(ordRow);
+    var editRow = kitEl("div", "kb-act-row");
+    editRow.appendChild(edit);
+    editRow.appendChild(dup);
+    editRow.appendChild(del);
+    act.appendChild(editRow);
+    card.appendChild(act);
+    return card;
+  }
+
+  /** A write of the Kit Builder; the answer is the templates body. then(d) runs after a success. */
+  function kbWrite(path, body, doneText, then) {
+    var s = currentStash();
+    if (!s) return;
+    if (kb.writing) {
+      toast("Another change is still saving");
+      return;
+    }
+    kb.writing = true;
+    var token = ++kb.token;
+    body.server = s.server;
+    body.stash = s.stash;
+    api(path, { method: "POST", body: body }).then(function (d) {
+      if (token === kb.token && d && typeof d === "object" && Array.isArray(d.templates)) kb.data = d;
+      toast(doneText || "Saved. The bot picks it up in a few seconds.");
+      kits.sig = "";
+      if (then) then(d);
+    }, function (e) {
+      var msg = kitFailText(e, "Couldn't save that.");
+      toast(msg);
+      if (kb.ed) {
+        kb.ed.error = msg;
+      }
+    }).then(function () {
+      kb.writing = false;
+      kb.token++;
+      kb.sig = "";
+      if (kb.ed) kb.ed.saving = false;
+      kbRender();
+      kbSync();
+      kitsSync();
+    });
+  }
+
+  // ----- the item list the editor draws from -----
+
+  var kbIndexMatch = { src: null, map: new Map() };
+
+  /** The match key of a slot: the "#*" key or a plain key is its own; an exact variant takes the index's. */
+  function kbMatchOf(s) {
+    var key = s.key;
+    if (key.indexOf("#") < 0 || key.slice(-2) === "#*") return key;
+    var idx = state.index;
+    if (idx && kbIndexMatch.src !== idx) {
+      kbIndexMatch.src = idx;
+      kbIndexMatch.map = new Map();
+      (Array.isArray(idx.items) ? idx.items : []).forEach(function (it) {
+        if (it && typeof it === "object" && typeof it.key === "string" && typeof it.match === "string") kbIndexMatch.map.set(it.key, it.match);
+      });
+    }
+    return kbIndexMatch.map.get(key) || s.match || key;
+  }
+
+  /** True for an exact variant slot the stash index doesn't know (any more). */
+  function kbSlotBad(s) {
+    var key = str(s.key);
+    if (key.indexOf("#") < 0 || key.slice(-2) === "#*") return false;
+    if (state.items.length) return !state.byKey.has(key);
+    return s.resolved === false || s.unres === true;
+  }
+
+  function kbMaxStack(key) {
+    var i = key.indexOf("#");
+    var base = i < 0 ? key : key.slice(0, i);
+    var e = state.byKey.get(key);
+    if (e) return e.item.maxStack;
+    var info = kbIdInfo(base);
+    return info ? info.maxStack : 64; // an item the stash has never held: the server checks the real stack size
+  }
+
+  // ----- the editor -----
+
+  function kbNorm(name) {
+    return String(name).replace(/§./g, "").toLowerCase().replace(/\s+/g, " ").trim();
+  }
+
+  /** Starts an editor on a template (or a preset / copy for isNew), or an empty kit. */
+  function kbOpenEditor(t, isNew) {
+    var slots = [];
+    for (var i = 0; i < 27; i++) {
+      var s = t && Array.isArray(t.slots) ? t.slots[i] : null;
+      slots.push(s && typeof s === "object" && typeof s.key === "string" ? {
+        key: s.key, count: Math.max(1, Math.floor(num(s.count, 1))), match: typeof s.match === "string" ? s.match : "",
+        exact: s.key.slice(-2) === "#*" ? "" : s.key, resolved: s.resolved, unres: s.resolved === false
+      } : null);
+    }
+    var first = 0;
+    for (var j = 0; j < 27; j++) if (slots[j]) { first = j; break; }
+    kb.ed = {
+      id: isNew || !t ? null : t.id,
+      name: t ? str(t.name) : "",
+      category: t ? str(t.category) || "pvp" : "pvp",
+      chest: t && typeof t.chest === "string" && t.chest !== "hidden" ? t.chest : "",
+      color: t && t.color ? str(t.color) : "",
+      keep: t ? Math.max(0, Math.floor(num(t.keep, 0))) : 0,
+      slots: slots, sel: t ? first : 0, search: "", mode: "stash", error: "", saving: false, orig: ""
+    };
+    kb.ed.orig = JSON.stringify(kbEdBody(kb.ed));
+    kbBuildEditor();
+    kbEdUpdate();
+  }
+
+  /** The template as it is sent. Only a variant slot carries its match key (an import); the server fills the rest from the index. */
+  function kbEdBody(ed) {
+    var t = {
+      name: ed.name.trim(), category: ed.category, chest: ed.chest || null, color: ed.color || null, keep: ed.keep,
+      slots: ed.slots.map(function (s) {
+        if (!s) return null;
+        var o = { key: s.key, count: s.count };
+        if (s.match && s.key.indexOf("#") > 0 && s.key.slice(-2) !== "#*") o.match = s.match;
+        return o;
+      })
+    };
+    if (ed.id) t.id = ed.id;
+    return t;
+  }
+
+  function kbEdDirty() {
+    return !!kb.ed && JSON.stringify(kbEdBody(kb.ed)) !== kb.ed.orig;
+  }
+
+  function kbEdClose() {
+    kb.ed = null;
+    kb.ui = null;
+    kb.sig = "";
+    kbRender();
+  }
+
+  function kbField(label, control, cls) {
+    var l = kitEl("label", "kits-sc-field" + (cls ? " " + cls : ""), label);
+    l.appendChild(control);
+    return l;
+  }
+
+  function kbBuildEditor() {
+    var ed = kb.ed;
+    var main = $("kb-main");
+    var ui = kb.ui = { slots: [], pickBtns: [] };
+    main.replaceChildren();
+    var title = kitEl("div", "section-title");
+    title.appendChild(document.createTextNode(ed.id ? "Edit kit: " : "New kit"));
+    if (ed.id) title.appendChild(hiddenSpan(ed.name));
+    main.appendChild(title);
+    ui.error = kitEl("div", "kits-note off");
+    ui.error.hidden = true;
+    main.appendChild(ui.error);
+
+    // fields
+    var fields = kitEl("div", "kits-sc-row kb-fields");
+    ui.name = document.createElement("input");
+    ui.name.type = "text";
+    ui.name.className = "mc-input kb-name";
+    ui.name.maxLength = 50;
+    ui.name.autocomplete = "off";
+    ui.name.spellcheck = false;
+    ui.name.setAttribute("data-sensitive", "");
+    ui.name.value = ed.name;
+    ui.name.addEventListener("input", function () { ed.name = ui.name.value; kbEdUpdate(); });
+    fields.appendChild(kbField("Name", ui.name, "kb-f-name"));
+
+    ui.cat = document.createElement("select");
+    ui.cat.className = "mc-select";
+    fields.appendChild(kbField("Kind of kit", ui.cat));
+    ui.cat.addEventListener("change", function () {
+      if (ui.cat.value === "__new__") {
+        kbNewCategory();
+        return;
+      }
+      ed.category = ui.cat.value;
+      kbEdUpdate();
+    });
+
+    ui.chest = document.createElement("select");
+    ui.chest.className = "mc-select";
+    fields.appendChild(kbField("Kept in", ui.chest));
+    ui.chest.addEventListener("change", function () { ed.chest = ui.chest.value; kbEdUpdate(); });
+
+    ui.color = document.createElement("select");
+    ui.color.className = "mc-select";
+    ui.color.appendChild(kitOption("", "Any colour"));
+    ui.color.appendChild(kitOption("plain", "Plain (undyed)"));
+    KB_COLORS.forEach(function (c) { ui.color.appendChild(kitOption(c[0], c[1])); });
+    ui.color.value = ed.color;
+    fields.appendChild(kbField("Shulker colour", ui.color));
+    ui.color.addEventListener("change", function () { ed.color = ui.color.value; kbEdUpdate(); });
+
+    var rs = kitEl("div", "kb-restock-field");
+    ui.restock = document.createElement("select");
+    ui.restock.className = "mc-select";
+    ui.restock.appendChild(kitOption("off", "Off"));
+    ui.restock.appendChild(kitOption("keep", "Keep"));
+    ui.restock.value = ed.keep > 0 ? "keep" : "off";
+    ui.keep = document.createElement("input");
+    ui.keep.type = "number";
+    ui.keep.className = "mc-input qty-input";
+    ui.keep.min = "1";
+    ui.keep.max = "27";
+    ui.keep.value = String(Math.max(1, ed.keep || 3));
+    ui.keep.setAttribute("aria-label", "How many complete kits to keep");
+    rs.appendChild(ui.restock);
+    rs.appendChild(ui.keep);
+    fields.appendChild(kbField("Restock", rs));
+    var syncKeep = function () {
+      ed.keep = ui.restock.value === "keep" ? clampInt(ui.keep.value, 1, 27) : 0;
+      ui.keep.hidden = ui.restock.value !== "keep";
+      kbEdUpdate();
+    };
+    ui.restock.addEventListener("change", syncKeep);
+    ui.keep.addEventListener("input", syncKeep);
+    ui.keep.hidden = ed.keep <= 0;
+    main.appendChild(fields);
+    ui.restockNote = kitEl("div", "hint");
+    main.appendChild(ui.restockNote);
+
+    // the grid and the picker
+    var cols = kitEl("div", "kb-cols");
+    var left = kitEl("div", "kb-left");
+    left.appendChild(kitEl("div", "hint", "The shulker box: click a slot, then pick an item. Right-click a slot to empty it."));
+    ui.grid = kitEl("div", "kb-grid");
+    ui.grid.setAttribute("role", "group");
+    ui.grid.setAttribute("aria-label", "Shulker box slots");
+    for (var i = 0; i < 27; i++) {
+      (function (index) {
+        var b = kitEl("button", "slot kb-slot");
+        b.type = "button";
+        b.appendChild(kitEl("span", "count"));
+        b.appendChild(kitEl("span", "kb-any", "*"));
+        b.addEventListener("click", function () { ed.sel = index; kbEdUpdate(); });
+        b.addEventListener("contextmenu", function (ev) {
+          ev.preventDefault();
+          if (ed.saving) return;
+          ed.slots[index] = null;
+          ed.sel = index;
+          kbEdUpdate();
+        });
+        ui.slots.push(b);
+        ui.grid.appendChild(b);
+      })(i);
+    }
+    left.appendChild(ui.grid);
+    ui.hint = kitEl("div", "hint", KB_MATCH_HINT);
+    left.appendChild(ui.hint);
+    cols.appendChild(left);
+
+    var right = kitEl("div", "kb-right");
+    ui.selBox = kitEl("div", "kb-sel");
+    ui.selName = kitEl("div", "kb-sel-name");
+    ui.selBox.appendChild(ui.selName);
+    var selRow = kitEl("div", "kits-sc-row");
+    ui.count = document.createElement("input");
+    ui.count.type = "number";
+    ui.count.className = "mc-input qty-input";
+    ui.count.min = "1";
+    ui.count.addEventListener("input", function () {
+      var s = ed.slots[ed.sel];
+      if (!s) return;
+      var max = kbMaxStack(s.key);
+      var v = Math.floor(Number(ui.count.value));
+      s.count = isFinite(v) && v >= 1 ? Math.min(v, 1000) : 1;
+      s.over = s.count > max;
+      kbEdUpdate(true);
+    });
+    selRow.appendChild(kbField("Count", ui.count));
+    ui.any = document.createElement("input");
+    ui.any.type = "checkbox";
+    ui.any.addEventListener("change", function () {
+      var s = ed.slots[ed.sel];
+      if (!s) return;
+      var base = s.key.split("#")[0];
+      if (ui.any.checked) {
+        if (s.key.slice(-2) !== "#*") s.exact = s.key;
+        s.key = base + "#*";
+        s.match = "";
+      } else {
+        s.key = s.exact || base;
+        s.match = "";
+      }
+      s.unres = false;
+      s.resolved = undefined;
+      kbEdUpdate();
+    });
+    var anyLab = kitEl("label", "user-check kb-any-label");
+    anyLab.appendChild(ui.any);
+    anyLab.appendChild(document.createTextNode(" Any variant"));
+    anyLab.title = "Any enchantments, potion type or other components count for this slot";
+    selRow.appendChild(anyLab);
+    ui.clear = kitEl("button", "mc-button small", "Empty this slot");
+    ui.clear.type = "button";
+    ui.clear.addEventListener("click", function () { ed.slots[ed.sel] = null; kbEdUpdate(); });
+    selRow.appendChild(ui.clear);
+    ui.selBox.appendChild(selRow);
+    right.appendChild(ui.selBox);
+
+    var modes = kitEl("div", "seg");
+    modes.setAttribute("role", "group");
+    modes.setAttribute("aria-label", "Item source");
+    ui.modeStash = kitEl("button", "mc-button small seg-btn", "Items in the stash");
+    ui.modeAny = kitEl("button", "mc-button small seg-btn", "Any item");
+    ui.modeStash.type = "button";
+    ui.modeAny.type = "button";
+    ui.modeStash.addEventListener("click", function () { ed.mode = "stash"; kbEdUpdate(); });
+    ui.modeAny.addEventListener("click", function () { ed.mode = "any"; kbEdUpdate(); });
+    modes.appendChild(ui.modeStash);
+    modes.appendChild(ui.modeAny);
+    right.appendChild(modes);
+    ui.search = document.createElement("input");
+    ui.search.type = "search";
+    ui.search.className = "mc-input";
+    ui.search.placeholder = "Search the stash's items";
+    ui.search.autocomplete = "off";
+    ui.search.spellcheck = false;
+    ui.search.addEventListener("input", function () { ed.search = ui.search.value; kbDrawPick(); });
+    right.appendChild(ui.search);
+    ui.anyBox = kitEl("div", "kits-chest-row");
+    ui.anyId = document.createElement("input");
+    ui.anyId.type = "text";
+    ui.anyId.className = "mc-input";
+    ui.anyId.placeholder = "Item id, e.g. minecraft:diamond";
+    ui.anyId.autocomplete = "off";
+    ui.anyId.spellcheck = false;
+    ui.anyId.maxLength = 160;
+    var useAny = kitEl("button", "mc-button small", "Use");
+    useAny.type = "button";
+    var useId = function () {
+      var raw = ui.anyId.value.trim().toLowerCase();
+      var id = raw.indexOf(":") < 0 ? "minecraft:" + raw : raw;
+      if (!/^[a-z0-9_.-]{1,64}:[a-z0-9_.\/-]{1,128}$/.test(id) || isShulkerBoxId(id)) {
+        toast("That isn't an item id. A shulker box can't go in a kit.");
+        return;
+      }
+      kbPlace({ key: id, count: 1, match: "", exact: id });
+      ui.anyId.value = "";
+    };
+    useAny.addEventListener("click", useId);
+    ui.anyId.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        useId();
+      }
+    });
+    ui.anyBox.appendChild(ui.anyId);
+    ui.anyBox.appendChild(useAny);
+    right.appendChild(ui.anyBox);
+    ui.anyHint = kitEl("div", "hint", "For an item the stash doesn't hold. The server checks the stack size when you save.");
+    right.appendChild(ui.anyHint);
+    ui.pick = kitEl("div", "item-grid picker-grid kb-pick");
+    right.appendChild(ui.pick);
+    ui.pickNote = kitEl("div", "hint");
+    right.appendChild(ui.pickNote);
+    cols.appendChild(right);
+    main.appendChild(cols);
+
+    // checks and buttons
+    ui.checks = kitEl("div", "kits-banner kb-checks");
+    main.appendChild(ui.checks);
+    var btns = kitEl("div", "kits-chest-row");
+    ui.save = kitEl("button", "mc-button primary", "Save");
+    ui.save.type = "button";
+    ui.save.addEventListener("click", kbSave);
+    ui.cancel = kitEl("button", "mc-button", "Cancel");
+    ui.cancel.type = "button";
+    ui.cancel.addEventListener("click", function () {
+      if (kbEdDirty() && !window.confirm("Throw away your changes to this kit?")) return;
+      kbEdClose();
+    });
+    btns.appendChild(ui.save);
+    btns.appendChild(ui.cancel);
+    main.appendChild(btns);
+    kbFillCategory();
+    kbFillChest();
+  }
+
+  function kbFillCategory() {
+    var ed = kb.ed;
+    var ui = kb.ui;
+    ui.cat.replaceChildren();
+    kitAllCats().forEach(function (c) { ui.cat.appendChild(kitOption(c.id, c.name)); });
+    ui.cat.appendChild(kitOption("__new__", "+ New category…"));
+    if (!Array.prototype.some.call(ui.cat.options, function (o) { return o.value === ed.category; })) ui.cat.appendChild(kitOption(ed.category, kitCatName(ed.category)));
+    ui.cat.value = ed.category;
+  }
+
+  /** The "Kept in" picker: the category's chest by default, else a container the bot reported as able to take kits. */
+  function kbFillChest() {
+    var ed = kb.ed;
+    var ui = kb.ui;
+    if (document.activeElement === ui.chest) return; // not under an open dropdown
+    var cat = kitCatName(ed.category);
+    ui.chest.replaceChildren();
+    ui.chest.appendChild(kitOption("", cat + " chest (default)"));
+    var list = kits.data && Array.isArray(kits.data.containers) ? kits.data.containers : [];
+    var seen = false;
+    list.forEach(function (c, i) {
+      if (c.pickable !== true && c.id !== ed.chest) return;
+      ui.chest.appendChild(kitOption(c.id, kitOptionText(c, i)));
+      if (c.id === ed.chest) seen = true;
+    });
+    if (ed.chest && !seen) ui.chest.appendChild(kitOption(ed.chest, (streamerOn() ? "Chest" : kitCoords(ed.chest)) + " · not reported"));
+    ui.chest.value = ed.chest;
+    ui.chest.disabled = !kbCan() || !kits.data;
+    ui.chest.title = kits.data ? "" : "The chests are not available here";
+  }
+
+  function kbNewCategory() {
+    var ed = kb.ed;
+    var name = window.prompt("Name for the new kind of kit (up to 32 characters):", "");
+    if (name == null || !name.trim()) {
+      kbFillCategory();
+      return;
+    }
+    kbWrite("/api/v1/kits/category", { name: name.trim() }, "Category added.", function (d) {
+      if (d && typeof d.id === "string" && kb.ed === ed) {
+        ed.category = d.id;
+        kbFillCategory();
+        kbFillChest();
+        kbEdUpdate();
+      }
+    });
+    // A failed or pending write puts the picker back on the current category.
+    kbFillCategory();
+  }
+
+  /** Puts an item into the selected slot (or the first empty one after it) and moves on. */
+  function kbPlace(slot) {
+    var ed = kb.ed;
+    if (!ed || ed.saving) return;
+    ed.slots[ed.sel] = slot;
+    var next = -1;
+    for (var k = 1; k <= 27; k++) {
+      var j = (ed.sel + k) % 27;
+      if (!ed.slots[j]) {
+        next = j;
+        break;
+      }
+    }
+    if (next >= 0) ed.sel = next;
+    kbEdUpdate();
+  }
+
+  var KB_PICK_MAX = 240;
+
+  function kbDrawPick() {
+    var ed = kb.ed;
+    var ui = kb.ui;
+    if (!ed || !ui) return;
+    ui.search.hidden = ed.mode !== "stash";
+    ui.anyBox.hidden = ed.mode !== "any";
+    ui.anyHint.hidden = ed.mode !== "any";
+    ui.pick.hidden = ed.mode !== "stash";
+    ui.pickNote.hidden = ed.mode !== "stash";
+    ui.modeStash.setAttribute("aria-pressed", ed.mode === "stash" ? "true" : "false");
+    ui.modeAny.setAttribute("aria-pressed", ed.mode === "any" ? "true" : "false");
+    if (ed.mode !== "stash") return;
+    var pickSig = ed.search + "|" + state.items.length + "|" + (state.items.length ? state.items[0].item.key : "");
+    if (ui.pickSig === pickSig && state.items === ui.pickSrc) return;
+    ui.pickSig = pickSig;
+    ui.pickSrc = state.items;
+    var query = parseQuery(ed.search);
+    var shown = [];
+    var total = 0;
+    for (var i = 0; i < state.items.length; i++) {
+      var e = state.items[i];
+      if (isShulkerBoxId(e.item.id) || !matches(e, query)) continue;
+      total++;
+      if (shown.length < KB_PICK_MAX) shown.push(e);
+    }
+    var frag = document.createDocumentFragment();
+    shown.forEach(function (e) {
+      var b = kitEl("button", "slot");
+      b.type = "button";
+      b.appendChild(iconImg(e.item.id, 32));
+      var cn = kitEl("span", "count", e.item.count > 1 ? compact(e.item.count) : "");
+      b.appendChild(cn);
+      var det = e.item.details.length ? " (" + e.item.details.slice(0, 3).join(", ") + ")" : "";
+      b.title = e.item.name + det + " – " + grouped(e.item.count) + " in the stash";
+      b.setAttribute("aria-label", b.title);
+      b.addEventListener("click", function () { kbPlace({ key: e.item.key, count: 1, match: "", exact: e.item.key }); });
+      frag.appendChild(b);
+    });
+    ui.pick.replaceChildren(frag);
+    ui.pickNote.textContent = !state.items.length ? "No stash index yet: use “Any item” to type an item id."
+      : total > shown.length ? "Showing the first " + shown.length + " of " + total + " items. Search to narrow it down."
+      : total === 0 ? "No item matches." : "";
+  }
+
+  function kbDrawSlots() {
+    var ed = kb.ed;
+    var ui = kb.ui;
+    ed.slots.forEach(function (s, i) {
+      var btn = ui.slots[i];
+      var base = s ? s.key.split("#")[0] : "";
+      if (btn.dataset.base !== base) {
+        btn.dataset.base = base;
+        var old = btn.querySelector("img");
+        if (old) old.remove();
+        if (base) btn.insertBefore(iconImg(base, 32), btn.firstChild);
+      }
+      var bad = !!s && kbSlotBad(s);
+      var any = !!s && s.key.slice(-2) === "#*";
+      btn.querySelector(".count").textContent = s && s.count > 1 ? compact(s.count) : "";
+      btn.classList.toggle("selected", i === ed.sel);
+      btn.classList.toggle("any", any);
+      btn.classList.toggle("bad", bad || (!!s && s.over === true));
+      btn.title = s ? kbItemLabel(s.key) + " ×" + s.count + (any ? " (any variant)" : "") + (bad ? ". " + KB_UNRESOLVED : "") : "Empty slot " + (i + 1);
+      btn.setAttribute("aria-label", "Slot " + (i + 1) + ": " + (s ? btn.title : "empty"));
+      btn.setAttribute("aria-pressed", i === ed.sel ? "true" : "false");
+    });
+  }
+
+  function kbDrawSel(keepCount) {
+    var ed = kb.ed;
+    var ui = kb.ui;
+    var s = ed.slots[ed.sel];
+    ui.selName.textContent = s ? "Slot " + (ed.sel + 1) + ": " + kbItemLabel(s.key) + (s.key.slice(-2) === "#*" ? " (any variant)" : "") : "Slot " + (ed.sel + 1) + " is empty. Pick an item below.";
+    ui.count.disabled = !s;
+    ui.any.disabled = !s;
+    ui.clear.disabled = !s;
+    if (s) {
+      var max = kbMaxStack(s.key);
+      ui.count.max = String(max);
+      if (!keepCount && document.activeElement !== ui.count) ui.count.value = String(s.count);
+      ui.any.checked = s.key.slice(-2) === "#*";
+    } else {
+      ui.count.value = "";
+      ui.any.checked = false;
+    }
+  }
+
+  /** The live checks of the editor. canSave is true when none fails. */
+  function kbEdChecks() {
+    var ed = kb.ed;
+    var res = { notes: [], canSave: true };
+    var bases = {};
+    var kinds = 0;
+    var bad = [];
+    var over = [];
+    var sig = {};
+    ed.slots.forEach(function (s, i) {
+      if (!s) return;
+      var base = s.key.split("#")[0];
+      if (!bases[base]) {
+        bases[base] = true;
+        kinds++;
+      }
+      if (kbSlotBad(s)) bad.push(i + 1);
+      var max = kbMaxStack(s.key);
+      if (s.count > max) over.push(i + 1);
+      var m = kbMatchOf(s);
+      sig[m] = (sig[m] || 0) + s.count;
+    });
+    var name = ed.name.trim();
+    if (!name) {
+      res.notes.push(["off", "Give the kit a name."]);
+      res.canSave = false;
+    } else {
+      var clash = ((kb.data && kb.data.templates) || []).filter(function (t) { return t.id !== ed.id && kbNorm(t.name) === kbNorm(name); })[0];
+      if (clash) {
+        res.notes.push(["off", "Another kit already has this name."]);
+        res.canSave = false;
+      }
+    }
+    if (kinds < 2) {
+      res.notes.push(["off", "A kit needs at least two kinds of item" + (kinds === 1 ? " (it has one)." : ".")]);
+      res.canSave = false;
+    } else {
+      res.notes.push(["ok", kinds + " kinds of item."]);
+    }
+    if (kinds >= 2) {
+      var mine = Object.keys(sig).sort().map(function (k) { return k + "=" + sig[k]; }).join("|");
+      var same = ((kb.data && kb.data.templates) || []).filter(function (t) {
+        if (t.id === ed.id) return false;
+        var m = {};
+        (t.slots || []).forEach(function (s) { if (s) m[s.match || s.key] = (m[s.match || s.key] || 0) + s.count; });
+        return Object.keys(m).sort().map(function (k) { return k + "=" + m[k]; }).join("|") === mine;
+      })[0];
+      if (same) {
+        res.notes.push(["off", "Same contents as another kit" + (streamerOn() ? "." : ": " + str(same.name) + ".") + " Change a slot so the two can be told apart."]);
+        res.canSave = false;
+      } else {
+        res.notes.push(["ok", "The contents are unique."]);
+      }
+    }
+    if (bad.length) {
+      res.notes.push(["off", KB_UNRESOLVED + " (slot" + (bad.length === 1 ? " " : "s ") + bad.join(", ") + ")."]);
+      res.canSave = false;
+    }
+    if (over.length) {
+      res.notes.push(["off", "A count is above the item's stack size (slot" + (over.length === 1 ? " " : "s ") + over.join(", ") + ")."]);
+      res.canSave = false;
+    }
+    return res;
+  }
+
+  /** Redraws the parts of the editor that follow its data. keepCount: the count box is being typed in. */
+  function kbEdUpdate(keepCount) {
+    var ed = kb.ed;
+    var ui = kb.ui;
+    if (!ed || !ui) return;
+    ed.slots.forEach(function (s) { if (s && s.over && s.count <= kbMaxStack(s.key)) s.over = false; });
+    kbDrawSlots();
+    kbDrawSel(keepCount);
+    kbDrawPick();
+    kbFillChest();
+    var cap = kb.data && kb.data.capability && typeof kb.data.capability === "object" ? kb.data.capability : {};
+    ui.restockNote.textContent = ed.keep > 0
+      ? "The bot keeps " + ed.keep + " complete " + (ed.keep === 1 ? "copy" : "copies") + " of this kit in its chest." +
+        (cap.restock === true ? "" : " This bot can't restock yet: the setting is saved for when it can.")
+      : "";
+    ui.restockNote.hidden = !ui.restockNote.textContent;
+    var res = kbEdChecks();
+    ui.checks.replaceChildren();
+    res.notes.forEach(function (n) { kitNote(ui.checks, n[1], n[0]); });
+    if (ed.error) {
+      ui.error.textContent = ed.error;
+      if (streamerOn()) ui.error.setAttribute("data-sensitive", "");
+      else ui.error.removeAttribute("data-sensitive");
+      ui.error.hidden = false;
+    } else {
+      ui.error.hidden = true;
+    }
+    var editable = kbCan() && !ed.saving;
+    ui.slots.forEach(function (b) { b.disabled = !!ed.saving; });
+    if (ed.saving) {
+      ui.count.disabled = true;
+      ui.any.disabled = true;
+      ui.clear.disabled = true;
+      ui.chest.disabled = true;
+      ui.modeStash.disabled = true;
+      ui.modeAny.disabled = true;
+    } else {
+      ui.modeStash.disabled = false;
+      ui.modeAny.disabled = false;
+    }
+    Array.prototype.forEach.call(ui.pick.querySelectorAll("button"), function (b) { b.disabled = !!ed.saving; });
+    [ui.name, ui.cat, ui.color, ui.restock, ui.keep, ui.search, ui.anyId].forEach(function (c) { c.disabled = !editable; });
+    ui.save.disabled = !editable || !res.canSave || !kbEdDirty();
+    ui.cancel.disabled = ed.saving;
+  }
+
+  function kbSave() {
+    var ed = kb.ed;
+    if (!ed || ed.saving) return;
+    var res = kbEdChecks();
+    if (!res.canSave || !kbCan()) return;
+    ed.saving = true;
+    ed.error = "";
+    kbEdUpdate();
+    kbWrite("/api/v1/kits/template", { template: kbEdBody(ed) }, "Saved. The bot picks it up in a few seconds.", function () {
+      kb.ed = null;
+      kb.ui = null;
+    });
+  }
 
   // ---------- dashboard: pages, bot picker ----------
   // Stash and Orders are the inventory view with its creative tabs; Bots, Settings and Console are dashboard pages
@@ -5862,6 +8738,7 @@
     if (page === "viewer") viewerOpen();
     else viewerClose();
     kitsSync();
+    kbSync();
   }
 
   el.dashNav.addEventListener("click", function (e) {
@@ -7038,6 +9915,11 @@
     chatBtn: $("v-chat-btn"),
     unread: $("v-unread"),
     debugBtn: $("v-debug-btn"),
+    areaBtn: $("v-area-btn"),
+    areaBox: $("v-area"),
+    areaText: $("v-area-text"),
+    areaSave: $("v-area-save"),
+    areaCancel: $("v-area-cancel"),
     debugBox: $("v-debug"),
     hotbar: $("v-hotbar"),
     gearBtn: $("v-gear-btn"),
@@ -7208,6 +10090,7 @@
       if (x1 < 0 || y1 < 0 || x0 > W || y0 > H) return;
       vctx.drawImage(t.canvas, x0, y0, x1 - x0, y1 - y0);
     });
+    areaMapDraw(vctx, toX, toY, dpr, c);
     var names = !streamerOn();
     var r = Math.max(2.5, Math.min(6, vw.zoom * 0.9)) * dpr;
     for (var i = vw.ents.length - 1; i >= 0; i--) {
@@ -7811,6 +10694,10 @@
   }
 
   vel.canvas.addEventListener("pointerdown", function (e) {
+    if (areaMapActive() && e.isPrimary && vw.pointers.size === 0) {
+      areaMapDown(e);
+      return;
+    }
     vel.canvas.setPointerCapture(e.pointerId);
     vw.pointers.set(e.pointerId, vLocal(e));
     if (vw.pointers.size === 2) {
@@ -7825,6 +10712,10 @@
     }
   });
   vel.canvas.addEventListener("pointermove", function (e) {
+    if (areaDrag.start) {
+      areaMapMove(e);
+      return;
+    }
     var prev = vw.pointers.get(e.pointerId);
     if (!prev) return;
     var cur = vLocal(e);
@@ -7845,6 +10736,15 @@
     }
   });
   var vUp = function (e) {
+    if (areaDrag.start) {
+      if (e.type === "pointerup") areaMapUp(e);
+      else {
+        areaDrag.start = null;
+        areaDrag.now = null;
+        vDirty();
+      }
+      return;
+    }
     vw.pointers.delete(e.pointerId);
     if (vw.pointers.size < 2) vw.pinch = null;
   };
@@ -7861,6 +10761,12 @@
     vZoomAt(e.shiftKey ? 0.5 : 2, p.x, p.y);
   });
   vel.centre.addEventListener("click", function () { vSetFollow(true); });
+  vel.areaBtn.addEventListener("click", function () {
+    areaSet.mapOn = !areaSet.mapOn;
+    areaMapRender();
+  });
+  vel.areaSave.addEventListener("click", areaSave);
+  vel.areaCancel.addEventListener("click", areaCancel);
   vel.zoomIn.addEventListener("click", function () { vZoomAt(1.5); });
   vel.zoomOut.addEventListener("click", function () { vZoomAt(1 / 1.5); });
   vel.gearBtn.addEventListener("click", function () {

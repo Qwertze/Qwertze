@@ -63,7 +63,7 @@ public final class IndexStore {
     private record Prepared(String server, String stash, String player, String indexHash, long receivedAt,
                             int itemTypes, long itemTotal, byte[] bytes, byte[] gzip, String etag,
                             Map<String, String> idNames, String mcVersion, OrderCounts orderCounts, long[] containers,
-                            Map<String, CreativeTabs.Entry> tabOrder) {
+                            Map<String, CreativeTabs.Entry> tabOrder, String dimension) {
     }
 
     /**
@@ -73,10 +73,33 @@ public final class IndexStore {
      */
     public record OrderCounts(Map<String, Long> items, Map<String, String> itemIds, Map<String, Integer> maxStacks,
                               Map<String, Long> shulkers, Map<String, Long> filledByItemKey, Map<String, Long> filledById,
-                              Map<String, Repair.Info> repairs) {
+                              Map<String, Repair.Info> repairs, Map<String, String> matches) {
         public OrderCounts(Map<String, Long> items, Map<String, String> itemIds, Map<String, Integer> maxStacks,
                            Map<String, Long> shulkers, Map<String, Long> filledByItemKey, Map<String, Long> filledById) {
-            this(items, itemIds, maxStacks, shulkers, filledByItemKey, filledById, Map.of());
+            this(items, itemIds, maxStacks, shulkers, filledByItemKey, filledById, Map.of(), Map.of());
+        }
+
+        public OrderCounts(Map<String, Long> items, Map<String, String> itemIds, Map<String, Integer> maxStacks,
+                           Map<String, Long> shulkers, Map<String, Long> filledByItemKey, Map<String, Long> filledById,
+                           Map<String, Repair.Info> repairs) {
+            this(items, itemIds, maxStacks, shulkers, filledByItemKey, filledById, repairs, Map.of());
+        }
+
+        /**
+         * The match key of an index key (KIT-CONTRACT-v2, revision 4): the bot's, else the key itself when it is a plain id (an
+         * older bot), else null (a variant key from an older bot has none; also null for a key that isn't in the index).
+         */
+        public String matchOf(String key) {
+            String m = matches.get(key);
+            if (m != null) return m;
+            if (items.containsKey(key) && key.indexOf('#') < 0) return key;
+            return null;
+        }
+
+        /** The base item id of an index key ("minecraft:bow#ab12cd34" is "minecraft:bow"). */
+        public static String baseOf(String key) {
+            int h = key.indexOf('#');
+            return h < 0 ? key : key.substring(0, h);
         }
 
         /** Repair info of an item key (not in the index: no Mending). */
@@ -328,6 +351,34 @@ public final class IndexStore {
         }
     }
 
+    private volatile java.util.function.BiConsumer<String, String> forgetListener = (s, t) -> {
+    };
+
+    /** Called when a stash is dropped from memory (so settings kept for it elsewhere can go too). */
+    void onForget(java.util.function.BiConsumer<String, String> listener) {
+        this.forgetListener = listener;
+    }
+
+    /** The dimension the stash's bot reported in its index (null: none). */
+    String dimension(String server, String stash) {
+        Stash s = stashes.get(new StashKey(server, stash));
+        if (s == null) return null;
+        Prepared p;
+        synchronized (s) {
+            p = s.index;
+        }
+        return p == null ? null : p.dimension;
+    }
+
+    /** The bot's delivery container position, or null. */
+    Delivery delivery(String server, String stash) {
+        Stash s = stashes.get(new StashKey(server, stash));
+        if (s == null) return null;
+        synchronized (s) {
+            return s.delivery;
+        }
+    }
+
     /** Makes room by dropping an offline stash that never sent an index (heartbeat-only entries). */
     private void evictOne() {
         long now = System.currentTimeMillis();
@@ -336,6 +387,11 @@ public final class IndexStore {
             synchronized (s) {
                 if (s.index == null && now - s.lastSeen >= ONLINE_WINDOW_MS) {
                     stashes.remove(e.getKey(), s);
+                    try {
+                        forgetListener.accept(e.getKey().server(), e.getKey().stash());
+                    } catch (RuntimeException ignored) {
+                        // cleanup of settings elsewhere must never stop a new stash from being added
+                    }
                     return;
                 }
             }
@@ -385,6 +441,9 @@ public final class IndexStore {
             if (item.has("tab") && !item.get("tab").isJsonNull()
                 && (!isString(item, "tab") || item.get("tab").getAsString().length() > 40)) return "items[" + i + "].tab must be a short string";
             if (item.has("tabOrder") && !item.get("tabOrder").isJsonNull() && !isNumber(item, "tabOrder")) return "items[" + i + "].tabOrder must be a number";
+            if (item.has("match") && !item.get("match").isJsonNull() && !matchOk(item.get("match"))) {
+                return "items[" + i + "].match must be an item key like minecraft:bow#ab12cd34";
+            }
             if (item.has("details")) {
                 if (!item.get("details").isJsonArray()) return "items[" + i + "].details must be an array";
                 for (JsonElement d : item.getAsJsonArray("details")) {
@@ -414,12 +473,18 @@ public final class IndexStore {
                         JsonObject c = contents.get(j).getAsJsonObject();
                         if (!isNumber(c, "slot") || c.get("slot").getAsDouble() < 0 || c.get("slot").getAsDouble() > 26) return cat + ".slot must be 0..26";
                         if (!isNonEmptyString(c, "key")) return cat + ".key must be a non-empty string";
+                        if (c.has("match") && !c.get("match").isJsonNull() && !matchOk(c.get("match"))) return cat + ".match must be an item key like minecraft:bow#ab12cd34";
                         if (!isNumber(c, "count")) return cat + ".count must be a number";
                     }
                 }
             }
         }
         return null;
+    }
+
+    /** A match key (KIT-CONTRACT-v2, revision 4): the item-key grammar, as a string. */
+    private static boolean matchOk(JsonElement e) {
+        return e.isJsonPrimitive() && e.getAsJsonPrimitive().isString() && KitTemplate.MATCH.matcher(e.getAsString()).matches();
     }
 
     private static boolean isString(JsonObject o, String field) {
@@ -509,8 +574,13 @@ public final class IndexStore {
         }
         Map<String, Repair.Info> repairs = new HashMap<>();
         for (Map.Entry<String, JsonObject> e : byKey.entrySet()) repairs.put(e.getKey(), Repair.of(e.getValue()));
+        Map<String, String> matches = new HashMap<>();
+        for (Map.Entry<String, JsonObject> e : byKey.entrySet()) {
+            String m = stringOrNull(e.getValue(), "match");
+            if (m != null && !m.isEmpty()) matches.put(e.getKey(), m);
+        }
         OrderCounts orderCounts = new OrderCounts(Map.copyOf(itemCounts), Map.copyOf(itemIds), Map.copyOf(maxStacks), Map.copyOf(shulkerCounts),
-            Map.copyOf(filledByItemKey), Map.copyOf(filledById), Map.copyOf(repairs));
+            Map.copyOf(filledByItemKey), Map.copyOf(filledById), Map.copyOf(repairs), Map.copyOf(matches));
 
         index.addProperty("receivedAt", receivedAt);
         byte[] disk = Json.GSON.toJson(index).getBytes(StandardCharsets.UTF_8);
@@ -547,7 +617,7 @@ public final class IndexStore {
             mc,
             orderCounts,
             containers(index),
-            Map.copyOf(tabOrder)), disk);
+            Map.copyOf(tabOrder), stringOrNull(index, "dimension")), disk);
     }
 
     /** {known, total, stale} from the index's containers object (missing numbers are 0), or null. */
@@ -745,6 +815,15 @@ public final class IndexStore {
             p = s.index;
         }
         return p == null ? Map.of() : p.tabOrder;
+    }
+
+    /** Whether the stash's bot sent a heartbeat or index recently. */
+    boolean online(String server, String stash) {
+        Stash s = stashes.get(new StashKey(server, stash));
+        if (s == null) return false;
+        synchronized (s) {
+            return s.lastSeen > 0 && System.currentTimeMillis() - s.lastSeen < ONLINE_WINDOW_MS;
+        }
     }
 
     /** The Minecraft version of a stash's current index, or null when it has none. */

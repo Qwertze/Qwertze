@@ -2,7 +2,7 @@
 
 A small standalone web server for the Qwerte addon's `stash-manager` module. The module pushes the item index of a Minecraft stash (what is in every known container) to this server, and the server shows it as a website that looks like a Minecraft inventory, for anyone on your local network.
 
-It also takes orders for the bots to fill, and can show and change the AquariusProxy plugin's settings, console and activity. Orders, the dashboard and streamer mode are new and still being tested.
+It also takes orders for the bots to fill, and can show and change the AquariusProxy plugin's settings, console and activity. Orders, the dashboard and streamer mode are new and still being tested. Kit sorting v2, the Kit Builder and kit orders are new too, and have not been tested in game yet.
 
 The wire format and the access rules are in [PROTOCOL.md](PROTOCOL.md).
 
@@ -34,7 +34,7 @@ Options:
 
 - `--data <dir>`: where config, indexes and the icon cache are stored. The default is `./stash-manager-data`, relative to the folder you start the server from.
 
-On startup the server prints the URLs it can be reached at (localhost and your LAN IPs) and the API key. Open one of the URLs in a browser. Stop the server with Ctrl+C. If the port is already in use, the server says so and exits; change `port=` in the config.
+On startup the server prints the URLs it can be reached at (localhost and your LAN IPs) and, on the very first run only, the API key (see "What the server prints at start"). Open one of the URLs in a browser. Stop the server with Ctrl+C. If the port is already in use, the server says so and exits; change `port=` in the config.
 
 ## Configuration
 
@@ -50,6 +50,7 @@ The first run creates `stash-manager-data/config.properties` with comments:
 | `minecraftJar` | empty | Minecraft client jar (or a launcher/`.minecraft` folder) for rendering icons. Empty: found automatically. See Item icons. |
 | `iconSource` | `auto` | `auto` (game files, then the wiki), `game` or `wiki`. |
 | `iconDownload` | `true` | When no Minecraft client jar is found on the machine, download the official one once from Mojang (piston-meta.mojang.com, piston-data.mojang.com; sha1 verified), render every item icon into `icons/game-<version>/` in the background, then delete the jar. `false` = never download. |
+| `recipeDownload` | empty | The same as `iconDownload`, for the crafting recipes the planner and the bots use. Empty = follow `iconDownload`; `true`/`false` to decide separately. The recipes are built in the same one-time pass as the icons, from the same jar. See Crafting from the stash. |
 | `trustedProxies` | empty | IP addresses of a reverse proxy / tunnel in front of the server. Only requests from these have their client address read from the last `X-Forwarded-For` entry (rate limit and audit log), and they never count as the server PC. |
 
 Restart the server after editing.
@@ -95,9 +96,9 @@ Click **Regenerate key** in the Link addon panel. The old key stops working at o
 
 ## Using the website
 
-- **Tabs.** Items are grouped like the creative inventory: Search (everything), one tab per creative tab that has items in the stash, Shulkers, and Orders on the right. Inside a creative tab items are in creative-menu order by default; the sort menu can switch to count, name or id. The search box filters the current tab, and searches everything on the Search tab. With the search box not focused, the left and right arrow keys switch tabs. Proxy bots, and indexes from older addon versions, send no tab data. For them the server fills the tabs in from its own creative-tab table for the index's Minecraft version (1.21.4 and 1.21.11 ship with it), so their items show in the creative tabs too; an item the table doesn't know stays under Other.
+- **Tabs.** Items are grouped like the creative inventory: Search (everything), one tab per creative tab that has items in the stash, Shulkers, and on the right Orders, Kits and Kit Builder (see [Kits](#kits)). Inside a creative tab items are in creative-menu order by default; the sort menu can switch to count, name or id. The search box filters the current tab, and searches everything on the Search tab. With the search box not focused, the left and right arrow keys switch tabs. Proxy bots, and indexes from older addon versions, send no tab data. For them the server fills the tabs in from its own creative-tab table for the index's Minecraft version (1.21.4 and 1.21.11 ship with it), so their items show in the creative tabs too; an item the table doesn't know stays under Other.
 - **Shulkers.** The Shulkers tab shows every filled shulker kind (identical shulkers are grouped, with a count). Right-click one to see its contents in a shulker-box window; close it with X, Escape or a click outside. Right-clicking a shulker box item in another tab lists the filled ones of that kind, or says they are all empty. **Shulker icons:** a plain shulker box icon always means empty shulkers. A filled shulker is drawn as the box with the item it holds most of on top (the most of by total count over all its stacks; items with the same id count together; a tie goes to the one in the lowest slot), and a small **+** in the top-left corner when it also holds other kinds of items. This is the same everywhere shulkers appear as icons: the creative tabs, Search, the Shulkers tab, the order picker, cart lines and the planned delivery chest. In the creative tabs and Search, a shulker box item's slot counts only its empty boxes, and its filled groups follow right after it (they are also found by what they hold: searching "diamond" lists shulkers full of diamonds). The tooltip and the shulker window still list the full contents.
-- **Orders.** The Orders tab is the order maker. Pick an item type, then drag an item onto the cart or double-click it to add one stack (hold Shift for a shulker's worth, 27 stacks). Click an item for an exact amount. The cart shows the planned delivery as a double chest: each planned shulker is one slot, with a fill bar (orange when 27/27). Below it, a shulker-box view shows the selected shulker's slots; it follows the last shulker as you add things, and says so when one fills up. Click a shulker in the chest to look inside, and right-click a stack there to remove it. One order can fill at most 54 shulkers (one double chest); the page and the server refuse more. The top of the tab shows the delivery container the bot reported, or a warning when none is set, and why the bot can't take orders, if it says so. The cart is kept in the browser per stash. "Place order" sends it to the server, and the bot picks it up, packs the items into shulkers and delivers them to the delivery container you set in game in the stash-manager module. Orders can be placed while the bot is offline; they wait until it reconnects. Shift-click an item in the other tabs to add a stack to the cart, and use "Add to order" in a shulker window to order a packed shulker as it is. An item line for a shulker box means empty shulkers. **Shulker names:** under the cart, choose "No names" (the default), "Same name for all" (one name for every shulker), or "Name each shulker" (one box per planned shulker, in delivery order, showing what it will hold; leave a box empty to keep that shulker unnamed). Names are up to 50 characters, without `§`. The bot renames the shulkers in an anvil before delivering them; if it can't (no anvil set, not enough XP, ...), they arrive unnamed and the order still completes. The form warns when the bot can't name shulkers, has no anvil set, or may run out of XP (about 1 level per shulker). When the bot reports auto-crafting on, a note says it may craft missing empty shulker boxes from the stash's materials (or that it can't, because no crafting table is set). The bot plans again from what it can reach, so it may deliver fewer shulkers; names go in order. The order list shows each order's status and progress and its names, and open orders can be cancelled (a running order stops at a safe point). **Retry** on a failed or cancelled order places it again as a new order (same items and names), checked against what is in the stash now. **Clear history** removes the finished orders (delivered, failed, cancelled) from the list; open orders are kept.
+- **Orders.** The Orders tab is the order maker. Pick an item type, then drag an item onto the cart or double-click it to add one stack (hold Shift for a shulker's worth, 27 stacks). Click an item for an exact amount. The cart shows the planned delivery as a double chest: each planned shulker is one slot, with a fill bar (orange when 27/27). Below it, a shulker-box view shows the selected shulker's slots; it follows the last shulker as you add things, and says so when one fills up. Click a shulker in the chest to look inside, and right-click a stack there to remove it. One order can fill at most 54 shulkers (one double chest); the page and the server refuse more. The top of the tab shows the delivery container the bot reported, or a warning when none is set, and why the bot can't take orders, if it says so. The cart is kept in the browser per stash. "Place order" sends it to the server, and the bot picks it up, packs the items into shulkers and delivers them to the delivery container you set in game in the stash-manager module. Orders can be placed while the bot is offline; they wait until it reconnects. Shift-click an item in the other tabs to add a stack to the cart, and use "Add to order" in a shulker window to order a packed shulker as it is. An item line for a shulker box means empty shulkers. **Shulker names:** under the cart, choose "No names" (the default), "Same name for all" (one name for every shulker), or "Name each shulker" (one box per planned shulker, in delivery order, showing what it will hold; leave a box empty to keep that shulker unnamed). Names are up to 50 characters, without `§`. The bot renames the shulkers in an anvil before delivering them; if it can't (no anvil set, not enough XP, ...), they arrive unnamed and the order still completes. The form warns when the bot can't name shulkers, has no anvil set, or may run out of XP (about 1 level per shulker). When the bot reports auto-crafting on, a note says it may craft missing empty shulker boxes from the stash's materials (or that it can't, because no crafting table is set). The bot plans again from what it can reach, so it may deliver fewer shulkers; names go in order. The order list shows each order's status and progress and its names, and open orders can be cancelled (a running order stops at a safe point). **Retry** on a failed or cancelled order places it again as a new order (same items and names), checked against what is in the stash now. **Clear history** removes the finished orders (delivered, failed, cancelled) from the list; open orders are kept. A kit can be ordered too: the Kit Builder's **Order** button adds a kit line to the cart (see [Kit orders](#kit-orders)).
 - **Repair.** Under the cart, the Repair box has "Repair all items" (only damaged items with Mending are repaired, with Bottles o' Enchanting from the stash) and a "Repair" toggle on each repairable item line (the line toggles are greyed out while "Repair all items" is on). A damaged line that can't be repaired says why, for example "can't repair (no Mending)". The box shows the estimate ("About N bottles needed, M in the stash") and warns when the stash is short or when the bot reports that it can't repair. The order is still placed, and anything the bot can't finish is delivered as it is. A finished order shows the estimate it was placed with, the bottles used, and the items that were not fully repaired, with the damage left or the reason.
 
 Anyone with the website password can place and cancel orders, the same as everything else on the page.
@@ -125,18 +126,62 @@ Proxy bots running the Qwerte Stash plugin with the dashboard turned on (`stash 
 - **Proxy** (bots with the plugin's proxy access): every AquariusProxy setting, plus the configs of other installed plugins (the menu next to Save). The left list has every section and module with its number of settings (a dot marks unsaved changes); the search box finds settings by path, name or help text across all of them. A module's on/off switch is shown first, highlighted. Saving works like Settings, but needs the password typed in the last 15 minutes. Secrets show only set / not set and are never sent to the website; settings that need a restart or are dangerous to change while running are read-only with the reason. The first time a config is opened, the page asks the bot for it (about a second).
 - **Console:** run proxy commands as if typed in the proxy's terminal, with the reply rendered under each command. Up/Down recall earlier commands. Commands that can disconnect or restart things (`shutdown`, `update`, `disconnect`, `auth`, `jvmArgs`, `plugins`, `releaseChannel`, `discordManage`) ask first. Commands whose input is sensitive show as "(hidden)". The page keeps the last 200 commands per bot (until the server restarts).
 - **Orders: what is already in the delivery chest** (bots that report it: plugin 1.11.0, addon 0.4.0-dev.7): the planned delivery chest shows the items left over from earlier orders in their slots (hatched; hover for the name, count and a shulker's contents), the planned shulkers in the free slots after them, and a line such as "Delivery chest: 20 of 54 slots used, 34 free; this order needs 3 (as of 1m ago)" (totals when there are several chests; "not seen yet" for a chest the bot hasn't read). When the order won't fit, a warning says whether the bot will put up more chests or the order will pause until a chest is emptied. It is only shown here: never counted as stock or searched. The server keeps it in memory only.
-- **Kits** (bots that support them: plugin 1.14.0, addon 0.4.0-dev.14). The Kits tab picks the kits chest and a chest per kit name, shows each kit's score and status, and edits the scoring. The bots do the scoring and the sorting. See [Kits](#kits).
+- **Kits** (bots that support them: plugin 1.14.0 and later for kit sorting; kit types, the Kit Builder and kit orders need plugin 1.16.0; the Qwerte addon does kit sorting only so far). The Kits tab picks the chests for each kind of kit and for each kit name, shows each kit's status, and edits the v1 scoring. The Kit Builder designs kits and their restock. The bots do the classifying and the sorting. See [Kits](#kits).
 - **Live** (the live viewer; bots whose plugin has it): the bot's surroundings as a live map (vanilla map colours, north up, 16x16 chunk tiles out to 8 chunks), with the bot as an arrow along its heading, other players as dots with their names, mobs as small dots (red when hostile) and dropped items as small squares. Drag to pan, pinch or scroll to zoom, double-click or double-tap to zoom in; panning stops following the bot and **Centre** follows it again. The top shows health, food, XP level, armour points and the coordinates with the dimension; the bottom the hotbar (the held slot outlined), under **Inventory** the 27 main inventory slots (open by default on wide screens, collapsed on phones; the choice is remembered; plugin 1.12.0 and later) and, under **Gear**, armour and offhand, with item counts and durability bars as in the stash grid. Chat (public, whispers, system and death messages; the last 200 lines) is a side panel on wide screens and a drawer with an unread count on phones. **Latency** shows how far behind the view is (p50/p95 of bot to server, server to browser, drawing, and end to end). In streamer mode the coordinates and dimension and the chat text are blurred, chat names read "Player" and the map shows no names. The bot sends frames (up to 5 a second) only while someone has the page open, and stops 10 s after the last viewer closes; the stream closes 30 s after the tab is hidden, and when you leave the page. Up to 8 viewers can be open on the server, 2 per user and 4 per bot. Nothing of it is stored or logged: the audit log only notes who started and stopped watching which bot (at most once per 15 minutes per user and bot). Sub-users need the **Live viewer** permission (it also turns on Bots and activity); the Operator preset has it.
 
 ## Kits
 
-Kit sorting sends the shulker boxes that score as kits to the chests you pick here. The bots do the scoring and the sorting
-(plugin 1.14.0 and addon 0.4.0-dev.14 and later). This server keeps your choices and the scoring settings, and shows what the
-bots report. A bot that doesn't know kits ignores all of it, and the Kits tab says so. New in 0.4.0-dev.14 and not tested in game yet.
+Kit sorting sends the shulker boxes that are kits to the chests you choose here. The Kit Builder designs kits, which the bots keep in stock and build for kit orders. The bots do the classifying, sorting and building. This server keeps your choices, the templates and the scoring, and shows what the bots report. A bot that doesn't know kits ignores all of it, and the Kits tab says so.
 
-### The score
+What each bot does:
 
-The bots give each shulker box points: `name` 2 for a custom name with the word "kit" or "kits" (a whole word: "PvP Kit" and
+- **Plugin 1.14.0 and later:** kit sorting with the v1 score (see [The score](#the-score-v1)).
+- **Plugin 1.16.0:** kit types with their chests, treat-as, the Kit Builder's templates, kit orders and restock. Kit orders and restock have not been tested in game yet.
+- **Qwerte addon:** kit sorting only. It doesn't do kit v2 or Kit Builder bot work yet; that comes in a later addon release, and its local `build-kits` stays until then.
+
+A bot that sends no v2 hash in its heartbeat keeps the v1 score, gets only the v1 settings, and gets no kit orders or restock.
+
+### Kit types and chests
+
+- **Types.** A bot sorts each shulker box into one of seven kit types, from the shared table `kits/kit-types.json` (built into the server): **PvP / Crystal**, **Travel**, **Redstone**, **Farming / Food**, **Building**, **Starter / Base** and **Other kit**. A box is a kit of a type when enough of its slots hold that type's items (three quarters of the slots, or half when its name has the word kit) and it holds enough different kinds of item for that type. A box of one kind of item is stock and is never a kit.
+- **Custom categories.** Up to 16 per stash, each named with up to 32 characters (no `§` and no control characters). A bot never detects a custom category: a box gets one only through a template or a treat-as.
+- **Chests.** Each type and each custom category can have a chest. The **general kits chest** takes the kits that have no usable chest of their own.
+- **Where a kit goes.** The first usable of: its kit name's chest rule (see [The Kits tab](#the-kits-tab)), its template's chest, its category's chest, the general kits chest. A stored kit only moves up this chain, never down because a chest filled up. A full chest is not a warning; a missing chest is.
+- **Reserved chests.** A type chest, a category chest and a template chest hold kits only, like the general kits chest.
+- **Treat as.** For one kit name, pick a kind (a type or a custom category: its boxes are kits of that kind), **Not a kit** (its boxes are never kits), or **Auto** (the classifier decides; the default). It overrides the classifier, but a box of one kind of item is still stock.
+
+### Kit Builder
+
+The Kit Builder tab lists the stash's templates by kind. A template has:
+
+- a **name** (1 to 50 characters, no `§` and no control characters, unique in the stash), a **kind** (a type or a custom category), a **chest** (blank: the kind's chest), a **shulker colour** (any, plain, or one of the 16 dye colours) and a **restock** count (off, or keep 1 to 27 complete copies);
+- **27 slots**. Each slot is empty or holds an item with a count (up to its stack size). A slot takes one exact variant of the item (its components must match), or **any variant** of it, for example any enchanted sword.
+
+A template needs at least two different items, and no two templates in a stash may hold the same contents. A stash has at most 50 templates. Nine presets (Crystal PvP, Sword PvP, Elytra Travel, Builder Basics, Assorted Concrete, Redstone Basics, Starter Base, Farmer and Food) fill a new template; a preset is not saved until you save it.
+
+**Matching.** A box matches a template when it holds the same items in the same counts, with the same enchantments, trims, potion contents and other components. Slot positions, how stacks are split, custom item names, damage and repair cost are ignored, so a renamed or damaged copy still matches. Any-variant slots take any variant of their item. Then:
+
+- a **complete copy** has everything the template has and nothing else;
+- an **incomplete copy** carries the template's name, has some of the template's items missing and nothing the template doesn't have. The bot keeps it in its chest and tops it up. An incomplete copy is never delivered for an order.
+
+**Restock.** With a restock count above 0, an idle bot builds or tops up copies from unreserved items, so the chest holds that many complete copies. Restock never crafts. Setting the count back to off stops it.
+
+Creating, editing and deleting templates and kinds needs the **Change plugin settings** permission. Deleting a template that an open order uses is allowed, because the order keeps its own copy of it. Deleting a custom category that a template or a treat-as uses is refused with `409`.
+
+### Kit orders
+
+- **Ordering.** The Kit Builder's **Order** button puts a kit line in the cart, with a count from 1 to 54. The order and the Orders tab show the kit's name.
+- **Limits.** One order has at most 16 different kits and reserves at most 256 item keys ("order fewer kits" otherwise). Each kit takes one shulker, so the 54-shulker cap of an order applies as well.
+- **Placement.** Complete copies the stash already holds are used first. For the rest, the items are reserved from the stash. Short plain items are crafted when the bot can craft (plugin 1.16.0 with craft orders). Anything still short fails the order with `400`, listing the items: "only N complete <name> kits can be made: short <item> ×<n>".
+- **Refused** with `409` when the bot can't build kits: `no_bot` (no bot that can build kits) or `disabled` (kit orders are off on the bot).
+- **Complete copies count only while current.** The server counts a bot's kit report only while the bot's latest heartbeat (at most 10 minutes old) carries the hash of that report. A bot that has gone quiet, or has changed its kits since, is not counted, so its kits are built instead. Incomplete copies never count as ready.
+- **A bot without the kit flag.** A bot that restarted, or has not loaded its kit settings yet, may claim a held kit order without the kit flag. The server doesn't fail the order at once: the claim gets nothing for up to 2 minutes after the first such claim. The order fails when no heartbeat with kit orders on has come in that time, and at 10 minutes after the first such claim at the latest. Flagless claims more than 10 minutes apart start a new episode, and an order that has seen two such episodes fails.
+- **Retry** of a failed or cancelled kit order plans again against the template as it is now (`409` when the template is deleted).
+- **Results.** A kit that can't be completed is never delivered. With two or more kinds of item and a name, it is stored as an incomplete copy in its chest; otherwise its items go back into the stash. The order's message says how many kits were not made, and why.
+
+### The score (v1)
+
+Bots that send no v2 hash (plugin before 1.16.0, and the addon) use the v1 score. Each shulker box gets points: `name` 2 for a custom name with the word "kit" or "kits" (a whole word: "PvP Kit" and
 "kit_3" count, "Kitchen" and "Toolkit" don't), `mix` 3 for a mix of useful items, `full` 1 when all 27 slots are used, and `op` 4
 when the box holds at least `opMin` OP items (3 by default, counted per item by stack count). The defaults give a threshold of 4.
 A box of a single item is never a kit unless all 27 slots are filled. The OP and mix item lists are in `kit-items.json`, the same
@@ -149,16 +194,18 @@ the owner has forced into streamer mode, and the server refuses kit requests fro
 **Change plugin settings** (the `settings` permission). Without it the tab is read-only, and its banner says so.
 
 - **Banner.** Says when the bot doesn't know kits yet, is offline, hasn't picked up the latest settings, hasn't reported its
-  containers yet, or when the kits chest is missing or full. No chest can be picked until the bot has reported its containers.
-- **Kits chest.** One chest for every kit that has no chest of its own. Unnamed kits always go there. **Clear** (after a confirm)
+  containers yet, is too old for kit types (its type chests may get other items), or when the general kits chest is missing or full. No chest can be picked until the bot has reported its containers.
+- **General kits chest.** Takes every kit that has no chest of its own. Unnamed kits without a rule always go there. **Clear** (after a confirm)
   stops using it: those kits go back to normal sorting. Only chests the bot reported as able to take kits are listed. The chest a kit already
   uses is kept in the list, marked "can't take kits", when it no longer qualifies. Picking a chest whose sign doesn't say "kit"
   asks you to confirm first, because it will then take only kit shulkers.
+- **Chests by kind.** A chest for each type and each custom category, chosen the same way as the general kits chest.
 - **Chest per kit.** The **Chest** column gives one kit name its own chest. "Kits chest (default)" (after a confirm) removes that rule. Unnamed kits
-  show "(unnamed)" and have no rule: they always use the kits chest.
-- **Table.** One row per kit name, up to 500 rows: the name, how many there are (in chests plus carried), the score, where they
-  are now, where they go, the status and the chest. The score reads like "10/10: name 2, mix 3, full 1, OP 4". "(lowest 8)" is
-  added when boxes of that name score differently.
+  show "(unnamed)" and have no rule: they always use the general kits chest.
+- **Treat as.** Per kit name, on the rows the classifier does not count as kits: pick a kind, **Not a kit**, or **Auto**.
+- **Table.** One row per kit name, up to 500 rows: the name, how many there are (in chests plus carried), where they
+  are now, where they go, the status and the chest. Kit Builder kits are marked as such, and an incomplete copy shows its reason.
+  The v1 score reads like "10/10: name 2, mix 3, full 1, OP 4". "(lowest 8)" is added when boxes of that name score differently.
 - **Statuses.**
   - *In place*: all of them are in the target chest, and none is carried.
   - *Waiting for the sorter*: the bot hasn't moved them there yet.
@@ -166,18 +213,22 @@ the owner has forced into streamer mode, and the server refuses kit requests fro
   - *Target missing*: the target isn't in the bot's report, or it can't take kits.
   - *Normal sorting*: no chest applies to them.
   - *None in the stash*: there is a rule for this name, but no such kit is in the stash or carried.
-- **Scoring editor.** Six boxes: Threshold (1 to 40), Name, Mix, Full and OP (0 to 10 each), and OP items needed (1 to 1728).
+- **Scoring editor.** Six boxes for the v1 score: Threshold (1 to 40), Name, Mix, Full and OP (0 to 10 each), and OP items needed (1 to 1728).
   The highest possible score is shown next to them. **Save** is enabled when the values are valid and changed. **Reset to defaults**
   is disabled at the defaults and asks you to confirm. The bots re-score every box on their next pass after a save.
 - **Streamer display.** In the page's own streamer mode, kit names are blurred, chests show as "Chest 1", "Chest 2" and so on, and
   the confirm texts carry no label or position.
 - **Limits.** 200 kit names per stash, and 60 kit changes a minute per user (then `429` with a `Retry-After` header).
 
+### Streamer mode and kits
+
+A user the owner has forced into streamer mode doesn't see the Kits tab, and the server refuses the kit settings requests from them with `403`. They can see the Kit Builder, read-only: kit names read "Kit 1", "Kit 2" and so on, custom categories read "Category 1" and so on, every chest is hidden, and template changes are refused. Kit orders still work for them, because they show no positions.
+
 ### Stored settings: kits.json and kits.json.bak
 
-Each stash's kit settings (its kits chest, a chest per kit name, the scoring and a revision number) are in
-`stash-manager-data/kits.json`, or in the folder you give with `--data`. The file holds at most 64 stashes. It is written
+Each stash's kit settings (the general kits chest, the chests by kind, a chest per kit name, treat-as, custom categories, the Kit Builder templates, the scoring and a revision number) are in `stash-manager-data/kits.json`, or in the folder you give with `--data`. The file holds at most 64 stashes. It is written
 atomically and only the owner can read it. Don't edit it while the server runs: stop the server, edit, then start it again.
+An older server that rewrites this file drops the kit types parts (chests by kind, treat-as, categories and templates), so keep the server up to date once you use them.
 
 - **`kits.json.bak`** is the file as it was before the last write. It is only refreshed when the old `kits.json` reads with no
   damaged entries, so a damaged file never replaces a good backup. If `kits.json` is missing or unreadable at startup, the server
@@ -189,8 +240,24 @@ atomically and only the owner can read it. Don't edit it while the server runs: 
   unchanged on every save, so nothing is lost. To repair it, fix that entry by hand (its `server` and `stash` must stay the same),
   or delete the entry to drop that stash's kit settings, then restart.
 
+The kit table (`kits/kit-types.json`) and the presets (`kits/kit-presets.json`) are read-only resources built into the jar.
+
 The kit reports the bots send are kept in memory only, for at most 64 stashes. They are never written to disk or logged. After a
 restart the Kits tab has no report for a stash until its bot sends a new one, which happens on the bot's next heartbeat.
+
+## Crafting from the stash
+
+The Build Planner and the Printer's stash orders can order items the stash does not hold but can make from what it holds. The server decides what is craftable (one planner for the website, the in-game window and the Printer); the stash bot carries the order out: it takes the ingredients from the stash, crafts at the crafting table you set for that stash, and delivers the results with the rest of the order. Only crafting-table recipes (shaped and shapeless) are used: no smelting, stonecutting, smithing, shulker-box dyeing or bundles, and no recolouring recipes. Kit orders use the same planner for the plain items a kit is short of, when the bot can craft (see [Kit orders](#kit-orders)).
+
+- **Recipes** come from the Minecraft client jar, in the same one-time pass as the icons: `stash-manager-data/recipes/<version>/` holds the saved recipe and tag files, `table.json` (served to the bots at `GET /api/v1/bot/recipes?mc=<version>`), `manifest.json` with the table's `tableHash`, and the `.complete` marker. If there is no jar on the machine the official one is downloaded once (`recipeDownload`, which follows `iconDownload`), and a version whose icons are done but whose recipes are missing downloads once more. Nothing from the jar is kept anywhere but that folder. A new server version that changes the table format rebuilds `table.json` from the saved files with no download.
+- **Settings per stash** (`POST /api/v1/craft/table` and `/never-use`): the crafting table's position and dimension (the bots' own table only serves shulker-box crafting; craft orders need this one) and a list of items the planner must never use as ingredients (shulker boxes and bundles never are). They are in `stash-manager-data/craft.json`, written atomically with a `craft.json.bak`, loaded like `kits.json` (a damaged entry switches crafting off for that stash only; neither file readable switches it off everywhere and nothing is overwritten). Forced-streamer users cannot read or change them, because they hold a position.
+- **When can an order include crafting?** The recipes for the stash's version are ready, the stash's bot told the server (in its last heartbeat since the server started) that it can carry out craft orders, its recipe table is the server's (same `tableHash`), a table is set, and the bot says the table is usable. Otherwise the order is refused with `409` and a `craft` code (`no_recipes`, `no_bot`, `recipes_differ`, `no_table`, `table_bad`), and the planner says why. Bots that are not new enough are never given a craft order: their claims skip it, and a craft order they already held becomes failed ("the bot can no longer craft") and can be retried.
+- **Reservations:** the ingredients of an open craft order are reserved like item lines, everywhere the stash's free amounts are counted.
+- **Limits:** at most 4 crafting levels below the item asked for; at most 64 steps and 64 ingredient kinds per order; the bot's own cap on grid fills per order (it reports it); 3 s and 1,000,000 steps per plan. The planner never rounds crafting up to stacks, and what is made over goes back to the stash.
+
+## What the server prints at start
+
+The start-up output goes to the console and, for a service, to its journal, which more people can read than the data folder. So the bots' **API key is printed only on the run that generated it** ("first setup: copy it now; it won't be shown again"). Every other start only says "API key: set". The key stays in `config.properties`, and the website's **Link addon** button links a bot without typing it. The dashboard setup code is shown only while no website password is set, and is never shown again once one is. No password, session or token is ever logged. If a start script tees the console to a file (`java -jar ... | tee server.log`, a redirect, a service that logs to a file), the key printed on the first run stays in that file: delete the line from it, or restrict the file, after you have copied the key.
 
 ## Running several bots
 

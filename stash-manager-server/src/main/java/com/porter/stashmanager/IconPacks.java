@@ -3,8 +3,6 @@ package com.porter.stashmanager;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import com.porter.stashmanager.assets.GameAssets;
-import com.porter.stashmanager.assets.IconRenderer;
 
 import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
@@ -48,6 +46,10 @@ import java.util.zip.ZipFile;
  * a jar the renderer can't open) go straight to FAILED; transient ones (network, I/O, 5xx) are retried on a schedule
  * (no thread sleeps) and only BUILDING counts as pending for the icon route, so while waiting or after failing the
  * wiki fallback is used. FAILED lasts until the next launch.
+ *
+ * <p>The same pass builds the version's recipe set when a {@link RecipePacks} is attached: when either set is incomplete
+ * the jar is taken once ({@link JarSources}) and every incomplete set is built from it before a downloaded jar is deleted.
+ * With {@code iconsEnabled(false)} (icon source "wiki") only the recipe set is built.
  */
 final class IconPacks implements AutoCloseable {
     enum State { BUILDING, WAITING, READY, FAILED }
@@ -68,7 +70,11 @@ final class IconPacks implements AutoCloseable {
     private final Path iconsDir;
     private final Path jarsDir;
     private final Path override;
-    private final ClientJarFetcher fetcher; // null = never download
+    private final ClientJarFetcher fetcher; // null = never download (for icons)
+    private final JarSources jars;
+    private volatile RecipePacks recipes;
+    private volatile ClientJarFetcher recipeFetcher; // null = no download for recipes
+    private volatile boolean iconsEnabled = true;
     private final int size;
     private final long[] retryDelaysMs;
     private final Map<String, State> states = new ConcurrentHashMap<>();
@@ -84,11 +90,32 @@ final class IconPacks implements AutoCloseable {
         this.iconsDir = dataDir.resolve("icons").toAbsolutePath().normalize();
         this.jarsDir = dataDir.resolve("jars").toAbsolutePath().normalize();
         this.override = override;
+        this.jars = new JarSources(jarsDir, override);
         this.fetcher = fetcher;
         this.size = size;
         this.retryDelaysMs = retryDelaysMs;
         int swept = sweep(dataDir, SWEEP_MIN_AGE_MS);
         if (swept > 0) System.out.println("Icon sets: removed " + swept + " leftover temp file(s) from an interrupted run.");
+    }
+
+    /**
+     * Builds the recipe sets in the same pass. recipeFetcher is the downloader to use when recipes are missing and no jar
+     * is on this machine (null: recipeDownload is off).
+     */
+    void attachRecipes(RecipePacks recipes, ClientJarFetcher recipeFetcher) {
+        this.recipes = recipes;
+        this.recipeFetcher = recipeFetcher;
+        recipes.driver(this::requestFor);
+    }
+
+    /** Whether icon sets are made at all (false: only recipes; the icon source is "wiki"). */
+    void iconsEnabled(boolean on) {
+        this.iconsEnabled = on;
+    }
+
+    private boolean requestFor(String v) {
+        request(v);
+        return states.containsKey(v);
     }
 
     /** Leftovers younger than this are skipped: they may belong to a live build of another instance. */
@@ -180,7 +207,10 @@ final class IconPacks implements AutoCloseable {
         long end = System.currentTimeMillis() + timeoutMs;
         while (true) {
             State s = states.get(mcVersion);
-            if (s != State.BUILDING && s != State.WAITING) return true;
+            RecipePacks rp = recipes;
+            RecipePacks.State r = rp == null ? null : rp.rawState(mcVersion);
+            boolean recipesBusy = r == RecipePacks.State.BUILDING || r == RecipePacks.State.WAITING;
+            if (s != State.BUILDING && s != State.WAITING && !recipesBusy) return true;
             if (System.currentTimeMillis() > end) return false;
             Thread.sleep(10);
         }
@@ -225,22 +255,36 @@ final class IconPacks implements AutoCloseable {
     // ---------- the task ----------
 
     private void run(String v, int attempt) {
-        states.put(v, State.BUILDING);
+        if (iconsEnabled && states.get(v) != State.READY) states.put(v, State.BUILDING);
+        RecipePacks rp = recipes;
+        boolean[] icons = {false}; // whether the icon set was incomplete in this run: only then may it fail or wait
         try {
             if (closed) return;
-            if (verify(packDir(v))) {
+            boolean needIcons = iconsEnabled && !verify(packDir(v));
+            icons[0] = needIcons;
+            // A complete icon set is ready at once; what happens to the recipes never changes its state.
+            if (!needIcons) states.put(v, State.READY);
+            boolean needRecipes = rp != null && !rp.complete(v) && !rp.rebuildFromRaw(v);
+            if (rp != null && !needRecipes) rp.mark(v, RecipePacks.State.READY);
+            if (!needIcons && !needRecipes) {
                 System.out.println("Icon set " + v + ": complete on disk, nothing to do.");
-                states.put(v, State.READY);
                 return;
             }
-            build(v);
-            states.put(v, State.READY);
+            if (needRecipes) rp.mark(v, RecipePacks.State.BUILDING);
+            IOException recipeRetry = build(v, needIcons, needRecipes);
+            if (needIcons) states.put(v, State.READY);
+            if (recipeRetry != null && !schedule(v, attempt, recipeRetry, "Recipes ")) rp.mark(v, RecipePacks.State.FAILED);
         } catch (ClientJarFetcher.PermanentException e) {
-            System.err.println("Icon set " + v + ": " + e.getMessage() + ". Using the wiki for this version until the next launch.");
+            System.err.println((icons[0] ? "Icon set " : "Recipes ") + v + ": " + e.getMessage() + (icons[0] ? ". Using the wiki for this version until the next launch." : ". Crafting is not offered for this version until the next launch."));
+            if (icons[0]) states.put(v, State.FAILED);
+            if (rp != null && rp.rawState(v) == RecipePacks.State.BUILDING) {
+                rp.mark(v, e instanceof JarSources.NoJarException ? RecipePacks.State.NONE : RecipePacks.State.FAILED);
+            }
         } catch (IOException | RuntimeException e) {
             if (!closed && attempt < retryDelaysMs.length) {
-                System.err.println("Icon set " + v + ": failed (" + e.getMessage() + "), trying again in " + retryDelaysMs[attempt] / 1000.0 + " s.");
-                states.put(v, State.WAITING);
+                System.err.println((icons[0] ? "Icon set " : "Recipes ") + v + ": failed (" + e.getMessage() + "), trying again in " + retryDelaysMs[attempt] / 1000.0 + " s.");
+                if (icons[0]) states.put(v, State.WAITING);
+                if (rp != null && rp.rawState(v) == RecipePacks.State.BUILDING) rp.mark(v, RecipePacks.State.WAITING);
                 try {
                     worker.schedule(() -> run(v, attempt + 1), retryDelaysMs[attempt], TimeUnit.MILLISECONDS);
                     return;
@@ -248,7 +292,8 @@ final class IconPacks implements AutoCloseable {
                     states.put(v, State.FAILED); // closing
                 }
             } else {
-                System.err.println("Icon set " + v + ": failed (" + e.getMessage() + "). It will be tried again at the next launch; the wiki is used meanwhile.");
+                System.err.println((icons[0] ? "Icon set " : "Recipes ") + v + ": failed (" + e.getMessage() + "). It will be tried again at the next launch"
+                    + (icons[0] ? "; the wiki is used meanwhile." : "; crafting is not offered for this version meanwhile."));
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -257,6 +302,24 @@ final class IconPacks implements AutoCloseable {
         } finally {
             State s = states.get(v);
             if (s == State.BUILDING) states.put(v, State.FAILED);
+            if (rp != null && rp.rawState(v) == RecipePacks.State.BUILDING) rp.mark(v, RecipePacks.State.FAILED);
+        }
+    }
+
+    /** Schedules another attempt of the whole pass (only the incomplete sets are built again). False when it won't run. */
+    private boolean schedule(String v, int attempt, Exception e, String what) {
+        if (closed || attempt >= retryDelaysMs.length) {
+            System.err.println(what + v + ": failed (" + e.getMessage() + "). It will be tried again at the next launch.");
+            return false;
+        }
+        System.err.println(what + v + ": failed (" + e.getMessage() + "), trying again in " + retryDelaysMs[attempt] / 1000.0 + " s.");
+        RecipePacks rp = recipes;
+        if (rp != null) rp.mark(v, RecipePacks.State.WAITING);
+        try {
+            worker.schedule(() -> run(v, attempt + 1), retryDelaysMs[attempt], TimeUnit.MILLISECONDS);
+            return true;
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+            return false;
         }
     }
 
@@ -285,52 +348,49 @@ final class IconPacks implements AutoCloseable {
 
     // ---------- build ----------
 
-    private void build(String v) throws IOException, InterruptedException {
+    /**
+     * Takes the jar once and builds every incomplete set from it. Throws for an icon failure (the caller's rules); a
+     * recipe failure is handled here, except a transient one, which is returned so the pass can be tried again.
+     */
+    private IOException build(String v, boolean needIcons, boolean needRecipes) throws IOException, InterruptedException {
         long start = System.nanoTime();
-        Path downloaded = jarsDir.resolve(v).resolve("client.jar");
-        Path jar = null;
-        IconRenderer renderer = null;
-        boolean weDownloaded = false;
-        try {
-            // The same candidates GameIcons tries; the first one that opens wins, a bad one does not stop the search.
-            for (Path candidate : GameAssets.candidates(v, override)) {
-                if (!Files.isRegularFile(candidate) || !Files.isReadable(candidate)) continue;
-                try {
-                    renderer = IconRenderer.open(candidate, size);
-                    jar = candidate;
-                    break;
-                } catch (IOException | RuntimeException e) {
-                    System.out.println("Icon set " + v + ": can't use " + candidate + " (" + e.getMessage() + ")");
+        RecipePacks rp = recipes;
+        ClientJarFetcher f = needIcons && fetcher != null ? fetcher : needRecipes ? recipeFetcher : null;
+        Exception iconFailure = null;
+        IOException recipeRetry = null;
+        try (JarSources.Lease lease = jars.acquire(v, needIcons, size, f)) {
+            if (needIcons) {
+                if (lease.renderer == null) {
+                    iconFailure = new ClientJarFetcher.PermanentException(lease.iconProblem);
+                } else {
+                    try {
+                        render(v, lease.jar, lease.renderer, start);
+                    } catch (IOException | RuntimeException e) {
+                        iconFailure = e;
+                    }
                 }
             }
-            if (renderer == null) {
-                if (fetcher == null) throw new ClientJarFetcher.PermanentException("no usable client jar for " + v + " on this machine and iconDownload=false");
-                Files.deleteIfExists(downloaded); // a leftover is never trusted; the fetch verifies a fresh one
-                System.out.println("Icon set " + v + ": downloading the official client jar from Mojang (once)...");
-                weDownloaded = true;
-                fetcher.fetch(v, downloaded);
-                System.out.printf("Icon set %s: downloaded %.1f MB (sha1 verified) in %.1f s.%n", v, Files.size(downloaded) / 1048576.0, (System.nanoTime() - start) / 1e9);
+            if (needRecipes) {
                 try {
-                    renderer = IconRenderer.open(downloaded, size);
-                } catch (IOException | RuntimeException e) {
-                    throw new ClientJarFetcher.PermanentException("the downloaded jar has no item definitions the renderer can use (" + e.getMessage() + ")");
-                }
-                jar = downloaded;
-            }
-            render(v, jar, renderer, start);
-        } finally {
-            if (renderer != null) renderer.close();
-            if (weDownloaded) {
-                Files.deleteIfExists(downloaded); // the set is complete without it; it is downloaded again only if the set goes missing
-                try {
-                    Files.deleteIfExists(downloaded.getParent());
-                } catch (IOException ignored) {
+                    rp.build(v, lease.jar);
+                    rp.mark(v, RecipePacks.State.READY);
+                } catch (ClientJarFetcher.PermanentException e) {
+                    System.err.println("Recipes " + v + ": " + e.getMessage() + ". Crafting is not offered for this version until the next launch.");
+                    rp.mark(v, RecipePacks.State.FAILED);
+                } catch (IOException e) {
+                    recipeRetry = e;
+                } catch (RuntimeException e) {
+                    System.err.println("Recipes " + v + ": " + e);
+                    rp.mark(v, RecipePacks.State.FAILED);
                 }
             }
         }
+        if (iconFailure instanceof IOException io) throw io;
+        if (iconFailure instanceof RuntimeException re) throw re;
+        return recipeRetry;
     }
 
-    private void render(String v, Path jar, IconRenderer r, long start) throws IOException, InterruptedException {
+    private void render(String v, Path jar, com.porter.stashmanager.assets.IconRenderer r, long start) throws IOException, InterruptedException {
         List<String> names = itemNames(jar);
         if (names.isEmpty()) throw new ClientJarFetcher.PermanentException("the jar has no item definitions");
         Path tmp = Files.createDirectories(iconsDir).resolve("game-" + v + ".build-" + Long.toHexString(System.nanoTime()));

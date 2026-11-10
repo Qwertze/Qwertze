@@ -57,6 +57,8 @@ final class Router implements HttpHandler {
         /** order, ordersAll or plannerOrder (cancel and retry: own orders, or any with ordersAll). */
         ORDER_OWN_OR_ALL("order", "change orders"),
         ORDERS_ALL("ordersAll", "change other users' orders"),
+        /** A craft quote for an order: order or plannerOrder (CRAFT-CONTRACT.md). */
+        CRAFT_QUOTE("order", "ask for a crafting quote"),
         /** Stash settings (the kit chests and rules). */
         SETTINGS("settings", "change stash settings"),
         ACTIVITY("activity", "view bots"),
@@ -88,6 +90,7 @@ final class Router implements HttpHandler {
                 case ORDER -> x.order();
                 case ORDER_OWN_OR_ALL -> x.order() || x.ordersAll() || x.plannerOrder();
                 case ORDERS_ALL -> x.ordersAll();
+                case CRAFT_QUOTE -> x.order() || x.plannerOrder();
                 case SETTINGS -> x.settings();
                 case ACTIVITY -> x.activity();
                 case RESCAN -> x.rescan();
@@ -340,6 +343,17 @@ final class Router implements HttpHandler {
             match.route.handle(ex);
         } catch (Http.TooLarge e) {
             safeError(ex, 413, "body too large (bot/* 1 MiB, others 8 MiB)");
+        } catch (CraftService.BusyException e) {
+            try {
+                ex.getResponseHeaders().set("Retry-After", Long.toString(e.retryAfter));
+                com.google.gson.JsonObject o = new com.google.gson.JsonObject();
+                o.addProperty("ok", false);
+                o.addProperty("error", e.getMessage());
+                o.addProperty("retryAfter", e.retryAfter);
+                Http.json(ex, e.status, o);
+            } catch (IOException | RuntimeException ignored) {
+                // headers already sent
+            }
         } catch (IOException e) {
             // Usually the client went away mid-request or mid-response. Nothing useful to send back.
         } catch (RuntimeException e) {

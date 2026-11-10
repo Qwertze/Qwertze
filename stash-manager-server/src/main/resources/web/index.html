@@ -194,17 +194,28 @@
 
       <div class="view view-kits" id="view-kits" hidden>
         <section class="inset kits-chest-box">
-          <div class="section-title">Kits chest</div>
+          <div class="section-title">Kits</div>
+          <div class="hint" id="kits-intro">Kits are sorted by type. Pick a chest for each type you use. A kit whose chest is unset, full or missing goes to the general kits chest; with neither, it is sorted like any other shulker. A box of one kind of item is never a kit.</div>
           <div class="kits-banner" id="kits-banner" role="status" hidden></div>
-          <div class="kits-chest-row">
-            <select id="kits-chest" class="mc-select" aria-label="Kits chest" disabled></select>
-            <button type="button" class="mc-button small" id="kits-chest-clear" disabled>Clear</button>
-          </div>
-          <div class="hint" id="kits-chest-info"></div>
         </section>
-        <section class="inset kits-scoring">
-          <div class="section-title">Kit scoring</div>
-          <div class="hint">The bot scores every shulker box: points for a name with &ldquo;kit&rdquo; in it, a mix of different useful items, all 27 slots filled, and OP items (totems, crystals, elytra and so on). A box with at least the threshold in points is a kit. A part-filled box of one item is never a kit.</div>
+        <section class="inset kits-chests">
+          <div class="section-title">Chests</div>
+          <div class="kits-lines" id="kits-chests"></div>
+        </section>
+        <section class="inset kits-list">
+          <div class="section-title">Kits by type</div>
+          <div class="kits-groups" id="kits-groups"></div>
+          <div class="hint" id="kits-empty" hidden></div>
+          <div class="hint" id="kits-count"></div>
+        </section>
+        <section class="inset kits-others" id="kits-others-box" hidden>
+          <div class="section-title">Sorted normally (not kits)</div>
+          <div class="hint">Named shulker boxes the bot does not count as kits, with the reason. A box of several kinds of item can be treated as a kit of a type by hand.</div>
+          <div class="kits-lines" id="kits-others"></div>
+        </section>
+        <details class="inset kits-scoring kits-adv" id="kits-adv" hidden>
+          <summary class="section-title">Advanced: scoring for older bots</summary>
+          <div class="hint">Only bots that do not know kit types use this. They score every shulker box (points for a name with &ldquo;kit&rdquo; in it, a mix of different useful items, all 27 slots filled, and OP items) and a box with at least the threshold in points is a kit. Newer bots ignore it.</div>
           <div class="kits-sc-row">
             <label class="kits-sc-field">Threshold <input id="kits-sc-threshold" class="mc-input" type="number" min="1" max="40" step="1" inputmode="numeric" disabled></label>
             <label class="kits-sc-field">Name <input id="kits-sc-name" class="mc-input" type="number" min="0" max="10" step="1" inputmode="numeric" disabled></label>
@@ -219,19 +230,78 @@
             <button type="button" class="mc-button small" id="kits-sc-reset" disabled>Reset to defaults</button>
           </div>
           <div class="hint">The bots re-score every box on their next pass after you save.</div>
-        </section>
-        <section class="inset kits-list">
-          <div class="section-title">Kits</div>
-          <div class="hint">Every kit the bot found, with its score. Unnamed kits always go to the kits chest. Name a shulker (like &ldquo;PvP Kit&rdquo;) and you can give that name its own chest. The chests you pick hold nothing but kits.</div>
-          <div class="kits-scroll">
-            <table class="kits-table">
-              <thead><tr><th>Kit</th><th>Count</th><th>Where it is now</th><th>Goes to</th><th>Status</th><th>Chest</th></tr></thead>
-              <tbody id="kits-rows"></tbody>
-            </table>
+        </details>
+        <section class="inset area-set" id="area-set" aria-labelledby="area-set-title">
+          <div class="section-title" id="area-set-title">Stash area</div>
+          <div class="hint">The box the bot keeps this stash in: it only reads, sorts and walks inside it. Changes wait until the bot is between tasks. Your edits stay in this page until you press Save.</div>
+          <div class="kits-banner" id="area-banner" role="status" hidden></div>
+          <div class="kits-sc-row">
+            <label class="kits-sc-field">Min X <input id="area-minx" class="mc-input" type="text" inputmode="numeric" maxlength="9" autocomplete="off" spellcheck="false" data-sensitive disabled></label>
+            <label class="kits-sc-field">Min Y <input id="area-miny" class="mc-input" type="text" inputmode="numeric" maxlength="5" autocomplete="off" spellcheck="false" data-sensitive disabled></label>
+            <label class="kits-sc-field">Min Z <input id="area-minz" class="mc-input" type="text" inputmode="numeric" maxlength="9" autocomplete="off" spellcheck="false" data-sensitive disabled></label>
           </div>
-          <div class="hint" id="kits-empty" hidden></div>
-          <div class="hint" id="kits-count"></div>
+          <div class="kits-sc-row">
+            <label class="kits-sc-field">Max X <input id="area-maxx" class="mc-input" type="text" inputmode="numeric" maxlength="9" autocomplete="off" spellcheck="false" data-sensitive disabled></label>
+            <label class="kits-sc-field">Max Y <input id="area-maxy" class="mc-input" type="text" inputmode="numeric" maxlength="5" autocomplete="off" spellcheck="false" data-sensitive disabled></label>
+            <label class="kits-sc-field">Max Z <input id="area-maxz" class="mc-input" type="text" inputmode="numeric" maxlength="9" autocomplete="off" spellcheck="false" data-sensitive disabled></label>
+            <label class="kits-sc-field">Dimension <input id="area-dim" class="mc-input" type="text" readonly disabled data-sensitive></label>
+          </div>
+          <div class="hint" id="area-size"></div>
+          <div class="kits-sc-row">
+            <label class="kits-sc-field">Expand by <input id="area-n" class="mc-input" type="text" inputmode="numeric" maxlength="4" value="8" autocomplete="off" spellcheck="false" disabled></label>
+            <label class="kits-sc-field">Side <select id="area-side" class="mc-select" disabled>
+              <option value="all">All sides</option><option value="-x">West (-X)</option><option value="+x">East (+X)</option>
+              <option value="-z">North (-Z)</option><option value="+z">South (+Z)</option><option value="down">Down</option><option value="up">Up</option>
+            </select></label>
+            <button type="button" class="mc-button small" id="area-expand" disabled>Expand</button>
+          </div>
+          <div class="hint" id="area-msg" role="status" data-sensitive></div>
+          <div class="kits-chest-row">
+            <button type="button" class="mc-button small" id="area-save" disabled>Save</button>
+            <button type="button" class="mc-button small" id="area-cancel" disabled>Cancel</button>
+            <button type="button" class="mc-button small" id="area-bots" disabled>Use the bot&rsquo;s current area</button>
+            <button type="button" class="mc-button small" id="area-clear" disabled>Clear area</button>
+          </div>
         </section>
+        <section class="inset craft-set" id="craft-set" aria-labelledby="craft-set-title">
+          <div class="section-title" id="craft-set-title">Crafting table</div>
+          <div class="hint">When an order asks for items the stash can make from what it holds (the Build Planner's &ldquo;Craft what the stash can make&rdquo;), the bot takes the ingredients from the stash and crafts at this table. Only crafting-table recipes: nothing that needs a furnace, stonecutter or smithing table.</div>
+          <div class="kits-banner" id="craft-banner" role="status" hidden></div>
+          <div class="kits-sc-row">
+            <label class="kits-sc-field">X <input id="craft-x" class="mc-input" type="text" inputmode="numeric" maxlength="9" autocomplete="off" spellcheck="false" data-sensitive disabled></label>
+            <label class="kits-sc-field">Y <input id="craft-y" class="mc-input" type="text" inputmode="numeric" maxlength="5" autocomplete="off" spellcheck="false" data-sensitive disabled></label>
+            <label class="kits-sc-field">Z <input id="craft-z" class="mc-input" type="text" inputmode="numeric" maxlength="9" autocomplete="off" spellcheck="false" data-sensitive disabled></label>
+            <label class="kits-sc-field">Dimension <select id="craft-dim" class="mc-select" disabled></select></label>
+          </div>
+          <div class="craft-seen" id="craft-seen" hidden>
+            <span class="hint">Crafting tables the bot saw in the stash area:</span>
+            <span class="craft-seen-list" id="craft-seen-list"></span>
+          </div>
+          <div class="hint" id="craft-msg" role="status"></div>
+          <div class="kits-chest-row">
+            <button type="button" class="mc-button small" id="craft-save" disabled>Save table</button>
+            <button type="button" class="mc-button small" id="craft-clear" disabled>Clear</button>
+          </div>
+          <div class="craft-never">
+            <div class="section-title">Never use as an ingredient</div>
+            <div class="hint">Items the planner must not craft with, on top of shulker boxes and bundles (which are never used). Use it to keep things you want to hold on to, like diamond blocks.</div>
+            <div class="craft-chips" id="craft-never-list"></div>
+            <div class="kits-chest-row">
+              <input id="craft-never-add" class="mc-input" type="text" list="craft-never-ids" placeholder="Item, e.g. minecraft:iron_block" aria-label="Item to never use as an ingredient" maxlength="160" autocomplete="off" spellcheck="false" disabled>
+              <datalist id="craft-never-ids"></datalist>
+              <button type="button" class="mc-button small" id="craft-never-btn" disabled>Add</button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <div class="view view-kb" id="view-kb" hidden>
+        <section class="inset kb-head">
+          <div class="section-title">Kit Builder</div>
+          <div class="hint">Design a kit once. The bot recognises shulker boxes that match it, sorts them into the kit's chest, can keep copies in stock and builds them for orders.</div>
+          <div class="kits-banner" id="kb-banner" role="status" hidden></div>
+        </section>
+        <section class="inset kb-main" id="kb-main"></section>
       </div>
     </main>
 
@@ -386,9 +456,15 @@
             <button type="button" class="mc-button small" id="v-zoom-in" aria-label="Zoom in">+</button>
             <button type="button" class="mc-button small" id="v-zoom-out" aria-label="Zoom out">&minus;</button>
             <button type="button" class="mc-button small v-narrow" id="v-chat-btn" aria-expanded="false" aria-controls="v-chat">Chat <span class="v-unread" id="v-unread" hidden></span></button>
+            <button type="button" class="mc-button small" id="v-area-btn" aria-pressed="false" title="Drag a rectangle on the map to set the stash area" hidden>Area</button>
             <button type="button" class="mc-button small" id="v-debug-btn" aria-pressed="false" title="Show the latency figures">Latency</button>
           </div>
           <div class="v-debug" id="v-debug" hidden></div>
+          <div class="v-area" id="v-area" hidden>
+            <span id="v-area-text" data-sensitive></span>
+            <button type="button" class="mc-button small" id="v-area-save">Save</button>
+            <button type="button" class="mc-button small" id="v-area-cancel">Cancel</button>
+          </div>
           <div class="note v-note" id="v-note" hidden></div>
           <div class="viewer-bottom">
             <div class="v-inv-box" id="v-inv-box" hidden>
@@ -459,9 +535,14 @@
             <label class="unset"><input type="checkbox" id="pl-fluids"> Water and lava (buckets)</label>
             <label class="unset"><input type="checkbox" id="pl-containers"> Chest contents</label>
           </div>
+          <div class="pl-option-row" id="pl-craft-row" hidden>
+            <label class="unset"><input type="checkbox" id="pl-craft"> <span id="pl-craft-text">Craft what the stash can make</span></label>
+          </div>
+          <div class="note" id="pl-craft-note" hidden></div>
           <div class="note" id="pl-locked" hidden>Options are locked while parts of this build are ordered, so nothing is ordered twice. Dismiss and upload the file again to start over.</div>
         </section>
         <section class="inset pl-summary" aria-label="Summary">
+          <div class="pl-craft-banner" id="pl-craft-banner" role="status" hidden></div>
           <div class="pl-tiles" id="pl-tiles"></div>
           <div class="pl-actions">
             <button type="button" class="mc-button primary" id="pl-order" hidden>Order build materials now</button>
@@ -492,6 +573,7 @@
                   <th scope="col" class="pl-c-num" aria-sort="none"><button type="button" class="pl-sort" data-sort="need">Need</button></th>
                   <th scope="col" class="pl-c-num" aria-sort="none"><button type="button" class="pl-sort" data-sort="inStash">In stash</button></th>
                   <th scope="col" class="pl-c-num" aria-sort="none"><button type="button" class="pl-sort" data-sort="available">Available</button></th>
+                  <th scope="col" class="pl-c-num pl-c-craft" id="pl-th-craft" aria-sort="none" hidden><button type="button" class="pl-sort" data-sort="craftable">Craftable</button></th>
                   <th scope="col" class="pl-c-num" aria-sort="none"><button type="button" class="pl-sort" data-sort="missing">Missing</button></th>
                 </tr>
               </thead>

@@ -472,6 +472,8 @@ class StreamerTest {
             "[GET, HEAD] ^/api/v1/bots/([A-Za-z0-9_-]{1,64})/(settings|jobs|console|activity)$ SESSION ACTIVITY",
             "[GET, HEAD] /api/v1/delivery SESSION VIEW",
             "[GET, HEAD] /api/v1/orders SESSION VIEW",
+            // The Kit Builder list: every container id is "hidden" for a forced streamer (KIT-CONTRACT-v2); see KitV2Test.
+            "[GET, HEAD] /api/v1/kits/templates SESSION VIEW",
             "[POST] /api/v1/orders BROWSER_WRITE ORDER",
             "[POST] ^/api/v1/orders/(o-[0-9a-f]{12})/cancel$ BROWSER_WRITE ORDER_OWN_OR_ALL",
             "[POST] ^/api/v1/orders/(o-[0-9a-f]{12})/force-cancel$ BROWSER_WRITE ORDER_OWN_OR_ALL",
@@ -493,6 +495,8 @@ class StreamerTest {
             "[POST] /api/v1/rescan BROWSER_WRITE RESCAN",
             "[POST] /api/v1/orders/clear BROWSER_WRITE ORDERS_ALL",
             "[POST] ^/api/v1/planner/(p-[0-9a-f]{12})/delete$ BROWSER_WRITE PLANNER",
+            // The Printer's craft quote: item ids and counts only, no positions (CRAFT-CONTRACT.md).
+            "[POST] /api/v1/craft/plan BROWSER_WRITE CRAFT_QUOTE",
             "[GET, HEAD] /icon/ SESSION ICONS");
         java.util.Set<String> forbidden = java.util.Set.of(
             "[POST] ^/api/v1/bots/([A-Za-z0-9_-]{1,64})/(settings|jobs|console|activity)$ BROWSER_WRITE ACTIVITY",
@@ -501,9 +505,23 @@ class StreamerTest {
             "[POST] /api/v1/kits/chest BROWSER_WRITE SETTINGS",
             "[POST] /api/v1/kits/rule BROWSER_WRITE SETTINGS",
             "[POST] /api/v1/kits/rule/delete BROWSER_WRITE SETTINGS",
-            "[POST] /api/v1/kits/scoring BROWSER_WRITE SETTINGS");
+            "[POST] /api/v1/kits/scoring BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/kits/typeChest BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/kits/treatAs BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/kits/template BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/kits/template/delete BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/kits/category BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/kits/category/delete BROWSER_WRITE SETTINGS",
+            // Crafting settings: the crafting table's position and the bot's table sightings (CRAFT-CONTRACT.md); see CraftRoutesTest.
+            "[GET, HEAD] /api/v1/craft SESSION VIEW",
+            "[POST] /api/v1/craft/table BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/craft/never-use BROWSER_WRITE SETTINGS",
+            // The stash area: a box with positions (AREA-CONTRACT.md); see AreaTest.
+            "[GET, HEAD] /api/v1/area SESSION VIEW",
+            "[POST] /api/v1/area BROWSER_WRITE SETTINGS");
         java.util.Set<String> ownerOnly = java.util.Set.of(
             "[POST] /api/v1/link/regenerate BROWSER_WRITE OWNER",
+            "[POST] /api/v1/area/home BROWSER_WRITE OWNER",
             "[GET, HEAD] /api/v1/users SESSION OWNER",
             "[POST] /api/v1/users BROWSER_WRITE OWNER",
             "[POST] /api/v1/users/owner BROWSER_WRITE OWNER",
@@ -517,6 +535,93 @@ class StreamerTest {
             if (!redacted.contains(r) && !noData.contains(r) && !forbidden.contains(r) && !ownerOnly.contains(r)) unclassified.add(r);
         }
         assertTrue(unclassified.isEmpty(), "classify these routes for forced streamer mode (StreamerTest): " + unclassified);
+    }
+
+    // ---------- kit names ----------
+
+    /** Kits for the stash: a bot that builds kits, a report, a custom category and a template named by a user. Returns the template id. */
+    String kitSetup() throws Exception {
+        ok(botPost("/api/v1/index", "{\"version\":1,\"server\":\"2b2t.org\",\"stash\":\"a\",\"player\":\"Bobby\",\"items\":["
+            + "{\"key\":\"minecraft:bread\",\"id\":\"minecraft:bread\",\"name\":\"Bread\",\"count\":100,\"maxStack\":64},"
+            + "{\"key\":\"minecraft:apple\",\"id\":\"minecraft:apple\",\"name\":\"Apple\",\"count\":10,\"maxStack\":64},"
+            + "{\"key\":\"minecraft:shulker_box\",\"id\":\"minecraft:shulker_box\",\"name\":\"Shulker Box\",\"count\":60,\"maxStack\":1}],\"shulkers\":[]}"));
+        ok(botPost("/api/v1/heartbeat", "{\"server\":\"2b2t.org\",\"stash\":\"a\",\"player\":\"Bobby\","
+            + "\"kitOrders\":{\"v\":1,\"enabled\":true,\"restock\":false,\"craft\":false}}"));
+        ok(botPost("/api/v1/kits/report", "{\"version\":1,\"server\":\"2b2t.org\",\"stash\":\"a\",\"player\":\"Bobby\",\"hash\":\"" + "1".repeat(40)
+            + "\",\"readAt\":1767225600000,\"containers\":[{\"id\":\"10,64,10\",\"label\":null,\"size\":54,\"free\":3,\"pickable\":true,\"readAt\":1767225500000}],"
+            + "\"kits\":[],\"carried\":[]}"));
+        ok(post(owner, "/api/v1/kits/category", "{\"server\":\"2b2t.org\",\"stash\":\"a\",\"name\":\"Steves Secret Shop\"}"));
+        String body = "{\"server\":\"2b2t.org\",\"stash\":\"a\",\"template\":{\"name\":\"Steves Secret Kit\",\"category\":\"c:steves-secret-shop\",\"slots\":["
+            + "{\"key\":\"minecraft:bread\",\"count\":1},{\"key\":\"minecraft:apple\",\"count\":1}" + ",null".repeat(25) + "]}}";
+        Res r = post(owner, "/api/v1/kits/template", body);
+        assertEquals(200, r.status, r.body);
+        String id = JsonParser.parseString(r.body).getAsJsonObject().get("id").getAsString();
+        // A second kit, so the numbers differ whichever way the ids sort.
+        String other = "{\"server\":\"2b2t.org\",\"stash\":\"a\",\"template\":{\"name\":\"Simple Kit\",\"category\":\"pvp\",\"slots\":["
+            + "{\"key\":\"minecraft:bread\",\"count\":2},{\"key\":\"minecraft:apple\",\"count\":2}" + ",null".repeat(25) + "]}}";
+        assertEquals(200, post(owner, "/api/v1/kits/template", other).status);
+        return id;
+    }
+
+    /** The name a forced user sees for a template in the Builder list (the number is its place in the list). */
+    String forcedName(String id) throws Exception {
+        JsonObject o = JsonParser.parseString(get(fay, "/api/v1/kits/templates?server=" + sid() + "&stash=a").body).getAsJsonObject();
+        for (JsonElement e : o.getAsJsonArray("templates")) if (e.getAsJsonObject().get("id").getAsString().equals(id)) return e.getAsJsonObject().get("name").getAsString();
+        throw new AssertionError("no such template " + id);
+    }
+
+    @Test
+    void kitTemplateNamesAreNumberedInTheBuilderList() throws Exception {
+        String id = kitSetup();
+        Res asOwner = get(owner, "/api/v1/kits/templates?server=2b2t.org&stash=a");
+        assertTrue(asOwner.body.contains("Steves Secret Kit") && asOwner.body.contains("c:steves-secret-shop"), asOwner.body);
+        Res r = get(fay, "/api/v1/kits/templates?server=" + sid() + "&stash=a");
+        assertEquals(200, r.status, r.body);
+        assertFalse(r.body.contains("Steve") && r.body.toLowerCase().contains("secret"), r.body);
+        assertFalse(r.body.contains("steves-secret"), r.body);
+        JsonObject o = JsonParser.parseString(r.body).getAsJsonObject();
+        JsonObject t = null;
+        for (JsonElement e : o.getAsJsonArray("templates")) if (e.getAsJsonObject().get("id").getAsString().equals(id)) t = e.getAsJsonObject();
+        assertNotNull(t, "the template id is random, not a name");
+        assertTrue(t.get("name").getAsString().matches("Kit [12]"), t.get("name").getAsString());
+        assertEquals(2, o.getAsJsonArray("templates").size());
+        assertEquals("Kit 1", o.getAsJsonArray("templates").get(0).getAsJsonObject().get("name").getAsString());
+        assertEquals("Kit 2", o.getAsJsonArray("templates").get(1).getAsJsonObject().get("name").getAsString());
+        JsonObject cat = o.getAsJsonArray("categories").get(0).getAsJsonObject();
+        assertEquals("Category 1", cat.get("name").getAsString());
+        assertEquals("c:1", cat.get("id").getAsString());
+        assertEquals(cat.get("id").getAsString(), t.get("category").getAsString(), "the read-only Builder still groups by category");
+    }
+
+    @Test
+    void kitNamesInOrdersAreNumberedForForcedUsers() throws Exception {
+        String id = kitSetup();
+        Res placed = post(fay, "/api/v1/orders", "{\"server\":\"" + sid() + "\",\"stash\":\"a\",\"lines\":[{\"type\":\"kit\",\"key\":\"" + id + "\",\"count\":1}]}");
+        assertEquals(200, placed.status, placed.body);
+        assertFalse(placed.body.contains("Secret") || placed.body.contains("steves-secret"), placed.body);
+        JsonObject line = JsonParser.parseString(placed.body).getAsJsonObject().getAsJsonObject("order").getAsJsonObject("kit")
+            .getAsJsonArray("lines").get(0).getAsJsonObject().getAsJsonObject("template");
+        assertEquals(forcedName(id), line.get("name").getAsString(), "the same kit has the same number in the Builder list and in Orders");
+        assertEquals("custom", line.get("category").getAsString());
+        assertEquals(id, JsonParser.parseString(placed.body).getAsJsonObject().getAsJsonObject("order").getAsJsonObject("kit").getAsJsonArray("lines")
+            .get(0).getAsJsonObject().getAsJsonObject("template").get("id").getAsString());
+        Res list = get(fay, "/api/v1/orders?server=" + sid() + "&stash=a");
+        assertFalse(list.body.contains("Secret"), list.body);
+        // The owner sees the name.
+        assertTrue(get(owner, "/api/v1/orders?server=2b2t.org&stash=a").body.contains("Steves Secret Kit"));
+    }
+
+    @Test
+    void theKitNameIsLeftOutOfAForcedUsersPlacementError() throws Exception {
+        String id = kitSetup();
+        String line = "\"lines\":[{\"type\":\"kit\",\"key\":\"" + id + "\",\"count\":20}]";
+        Res forced = post(fay, "/api/v1/orders", "{\"server\":\"" + sid() + "\",\"stash\":\"a\"," + line + "}");
+        assertEquals(400, forced.status, forced.body);
+        assertTrue(JsonParser.parseString(forced.body).getAsJsonObject().get("error").getAsString().contains(forcedName(id) + " kits can be made"), forced.body);
+        assertFalse(forced.body.contains("Secret"), forced.body);
+        Res owned = post(owner, "/api/v1/orders", "{\"server\":\"2b2t.org\",\"stash\":\"a\"," + line + "}");
+        assertEquals(400, owned.status);
+        assertTrue(owned.body.contains("Steves Secret Kit kits can be made"), owned.body);
     }
 
     // ---------- the live viewer ----------
