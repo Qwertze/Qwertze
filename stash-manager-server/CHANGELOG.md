@@ -3,11 +3,20 @@
 All notable changes to the Stash Manager server are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-The server has no release numbers yet, so each release is headed by its date and jar name.
+## Versioning
+
+The server uses the same rule as the Qwerte addon:
+
+- **x.0.0**: major breaking changes.
+- **x.y.0**: new features, bug fixes and more.
+- **x.y.z**: minor bug fixes, single one-off patches and hotfixes.
+
+The version is set in `stash-manager-server/build.gradle.kts`. Version 1.1.0 is the first release with a version number. Releases
+before it are headed by their date and jar name. Qwerte addon 0.5.0 works with this server.
 
 ## [Unreleased]
 
-## [2026-11-09] - kit2 (`stash-manager-server-kit2.jar`)
+## [1.1.0] - 2026-11-09 (stash-manager-server-kit2.jar)
 
 Release jar `stash-manager-server-kit2.jar`, SHA-256 `72b971164593eb5d2240b5f77202354117afa94a0da102405aedebd7ed4df0f6`,
 487 automated tests. The build output is `stash-manager-server/build/libs/stash-manager-server.jar`.

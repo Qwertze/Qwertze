@@ -6,6 +6,14 @@ It also takes orders for the bots to fill, and can show and change the AquariusP
 
 The wire format and the access rules are in [PROTOCOL.md](PROTOCOL.md).
 
+## Versioning
+
+The server uses the same rule as the Qwerte addon: **x.0.0** for major breaking changes, **x.y.0** for new features, bug
+fixes and more, and **x.y.z** for minor bug fixes, single one-off patches and hotfixes. The version is set in
+`build.gradle.kts` (`version`). This is version **1.1.0** (the kit2 release, see [CHANGELOG.md](CHANGELOG.md)).
+
+Compatibility: Qwerte addon **0.5.0** works with Stash Manager server **1.1.0** and the Stash Sorter plugin **1.16.1**.
+
 ## Build
 
 You need JDK 21 or newer. From the repository root:
