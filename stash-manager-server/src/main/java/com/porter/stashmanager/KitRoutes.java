@@ -31,6 +31,7 @@ final class KitRoutes {
     private final Owners owners;
     private final AuditLog audit;
     private final LongSupplier clock;
+    private volatile RepairStore repair; // null: no repair passes (nothing to protect)
     private final Map<String, ArrayDeque<Long>> writes = new HashMap<>();
 
     KitRoutes(KitStore store, KitReports reports, Owners owners, AuditLog audit, IndexStore index) {
@@ -44,6 +45,11 @@ final class KitRoutes {
         this.owners = owners;
         this.audit = audit;
         this.clock = clock;
+    }
+
+    /** Gives the kit routes the repair settings, so a kit chest can't be the needs-repair chest. */
+    void repair(RepairStore repair) {
+        this.repair = repair;
     }
 
     void register(Router router) {
@@ -248,6 +254,17 @@ final class KitRoutes {
         if (c == null || !c.pickable()) {
             Http.error(ex, 400, "that container can't take kits");
             return false;
+        }
+        RepairStore rs = repair;
+        if (rs != null) {
+            try {
+                if (id.equals(rs.get(server, stash).needsRepairChest())) {
+                    Http.error(ex, 400, "that container is the needs-repair chest");
+                    return false;
+                }
+            } catch (RepairStore.DisabledException e) {
+                // no repair settings, nothing to protect
+            }
         }
         return true;
     }

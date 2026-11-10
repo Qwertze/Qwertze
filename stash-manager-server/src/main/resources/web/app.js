@@ -3482,6 +3482,7 @@
       kitsRender();
       craftSetRender();
       areaSetRender();
+      repairRender();
     } else if (kbTab) {
       kbRender();
     } else if (!orders) {
@@ -6288,6 +6289,344 @@
     });
   });
 
+  // ---------- Repair (REPAIR-CONTRACT v2.0) ----------
+  // GET/POST /api/v1/repair*: the stash's repair settings, the bot's status and the last pass. The chest and the item lists show
+  // positions, so a user the owner forced into streamer mode gets 403 {permission: "streamer"} for all of it. Polled with the Kits tab.
+
+  var REPAIR_POLL_MS = 5000;
+  var REPAIR_SHULKER = 1728;
+  var REPAIR_WHY = {
+    disabled: "repair mode is off",
+    no_settings: "the bot hasn't got these settings yet",
+    reserve: "there aren't enough bottles above the reserve",
+    no_candidates: "nothing needs repair",
+    order: "an order comes first",
+    player_near: "a player is nearby",
+    foreign: "another module is working",
+    sorter_off: "the sorter is off",
+    offline: "the bot is offline",
+    cooldown: "it waits between passes",
+    inventory_full: "the bot's inventory is full",
+    kit_conflict: "the needs-repair chest is also a kit chest"
+  };
+  var REPAIR_ITEM_WHY = {
+    "no bottles": "no bottles", reserve: "kept for the reserve", interrupted: "interrupted", "in a shulker": "in a shulker box", "no room": "no room",
+    stopped: "stopped", order: "an order came first", cooldown: "tried recently", "in a named shulker": "in a named box (not opened)",
+    "in a kit": "in a kit (not opened)", "box cap": "too many boxes this pass", "box failed": "the box couldn't be opened", "player near": "a player was near"
+  };
+  var repairSet = { timer: 0, loading: false, writing: false, token: 0, data: null, error: "", sig: "", dirty: false };
+
+  function repEl(id) {
+    return $("repair-" + id);
+  }
+
+  function repairSync() {
+    window.clearTimeout(repairSet.timer);
+    repairSet.timer = 0;
+    if (kitsVisible()) repairPoll();
+  }
+
+  function repairReset() {
+    repairSet.token++;
+    repairSet.data = null;
+    repairSet.error = "";
+    repairSet.sig = "";
+    repairSet.dirty = false;
+    repairRender();
+    repairSync();
+  }
+
+  function repairPoll() {
+    if (repairSet.loading || repairSet.writing) return;
+    var s = currentStash();
+    if (!s) return;
+    repairSet.loading = true;
+    var token = repairSet.token;
+    api("/api/v1/repair?server=" + encodeURIComponent(s.server) + "&stash=" + encodeURIComponent(s.stash)).then(function (d) {
+      if (token !== repairSet.token) return;
+      repairSet.data = d && typeof d === "object" ? d : null;
+      repairSet.error = "";
+    }, function (e) {
+      if (token !== repairSet.token) return;
+      repairSet.data = null;
+      repairSet.error = repairError(e, "read");
+    }).then(function () {
+      repairSet.loading = false;
+      if (token !== repairSet.token) {
+        repairSync();
+        return;
+      }
+      repairRender();
+      window.clearTimeout(repairSet.timer);
+      repairSet.timer = kitsVisible() ? window.setTimeout(repairPoll, REPAIR_POLL_MS) : 0;
+    });
+  }
+
+  function repairError(e, what) {
+    var b = e && e.body && typeof e.body === "object" ? e.body : {};
+    if (e && e.status === 403 && b.permission === "streamer") return "Repair settings are hidden while streamer mode is forced on for your account, because they show positions.";
+    if (e && e.status === 403) return what === "read" ? "You don't have permission to see the repair settings." : "Changing the repair settings needs the “settings” permission.";
+    if (e && e.status === 404) return "That stash isn't available.";
+    if (e && e.status === 429) return "Too many changes. Wait " + num(b.retryAfter, 1) + " s.";
+    if (e && e.status === 503) return "The server can't read its repair settings (repair.json is damaged). Fix or remove the file and restart the server.";
+    if (e && e.network) return "Can't reach the server. Trying again.";
+    if (typeof b.error === "string" && b.error) return safeServerText(sentence(b.error), "The server refused that (details are hidden in streamer mode).");
+    return what === "read" ? "Couldn't load the repair settings." : "Couldn't save that.";
+  }
+
+  function repairCan() {
+    return can("settings") && !forcedStreamer() && !repairSet.writing;
+  }
+
+  /** The reserve the three boxes hold, in bottles (null when one is not a whole number). */
+  function repairReserveRead() {
+    var parts = [repEl("res-shulkers").value, repEl("res-stacks").value, repEl("res-bottles").value];
+    var n = [];
+    for (var i = 0; i < 3; i++) {
+      var t = String(parts[i]).trim();
+      if (t === "") t = "0";
+      if (!/^[0-9]{1,7}$/.test(t)) return null;
+      n.push(parseInt(t, 10));
+    }
+    var total = n[0] * REPAIR_SHULKER + n[1] * 64 + n[2];
+    return total <= 1000000 ? total : null;
+  }
+
+  function repairReserveWrite(total) {
+    var sh = Math.floor(total / REPAIR_SHULKER);
+    var rest = total - sh * REPAIR_SHULKER;
+    repEl("res-shulkers").value = String(sh);
+    repEl("res-stacks").value = String(Math.floor(rest / 64));
+    repEl("res-bottles").value = String(rest % 64);
+  }
+
+  function repairThresholdRead() {
+    var t = repEl("threshold").value.trim();
+    if (!/^[0-9]{1,3}$/.test(t)) return null;
+    var v = parseInt(t, 10);
+    return v >= 1 && v <= 100 ? v : null;
+  }
+
+  /** Plain words for what the bot is doing (bot.state and bot.why). */
+  function repairStateText(bot) {
+    if (!bot || !bot.supports) return "This stash's bot can't run repair passes (it needs StashSorter 1.17.0+).";
+    var why = bot.why && REPAIR_WHY[bot.why] ? REPAIR_WHY[bot.why] : "";
+    var p = bot.progress && typeof bot.progress === "object" ? " (" + num(bot.progress.done, 0) + " of " + num(bot.progress.total, 0) + " items)" : "";
+    var t = bot.state;
+    var out;
+    if (t === "off") out = "The bot has repair passes turned off.";
+    else if (t === "idle") out = "The bot is idle and will start a pass when something needs repair.";
+    else if (t === "waiting") out = "The bot wants to repair but is waiting" + (why ? ": " + why : "") + ".";
+    else if (t === "running") out = "The bot is repairing" + p + ".";
+    else if (t === "yielding") out = "The bot is putting things back to make way" + (why ? " (" + why + ")" : "") + ".";
+    else if (t === "blocked") out = "The bot can't repair right now" + (why ? ": " + why : "") + ".";
+    else out = "The bot hasn't reported on repair yet.";
+    if (!bot.synced) out += " It hasn't picked up the latest settings yet.";
+    if (bot.runPending) out += " A run is requested.";
+    if (bot.stopPending) out += " A stop is requested.";
+    return out;
+  }
+
+  function repairTile(label, value, sub) {
+    var t = kitEl("div", "repair-tile");
+    t.appendChild(kitEl("div", "repair-tile-n", String(value)));
+    t.appendChild(kitEl("div", "repair-tile-l", label));
+    if (sub) t.appendChild(kitEl("div", "hint", sub));
+    return t;
+  }
+
+  function repairPassItemName(key) {
+    var id = str(key).split("#")[0];
+    var path = id.indexOf(":") >= 0 ? id.split(":")[1] : id;
+    var words = path.split("_").join(" ");
+    return words.charAt(0).toUpperCase() + words.slice(1);
+  }
+
+  function repairRender() {
+    var d = repairSet.data;
+    var banner = repEl("banner");
+    banner.hidden = !repairSet.error;
+    banner.textContent = repairSet.error;
+    var st = d && d.settings && typeof d.settings === "object" ? d.settings : null;
+    var can_ = repairCan();
+    var sig = d ? JSON.stringify([d, streamerOn()]) : "";
+    var inputs = ["enabled", "auto", "shulkers", "threshold", "res-shulkers", "res-stacks", "res-bottles", "chest"];
+    // The controls take the stored values unless the user is editing them.
+    if (st && !repairSet.dirty && repairSet.sig !== sig) {
+      repEl("enabled").checked = !!st.enabled;
+      repEl("auto").checked = !!st.auto;
+      repEl("shulkers").checked = st.shulkers !== false;
+      repEl("threshold").value = String(num(st.threshold, 50));
+      repairReserveWrite(num(st.reserve, 1728));
+    }
+    if (!st) {
+      ["threshold", "res-shulkers", "res-stacks", "res-bottles"].forEach(function (f) { repEl(f).value = ""; });
+      ["enabled", "auto", "shulkers"].forEach(function (f) { repEl(f).checked = false; });
+    }
+    inputs.forEach(function (f) { repEl(f).disabled = !st || !can_; });
+    // The chest picker: pickable containers (labels and free slots), plus the current value when it is no longer one of them.
+    var sel = repEl("chest");
+    if (repairSet.sig !== sig || !sel.options.length) {
+      sel.textContent = "";
+      var none = document.createElement("option");
+      none.value = "";
+      none.textContent = "(not set)";
+      sel.appendChild(none);
+      var list = d && Array.isArray(d.containers) ? d.containers : [];
+      var cur = st ? st.needsRepairChest : null;
+      var seen = false;
+      var n = 0;
+      list.forEach(function (c) {
+        if (!c.pickable) return;
+        var o = document.createElement("option");
+        o.value = c.id;
+        o.textContent = streamerOn() ? "Chest " + (++n) + " · " + num(c.free, 0) + " free" : kitCoords(c.id) + (c.label ? " " + c.label : "") + " (" + num(c.free, 0) + " free)";
+        if (c.id === cur) seen = true;
+        sel.appendChild(o);
+      });
+      if (cur && !seen) {
+        var o2 = document.createElement("option");
+        o2.value = cur;
+        o2.textContent = streamerOn() ? "Chest (not reported)" : kitCoords(cur) + " (not reported)";
+        sel.appendChild(o2);
+      }
+      sel.value = cur || "";
+    }
+    repEl("chest-clear").disabled = !st || !st.needsRepairChest || !can_;
+    var cs = d ? d.needsRepairChestStatus : "";
+    repEl("chest-status").textContent = !st ? "" : cs === "unset" ? "No chest: items without Mending stay where they are." :
+      cs === "ok" ? "Ready." : cs === "full" ? "That chest is full." : cs === "missing" ? "The bot doesn't see that chest." :
+      cs === "reserved" ? "That chest is also used for kits." : "";
+    var t = repairThresholdRead();
+    var r = repairReserveRead();
+    repEl("reserve-note").textContent = r == null ? "Check the reserve numbers." : "Keeps at least " + r + " bottles for orders.";
+    var changed = !!st && t != null && r != null && (repEl("enabled").checked !== !!st.enabled || repEl("auto").checked !== !!st.auto ||
+      repEl("shulkers").checked !== (st.shulkers !== false) || t !== st.threshold || r !== st.reserve);
+    repEl("save").disabled = !st || !can_ || !changed || t == null || r == null;
+    var bot = d && d.bot ? d.bot : null;
+    var supports = !!bot && !!bot.supports;
+    repEl("run").disabled = !can_ || !supports || !st;
+    repEl("stop").disabled = !can_ || !supports || !st;
+    repEl("state").textContent = d ? repairStateText(bot) : "";
+    repEl("msg").textContent = d && !can("settings") ? "You can look at these settings but not change them." : "";
+    if (repairSet.sig === sig) return;
+    repairSet.sig = sig;
+    // The tiles: the bot's own numbers when it sent them, else the server's estimate from the index.
+    var tiles = repEl("tiles");
+    tiles.textContent = "";
+    if (d) {
+      var cand = bot && bot.candidates && typeof bot.candidates === "object" ? bot.candidates : null;
+      var est = d.estimate && typeof d.estimate === "object" ? d.estimate : null;
+      var bt = bot && bot.bottles && typeof bot.bottles === "object" ? bot.bottles : null;
+      if (cand) {
+        tiles.appendChild(repairTile("Mending items to repair", num(cand.mend, 0), num(cand.mendBottles, 0) + " bottles needed"));
+        tiles.appendChild(repairTile("Without Mending (to the needs-repair chest)", num(cand.needsRepair, 0), ""));
+        tiles.appendChild(repairTile("In boxes the bot will open", num(cand.inBoxes, 0), num(cand.boxes, 0) + " boxes"));
+        tiles.appendChild(repairTile("In named boxes or kits (not opened)", num(cand.inShulkers, 0), "Name a box to keep it closed."));
+      } else if (est) {
+        tiles.appendChild(repairTile("Mending items to repair", num(est.mend && est.mend.items, 0), num(est.mend && est.mend.bottles, 0) + " bottles needed"));
+        tiles.appendChild(repairTile("Without Mending (to the needs-repair chest)", num(est.needsRepair && est.needsRepair.items, 0), ""));
+        tiles.appendChild(repairTile("In shulker boxes", num(est.mend && est.mend.inShulkers, 0) + num(est.needsRepair && est.needsRepair.inShulkers, 0),
+          "Opened only if unnamed and not a kit."));
+      }
+      var usable = bt ? num(bt.usable, 0) : est && est.bottles ? num(est.bottles.usable, 0) : null;
+      if (usable != null) tiles.appendChild(repairTile("Bottles usable", usable, "Above the reserve."));
+    }
+    // The last pass.
+    var last = repEl("last");
+    last.textContent = "";
+    var lp = d && d.lastPass && typeof d.lastPass === "object" ? d.lastPass : null;
+    if (lp) {
+      var head = kitEl("div", "hint", "Last pass (" + str(lp.trigger) + ", " + str(lp.state) + "): " + num(lp.repaired, 0) + " repaired, " + num(lp.partial, 0) +
+        " partly, " + num(lp.bottlesUsed, 0) + " bottles used, " + (num(lp.rehomed, 0) + num(lp.toNeedsRepair, 0)) + " moved, " + num(lp.skipped, 0) + " skipped" +
+        (lp.boxesOpened ? ", " + num(lp.boxesOpened, 0) + " boxes opened" : "") + ".");
+      last.appendChild(head);
+      var by = lp.skippedBy && typeof lp.skippedBy === "object" ? Object.keys(lp.skippedBy) : [];
+      if (by.length) {
+        last.appendChild(kitEl("div", "hint", "Skipped because: " + by.map(function (k) { return (REPAIR_ITEM_WHY[k] || k) + " (" + num(lp.skippedBy[k], 0) + ")"; }).join(", ") + "."));
+      }
+      var items = Array.isArray(d.items) ? d.items : [];
+      items.slice(0, 50).forEach(function (it) {
+        var row = kitEl("div", "repair-item");
+        var why = it.reason && REPAIR_ITEM_WHY[it.reason] ? " – " + REPAIR_ITEM_WHY[it.reason] : "";
+        row.appendChild(kitEl("span", "", repairPassItemName(it.key) + " (" + str(it.status).replace("_", " ") + ")" + why));
+        if (it.from || it.to) {
+          // The arrow only when the bot says where it went; otherwise just where it was.
+          var span = kitEl("span", "hint", it.to ? " " + (it.from ? kitCoords(it.from) : "?") + " → " + kitCoords(it.to) : " in " + kitCoords(it.from));
+          span.setAttribute("data-sensitive", "");
+          row.appendChild(span);
+        }
+        last.appendChild(row);
+      });
+    }
+  }
+
+  function repairWrite(path, body, done) {
+    var s = currentStash();
+    if (!s || repairSet.writing) return;
+    repairSet.writing = true;
+    var token = ++repairSet.token;
+    body.server = s.server;
+    body.stash = s.stash;
+    repairSet.sig = "";
+    repairRender();
+    api(path, { method: "POST", body: body }).then(function (d) {
+      if (token !== repairSet.token) return;
+      repairSet.data = d && typeof d === "object" ? d : repairSet.data;
+      repairSet.error = "";
+      if (path.indexOf("/settings") >= 0 || path.indexOf("/chest") >= 0) {
+        repairSet.dirty = false; // only a save clears the unsaved edits; a run or stop leaves them alone
+        toast("Saved. The bot picks it up in a few seconds.");
+      } else if (path.indexOf("/run") >= 0) {
+        toast("Repair pass requested. The bot starts when it is idle.");
+      } else {
+        toast("Stop requested.");
+      }
+      if (done) done();
+    }, function (e) {
+      toast(repairError(e, "write"));
+    }).then(function () {
+      repairSet.writing = false;
+      repairSet.token++;
+      repairSet.sig = "";
+      repairRender();
+      repairSync();
+    });
+  }
+
+  ["enabled", "auto", "shulkers"].forEach(function (f) {
+    repEl(f).addEventListener("change", function () {
+      repairSet.dirty = true;
+      repairRender();
+    });
+  });
+  ["threshold", "res-shulkers", "res-stacks", "res-bottles"].forEach(function (f) {
+    repEl(f).addEventListener("input", function () {
+      repairSet.dirty = true;
+      repairRender();
+    });
+  });
+  repEl("save").addEventListener("click", function () {
+    var t = repairThresholdRead();
+    var r = repairReserveRead();
+    if (t == null || r == null) return;
+    repairWrite("/api/v1/repair/settings", { enabled: repEl("enabled").checked, auto: repEl("auto").checked, shulkers: repEl("shulkers").checked,
+      threshold: t, reserve: r });
+  });
+  repEl("chest").addEventListener("change", function () {
+    var v = repEl("chest").value;
+    repairWrite("/api/v1/repair/chest", { container: v || null });
+  });
+  repEl("chest-clear").addEventListener("click", function () {
+    repairWrite("/api/v1/repair/chest", { container: null });
+  });
+  repEl("run").addEventListener("click", function () {
+    repairWrite("/api/v1/repair/run", {});
+  });
+  repEl("stop").addEventListener("click", function () {
+    repairWrite("/api/v1/repair/stop", {});
+  });
+
   // ---------- stash area ----------
   // GET/POST /api/v1/area (AREA-CONTRACT.md): the box the bots keep the stash in. The draft lives only in the page (the six
   // fields) until Save. The numbers are positions: blurred in streamer mode; a user forced into streamer mode gets 403.
@@ -6818,6 +7157,7 @@
     if (kitsDataWanted()) kitsPoll();
     craftSetSync();
     areaSetSync();
+    repairSync();
   }
 
   function kitsReset() {
@@ -6830,6 +7170,7 @@
     kitsSync();
     craftSetReset();
     areaSetReset();
+    repairReset();
   }
 
   function kitsPoll() {

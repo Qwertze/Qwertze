@@ -16,6 +16,38 @@ before it are headed by their date and jar name. Qwerte addon 0.5.0 works with t
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-10
+
+Release jar `stash-manager-server-repair-pre.jar`, SHA-256 `be83fb27596720e8544f0613c9c843bee3b3e98fc990d607aaa2498832d66528`,
+500 automated tests. The build output is `stash-manager-server/build/libs/stash-manager-server.jar`.
+
+### Added
+- **Repair passes** (REPAIR-CONTRACT v2.0, with the "opening unnamed shulkers" revision). The stash bot repairs low-durability items when it is idle. The server keeps the settings, shows the bot's status and last pass on the website, and sends the bot its run and stop requests. See [Repair passes](README.md#repair-passes).
+- **Repair settings per stash, in `repair.json`.** `enabled` (repair mode, on by default), `auto` (automatic passes when idle, on), `threshold` (1 to 100 percent, default 50; "below 50%" is strict), `reserve` (0 to 1,000,000 bottles, default 1728), `needsRepairChest` (a container id, or null) and `shulkers` (open unnamed, non-kit boxes, on by default). Each change raises `rev` by 1; `hash` is the contract's SHA-1 that the bot caches. The file is written atomically and owner-only, with a `repair.json.bak` from a clean previous file. At most 64 stashes. A damaged entry answers `503` for that stash only and is kept as it is.
+- **Heartbeat fields.** A bot that runs passes sends `repairHash` and `repairPass` (state, why, progress, candidates including `inBoxes` and `boxes`, bottles, the run and stop ids it acknowledged, and the hash of its last report). The reply carries `repairHash` always, `repairSettings` when the bot's hash differs, `repairRun` and `repairStop` while a website request is newer than what the bot acknowledged, and `needRepairReport`. A bot that sends no `repairHash` is never asked to run a pass.
+- **Signed repair report, `POST /api/v1/repair/report`.** Signed like the index, with `player` required. At most 512 KiB (`413`) and 200 items; `containers` is taken when the bot sends no kit report. An unknown stash answers `400` ("send a heartbeat first"), another player's ownership `409 { owner }`. Kept in memory only, for at most 64 stashes, and never logged.
+- **Browser routes.** `GET /api/v1/repair` (view), and `POST /api/v1/repair/settings`, `/chest`, `/run` and `/stop` (the settings permission). Rate limits: 60 settings or chest writes and 6 run or stop requests per user per minute, then `429 { error, retryAfter }` with `Retry-After`. Bodies are at most 4 KiB. A run or stop answers `409` ("this bot can't run repair passes") when the stash's last heartbeat had no `repairHash`; an offline bot gets the request when it reconnects. Audit actions `repair.settings`, `repair.chest`, `repair.run` and `repair.stop`.
+- **Forced streamer mode.** A user the owner has forced into streamer mode gets `403 { permission: "streamer" }` on all five routes. `GET /api/v1/stashes` entries gain `repairPass: { supports, synced, enabled, state, why }`, with no positions.
+- **Repair panel (Kits tab, below the Stash area and Crafting table panels).** Switches for repair mode, automatic when idle and open unnamed boxes (named boxes and kits are never opened); the threshold; the reserve, entered as shulkers, stacks and bottles and stored as bottles; the needs-repair chest picker with Clear; the bot's status in plain words; Save, Run repair pass and Stop; estimate tiles; and the last pass, with its skip reasons and item list (from and to). View-only users see it read-only.
+- **Chest checks against kit chests.** The needs-repair chest can't be a kit chest: `POST /api/v1/repair/chest` answers `400 "that container is reserved for kits"` for the general kits chest, a rule target, or a type, category or template chest. Setting a chest needs the bot's container list (`409`) and a pickable container (`400 "that container can't take items"`); clearing always works.
+- **Acknowledged run and stop ids are kept and never lowered.** A heartbeat that leaves them out, or clears the pass, keeps what the server holds, and a lower id is ignored. After a server restart the ids are learned again from the bot's next heartbeat.
+
+### Changed
+- The kit chest, rule, type and template routes answer `400 "that container is the needs-repair chest"` for the chest set as the needs-repair chest. Nothing else in the kit routes changed.
+
+### Compatibility
+- A bot that sends no `repairHash` (plugin before 1.17.0, and the Qwerte addon 0.5.0) works as before: the Repair panel says the bot can't run passes, a run is `409`, and settings are stored for later.
+- An older server sends no `repairHash`: a plugin 1.17.0 keeps its cached settings and makes no automatic passes. `stash repair run` still works on the bot.
+
+### Known limits
+- An open order for an item that a pass repaired is not moved to the repaired item.
+- The report's `to` is never sent, so every item's `to` is null. The Repair panel's item list therefore shows "stayed" as every item's destination, so that column is unknown until a later release.
+- `toNeedsRepair` and `rehomed` are approximations (see the plugin's 1.17.0 notes).
+- The box cooldown is kept in the bot's memory: a bot restart can open a box again sooner than 24 hours.
+- Pass reports and bot status are kept in memory. After a server restart a bot is unknown until its next heartbeat.
+- The Qwerte addon has no repair passes yet.
+- Nothing in this release has been tested in game. The 500 automated tests cover the routes, the settings store and the hash vectors.
+
 ## [1.1.0] - 2026-11-09 (stash-manager-server-kit2.jar)
 
 Release jar `stash-manager-server-kit2.jar`, SHA-256 `72b971164593eb5d2240b5f77202354117afa94a0da102405aedebd7ed4df0f6`,

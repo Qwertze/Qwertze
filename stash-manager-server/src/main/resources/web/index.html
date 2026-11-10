@@ -293,6 +293,37 @@
             </div>
           </div>
         </section>
+        <section class="inset repair-set" id="repair-set" aria-labelledby="repair-set-title">
+          <div class="section-title" id="repair-set-title">Repair</div>
+          <div class="hint">When the bot has nothing else to do, it takes items that are low on durability, repairs the ones with Mending using Bottles o' Enchanting from the stash, and sorting puts them in their best chest. Items without Mending go to a &ldquo;Needs repair&rdquo; chest. Orders always come first.</div>
+          <div class="kits-banner" id="repair-banner" role="status" hidden></div>
+          <div class="repair-switches">
+            <label class="unset user-check" for="repair-enabled"><input type="checkbox" id="repair-enabled" disabled> Repair mode</label>
+            <label class="unset user-check" for="repair-auto"><input type="checkbox" id="repair-auto" disabled> Automatic when idle</label>
+            <label class="unset user-check" for="repair-shulkers"><input type="checkbox" id="repair-shulkers" disabled> Open unnamed shulker boxes (named boxes and kits are never opened)</label>
+          </div>
+          <div class="kits-sc-row">
+            <label class="kits-sc-field">Repair items below (% durability) <input id="repair-threshold" class="mc-input" type="number" min="1" max="100" step="1" inputmode="numeric" disabled></label>
+            <label class="kits-sc-field">Reserve: shulkers <input id="repair-res-shulkers" class="mc-input" type="number" min="0" max="578" step="1" inputmode="numeric" disabled></label>
+            <label class="kits-sc-field">stacks <input id="repair-res-stacks" class="mc-input" type="number" min="0" max="26" step="1" inputmode="numeric" disabled></label>
+            <label class="kits-sc-field">bottles <input id="repair-res-bottles" class="mc-input" type="number" min="0" max="63" step="1" inputmode="numeric" disabled></label>
+          </div>
+          <div class="hint" id="repair-reserve-note"></div>
+          <div class="kits-chest-row">
+            <label class="kits-sc-field">Needs-repair chest <select id="repair-chest" class="mc-select" data-sensitive disabled></select></label>
+            <button type="button" class="mc-button small" id="repair-chest-clear" disabled>Clear</button>
+            <span class="hint" id="repair-chest-status"></span>
+          </div>
+          <div class="kits-chest-row">
+            <button type="button" class="mc-button small" id="repair-save" disabled>Save</button>
+            <button type="button" class="mc-button small" id="repair-run" disabled>Run repair pass</button>
+            <button type="button" class="mc-button small" id="repair-stop" disabled>Stop</button>
+          </div>
+          <div class="hint" id="repair-state" role="status"></div>
+          <div class="hint" id="repair-msg" role="status"></div>
+          <div class="repair-tiles" id="repair-tiles"></div>
+          <div class="repair-last" id="repair-last"></div>
+        </section>
       </div>
 
       <div class="view view-kb" id="view-kb" hidden>

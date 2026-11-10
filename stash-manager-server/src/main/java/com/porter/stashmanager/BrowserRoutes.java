@@ -20,6 +20,7 @@ final class BrowserRoutes {
     private final AuditLog audit;
     private final DeliveryContents delivery;
     private final KitStore kits;
+    private volatile RepairRoutes repairRoutes;
     private final KitReports kitReports;
     private final CraftService craft; // null: no crafting support (craft: null in the stash list)
     private volatile AreaRoutes areaRoutes; // null: no stash area (area: null in the stash list)
@@ -117,6 +118,8 @@ final class BrowserRoutes {
             DeliveryContents.Snapshot dc = delivery.get(server, stash);
             o.add("deliveryContents", dc == null ? com.google.gson.JsonNull.INSTANCE : dc.summary());
             o.add("kits", kitSummary(server, stash));
+            RepairRoutes rr = repairRoutes;
+            o.add("repairPass", rr == null ? com.google.gson.JsonNull.INSTANCE : rr.summaryJson(server, stash)); // no positions
             AreaRoutes ar = areaRoutes;
             o.add("area", ar == null ? com.google.gson.JsonNull.INSTANCE : ar.summaryJson(server, stash)); // no positions
             o.add("craft", craft == null ? com.google.gson.JsonNull.INSTANCE : craft.summaryJson(server, stash)); // no positions
@@ -129,6 +132,11 @@ final class BrowserRoutes {
             o.addProperty("serverLabel", labels.get(o.get("server").getAsString()));
         }
         return list;
+    }
+
+    /** Gives the stash list the repair passes' summary (set once at start). */
+    void repair(RepairRoutes routes) {
+        this.repairRoutes = routes;
     }
 
     /** {supports, synced, flagged} (numbers and booleans only, KIT-CONTRACT.md), or null when this server has no kit settings. */

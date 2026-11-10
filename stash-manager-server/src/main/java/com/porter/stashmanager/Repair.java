@@ -25,6 +25,15 @@ final class Repair {
     private Repair() {
     }
 
+    /**
+     * Low durability (REPAIR-CONTRACT v2.0): a damaged item with (maxDamage - damage) * 100 < threshold * maxDamage, in integers;
+     * "below 50%" is strict (exactly half is not low), and a threshold of 100 means any damage. False for an undamaged item or
+     * one without durability.
+     */
+    static boolean low(long maxDamage, long damage, int threshold) {
+        return maxDamage > 0 && damage > 0 && (maxDamage - damage) * 100 < (long) threshold * maxDamage;
+    }
+
     /** Bottles to repair this much damage: ceil(damage / 14); 0 for no damage. */
     static long bottlesFor(long damage) {
         return damage <= 0 ? 0 : (damage + DURABILITY_PER_BOTTLE - 1) / DURABILITY_PER_BOTTLE;

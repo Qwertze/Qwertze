@@ -275,7 +275,16 @@ public final class StashManagerServer {
                 return 0;
             }
         };
+        RepairStore repairStore = new RepairStore(config.dataDir());
+        repairStore.load();
+        RepairBots repairBots = new RepairBots(); // in memory only
         store.onForget((srv, stashName) -> {
+            try {
+                repairStore.forget(srv, stashName);
+            } catch (IOException e) {
+                System.err.println("Could not drop the repair settings of a forgotten stash: " + e.getMessage());
+            }
+            repairBots.forget(srv, stashName);
             try {
                 craftStore.forget(srv, stashName);
             } catch (IOException e) {
@@ -290,14 +299,21 @@ public final class StashManagerServer {
             areaBots.forget(srv, stashName);
         });
         AreaGuard areaGuard = new AreaGuard(areaStore, store, kitReports);
+        RepairRoutes repairRoutes = new RepairRoutes(repairStore, repairBots, kitReports, kits, orders, store, owners, audit);
         AreaRoutes areaRoutes = new AreaRoutes(areaStore, areaBots, store, audit, areaGuard, kitReports, sessions);
-        new AddonRoutes(store, link, icons, orders, owners, delivery, kits, kitReports, craft, areaStore, areaBots, audit, areaGuard).register(router);
+        AddonRoutes addonRoutes = new AddonRoutes(store, link, icons, orders, owners, delivery, kits, kitReports, craft, areaStore, areaBots, audit, areaGuard);
+        addonRoutes.repair(repairStore, repairBots);
+        addonRoutes.register(router);
         BrowserRoutes browserRoutes = new BrowserRoutes(store, config, link, urls, orders, owners, sessions, audit, delivery, kits, kitReports, craft);
         browserRoutes.areas(areaRoutes);
+        browserRoutes.repair(repairRoutes);
         browserRoutes.register(router);
         areaRoutes.register(router);
         new CraftRoutes(craft, orders, audit, store).register(router);
-        new KitRoutes(kits, kitReports, owners, audit, store).register(router);
+        KitRoutes kitRoutes = new KitRoutes(kits, kitReports, owners, audit, store);
+        kitRoutes.repair(repairStore);
+        kitRoutes.register(router);
+        repairRoutes.register(router);
         new DeliveryRoutes(delivery, owners).register(router);
         new OrderRoutes(orders, owners, audit).register(router);
         new BotRoutes(hub).register(router);

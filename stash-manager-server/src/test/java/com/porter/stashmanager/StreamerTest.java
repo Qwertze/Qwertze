@@ -512,6 +512,12 @@ class StreamerTest {
             "[POST] /api/v1/kits/template/delete BROWSER_WRITE SETTINGS",
             "[POST] /api/v1/kits/category BROWSER_WRITE SETTINGS",
             "[POST] /api/v1/kits/category/delete BROWSER_WRITE SETTINGS",
+            // Repair passes: container positions and the bot's item lists (REPAIR-CONTRACT v2.0); see RepairRoutesTest.
+            "[POST] /api/v1/repair/settings BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/repair/chest BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/repair/run BROWSER_WRITE SETTINGS",
+            "[POST] /api/v1/repair/stop BROWSER_WRITE SETTINGS",
+            "[GET, HEAD] /api/v1/repair SESSION VIEW",
             // Crafting settings: the crafting table's position and the bot's table sightings (CRAFT-CONTRACT.md); see CraftRoutesTest.
             "[GET, HEAD] /api/v1/craft SESSION VIEW",
             "[POST] /api/v1/craft/table BROWSER_WRITE SETTINGS",

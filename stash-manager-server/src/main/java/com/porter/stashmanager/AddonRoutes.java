@@ -26,6 +26,8 @@ final class AddonRoutes {
     private final DeliveryContents delivery;
     private final KitStore kits;       // null: this server has no kit support (the reply leaves the kit fields out)
     private final KitReports kitReports;
+    private volatile RepairStore repairStore; // null: this server has no repair passes (the reply leaves the repair fields out)
+    private volatile RepairBots repairBots;
     private final CraftService craft;  // null: this server has no crafting support (the reply leaves the craft fields out)
     private final AreaStore areas;     // null: no stash area support (the reply leaves areaHash out)
     private final AreaBots areaBots;
@@ -190,6 +192,32 @@ final class AddonRoutes {
             Http.error(ex, 400, "player is required when kitOrders is sent");
             return;
         }
+        // REPAIR-CONTRACT v2.0: repairHash is the cached settings hash (null: none; absent: a bot without repair passes);
+        // repairPass is the pass status (an object), null (cleared) or absent (kept).
+        boolean hasRepairHash = o.has("repairHash");
+        String repairHash = string(o, "repairHash");
+        if (hasRepairHash && !o.get("repairHash").isJsonNull() && (repairHash == null || !KitReports.HASH.matcher(repairHash).matches())) {
+            Http.error(ex, 400, "repairHash must be 40 lowercase hex digits or null");
+            return;
+        }
+        boolean hasRepairPass = o.has("repairPass");
+        JsonObject repairPass = null;
+        if (hasRepairPass && !o.get("repairPass").isJsonNull()) {
+            if (!o.get("repairPass").isJsonObject()) {
+                Http.error(ex, 400, "repairPass must be an object or null");
+                return;
+            }
+            try {
+                repairPass = RepairBots.parsePass(o.getAsJsonObject("repairPass"));
+            } catch (IllegalArgumentException e) {
+                Http.error(ex, 400, e.getMessage());
+                return;
+            }
+        }
+        if ((hasRepairHash || hasRepairPass) && (string(o, "player") == null || string(o, "player").isEmpty())) {
+            Http.error(ex, 400, "player is required when repairHash or repairPass is sent");
+            return;
+        }
         // CRAFT-CONTRACT.md: craftOrders is an object (the bot can carry out craft orders), null (it can't any more) or absent
         // (an older bot); craftHash is the hash of the craft settings it has cached, null (none) or absent.
         // AREA-CONTRACT.md: area is the bot's report of its stash area (object), absent for an older bot. player is required.
@@ -277,13 +305,48 @@ final class AddonRoutes {
             // Stored before the reply is made: the pending count below depends on this heartbeat's kitOrders.
             kitReports.beat(server, stash, hasKitsHash, kitsHash, hasKitsHash2, kitsHash2, hasKitOrders, kitCap, o.has("kitsReportHash"), kitsReportHash);
         }
+        if (repairBots != null) repairBots.beat(server, stash, hasRepairHash, repairHash, hasRepairPass, repairPass); // before the reply: it reads the bot's acknowledgements
         out.add("orders", orders.heartbeatJson(server, stash, craft == null || craft.bots().capable(server, stash),
             kitReports == null || kitReports.kitCapable(server, stash)));
         if (result.rescan() != null) out.addProperty("rescan", result.rescan());
         if (kits != null && kitReports != null) kitFields(out, server, stash, hasKitsHash, kitsHash, kitsReportHash, hasKitsHash2, kitsHash2);
+        if (repairBots != null) {
+            RepairBots.Beat rbeat = repairBots.beat(server, stash);
+            repairFields(out, server, stash, hasRepairHash, repairHash, rbeat == null ? null : rbeat.pass());
+        }
         if (craft != null) craftFields(out, server, stash, hasCraftHash, craftHash);
         if (areas != null && areaBots != null) areaFields(ex, out, server, stash, string(o, "player"), hasArea, areaReport);
         Http.json(ex, 200, out);
+    }
+
+    /** Gives the heartbeat the repair passes (set once at start). */
+    void repair(RepairStore store, RepairBots bots) {
+        this.repairStore = store;
+        this.repairBots = bots;
+    }
+
+    /**
+     * The repair part of the reply (REPAIR-CONTRACT v2.0, "Heartbeat"): repairHash always, repairSettings when the body had a
+     * repairHash that differs (null counts as different), repairRun / repairStop while a website request is newer than what the bot
+     * acknowledged, needRepairReport (true only for a non-null reportHash the server doesn't hold). An unreadable settings file leaves
+     * out repairHash and repairSettings.
+     */
+    private void repairFields(JsonObject out, String server, String stash, boolean hasHash, String hash, JsonObject pass) {
+        RepairStore rs = repairStore;
+        RepairBots rb = repairBots;
+        if (rs == null || rb == null) return;
+        try {
+            RepairStore.Settings s = rs.get(server, stash);
+            out.addProperty("repairHash", s.hash());
+            if (hasHash && !s.hash().equals(hash)) out.add("repairSettings", s.toJson());
+        } catch (RepairStore.DisabledException e) {
+            // left out: the bot keeps what it has
+        }
+        long run = rb.pending(server, stash, 0), stop = rb.pending(server, stash, 1);
+        if (run > 0) out.addProperty("repairRun", run);
+        if (stop > 0) out.addProperty("repairStop", stop);
+        String reportHash = pass == null || pass.get("reportHash").isJsonNull() ? null : pass.get("reportHash").getAsString();
+        out.addProperty("needRepairReport", rb.needReport(server, stash, reportHash));
     }
 
     /**

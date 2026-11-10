@@ -2,7 +2,7 @@
 
 A small standalone web server for the Qwerte addon's `stash-manager` module. The module pushes the item index of a Minecraft stash (what is in every known container) to this server, and the server shows it as a website that looks like a Minecraft inventory, for anyone on your local network.
 
-It also takes orders for the bots to fill, and can show and change the AquariusProxy plugin's settings, console and activity. Orders, the dashboard and streamer mode are new and still being tested. Kit sorting v2, the Kit Builder and kit orders are new too, and have not been tested in game yet.
+It also takes orders for the bots to fill, and can show and change the AquariusProxy plugin's settings, console and activity. Orders, the dashboard and streamer mode are new and still being tested. Kit sorting v2, the Kit Builder and kit orders are new too, and have not been tested in game yet. Repair passes are new as well and have not been tested in game yet.
 
 The wire format and the access rules are in [PROTOCOL.md](PROTOCOL.md).
 
@@ -10,9 +10,9 @@ The wire format and the access rules are in [PROTOCOL.md](PROTOCOL.md).
 
 The server uses the same rule as the Qwerte addon: **x.0.0** for major breaking changes, **x.y.0** for new features, bug
 fixes and more, and **x.y.z** for minor bug fixes, single one-off patches and hotfixes. The version is set in
-`build.gradle.kts` (`version`). This is version **1.1.0** (the kit2 release, see [CHANGELOG.md](CHANGELOG.md)).
+`build.gradle.kts` (`version`). This is version **1.2.0** (the repair release, see [CHANGELOG.md](CHANGELOG.md)).
 
-Compatibility: Qwerte addon **0.5.0** works with Stash Manager server **1.1.0** and the Stash Sorter plugin **1.16.1**.
+Compatibility: Qwerte addon **0.5.0** works with Stash Manager server **1.2.0**, and the Stash Sorter plugin **1.17.0** works with it too. Repair passes need the plugin 1.17.0; the addon has none yet.
 
 ## Build
 
@@ -135,6 +135,7 @@ Proxy bots running the Qwerte Stash plugin with the dashboard turned on (`stash 
 - **Console:** run proxy commands as if typed in the proxy's terminal, with the reply rendered under each command. Up/Down recall earlier commands. Commands that can disconnect or restart things (`shutdown`, `update`, `disconnect`, `auth`, `jvmArgs`, `plugins`, `releaseChannel`, `discordManage`) ask first. Commands whose input is sensitive show as "(hidden)". The page keeps the last 200 commands per bot (until the server restarts).
 - **Orders: what is already in the delivery chest** (bots that report it: plugin 1.11.0, addon 0.4.0-dev.7): the planned delivery chest shows the items left over from earlier orders in their slots (hatched; hover for the name, count and a shulker's contents), the planned shulkers in the free slots after them, and a line such as "Delivery chest: 20 of 54 slots used, 34 free; this order needs 3 (as of 1m ago)" (totals when there are several chests; "not seen yet" for a chest the bot hasn't read). When the order won't fit, a warning says whether the bot will put up more chests or the order will pause until a chest is emptied. It is only shown here: never counted as stock or searched. The server keeps it in memory only.
 - **Kits** (bots that support them: plugin 1.14.0 and later for kit sorting; kit types, the Kit Builder and kit orders need plugin 1.16.0; the Qwerte addon does kit sorting only so far). The Kits tab picks the chests for each kind of kit and for each kit name, shows each kit's status, and edits the v1 scoring. The Kit Builder designs kits and their restock. The bots do the classifying and the sorting. See [Kits](#kits).
+- **Repair** (bots that run repair passes: plugin 1.17.0 and later). The Repair panel on the Kits tab sets the passes for each stash and shows the bot's status and last pass. See [Repair passes](#repair-passes).
 - **Live** (the live viewer; bots whose plugin has it): the bot's surroundings as a live map (vanilla map colours, north up, 16x16 chunk tiles out to 8 chunks), with the bot as an arrow along its heading, other players as dots with their names, mobs as small dots (red when hostile) and dropped items as small squares. Drag to pan, pinch or scroll to zoom, double-click or double-tap to zoom in; panning stops following the bot and **Centre** follows it again. The top shows health, food, XP level, armour points and the coordinates with the dimension; the bottom the hotbar (the held slot outlined), under **Inventory** the 27 main inventory slots (open by default on wide screens, collapsed on phones; the choice is remembered; plugin 1.12.0 and later) and, under **Gear**, armour and offhand, with item counts and durability bars as in the stash grid. Chat (public, whispers, system and death messages; the last 200 lines) is a side panel on wide screens and a drawer with an unread count on phones. **Latency** shows how far behind the view is (p50/p95 of bot to server, server to browser, drawing, and end to end). In streamer mode the coordinates and dimension and the chat text are blurred, chat names read "Player" and the map shows no names. The bot sends frames (up to 5 a second) only while someone has the page open, and stops 10 s after the last viewer closes; the stream closes 30 s after the tab is hidden, and when you leave the page. Up to 8 viewers can be open on the server, 2 per user and 4 per bot. Nothing of it is stored or logged: the audit log only notes who started and stopped watching which bot (at most once per 15 minutes per user and bot). Sub-users need the **Live viewer** permission (it also turns on Bots and activity); the Operator preset has it.
 
 ## Kits
@@ -262,6 +263,59 @@ The Build Planner and the Printer's stash orders can order items the stash does 
 - **When can an order include crafting?** The recipes for the stash's version are ready, the stash's bot told the server (in its last heartbeat since the server started) that it can carry out craft orders, its recipe table is the server's (same `tableHash`), a table is set, and the bot says the table is usable. Otherwise the order is refused with `409` and a `craft` code (`no_recipes`, `no_bot`, `recipes_differ`, `no_table`, `table_bad`), and the planner says why. Bots that are not new enough are never given a craft order: their claims skip it, and a craft order they already held becomes failed ("the bot can no longer craft") and can be retried.
 - **Reservations:** the ingredients of an open craft order are reserved like item lines, everywhere the stash's free amounts are counted.
 - **Limits:** at most 4 crafting levels below the item asked for; at most 64 steps and 64 ingredient kinds per order; the bot's own cap on grid fills per order (it reports it); 3 s and 1,000,000 steps per plan. The planner never rounds crafting up to stacks, and what is made over goes back to the stash.
+
+## Repair passes
+
+When the stash bot is idle, it can repair the items in its stash that are low on durability. Mending items are repaired with Bottles o' Enchanting from the stash, and sorting then puts each one in its best chest. Items without Mending go to a **Needs repair** chest that you pick here. The bot does the work. This server keeps the settings, shows the bot's status and its last pass, and passes the website's run and stop requests on to the bot. Orders always come first. The bots that run passes are Stash Sorter plugin 1.17.0 and later; the Qwerte addon has none yet. Nothing here has been tested in game.
+
+The panel is on the **Kits** tab, below the Stash area and Crafting table panels. Seeing it needs the **view** permission, and changing it needs **Change plugin settings** (the `settings` permission). A user the owner has forced into streamer mode doesn't see the Kits tab, and the server refuses their repair requests with `403`.
+
+### Settings
+
+Each stash has its own settings, which the server stores (see below). The bot caches them and sends back a hash of them, so it always knows which version it has.
+
+| Setting (panel) | Default | Range | What it does |
+| --- | --- | --- | --- |
+| Repair mode (`enabled`) | on | on or off | Off: no passes run, a run request is dropped, and needs-repair items are sorted like any other. The bot reports "disabled". |
+| Automatic when idle (`auto`) | on | on or off | Off: passes run only when you press **Run repair pass**. |
+| Open unnamed shulker boxes (`shulkers`) | on | on or off | An unnamed box that isn't a kit can be opened for the items in it. Named boxes and kits are never opened. |
+| Threshold (`threshold`) | 50 | 1 to 100 % | Items below this durability are repaired. "Below 50%" is strict: exactly half is not low. 100 means any damage. |
+| Reserve (`reserve`) | 1728 | 0 to 1,000,000 bottles | A pass never takes the stash below this many bottles. One full shulker is 1728. The panel takes shulkers, stacks and bottles and stores bottles. |
+| Needs-repair chest (`needsRepairChest`) | none | a chest the bot reports | Where items without Mending go. Clear it to stop. |
+
+The bot's own limits (how many items and boxes one pass takes, how long it may throw, the gap between passes and its bottle floor) are set on the bot, not here. Their defaults are in the Stash Sorter plugin's README and CHANGELOG (1.17.0).
+
+### What the bot does
+
+- It starts a pass only when it is idle: nothing carried, no job running, no order held or waiting, no other module working, and no player within 8 blocks (friends count too). It gives way at once to an order, a player, a stop, or the sorter being switched off, and puts everything back.
+- A pass takes only the bottles above the reserve. An item whose bottles don't fit is skipped with the reason "reserve".
+- Opening a box needs nobody within 16 blocks (friends count too). One box is open at a time, and a box is not opened again for 24 hours unless its contents change. Items that come back unrepaired are not retried by automatic passes for 6 hours.
+- The bot reports each pass to this server, and the last pass shows on the panel. After a server restart the status and the last pass are empty until the bot's next heartbeat, and the server asks for the report again then.
+
+### The needs-repair chest
+
+- Only a chest the bot reports as able to take items can be picked. A kit chest can't be the needs-repair chest, and a needs-repair chest can't be a kit chest: the kit routes and this panel each refuse the other with `400`.
+- The bot reserves this chest. Nothing else is sorted into it, and Mending items never go there. An item that has been repaired by hand, or is no longer low, is sorted normally.
+- The panel says what state the chest is in: not set, ready, full (it has no free slot), missing (the bot doesn't see it), or used for kits.
+
+### The panel
+
+- **Status line:** the bot's state in plain words ("idle", "waiting: an order comes first", "repairing (3 of 12 items)", "blocked: repair mode is off"). It says so when the bot hasn't picked up the latest settings yet, or when it can't run passes at all (a bot without this release).
+- **Estimate tiles:** Mending items to repair and the bottles they need; items without Mending; items in boxes the bot will open; items in named boxes or kits, which aren't opened; and the bottles usable above the reserve. The bot's own numbers are shown when it reports them.
+- **Run repair pass** asks the bot to start a pass when it is idle. **Stop** ends a running pass and drops a queued run.
+- **Last pass:** the trigger (automatic or manual), how it ended, how many items were repaired or only partly, the bottles used, how many moved, the reasons items were skipped, and the item list. The "to" part of each item is not reported yet (see the known limits in the CHANGELOG).
+
+### Limits
+
+- Settings and needs-repair chest changes: 60 per minute per user. Run and stop: 6 per minute per user. Over the limit, the server answers `429` with a `Retry-After` header.
+- A run or stop for a bot that can't run passes answers `409`. A bot that is offline gets the request when it reconnects.
+
+### Stored settings: repair.json and repair.json.bak
+
+Each stash's repair settings are in `stash-manager-data/repair.json`, or in the folder you give with `--data`. The rules are the same as for `kits.json`: the file is written atomically and only the owner can read it, the previous file is kept as `repair.json.bak` when it reads clean, and the backup is used when the file is missing or unreadable. At most 64 stashes are stored.
+
+- **One stash's entry can't be read:** repair is off for that stash only (its routes answer `503`). The entry is kept as it is and written back unchanged on later saves. Fix it by hand, keeping its `server` and `stash`, then restart.
+- **Neither file can be read:** repair is off for every stash, the routes answer `503`, and the server never writes over either file.
 
 ## What the server prints at start
 

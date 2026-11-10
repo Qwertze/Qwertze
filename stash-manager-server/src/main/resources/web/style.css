@@ -2774,3 +2774,10 @@ html[data-theme="mac"] .conn-online::before {
 .order-kit { color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
 .order-kit-short { background: var(--warn-bg); color: var(--warn-fg); border-radius: var(--radius); padding: 1px 6px; }
 .view-kb [hidden], .kits-groups [hidden] { display: none !important; }
+.repair-set .repair-switches { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+.repair-tiles { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.repair-tile { min-width: 150px; max-width: 240px; padding: 6px 10px; border: 1px solid var(--border, #555); border-radius: var(--radius); }
+.repair-tile-n { font-size: 20px; font-weight: bold; }
+.repair-tile-l { font-size: 13px; overflow-wrap: anywhere; }
+.repair-last { margin-top: 8px; }
+.repair-item { font-size: 13px; overflow-wrap: anywhere; }
