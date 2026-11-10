@@ -28,7 +28,8 @@ public final class KitStore {
     /** The most stashes kept (the oldest change goes first). */
     public static final int MAX_STASHES = 64;
     private static final int FILE_VERSION = 1;
-    private static final long MAX_FILE_BYTES = 4L * 1024 * 1024;
+    // 64 stashes with 50 templates of 27 slots each are about 8 MiB of JSON: the cap is above what the store can write itself
+    private static final long MAX_FILE_BYTES = 16L * 1024 * 1024;
     private static final Gson GSON = new Gson();
     private static final Logger LOG = LogUtils.getLogger();
 
@@ -92,7 +93,7 @@ public final class KitStore {
         if (!Files.isRegularFile(file)) return;
         try {
             if (Files.size(file) > MAX_FILE_BYTES) throw new IOException("file too big");
-            JsonElement root = JsonParser.parseString(Files.readString(file, StandardCharsets.UTF_8));
+            JsonElement root = com.porter.qwerte.craft.SafeJson.parse(Files.readString(file, StandardCharsets.UTF_8));
             if (!root.isJsonObject() || !root.getAsJsonObject().has("stashes") || !root.getAsJsonObject().get("stashes").isJsonArray()) throw new IOException("not a kit settings file");
             int dropped = 0;
             for (JsonElement e : root.getAsJsonObject().getAsJsonArray("stashes")) {

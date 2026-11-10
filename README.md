@@ -257,7 +257,8 @@ saved kits that `build-kits` builds. To send kit shulkers that are already in yo
 - **Building** with `build-kits` (off by default, Signs mode only): it builds as many copies as the stash allows. It
   takes an empty shulker, preferring boxes signed "empty shulkers", gathers the items and fills the shulker with the
   exact saved counts. Durability and anvil cost are ignored, but everything else must match: names, enchantments,
-  potions and trims.
+  potions and trims. A saved kit whose name is a Kit Builder template is skipped here (from 0.6.0); the Kit Builder's
+  **Import local kits** button can turn it into a template instead.
 - **Where kits go:** a finished kit goes to the chest whose sign is the kit's name, "<name> kit" or "<name> kits". With
   no such chest the kit isn't built, and the chat says so once.
 - **Kit chests are reserved:** a sign naming a kit's chest keeps loose items out of it, even with `build-kits` off. So
@@ -269,21 +270,26 @@ saved kits that `build-kits` builds. To send kit shulkers that are already in yo
   clicks.
 
 #### Kit sorting
-New in 0.4.0-dev.14 and not tested in game yet. With the `kit-sorting` setting on (the default), a shulker box that scores
-as a kit goes to a chest you pick on the [Stash Manager](#stash-manager) website or in the Stash Window's Kits tab, and
-the sorter moves it there when it finds it somewhere else.
+New in 0.6.0 (kit sorting v2) and not tested in game yet. With the `kit-sorting` setting on (the default), a shulker box that
+is a kit goes to a chest you pick on the [Stash Manager](#stash-manager) website or in the Stash Window's Kits tab, and the
+sorter moves it there when it finds it somewhere else. Stash Manager server 1.1.0 or newer is needed for kit v2.
 
-- **The score.** Each shulker box gets points: `name` 2 for a custom name with the word "kit" or "kits" (a whole word:
-  "PvP Kit" and "kit_3" count, "Kitchen", "Toolkit" and "Kitsune" don't); `mix` 3 for a group of useful items from the
-  shared `kit-items.json` table (for example three pieces of gear, or five wool colours); `full` 1 when all 27 slots are
-  filled; and `op` 4 when the box holds at least `opMin` OP items (3 by default), counted per item by stack count (3
-  totems, or a sword and 2 god apples, qualify). A box is a kit when its total reaches the threshold (4 by default). A
-  part-filled box of one item is never a kit, and an empty box never is. Items are compared by their ids: enchantments,
-  potions, trims and names on the items don't matter, and a bundle counts as one item.
-- **Where kits go.** A named kit with a rule for its name goes to that rule's chest. Otherwise it goes to the kits chest,
-  and unnamed kits always go there. A kit with neither sorts exactly as before. So with no kits chest set, only kits with
-  a rule for their name change. A shulker that KitBuilder already routes (a finished or part-built kit, above) keeps
-  KitBuilder's routing.
+- **What is a kit.** The bot works out a box's kit type from its contents, with the shared `kit-types.json` table. The seven
+  types are PvP / Crystal, Travel, Redstone, Farming / Food, Building, Starter / Base and Other kit. A box is a kit of the type
+  most of its items belong to, when it holds enough different kinds of item (three for PvP, Redstone and Starter, two for the
+  others). Three quarters of its items must belong to the type. That drops to half when the name has a word for the type
+  (a whole word, like "pvp" or "travel") or the word "kit" or "kits". A box of one kind of item is never a kit, whatever its
+  name, and a mix with no type in the majority isn't one either.
+- **Kit templates.** A box that matches a kit template from the Kit Builder is a kit of that template's type. A complete copy
+  has the template's items, counts and components. Slot order, how stacks are split, custom names, damage and repair cost
+  don't matter, and a template slot set to any variant takes any version of its item. A part-built copy carries the
+  template's name and holds some of the template's items; the Kits tab shows it as incomplete.
+- **Treat as.** In the Kits tab, a kit's name can be set to a type, or to "not a kit". A name set to "not a kit" is never
+  sorted as a kit.
+- **Where kits go.** A kit goes along its chain and into the first chest on it that can take kits: the chest of its name's
+  rule, then its template's chest, then its type's chest, then the kits chest. A kit that is already in one of these chests
+  only moves up the chain, never down: when its chest is full it stays where it is. A kit whose chain has no chest set sorts
+  as before. A shulker that KitBuilder already routes (a finished or part-built kit, above) keeps KitBuilder's routing.
 - **Kit-reserved chests.** The kits chest and every kit's chest hold only kits. Nothing else is sorted into them, and they
   are left out of overflow, sign scoring, Tiers, compacting, repacking and auto-labelling. A put-back into one happens
   only for a kit routed to it.
@@ -293,14 +299,14 @@ the sorter moves it there when it finds it somewhere else.
   gives the kit no destination: a kit already in the stash stays where it is, one from a drop-off or your inventory goes
   to overflow, and you get one warning per kit and chest until the settings change. A full chest takes the normal path,
   so kits in the stash move once it has room.
-- **Settings.** The bot takes its settings from the Stash Manager server: the kits chest, a chest per kit name, and the
-  points, threshold and `opMin`. It keeps the last ones it received in `meteor-client/qwerte/kit-settings.json`, so it
-  keeps routing while the server is offline. Settings that fail their check are ignored, and a warning is logged once.
+- **Settings.** The bot takes its settings from the Stash Manager server: the kits chest, a chest per kit type and per kit
+  name, the name rules, the Treat as choices and the kit templates. It keeps the last ones it received in
+  `meteor-client/qwerte/kit-settings.json`, so it keeps routing while the server is offline. Settings that fail their check
+  are ignored, and a warning is logged once.
 - **Off.** Turn `kit-sorting` off to sort kits like any other shulker box. Nothing about kits is sent to the server then,
   and the saved settings are kept.
-- **A consequence of the defaults.** A full box of one OP item, for example 27 totems (the way the compactor may make
-  them), is a kit. Once a kits chest is set, it goes there. Raise the threshold, or set `op` to 0, to keep those boxes in
-  their item chests.
+- **Older bots.** A full box of one OP item, for example 27 totems (the way the compactor may make them), is one kind of
+  item, so it is stock and not a kit. While an older bot reports, the Kits tab's Advanced section still shows the v1 points.
 - The settings and the report travel in the [stash-manager](#stash-manager) module's heartbeat, so that module needs to be
   on, with `server-url` and `api-key` set and a stash loaded. Without it the bot has no kit settings and sorts kits as before.
 
@@ -549,7 +555,7 @@ New in 0.4.0-dev and still being tested.
 - Optionally turn on `connect-to-server`, set `server-url` and log in to see the stash of your Stash Manager server with
   your website account's permissions. Plain `http://` outside your own network is refused unless `allow-insecure-http` is on.
 - With a server connected, the window also has the server's pages, each shown only when your account's permissions allow
-  it: Kits, Orders, Live, Build Planner, Bots, Activity, Proxy, Console and Settings. Settings holds the bot settings, your
+  it: Kits, Kit Builder, Orders, Live, Build Planner, Bots, Activity, Proxy, Console and Settings. Settings holds the bot settings, your
   account and, for the owner, the Users list; the bot settings show one section at a time, picked from a drop-down. The
   palette button in the header opens Settings > Appearance, where the window's themes are. The Build Planner works from
   your game's `schematics` folder (or an uploaded file) and can order a build's materials part by part.
@@ -570,11 +576,25 @@ New in 0.4.0-dev and still being tested.
   header to maximize it. Its place and size are remembered. It follows Minecraft's GUI scale (`window-scale` in the module
   overrides that; Meteor's own GUI scale does not apply to it) and uses the game's font, at about the website's size next to
   the slots (`window-text-scale`: Auto, Small, Normal or Large).
-- **Kits** (New in 0.4.0-dev.14 and not tested in game yet; needs `view`, and not shown to a user the owner forced into
-  streamer mode): the kits chest picker, a chest per kit name, a table of every kit the bot found with its score and
-  status, and the kit scoring editor (threshold, the four points and "OP items needed"). Changing a setting needs the
-  `settings` permission. The window's streamer mode shows kits as "Kit 1" and chests as "Chest 1" with no labels or
-  coordinates. See [Kit sorting](#kit-sorting).
+- **Kits** (rebuilt in 0.6.0 and not tested in game yet; needs `view`, and not shown to a user the owner forced into
+  streamer mode): the kits chest picker, a chest per kit type and per kit name, and a table of every kit the bot found,
+  with where it is kept, its status and a **Treat as** choice. Changing a setting needs the `settings` permission. A
+  server older than kit v2 gets the earlier layout, and the **Advanced** section shows the v1 points while an older bot
+  reports. The window's streamer mode shows kits as "Kit 1" and chests as "Chest 1" with no labels or coordinates. See
+  [Kit sorting](#kit-sorting).
+- **Kit Builder** (New in 0.6.0 and not tested in game yet; server mode only; needs `view`): the stash's kit templates,
+  grouped by type, with their stock (complete and incomplete copies, and what the incomplete ones are short of). **New
+  kit** and the **From a preset** list start a new template, and **Edit** opens an existing one in its editor: a 27-slot
+  grid where you click a slot to pick it, right-click to empty it, and click an item
+  below to put it in the picked slot. Each slot is either an exact item or any variant of it, and a slot the stash no longer
+  has is shown in red. The editor also has presets, a shulker colour, and the restock keep (0 is off). Saving needs
+  `settings`, and deleting a template keeps its boxes, which are no longer copies of it. **Order** needs `order`, and shows
+  only where the stash's bot can carry out kit orders, which the addon's bot can't yet.
+- **Import local kits** (on the Kit Builder tab, when this client has saved kits): makes a template from each kit you saved
+  in stash-sorter's Kits section. Press it once, then **Confirm import?** to go ahead. Kits of one kind of item, and copies
+  of a template already on the server, are skipped, and the import stops at the server's template limit (50 templates).
+  Local kits are kept. They are saved per client, not per server, so the import can't be limited to one server's kits.
+  The server takes 60 writes a minute; if the import stops there, run it again.
 - **Build Planner crafting** (New in 0.4.0-dev.18; not tested in game yet). The planner also shows what the stash can make
   from what it holds.
   - A Craft column shows how many of each row can be made: "-" when there is nothing to make or nothing can be made, "0"
@@ -1036,9 +1056,9 @@ Out of materials:
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) for Minecraft **1.21.11** or **1.21.4**.
 2. Put [Meteor Client](https://meteorclient.com) for the same Minecraft version in your `mods` folder.
 3. Download the `qwerte-addon` jar for your Minecraft version from the
-   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.5.0`, see
-   [Versioning](#versioning) and [Dev builds](#dev-builds)): `qwerte-addon-0.5.0+1.21.11.jar` or `qwerte-addon-0.5.0+1.21.4.jar`.
-   Put it in your `mods` folder. It works with Stash Manager server 1.1.0 and Stash Sorter plugin 1.16.1.
+   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.6.0`, see
+   [Versioning](#versioning) and [Dev builds](#dev-builds)): `qwerte-addon-0.6.0+1.21.11.jar` or `qwerte-addon-0.6.0+1.21.4.jar`.
+   Put it in your `mods` folder. It needs Stash Manager server 1.1.0 or newer for kit v2, and works alongside Stash Sorter plugin 1.17.0.
 4. *(Optional, for auto-walk and refilling)* Download `baritone-api-fabric-1.3.0-<minecraft>.jar` for your version from
    [dekrom's Baritone releases](https://github.com/dekrom/baritone/releases) (for example
    [1.21.11](https://github.com/dekrom/baritone/releases/tag/v1.3.0-1.21.11) or
@@ -1064,14 +1084,15 @@ Qwerte uses `MAJOR.MINOR.PATCH` versions:
 The `0.4.0-dev.N` counting has ended. 0.5.0 is the first release under this scheme. 0.5.x releases are fixes, 0.6.0 is the
 next feature batch, and 1.0.0 will mark the first stable release.
 
-**Compatibility:** Qwerte **0.5.0** works with [Stash Manager server](stash-manager-server/README.md) **1.1.0** and the
-Stash Sorter plugin **1.16.1** (see [Stash Sorter for AquariusProxy](https://github.com/Qwertze/Stash-Sorter)).
+**Compatibility:** Qwerte **0.6.0** needs [Stash Manager server](stash-manager-server/README.md) **1.1.0** or newer for kit v2
+(**1.2.0** is current), and works alongside the Stash Sorter plugin **1.17.0** (see
+[Stash Sorter for AquariusProxy](https://github.com/Qwertze/Stash-Sorter)).
 
 ## Dev builds
 
 New features are tested on the [`dev`](https://github.com/Qwertze/Qwertze/tree/dev) branch before they reach `main`.
 Each round of testing gets a **pre-release** on the [releases page](https://github.com/Qwertze/Qwertze/releases), named
-by its version, like `v0.5.0`. These are unofficial: they may be buggy and settings may change. Use the latest regular release
+by its version, like `v0.6.0`. These are unofficial: they may be buggy and settings may change. Use the latest regular release
 unless you're helping test.
 
 ## Setup guide
@@ -1135,9 +1156,10 @@ around. The purple boxes are the blocks it's about to till.
 6. Search the stash anytime from the module's settings.
 7. Turn on **stash-overlay** to see what each container holds.
 8. *(Optional)* To build kits, save them in the **Kits** section of the module's settings, put a chest signed with each
-   kit's name, then turn on `build-kits` in Signs mode.
+   kit's name, then turn on `build-kits` in Signs mode. Saved kits that are also Kit Builder templates are skipped here.
 9. *(Optional, not tested in game yet)* For kit sorting, link the addon to your Stash Manager server (see
-   `stash-manager` above), then pick a kits chest on the website or in the Stash Window's Kits tab, and a chest for any
+   `stash-manager` above), then pick a kits chest on the website or in the Stash Window's Kits tab, a chest for each kit
+   type you want, and a chest for any
    kit name you want its own. `kit-sorting` is on by default.
 
 ## Settings reference
@@ -1274,7 +1296,7 @@ station. If you'd rather work hands-on, turn off `auto-walk`, `auto-water` and `
 | General | `walk` | off | Walk to containers out of reach with Baritone. |
 | General | `rotate` | on | Face containers when opening them. |
 | General | `unsigned-overflow` | on | Signs mode: items with nowhere to go, and no chest signed misc, other or overflow, go to a chest with no sign at all (one already in use first). Never a chest signed for something else. |
-| General | `kit-sorting` | on | Send shulker boxes that score as kits to the chests picked for them on the Stash Manager website or in the Stash Window's Kits tab (see Kit sorting). Off: kits sort like any shulker and nothing about kits is sent. The settings come from the Stash Manager server; the last ones it sent are kept while it is offline. |
+| General | `kit-sorting` | on | Send shulker boxes that are kits (by type or template) to the chests picked for them on the Stash Manager website or in the Stash Window's Kits tab (see Kit sorting). Off: kits sort like any shulker and nothing about kits is sent. The settings come from the Stash Manager server; the last ones it sent are kept while it is offline. |
 | General | `log-level` | Normal | Quiet: now/next lines, errors and alerts (alerts are also whispered to the whitelist). Normal: the usual messages. Debug: also why it decides what it does. Replaces `debug`. |
 | Bot | `stay-on` | off | Keep running after sorting, as a sorting bot. |
 | Bot | `recheck` | 30 | Seconds between drop-off checks (the shortest wait with `smart-recheck`). |
@@ -1292,7 +1314,7 @@ station. If you'd rather work hands-on, turn off `auto-walk`, `auto-water` and `
 | Shulkers | `compact-exclude` | empty | Items that are never compacted, like ender pearls. |
 | Shulkers | `repack` | on | Signs mode: clean mixed shulkers and pack loose items into bulk shulkers. |
 | Shulkers | `new-bulk-at` | 9 | Start a new bulk shulker from an empty one at this many stacks of one item. 0 only tops up existing ones. Only used while `compact` is off. |
-| Kits | `build-kits` | off | Signs mode only: build the saved kits out of the stash, into chests signed with the kit's name. |
+| Kits | `build-kits` | off | Signs mode only: build the saved kits out of the stash, into chests signed with the kit's name. Saved kits whose name is a Kit Builder template are skipped (from 0.6.0). |
 | Slots | `carry-slots` | blank | Slots to carry items in. Blank uses every slot that's empty when sorting starts. |
 | Slots | `keep-slots` | blank | Slots never to touch. |
 | Search | `whisper-search` | off | Let whitelisted players search by whisper. |
@@ -1375,9 +1397,13 @@ src/main/java/com/porter/qwerte/
 │   ├── Kit.java              A saved kit: 27 slots, and how to tell if a shulker is finished or part built
 │   ├── Kits.java             The saved kits of the current server, saved and loaded from disk
 │   ├── KitItems.java         The shared kit-items table (kit-items.json): the OP items and the item-mix groups
+│   ├── KitTypes.java         The shared kit-types table (kit-types.json): the seven kit types, their words and item types
+│   ├── KitClassifier.java    Works out a box's kit type, or the reason it isn't a kit (templates, Treat as, types)
+│   ├── KitTemplate.java      One kit template, checked: its name, category, chest and 27 slots
+│   ├── KitTemplates.java     Matches a box against the templates: complete and incomplete copies
 │   ├── KitNames.java         Turns a shulker's custom name into a kit key, and says whether it is a kit
-│   ├── KitScore.java         The kit score of one shulker box: name, mix, full and OP points, and the threshold
-│   ├── KitRouting.java       Where a kit shulker goes: a name's chest, the kits chest, or normal sorting
+│   ├── KitScore.java         The kit score of one shulker box: name, mix, full and OP points, and the threshold (older bots)
+│   ├── KitRouting.java       Where a kit shulker goes: along its chain (name rule, template, type, kits chest)
 │   ├── KitSettings.java      One stash's kit settings from the Stash Manager server, checked whole (or refused)
 │   ├── KitStore.java         The kit settings kept per server and stash (kit-settings.json), for when the server is offline
 │   ├── KitReport.java        The kit report sent to the Stash Manager server: containers, kits and carried kits
@@ -1394,7 +1420,7 @@ src/main/java/com/porter/qwerte/
 │   ├── StashWatch.java       Notices other players' changes to containers and signs
 │   ├── ItemPreviewScreen.java  Shows a found item in a look-only container screen
 │   └── KitPreviewScreen.java   Shows a saved kit in a look-only container screen
-├── manager/                  The Stash Window: gui/ (the screen, tabs such as KitsTab, and widgets), model/ (its data and rules, such as KitsModel),
+├── manager/                  The Stash Window: gui/ (the screen, tabs such as KitsTab and BuilderTab, and widgets), model/ (its data and rules, such as KitsModel, KitsV2 and BuilderModel),
 │                             net/ (the connection to the Stash Manager server), local/ (the local index and orders),
 │                             map/ (the live map)
 ├── pearl/                    Reset Pearl's parts: the chamber, the shaft scan, the trapdoor clicks, the sequence and the pearl's rest check (PearlRest)
@@ -1445,8 +1471,8 @@ src/<minecraft>/java/com/porter/qwerte/compat/   (the same eleven files in src/1
 versions/<minecraft>.properties   Minecraft, Meteor and Baritone versions for each supported Minecraft version
 ```
 
-Shared code is in `src/main`, and so is the shared kit-items table, `src/main/resources/kit-items.json` (the same file the
-ZenithProxy plugin uses). The little that differs between Minecraft versions is in `src/<minecraft>`, and only the
+Shared code is in `src/main`, and so are the shared kit tables, `src/main/resources/kit-items.json` and
+`src/main/resources/kit-types.json` (the same files the ZenithProxy plugin uses). The little that differs between Minecraft versions is in `src/<minecraft>`, and only the
 folder for the version being built is compiled. The addon version, Fabric Loader and Loom versions live in
 `gradle/libs.versions.toml`.
 

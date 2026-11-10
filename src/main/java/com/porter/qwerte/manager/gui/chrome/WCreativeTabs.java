@@ -38,6 +38,7 @@ public class WCreativeTabs extends WPressable {
         Map.entry("shulkers", new String[] {"Shulkers", "minecraft:shulker_box"}),
         Map.entry("kits", new String[] {"Kits", "minecraft:purple_shulker_box"}),
         Map.entry("area", new String[] {"Area", "minecraft:map"}),
+        Map.entry("builder", new String[] {"Kit Builder", "minecraft:smithing_table"}),
         Map.entry("orders", new String[] {"Orders", "minecraft:writable_book"}));
 
     private static final int GAP = 1;
@@ -103,7 +104,7 @@ public class WCreativeTabs extends WPressable {
         left = new double[n];
         // In a row, left to right; Area, Kits and Orders are the last ones and move to the right end when there is room to spare
         int firstRight = n;
-        for (String right : new String[] {IndexModel.TAB_AREA, IndexModel.TAB_KITS, IndexModel.TAB_ORDERS}) {
+        for (String right : new String[] {IndexModel.TAB_AREA, IndexModel.TAB_BUILDER, IndexModel.TAB_KITS, IndexModel.TAB_ORDERS}) {
             int at = ids.indexOf(right);
             if (at >= 0) firstRight = Math.min(firstRight, at);
         }

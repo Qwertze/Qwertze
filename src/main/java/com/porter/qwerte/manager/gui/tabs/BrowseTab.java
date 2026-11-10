@@ -71,6 +71,15 @@ public final class BrowseTab {
         default void openArea() {
         }
 
+        /** True when the Kit Builder tab is offered (a window with a server, an account that may view; a forced streamer gets it read-only). */
+        default boolean builderTab() {
+            return false;
+        }
+
+        /** The Kit Builder tab of the creative tabs was clicked. */
+        default void openBuilder() {
+        }
+
         /** True when right-clicking an item can put it in the order cart (for the hint under the grid). */
         default boolean cartEnabled() {
             return false;
@@ -141,6 +150,10 @@ public final class BrowseTab {
             }
             if (IndexModel.TAB_AREA.equals(id)) {
                 host.openArea();
+                return;
+            }
+            if (IndexModel.TAB_BUILDER.equals(id)) {
+                host.openBuilder();
                 return;
             }
             if (!id.equals(tab)) {
@@ -227,7 +240,7 @@ public final class BrowseTab {
         if (grid == null) return;
         dirty = false;
         IndexModel index = source.index();
-        List<String> ids = index.visibleTabs(host.kitsTab(), host.areaTab());
+        List<String> ids = index.visibleTabs(host.kitsTab(), host.areaTab(), host.builderTab());
         if (!ids.contains(tab)) tab = IndexModel.TAB_ALL;
         page.tabs.setTabs(ids, tab);
         page.label = IndexModel.TAB_ALL.equals(tab) ? "Search Items" : WCreativeTabs.nameOf(tab);

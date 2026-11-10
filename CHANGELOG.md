@@ -19,6 +19,52 @@ next feature batch, and 1.0.0 will mark the first stable release. The version is
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-10
+
+A pre-release build from the `dev` branch. Nothing in it has been tested in game yet. It covers everything since 0.5.0.
+Works with Stash Manager server 1.1.0 (kit2) or newer, and works alongside Stash Sorter plugin 1.17.0. The details of
+kit sorting are in the [README](README.md#kit-sorting).
+
+### Added
+- **Kit sorting v2 in the addon's stash bot.**
+  - Kit types from the shared `kit-types.json` table: PvP / Crystal, Travel, Redstone, Farming / Food, Building, Starter / Base
+    and Other kit. A box is a kit of the type most of its items belong to, with enough kinds of item. A box of one kind of
+    item is never a kit, whatever its name.
+  - Per-type chests. A kit goes along its chain: its name's chest, its template's chest, its type's chest, then the general
+    kits chest. A stored kit only moves up its chain, and never down because its chest filled up.
+  - Treat-as: a name can be set to a type, or to "not a kit".
+  - Kit templates. A complete copy matches the template's items, counts and components. A part-built copy carries the
+    template's name and holds some of its items. Slot order, stack splits, custom names, damage and repair cost are ignored,
+    and a `#*` slot takes any variant of its item.
+  - Match keys in the stash index (`match` on each item and shulker-box entry), and the v2 kit report, sent with `kitsHash2`
+    in the heartbeat.
+- **Kits tab rebuilt** (Stash window). It shows where each kit is kept and its status, with Treat-as and the type chests. A
+  server older than kit v2 still gets the v1 layout.
+- **Kit Builder tab** (Stash window, server mode). A list of the stash's kit templates with their stock, and an editor with a
+  27-slot grid. It has any-variant slots, presets, a shulker colour, the restock keep, and unresolved slots shown in red. Order
+  appears only where the stash's bot can carry out kit orders (see Known limits).
+- **Import local kits** (Kit Builder tab). It makes one template from each kit saved in this client, after a second click to
+  confirm. It stops at the server's template limit, skips kits of one kind of item and copies of an existing template, and keeps
+  the local kits.
+
+### Changed
+- Local `build-kits` skips kits whose name is a dashboard template. Those are left to the Kit Builder.
+- Against an older Stash Manager server, which boxes count as kits follows the v2 type table, not the v1 points. A loose
+  assortment with no type majority, and a full single-item box of OP items, are no longer kits. The v1 points still show under
+  Advanced on the Kits tab while an older bot reports.
+- The chat warning for a missing kit chest no longer shows its coordinates. The log keeps them.
+
+### Known limits
+- The addon doesn't build kit orders or restock yet (release 2). The heartbeat says so, and the Kit Builder shows "This bot
+  can't build kits yet". Until then, local `build-kits` still builds the saved kits whose names aren't dashboard templates.
+- Import can't be limited to one server's kits, because saved kits are stored per client.
+- Import may stop at the server's 60 writes a minute. Run it again to finish; copies that were already imported are skipped.
+- Match keys aren't comparable between the plugin and the addon. After a change of bot, exact template slots can stop
+  resolving, and the editor asks you to pick the item again.
+
+### Not tested in game
+- The tabs and routing: the Kits and Kit Builder tabs, the import, and kit routing.
+
 ## [0.5.0] - 2026-11-10
 
 A pre-release build from the `dev` branch. Nothing in it has been tested in game yet. It covers everything since

@@ -8,7 +8,9 @@ import com.porter.qwerte.manager.gui.style.SmGuiTheme;
 import com.porter.qwerte.manager.gui.style.SmPill;
 import com.porter.qwerte.manager.gui.style.SmTable;
 import com.porter.qwerte.manager.gui.style.Ui;
+import com.porter.qwerte.manager.gui.chrome.WFlow;
 import com.porter.qwerte.manager.model.KitsModel;
+import com.porter.qwerte.manager.model.KitsV2;
 import com.porter.qwerte.manager.model.KitsModel.Data;
 import com.porter.qwerte.manager.model.KitsModel.Row;
 import com.porter.qwerte.manager.model.StashRef;
@@ -22,7 +24,9 @@ import meteordevelopment.meteorclient.gui.widgets.containers.WHorizontalList;
 import meteordevelopment.meteorclient.gui.widgets.input.WDropdown;
 import meteordevelopment.meteorclient.gui.widgets.input.WTextBox;
 
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -50,6 +54,7 @@ public final class KitsTab {
 
     private String stashKey = "";
     private Data data;
+    private KitsV2.Data d2;
     private String error = "";
     private String dataSig = "";
     private boolean busy;
@@ -90,6 +95,7 @@ public final class KitsTab {
         busy = false;
         writing = false;
         data = null;
+        d2 = null;
         error = "";
         dataSig = "";
         stashKey = "";
@@ -97,6 +103,7 @@ public final class KitsTab {
         nextCheck = 0;
         armedKey = "";
         armedUntil = 0;
+        advancedOpen = false;
         builtSig = "";
         builtArmed = "";
         builtStash = "";
@@ -124,6 +131,7 @@ public final class KitsTab {
             busy = false;
             writing = false;
             data = null;
+            d2 = null;
             error = "";
             dataSig = "";
             stashKey = key;
@@ -177,11 +185,13 @@ public final class KitsTab {
                 if (d == null) {
                     error = KitsModel.error(0, null);
                     data = null;
+                    d2 = null;
                 } else {
                     error = "";
                     data = d;
+                    d2 = KitsV2.parse(r.body());
                 }
-                dataSig = signature(data, error);
+                dataSig = signature(data, d2, error);
             } else if (r.kind() == ApiError.Kind.LOGIN || r.kind() == ApiError.Kind.MUST_CHANGE) {
                 nextGet = System.currentTimeMillis() + RETRY_MS;
                 host.failed(r);
@@ -190,16 +200,19 @@ public final class KitsTab {
             } else {
                 nextGet = System.currentTimeMillis() + RETRY_MS;
                 data = null;
+                d2 = null;
                 error = r.kind() == ApiError.Kind.CONFIRM ? KitsModel.error(0, null) : KitsModel.error(r.status(), ApiError.permission(r.body()));
-                dataSig = signature(null, error);
+                dataSig = signature(null, null, error);
             }
         });
     }
 
     /** Everything the page shows from an answer, as one string, made once per answer. */
-    private static String signature(Data d, String error) {
+    private static String signature(Data d, KitsV2.Data x, String error) {
         StringBuilder sb = new StringBuilder(error);
         if (d == null) return sb.toString();
+        // Everything the v2 page shows: the records compare by content
+        if (x != null) sb.append('~').append(x.hashCode());
         KitsModel.Scoring sc = d.scoring();
         sb.append('#').append(d.rev()).append(d.kitsChest()).append(Arrays.toString(sc.values())).append(d.kitsChestStatus()).append(d.hasReport())
             .append(d.bot().supports()).append(d.bot().synced()).append(d.bot().online()).append(d.totalRows());
@@ -215,6 +228,14 @@ public final class KitsTab {
     // ---------- widgets ----------
 
     public void build(WContainer parent, GuiTheme theme) {
+        if (data != null && d2 != null && d2.v2() && host.selectedStash() != null) {
+            buildV2(parent, theme);
+            return;
+        }
+        buildV1(parent, theme);
+    }
+
+    private void buildV1(WContainer parent, GuiTheme theme) {
         this.theme = theme;
         root = parent;
         maxLabel = null;
@@ -480,6 +501,245 @@ public final class KitsTab {
         }
     }
 
+
+    // ---------- the v2 page (KIT-CONTRACT v2: types, reasons, chains) ----------
+
+    private boolean advancedOpen;
+
+    private static String usualName(String id) {
+        try {
+            return com.porter.qwerte.stash.StashIndex.nameOf(id);
+        } catch (RuntimeException | LinkageError e) {
+            return null;
+        }
+    }
+
+    private static String reasonOf(KitsV2.Data x, KitsV2.Why w, String templateName, boolean hide) {
+        return KitsV2.reason(x, w, templateName, hide, KitsTab::usualName);
+    }
+
+    private static WFlow flow(WContainer parent, double width) {
+        WFlow f = parent.add(new WFlow()).expandX().widget();
+        f.maxWidth = width;
+        f.gapX = 6;
+        f.gapY = 4;
+        return f;
+    }
+
+    private void buildV2(WContainer parent, GuiTheme theme) {
+        this.theme = theme;
+        root = parent;
+        maxLabel = null;
+        saveHolder = resetHolder = null;
+        builtSig = dataSig;
+        builtHide = host.policy().hideCoords();
+        builtWriting = writing;
+        builtWrite = canWrite();
+        builtArmed = armedKey;
+        builtStash = stashKey;
+        Ui.pageTitle(parent, theme, "kits");
+        double inner = PageRoom.width(parent, 16);
+        Data d = data;
+        KitsV2.Data x = d2;
+        boolean hide = builtHide;
+        boolean can = builtWrite && !writing && d.hasReport();
+        makePickers(d, hide);
+
+        SmCard head = Ui.card(parent, "Kits");
+        head.add(Ui.wrap(theme, KitsV2.HEADER, inner)).expandX();
+        if (x.botSupports() && !x.botTypes()) head.add(Ui.wrap(theme, KitsV2.OLD_BOT, inner)).expandX().widget().color(Ui.warn(theme));
+        for (KitsModel.Note n : KitsModel.banner(d, builtWrite)) {
+            WLabel l = head.add(Ui.wrap(theme, n.text(), inner)).expandX().widget();
+            if (n.kind().equals("warn")) l.color(Ui.warn(theme));
+            else if (n.kind().equals("off")) l.color(Ui.err(theme));
+            else l.color(Ui.dim(theme));
+        }
+
+        // The chests card: one line per type (and custom category), then the general kits chest
+        SmCard chests = Ui.card(parent, "Chests");
+        for (KitsV2.TypeInfo t : x.types()) {
+            WFlow line = flow(chests, inner);
+            line.add(Ui.bold(theme, t.name().isEmpty() ? t.id() : t.name()));
+            KitsV2.TypeWords w = KitsV2.words(t.id());
+            if (w != null) line.add(Ui.muted(theme, w.hint()));
+            KitsModel.Options opts = chestUnset.select(t.chest());
+            String shown = opts.texts().length == 0 ? "" : opts.texts()[Math.max(0, opts.selected())];
+            if (can && chestUnset.size() <= KitsModel.MAX_CHOICES) {
+                WDropdown<String> dd = line.add(theme.dropdown(opts.texts(), shown)).widget();
+                dd.action = () -> pickTypeChest(t.id(), opts, dd.get());
+            } else {
+                line.add(theme.label(shown));
+            }
+            if (can && !t.chest().isEmpty()) {
+                SmButton clear = (SmButton) line.add(theme.button("Clear")).widget();
+                clear.pill = true;
+                clear.tooltip = "Stop using a chest for this type: its kits go to the kits chest.";
+                clear.action = () -> writeTypeChest(t.id(), null);
+            }
+            WLabel st = line.add(Ui.muted(theme, KitsV2.chestStatusText(t.chestStatus()) + " · " + t.count() + (t.count() == 1 ? " kit" : " kits"))).widget();
+            if (t.chestStatus().equals("missing")) st.color(Ui.err(theme));
+            else if (t.chestStatus().equals("full")) st.color(Ui.warn(theme));
+        }
+        WFlow general = flow(chests, inner);
+        general.add(Ui.bold(theme, "General kits chest"));
+        general.add(Ui.muted(theme, KitsV2.GENERAL_HINT));
+        String chest = d.kitsChest();
+        KitsModel.Picker chestPicker = chest.isEmpty() ? chestUnset : chestPick;
+        KitsModel.Options gopts = chestPicker.select(chest);
+        String gshown = gopts.texts().length == 0 ? "" : gopts.texts()[Math.max(0, gopts.selected())];
+        if (can && chestPicker.size() <= KitsModel.MAX_CHOICES) {
+            WDropdown<String> dd = general.add(theme.dropdown(gopts.texts(), gshown)).widget();
+            dd.action = () -> pickChest(d, gopts, dd.get(), hide);
+        } else {
+            general.add(theme.label(gshown));
+        }
+        boolean armedClear = armedKey.equals("clear");
+        if (can && !chest.isEmpty()) {
+            SmButton clear = (SmButton) general.add(theme.button(armedClear ? "Confirm clear?" : "Clear")).widget();
+            clear.pill = true;
+            clear.tooltip = "Stop using a general kits chest. Click twice.";
+            clear.action = this::clickedClear;
+        }
+        chests.add(Ui.muted(theme, KitsModel.chestInfo(d, hide), inner)).expandX();
+        if (armedKey.startsWith("chest:")) {
+            KitsModel.Container c = d.container(armedKey.substring(6));
+            if (c != null) chests.add(Ui.wrap(theme, KitsModel.signedWarning(c, hide), inner)).expandX().widget().color(Ui.warn(theme));
+        }
+        if (armedClear) chests.add(Ui.wrap(theme, "Stop using a general kits chest? Kits whose type chest is unset, full or missing go back to normal sorting. Click Confirm clear? to do it.", inner)).expandX().widget().color(Ui.warn(theme));
+
+        // The kits, grouped by type in type order, each group headed with the type's chest
+        int index = 0;
+        boolean any = false;
+        List<String> order = new ArrayList<>();
+        for (KitsV2.TypeInfo t : x.types()) order.add(t.id());
+        order.add("");
+        for (String typeId : order) {
+            List<KitsV2.Row> group = new ArrayList<>();
+            for (KitsV2.Row r : x.rows()) if (r.type().equals(typeId)) group.add(r);
+            if (group.isEmpty()) continue;
+            any = true;
+            KitsV2.TypeInfo ti = x.type(typeId);
+            String title = ti == null ? "Other rules and older bots" : (ti.name().isEmpty() ? ti.id() : ti.name());
+            if (ti != null && !ti.chest().isEmpty()) title += " · " + KitsModel.place(d, ti.chest(), hide);
+            SmCard card = Ui.card(parent, title);
+            for (KitsV2.Row r : group) {
+                kitRow(card, d, x, r, index++, inner, hide, can);
+            }
+        }
+        if (!any) parent.add(Ui.muted(theme, KitsModel.empty(d), inner)).expandX();
+
+        // Sorted normally (not kits)
+        if (!x.others().isEmpty()) {
+            SmCard card = Ui.card(parent, "Sorted normally (not kits)");
+            card.add(Ui.muted(theme, KitsV2.NOT_KITS_HINT, inner)).expandX();
+            int n = 0;
+            for (KitsV2.Other o : x.others()) {
+                WFlow line = flow(card, inner);
+                line.add(Ui.bold(theme, o.title(hide, n++)));
+                line.add(Ui.muted(theme, "×" + o.count() + " · " + KitsV2.where(d, o, hide)));
+                card.add(Ui.wrap(theme, reasonOf(x, o.why(), "", hide), inner)).expandX().widget().color(Ui.dim(theme));
+                if (!o.single()) {
+                    KitsModel.Options topts = KitsV2.typeOptions(x, o.treatAs());
+                    if (can && !o.single() && topts.texts().length <= KitsModel.MAX_CHOICES) {
+                        WFlow pick = flow(card, inner);
+                        pick.add(Ui.muted(theme, "Treat as"));
+                        WDropdown<String> dd = pick.add(theme.dropdown(topts.texts(), topts.texts()[topts.selected()])).widget();
+                        dd.action = () -> pickTreatAs(o.key(), topts, dd.get());
+                    }
+                }
+            }
+        }
+
+        // Advanced: the v1 scoring, only while an older bot is reporting
+        if (x.v1Reporting()) {
+            SmButton adv = (SmButton) parent.add(theme.button(advancedOpen ? "Advanced ▾" : "Advanced ▸")).widget();
+            adv.pill = true;
+            adv.tooltip = "Scoring for older bots";
+            adv.action = () -> {
+                advancedOpen = !advancedOpen;
+                host.later(host::rebuild);
+            };
+            if (advancedOpen) scoringCard(parent, d, inner);
+        }
+    }
+
+    private void kitRow(WContainer card, Data d, KitsV2.Data x, KitsV2.Row r, int index, double inner, boolean hide, boolean can) {
+        WFlow line = flow(card, inner);
+        line.add(Ui.bold(theme, r.title(hide, index)));
+        line.add(Ui.muted(theme, "×" + r.count() + (r.carried() > 0 ? " (" + r.carried() + " carried)" : "")));
+        KitsModel.Status st = KitsV2.status(d, r);
+        line.add(new SmPill(st.text(), switch (st.kind()) {
+            case "ok" -> SmPill.Kind.OK;
+            case "warn" -> SmPill.Kind.WARN;
+            case "off" -> SmPill.Kind.ERROR;
+            default -> SmPill.Kind.NEUTRAL;
+        }));
+        card.add(Ui.muted(theme, "Where: " + KitsV2.where(d, r, hide), inner)).expandX();
+        card.add(Ui.muted(theme, "Goes to: " + KitsV2.goesTo(x, d, r, hide), inner)).expandX();
+        if (r.why() != null) card.add(Ui.wrap(theme, reasonOf(x, r.why(), r.templateName(), hide), inner)).expandX().widget().color(Ui.dim(theme));
+        if (!r.unnamed()) {
+            WFlow ctl = flow(card, inner);
+            // Own chest (the v1.1 rule)
+            ctl.add(Ui.muted(theme, "Own chest"));
+            KitsModel.Options ro = ruleStatic.select(r.rule());
+            String current = ro.texts()[Math.max(0, ro.selected())];
+            if (can && ruleStatic.size() <= KitsModel.MAX_CHOICES) {
+                WDropdown<String> dd = ctl.add(theme.dropdown(ro.texts(), current)).widget();
+                dd.action = () -> assignRule(r.key(), ro, dd.get(), hide);
+            } else {
+                ctl.add(theme.label(current));
+            }
+            // Type (Auto / each type / Not a kit): writes treatAs
+            String treat = x.treatAsOf(r.key());
+            KitsModel.Options topts = KitsV2.typeOptions(x, treat);
+            ctl.add(Ui.muted(theme, "Type"));
+            if (can && topts.texts().length <= KitsModel.MAX_CHOICES) {
+                WDropdown<String> dd = ctl.add(theme.dropdown(topts.texts(), topts.texts()[topts.selected()])).widget();
+                dd.action = () -> pickTreatAs(r.key(), topts, dd.get());
+            } else {
+                ctl.add(theme.label(topts.texts()[topts.selected()]));
+            }
+        }
+    }
+
+    private void pickTypeChest(String type, KitsModel.Options opts, String picked) {
+        String v = valueOf(opts, picked);
+        if (v == null || v.isEmpty()) return;
+        writeTypeChest(type, v);
+    }
+
+    private void writeTypeChest(String type, String container) {
+        JsonObject body = new JsonObject();
+        body.addProperty("type", type);
+        if (container == null) body.add("container", com.google.gson.JsonNull.INSTANCE);
+        else body.addProperty("container", container);
+        write("/api/v1/kits/typeChest", body);
+    }
+
+    private void pickTreatAs(String key, KitsModel.Options opts, String picked) {
+        String v = valueOf(opts, picked);
+        if (v == null) return;
+        JsonObject body = new JsonObject();
+        body.addProperty("key", key);
+        if (v.isEmpty()) body.add("type", com.google.gson.JsonNull.INSTANCE);
+        else body.addProperty("type", v);
+        write("/api/v1/kits/treatAs", body);
+    }
+
+    private void assignRule(String key, KitsModel.Options opts, String picked, boolean hide) {
+        String v = valueOf(opts, picked);
+        if (v == null) return;
+        JsonObject body = new JsonObject();
+        body.addProperty("key", key);
+        if (v.isEmpty()) {
+            body.addProperty("key", key);
+            write("/api/v1/kits/rule/delete", body);
+        } else {
+            body.addProperty("container", v);
+            write("/api/v1/kits/rule", body);
+        }
+    }
+
     private void saveScoring() {
         int[] v = typed();
         if (v == null || data == null || Arrays.equals(v, data.scoring().values())) return;
@@ -523,8 +783,9 @@ public final class KitsTab {
                 Data d = KitsModel.parse(r.body());
                 if (d != null) {
                     data = d;
+                    d2 = KitsV2.parse(r.body());
                     error = "";
-                    dataSig = signature(d, "");
+                    dataSig = signature(d, d2, "");
                     // after a scoring write the boxes follow the saved numbers; other writes keep unsaved edits
                     if (path.endsWith("/scoring")) draftBase = null;
                 }

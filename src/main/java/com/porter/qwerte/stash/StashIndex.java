@@ -55,6 +55,10 @@ public final class StashIndex {
     // Shulkers coming through ViaVersion hold their items in block_entity_data
     private static final Predicate<DataComponentType<?>> SHULKER_CONTENTS = t -> CONTENTS.test(t) || t == DataComponents.BLOCK_ENTITY_DATA;
 
+    // The match key (KIT-CONTRACT v2, revision 4) is the index key over the patch with this strip set also removed: always the custom name, damage and
+    // repair cost (custom data, container and bundle contents, and a shulker's block entity data, are already left out of the key). Everything else counts.
+    private static final Predicate<DataComponentType<?>> MATCH_STRIP = t -> t == DataComponents.CUSTOM_NAME || t == DataComponents.DAMAGE || t == DataComponents.REPAIR_COST;
+
     private static final Map<CacheKey, Info> CACHE = new HashMap<>();
     private static final List<String> TABS = List.of("building_blocks", "colored_blocks", "natural_blocks", "functional_blocks", "redstone_blocks",
         "tools_and_utilities", "combat", "food_and_drinks", "ingredients", "spawn_eggs", "op_blocks");
@@ -245,7 +249,21 @@ public final class StashIndex {
      * when the addon has nothing: {@code settingsHash} is the hash of the cached settings for this stash, {@code reportHash} the hash of
      * the current report.
      */
-    public record KitsHashes(String settingsHash, String reportHash) {}
+    public record KitsHashes(String settingsHash, String reportHash, String settingsHash2, KitOrdersCap kitOrders) {
+        public KitsHashes(String settingsHash, String reportHash) {
+            this(settingsHash, reportHash, null, null);
+        }
+
+        public KitsHashes(String settingsHash, String reportHash, String settingsHash2) {
+            this(settingsHash, reportHash, settingsHash2, null);
+        }
+    }
+
+    /** The heartbeat's {@code kitOrders}: what this bot can do with kits. The addon's first release can only import its local kits. */
+    public record KitOrdersCap(boolean enabled, boolean restock, boolean craft, boolean importer) {
+        /** Release 1: sorts by type and template, can't carry out kit orders or restock, can import its local kits. */
+        public static final KitOrdersCap IMPORT_ONLY = new KitOrdersCap(false, false, false, true);
+    }
 
     /** As above, with {@code kits} sent as {@code kitsHash} and {@code kitsReportHash}; null leaves both out (kit sorting is off). */
     public static byte[] heartbeat(Built b, int[] delivery, String orderBlocker, long rescanDone, String rescanBlocked, int[] naming, int[] crafting, String anvilSource,
@@ -360,6 +378,19 @@ public final class StashIndex {
             else o.addProperty("kitsHash", clamp(kits.settingsHash(), 64));
             if (kits.reportHash() == null) o.add("kitsReportHash", com.google.gson.JsonNull.INSTANCE);
             else o.addProperty("kitsReportHash", clamp(kits.reportHash(), 64));
+            // v2: the cached v2 hash, an explicit null when there is no cache or it has no types (so the server sends the settings)
+            if (kits.settingsHash2() == null) o.add("kitsHash2", com.google.gson.JsonNull.INSTANCE);
+            else o.addProperty("kitsHash2", clamp(kits.settingsHash2(), 64));
+            // What the bot can do with kits (needs a player, like the other capability objects)
+            if (kits.kitOrders() != null && b.player() != null && !b.player().isBlank()) {
+                JsonObject ko = new JsonObject();
+                ko.addProperty("v", 1);
+                ko.addProperty("enabled", kits.kitOrders().enabled());
+                ko.addProperty("restock", kits.kitOrders().restock());
+                ko.addProperty("craft", kits.kitOrders().craft());
+                ko.addProperty("import", kits.kitOrders().importer());
+                o.add("kitOrders", ko);
+            }
         }
         if (deliveryHash != null) o.addProperty("deliveryHash", deliveryHash);
         if (storage != null) {
@@ -586,6 +617,53 @@ public final class StashIndex {
         return KitReport.build(stash.server, stash.name, player, boxes, carried);
     }
 
+    private static KitReport.Shulker reportShulkerV2(ItemStack stack, KitSettings.Scoring scoring, KitSettings settings) {
+        if (stack == null || stack.isEmpty() || !Utils.isShulker(stack.getItem()) || builderKit(stack)) return null;
+        KitScore.Result score = kitScore(stack, scoring);
+        if (score == null) return null;
+        return new KitReport.Shulker(customName(stack), score, classify(stack, settings), templateOf(stack, settings));
+    }
+
+    /**
+     * The v2 kit report (KIT-CONTRACT v2): every shulker box in the covered containers and in {@code inventory} with the classifier's verdict and
+     * the template it is a copy of; the report lists the kits among them, and the named boxes that are not kits. Null with no stash or no table.
+     */
+    public static KitReport.Built kitReportV2(Stash stash, boolean includeExcluded, String player, Iterable<ItemStack> inventory, KitSettings settings,
+                                              java.util.function.Predicate<ItemStack> notCarried) {
+        if (stash == null) return null;
+        KitTypes table = KitTypes.shared();
+        if (table == null) return null;
+        KitSettings.Scoring scoring = settings == null ? KitSettings.Scoring.DEFAULT : settings.scoring();
+        List<KitReport.BoxInfo> boxes = new ArrayList<>(stash.boxes.size());
+        for (Box box : stash.boxes) {
+            if (box.delivery || box.foreign || box.excluded && !includeExcluded) continue;
+            ItemStack[] contents = box.contents;
+            int size = contents != null ? (contents.length >= 54 ? 54 : 27) : (box.parts.size() > 1 ? 54 : 27);
+            int free = 0;
+            List<KitReport.Shulker> shulkers = List.of();
+            if (contents != null) {
+                for (ItemStack stack : contents) {
+                    if (stack == null || stack.isEmpty()) {
+                        free++;
+                        continue;
+                    }
+                    KitReport.Shulker sh = reportShulkerV2(stack, scoring, settings);
+                    if (sh == null) continue;
+                    if (shulkers.isEmpty()) shulkers = new ArrayList<>();
+                    shulkers.add(sh);
+                }
+            }
+            boxes.add(new KitReport.BoxInfo(kitId(box), box.labels.isEmpty() ? null : box.labels.getFirst(), size, free, kitPickable(box), Math.max(0, box.lastRead), shulkers));
+        }
+        List<KitReport.Shulker> carried = new ArrayList<>();
+        for (ItemStack stack : inventory) {
+            if (notCarried != null && notCarried.test(stack)) continue;
+            KitReport.Shulker sh = reportShulkerV2(stack, scoring, settings);
+            if (sh != null) carried.add(sh);
+        }
+        return KitReport.buildV2(stash.server, stash.name, player, boxes, carried, table.fingerprint(), settings);
+    }
+
     /**
      * What a heartbeat reply says about kits. {@code reportKnown}: the reply has a {@code needKitsReport} key (true or false), so the
      * server knows the report route. {@code needReport}: it wants the report. {@code settings}: a valid {@code kits} object, else null.
@@ -598,7 +676,7 @@ public final class StashIndex {
     /** Reads the kit fields of a heartbeat reply. Missing or broken fields mean nothing was said; a bad {@code kits} object is refused whole. */
     public static KitsReply kitsReply(String body) {
         try {
-            JsonElement e = JsonParser.parseString(body);
+            JsonElement e = com.porter.qwerte.craft.SafeJson.parse(body);
             if (!e.isJsonObject()) return NO_KITS;
             JsonObject o = e.getAsJsonObject();
             boolean known = false, need = false;
@@ -743,6 +821,71 @@ public final class StashIndex {
         return infoOf(mc.level.registryAccess().createSerializationContext(NbtOps.INSTANCE), stack).key();
     }
 
+    /**
+     * The match key of a stack: the index key of its component patch with the contents, custom data (and a shulker's block entity data) and also
+     * the custom name, damage and repair cost left out. Package-private so the tests can apply the real strip set to real stacks.
+     */
+    static String matchKey(RegistryOps<Tag> ops, ItemStack stack, boolean shulker) {
+        DataComponentPatch stripped = stack.getComponentsPatch().forget(shulker ? SHULKER_CONTENTS : CONTENTS);
+        return key(ops, BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(), stripped.forget(MATCH_STRIP));
+    }
+
+    /** The match key of a stack (KIT-CONTRACT v2): its index key with the custom name, damage and repair cost left out too, or null with no world. */
+    public static String matchKeyOf(ItemStack stack) {
+        if (mc.level == null || stack == null || stack.isEmpty()) return null;
+        return infoOf(mc.level.registryAccess().createSerializationContext(NbtOps.INSTANCE), stack).match();
+    }
+
+    /** The occupied slots of a shulker box in slot order, as the classifier and the template match take them (id, match key, count). */
+    public static List<KitTemplates.BoxStack> boxStacks(ItemStack shulker) {
+        List<KitTemplates.BoxStack> out = new ArrayList<>(27);
+        for (ItemStack s : Kits.inside(shulker)) {
+            if (s == null || s.isEmpty()) continue;
+            String id = BuiltInRegistries.ITEM.getKey(s.getItem()).toString();
+            String match = matchKeyOf(s);
+            out.add(new KitTemplates.BoxStack(id, match == null ? id : match, s.getCount()));
+        }
+        return out;
+    }
+
+    private record ClassKey(Item item, DataComponentPatch patch, String typesHash) {}
+
+    private static final Map<ClassKey, KitClassifier.Result> CLASSES = new HashMap<>();
+
+    /** What the classifier makes of a table that can't be read: never a kit. */
+    private static final KitClassifier.Result NO_TABLE = new KitClassifier.Result(false, KitClassifier.NO_PURPOSE, null, 0, 0, 0, 0, 0, List.of(), List.of(), null, List.of());
+
+    /** The normalised custom name of a stack (KIT-CONTRACT v1.1 normalize), or null when it has none. */
+    public static String normalizedName(ItemStack stack) {
+        String name = customName(stack);
+        return name == null ? null : KitNames.normalize(name);
+    }
+
+    /**
+     * The kit classifier's verdict for a shulker box (KIT-CONTRACT v2): null for anything but a shulker box. Worked out once per item, components
+     * (name, contents) and v2 settings, then remembered. A table that can't be read means no kit. Client thread only.
+     */
+    public static KitClassifier.Result classify(ItemStack stack, KitSettings settings) {
+        if (stack == null || stack.isEmpty() || !Utils.isShulker(stack.getItem())) return null;
+        KitTypes table = KitTypes.shared();
+        if (table == null) return NO_TABLE;
+        KitSettings.Types types = settings == null ? null : settings.types();
+        if (CLASSES.size() > MAX_CACHE) CLASSES.clear();
+        return CLASSES.computeIfAbsent(new ClassKey(stack.getItem(), stack.getComponentsPatch(), types == null ? "" : types.hash()),
+            k -> KitClassifier.classify(table, boxStacks(stack), normalizedName(stack), types));
+    }
+
+    /** The kit template a shulker is a copy of (complete or part built), or null. */
+    public static KitTemplates.Found templateOf(ItemStack stack, KitSettings settings) {
+        if (settings == null || settings.types() == null || settings.types().templates().isEmpty() || stack == null || stack.isEmpty() || !Utils.isShulker(stack.getItem())) return null;
+        // Worked out once per item, components and v2 settings, like the classification (a report of a big stash asks for every shulker)
+        if (FOUNDS.size() > MAX_CACHE) FOUNDS.clear();
+        return FOUNDS.computeIfAbsent(new ClassKey(stack.getItem(), stack.getComponentsPatch(), settings.types().hash()),
+            k -> java.util.Optional.ofNullable(KitTemplates.find(settings.types().templates(), boxStacks(stack), normalizedName(stack)))).orElse(null);
+    }
+
+    private static final Map<ClassKey, java.util.Optional<KitTemplates.Found>> FOUNDS = new HashMap<>();
+
     /** The group key ("s:...") the index gives a shulker with this content, or null if it is not a shulker or is empty. */
     public static String groupKey(ItemStack stack) {
         if (mc.level == null || stack == null || stack.isEmpty() || !Utils.isShulker(stack.getItem())) return null;
@@ -768,13 +911,16 @@ public final class StashIndex {
         ItemStack[] inside = Kits.inside(stack);
         List<int[]> slots = new ArrayList<>();
         List<String> keys = new ArrayList<>();
+        List<String> matches = new ArrayList<>();
         StringBuilder canon = new StringBuilder();
         for (int slot = 0; slot < inside.length; slot++) {
             ItemStack inner = inside[slot];
             if (inner == null || inner.isEmpty()) continue;
-            String k = infoOf(ops, inner).key();
+            Info innerInfo = infoOf(ops, inner);
+            String k = innerInfo.key();
             slots.add(new int[] { slot, inner.getCount() });
             keys.add(k);
+            matches.add(innerInfo.match());
             if (canon.length() > 0) canon.append(',');
             canon.append(slot).append(':').append(k).append(':').append(inner.getCount());
         }
@@ -784,6 +930,7 @@ public final class StashIndex {
         Shulker sh = new Shulker(info, "s:" + sha1(info.key() + "|" + canon).substring(0, 10));
         sh.slots.addAll(slots);
         sh.keys.addAll(keys);
+        sh.matches.addAll(matches);
         return sh;
     }
 
@@ -838,7 +985,8 @@ public final class StashIndex {
         TabSlot tab = tabOf(stack.getItem());
         return new Info(key(ops, id, stripped), id, stack.getHoverName().getString(), englishName(stack), stack.getMaxStackSize(),
             details(info), info != null && !info.enchants.isEmpty(), tab.tab(), tab.order(),
-            durability(stack.getDamageValue(), stack.getMaxDamage())[0], durability(stack.getDamageValue(), stack.getMaxDamage())[1], Mending.has(stack));
+            durability(stack.getDamageValue(), stack.getMaxDamage())[0], durability(stack.getDamageValue(), stack.getMaxDamage())[1], Mending.has(stack),
+            key(ops, id, stripped.forget(MATCH_STRIP)));
     }
 
     /** {damage, maxDamage} to send for an item, or {0, 0} to send neither: only damageable (maxDamage > 0) and damaged (damage > 0). */

@@ -77,6 +77,11 @@ final class KitBuilder {
             return false;
         }
 
+        /** A dashboard kit template has this name (normalised): the saved kit of that name is left to the dashboard Kit Builder (kit sorting v2). */
+        default boolean dashboardKit(String name) {
+            return false;
+        }
+
         /** The carry slot of a shulker box crafted for the order (empty, unused), or -1. An order kit is built in it. */
         default int craftedBase() {
             return -1;
@@ -451,6 +456,8 @@ final class KitBuilder {
         int bestBuilt = 0;
         for (Kit k : kits) {
             if (tried.contains(k)) continue;
+            // Until the addon builds dashboard kits itself (release 2): a saved kit whose name is a dashboard template is not built here
+            if (owner.dashboardKit(k.name)) continue;
 
             if (Kits.homes(k, stash).isEmpty()) {
                 if (warnedNoChest.add(Categories.normalize(k.name))) {

@@ -8,8 +8,10 @@ import com.google.gson.JsonPrimitive;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.regex.Pattern;
@@ -22,7 +24,40 @@ import java.util.regex.Pattern;
  * @param rules     kit key to container id, at most {@link #MAX_RULES}, sorted by key
  * @param scoring   the points of the kit score and the threshold
  */
-public record KitSettings(long rev, String hash, String kitsChest, Map<String, String> rules, Scoring scoring) {
+public record KitSettings(long rev, String hash, String kitsChest, Map<String, String> rules, Scoring scoring, Types types) {
+    /** Settings without the v2 part (an older server, or tests of the v1 parts). */
+    public KitSettings(long rev, String hash, String kitsChest, Map<String, String> rules, Scoring scoring) {
+        this(rev, hash, kitsChest, rules, scoring, null);
+    }
+
+    public static final int MAX_CATEGORIES = 16, MAX_TEMPLATES = 50, MAX_CHESTS = 23, MAX_TREAT_AS = 200;
+    private static final Pattern CATEGORY = Pattern.compile("^c:[a-z0-9-]{1,24}$");
+
+    /** A custom category: id {@code c:} and a slug, a name of 1..32 characters. */
+    public record Category(String id, String name) {
+    }
+
+    /**
+     * The v2 part of the settings (KIT-CONTRACT v2): {@code hash} is the v2 hash; {@code chests} category id to container id (the seven types and
+     * the custom categories); {@code treatAs} normalised name to a category id or "none"; the custom {@code categories} and the kit {@code templates}.
+     */
+    public record Types(String hash, List<Category> categories, Map<String, String> chests, Map<String, String> treatAs, List<KitTemplate> templates) {
+        public KitTemplate template(String id) {
+            for (KitTemplate t : templates) if (t.id().equals(id)) return t;
+            return null;
+        }
+
+        public boolean hasCategory(String id) {
+            for (Category c : categories) if (c.id().equals(id)) return true;
+            return false;
+        }
+    }
+
+    /** A category id: one of the seven types, or the shape of a custom category (that it exists is checked against the settings). */
+    public static boolean validCategory(String id) {
+        return id != null && (KitTypes.TYPE_IDS.contains(id) || CATEGORY.matcher(id).matches());
+    }
+
     public static final int MAX_RULES = 200;
     private static final Pattern ID = Pattern.compile("^-?[0-9]{1,8},-?[0-9]{1,4},-?[0-9]{1,8}$");
     private static final Pattern HASH = Pattern.compile("^[0-9a-f]{40}$");
@@ -73,8 +108,12 @@ public record KitSettings(long rev, String hash, String kitsChest, Map<String, S
     public record Pos(int x, int y, int z) {
     }
 
-    /** Whether nothing is set: no kits chest and no rule (the scoring may still differ from the defaults). */
+    /** Whether no chest is set: no kits chest, no rule, no category chest and no template chest (the scoring alone routes nothing). */
     public boolean isEmpty() {
+        if (types != null) {
+            if (!types.chests().isEmpty()) return false;
+            for (KitTemplate t : types.templates()) if (t.chest() != null) return false;
+        }
         return kitsChest == null && rules.isEmpty();
     }
 
@@ -166,7 +205,104 @@ public record KitSettings(long rev, String hash, String kitsChest, Map<String, S
         }
         // The hash has to be the one of what is in the object: an object that does not hash to its own hash is refused whole
         if (!hashOf(chest, scoring, rules).equals(hash)) throw new Invalid("hash does not match the settings");
-        return new KitSettings(rev, hash, chest, Collections.unmodifiableMap(rules), scoring);
+        // The v2 part, when the server sent one: any failure refuses the whole object
+        Types types = null;
+        JsonElement t = o.get("types");
+        if (t != null && !t.isJsonNull()) types = parseTypes(t, hash);
+        return new KitSettings(rev, hash, chest, Collections.unmodifiableMap(rules), scoring, types);
+    }
+
+    private static Types parseTypes(JsonElement element, String v1Hash) throws Invalid {
+        if (!element.isJsonObject()) throw new Invalid("types is not an object");
+        JsonObject o = element.getAsJsonObject();
+        JsonElement h = o.get("hash");
+        if (h == null || !h.isJsonPrimitive() || !h.getAsJsonPrimitive().isString() || !HASH.matcher(h.getAsString()).matches()) throw new Invalid("types.hash is not 40 lowercase hex digits");
+
+        List<Category> categories = new ArrayList<>();
+        JsonElement ca = o.get("categories");
+        if (ca != null && !ca.isJsonNull()) {
+            if (!ca.isJsonArray() || ca.getAsJsonArray().size() > MAX_CATEGORIES) throw new Invalid("categories is not a list of at most " + MAX_CATEGORIES);
+            java.util.Set<String> seen = new java.util.HashSet<>();
+            for (JsonElement e : ca.getAsJsonArray()) {
+                if (!e.isJsonObject()) throw new Invalid("a category is not an object");
+                String id = str(e.getAsJsonObject().get("id")), name = str(e.getAsJsonObject().get("name"));
+                if (id == null || !CATEGORY.matcher(id).matches() || !seen.add(id)) throw new Invalid("a category id is not usable");
+                if (name == null || name.isEmpty() || name.length() > 32 || name.indexOf('\u00a7') >= 0 || hasControl(name)) throw new Invalid("a category name is not usable");
+                categories.add(new Category(id, name));
+            }
+        }
+        java.util.Set<String> known = new java.util.HashSet<>(KitTypes.TYPE_IDS);
+        for (Category c : categories) known.add(c.id());
+
+        Map<String, String> chests = new TreeMap<>();
+        JsonElement ch = o.get("chests");
+        if (ch != null && !ch.isJsonNull()) {
+            if (!ch.isJsonObject() || ch.getAsJsonObject().size() > MAX_CHESTS) throw new Invalid("chests is not an object of at most " + MAX_CHESTS);
+            for (Map.Entry<String, JsonElement> e : ch.getAsJsonObject().entrySet()) {
+                String v = str(e.getValue());
+                if (!known.contains(e.getKey()) || !validId(v)) throw new Invalid("a type chest is not a known category with a container id");
+                chests.put(e.getKey(), v);
+            }
+        }
+        Map<String, String> treatAs = new TreeMap<>();
+        JsonElement ta = o.get("treatAs");
+        if (ta != null && !ta.isJsonNull()) {
+            if (!ta.isJsonObject() || ta.getAsJsonObject().size() > MAX_TREAT_AS) throw new Invalid("treatAs is not an object of at most " + MAX_TREAT_AS);
+            for (Map.Entry<String, JsonElement> e : ta.getAsJsonObject().entrySet()) {
+                String v = str(e.getValue());
+                if (!KitNames.validKey(e.getKey()) || v == null || !(v.equals("none") || known.contains(v))) throw new Invalid("a treatAs entry is not a key and a category or none");
+                treatAs.put(e.getKey(), v);
+            }
+        }
+        List<KitTemplate> templates = new ArrayList<>();
+        JsonElement te = o.get("templates");
+        if (te != null && !te.isJsonNull()) {
+            if (!te.isJsonArray() || te.getAsJsonArray().size() > MAX_TEMPLATES) throw new Invalid("templates is not a list of at most " + MAX_TEMPLATES);
+            java.util.Set<String> ids = new java.util.HashSet<>(), names = new java.util.HashSet<>();
+            for (JsonElement e : te.getAsJsonArray()) {
+                KitTemplate t;
+                try {
+                    t = KitTemplate.parse(e);
+                } catch (KitTemplate.Invalid ex) {
+                    throw new Invalid(ex.getMessage());
+                }
+                if (!known.contains(t.category())) throw new Invalid("a template's category does not exist");
+                if (!ids.add(t.id()) || !names.add(KitNames.normalize(t.name()))) throw new Invalid("two templates share an id or a name");
+                templates.add(t);
+            }
+        }
+        String hash = hashV2(v1Hash, categories, chests, treatAs, templates);
+        if (!hash.equals(h.getAsString())) throw new Invalid("types.hash does not match the content");
+        return new Types(hash, Collections.unmodifiableList(categories), Collections.unmodifiableMap(chests), Collections.unmodifiableMap(treatAs), Collections.unmodifiableList(templates));
+    }
+
+    private static String str(JsonElement e) {
+        return e != null && e.isJsonPrimitive() && e.getAsJsonPrimitive().isString() ? e.getAsString() : null;
+    }
+
+    private static boolean hasControl(String s) {
+        return KitTemplate.hasControl(s);
+    }
+
+    /**
+     * The v2 hash: SHA-1 (lowercase hex) of {@code "v2\n" + v1 hash + "\n"}, then {@code "chest " + category + " " + id + "\n"} (the seven types in
+     * type order, then the custom categories by id), {@code "cat " + id + "\t" + name + "\n"} per custom category by id, {@code "as " + key + "\t" +
+     * value + "\n"} per treatAs by key and {@code "tpl " + id + " " + template hash + "\n"} per template by id.
+     */
+    public static String hashV2(String v1Hash, List<Category> categories, Map<String, String> chests, Map<String, String> treatAs, List<KitTemplate> templates) {
+        StringBuilder sb = new StringBuilder("v2\n").append(v1Hash).append('\n');
+        for (String type : KitTypes.TYPE_IDS) if (chests.containsKey(type)) sb.append("chest ").append(type).append(' ').append(chests.get(type)).append('\n');
+        for (Map.Entry<String, String> e : new TreeMap<>(chests).entrySet()) {
+            if (!KitTypes.TYPE_IDS.contains(e.getKey())) sb.append("chest ").append(e.getKey()).append(' ').append(e.getValue()).append('\n');
+        }
+        for (Category c : categories.stream().sorted(java.util.Comparator.comparing(Category::id)).toList()) sb.append("cat ").append(c.id()).append('\t').append(c.name()).append('\n');
+        for (Map.Entry<String, String> e : new TreeMap<>(treatAs).entrySet()) sb.append("as ").append(e.getKey()).append('\t').append(e.getValue()).append('\n');
+        for (KitTemplate t : templates.stream().sorted(java.util.Comparator.comparing(KitTemplate::id)).toList()) sb.append("tpl ").append(t.id()).append(' ').append(t.hash()).append('\n');
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-1").digest(sb.toString().getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     private static int points(JsonObject o, String name) throws Invalid {
@@ -194,6 +330,28 @@ public record KitSettings(long rev, String hash, String kitsChest, Map<String, S
         for (Map.Entry<String, String> e : rules.entrySet()) r.addProperty(e.getKey(), e.getValue());
         o.add("rules", r);
         o.add("scoring", scoring.toJson());
+        if (types != null) {
+            JsonObject t = new JsonObject();
+            t.addProperty("hash", types.hash());
+            com.google.gson.JsonArray cats = new com.google.gson.JsonArray();
+            for (Category c : types.categories()) {
+                JsonObject co = new JsonObject();
+                co.addProperty("id", c.id());
+                co.addProperty("name", c.name());
+                cats.add(co);
+            }
+            t.add("categories", cats);
+            JsonObject chests = new JsonObject();
+            for (Map.Entry<String, String> e : types.chests().entrySet()) chests.addProperty(e.getKey(), e.getValue());
+            t.add("chests", chests);
+            JsonObject as = new JsonObject();
+            for (Map.Entry<String, String> e : types.treatAs().entrySet()) as.addProperty(e.getKey(), e.getValue());
+            t.add("treatAs", as);
+            com.google.gson.JsonArray tpl = new com.google.gson.JsonArray();
+            for (KitTemplate k : types.templates()) tpl.add(k.toJson());
+            t.add("templates", tpl);
+            o.add("types", t);
+        }
         return o;
     }
 }

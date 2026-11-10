@@ -55,6 +55,9 @@ public class WItemGrid extends WPressable {
     private boolean dragBar;
     private boolean dragChecked;
 
+    /** Cells this says yes to get a red outline (the Kit Builder's slot whose item is not in the stash index any more). */
+    public java.util.function.Predicate<Cell> red;
+
     /** Called with the cell under the mouse and the mouse button (0 left, 1 right). */
     public BiConsumer<Cell, Integer> onCell;
 
@@ -291,6 +294,7 @@ public class WItemGrid extends WPressable {
                 SlotArt.draw(renderer, t, sx, sy, u, index == hover);
                 if (index == selected) Paint.outline(renderer, t, sx, sy, GridLayout.SLOT * u, GridLayout.SLOT * u, u, p.accent());
                 Cell cell = cells.get(index);
+                if (red != null && red.test(cell)) Paint.outline(renderer, t, sx, sy, GridLayout.SLOT * u, GridLayout.SLOT * u, u, 0xFFE04040);
                 boolean under = cover != null && sx < cover[0] + cover[2] && sx + GridLayout.SLOT * u > cover[0]
                     && sy < cover[1] + cover[3] && sy + GridLayout.SLOT * u > cover[1];
                 if (!under) ItemLayer.draw(renderer, t, g, cell.stack(), cell.count(), sx + u, sy + u);

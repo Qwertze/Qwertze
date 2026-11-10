@@ -17,9 +17,14 @@ final class IndexJson {
     private IndexJson() {}
 
     /** What is worked out once per kind of stack (item plus components, container contents ignored). */
-    record Info(String key, String id, String name, String englishName, int maxStack, List<String> details, boolean enchanted, String tab, int tabOrder, int damage, int maxDamage, boolean mending) {
+    record Info(String key, String id, String name, String englishName, int maxStack, List<String> details, boolean enchanted, String tab, int tabOrder, int damage, int maxDamage, boolean mending,
+                String match) {
         public Info(String key, String id, String name, String englishName, int maxStack, List<String> details, boolean enchanted, String tab, int tabOrder, int damage, int maxDamage) {
-            this(key, id, name, englishName, maxStack, details, enchanted, tab, tabOrder, damage, maxDamage, false);
+            this(key, id, name, englishName, maxStack, details, enchanted, tab, tabOrder, damage, maxDamage, false, null);
+        }
+
+        public Info(String key, String id, String name, String englishName, int maxStack, List<String> details, boolean enchanted, String tab, int tabOrder, int damage, int maxDamage, boolean mending) {
+            this(key, id, name, englishName, maxStack, details, enchanted, tab, tabOrder, damage, maxDamage, mending, null);
         }
     }
 
@@ -38,6 +43,8 @@ final class IndexJson {
         final Info info;
         final List<int[]> slots = new ArrayList<>();
         final List<String> keys = new ArrayList<>();
+        /** The match key of each content entry (parallel to {@code keys}); empty when none was worked out. */
+        final List<String> matches = new ArrayList<>();
         final String key;
         int count;
 
@@ -60,6 +67,8 @@ final class IndexJson {
             o.addProperty("id", i.id());
             o.addProperty("name", i.name());
             o.addProperty("englishName", i.englishName());
+            // The match key (KIT-CONTRACT v2): the key without the custom name, damage, repair cost and contents; older indexes have none
+            if (i.match() != null) o.addProperty("match", i.match());
             o.addProperty("count", a.count);
             o.addProperty("maxStack", i.maxStack());
             JsonArray details = new JsonArray();
@@ -97,6 +106,7 @@ final class IndexJson {
                 JsonObject c = new JsonObject();
                 c.addProperty("slot", sh.slots.get(n)[0]);
                 c.addProperty("key", sh.keys.get(n));
+                if (sh.matches.size() == sh.keys.size()) c.addProperty("match", sh.matches.get(n));
                 c.addProperty("count", sh.slots.get(n)[1]);
                 contents.add(c);
             }

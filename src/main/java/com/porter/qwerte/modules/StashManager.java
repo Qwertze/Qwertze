@@ -732,7 +732,9 @@ public class StashManager extends Module {
         if (!kitSorting()) return null;
         com.porter.qwerte.stash.KitSettings cached = com.porter.qwerte.stash.KitStore.shared().get(built.server(), built.stash());
         com.porter.qwerte.stash.KitReport.Built report = kitReport;
-        return new StashIndex.KitsHashes(cached == null ? null : cached.hash(), report == null ? null : report.hash());
+        // v2: the cached v2 hash (null with no cache or no types: the server then sends the settings), and what this bot can do with kits
+        return new StashIndex.KitsHashes(cached == null ? null : cached.hash(), report == null ? null : report.hash(),
+            cached == null || cached.types() == null ? null : cached.types().hash(), StashIndex.KitOrdersCap.IMPORT_ONLY);
     }
 
     /** What a heartbeat reply says about kits: new settings are checked and cached (the sorter notices and plans again); the report is asked for or not. */
@@ -781,8 +783,7 @@ public class StashManager extends Module {
             kitBuiltAt = now;
             kitBuiltValid = true;
             com.porter.qwerte.stash.KitSettings cached = com.porter.qwerte.stash.KitStore.shared().get(built.server(), built.stash());
-            kitReport = StashIndex.kitReport(stash, includeExcluded.get(), built.player(), inv,
-                cached == null ? com.porter.qwerte.stash.KitSettings.Scoring.DEFAULT : cached.scoring(), sorter == null ? null : sorter::buildingKit);
+            kitReport = StashIndex.kitReportV2(stash, includeExcluded.get(), built.player(), inv, cached, sorter == null ? null : sorter::buildingKit);
         } catch (RuntimeException e) {
             QwerteAddon.LOG.debug("stash-manager: couldn't build the kit report: {}", e.toString());
             kitReport = null;

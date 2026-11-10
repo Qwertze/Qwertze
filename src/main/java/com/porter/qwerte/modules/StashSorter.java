@@ -6,7 +6,9 @@ import com.porter.qwerte.stash.Categories;
 import com.porter.qwerte.stash.ItemPreviewScreen;
 import com.porter.qwerte.stash.Kit;
 import com.porter.qwerte.stash.KitPreviewScreen;
+import com.porter.qwerte.stash.KitClassifier;
 import com.porter.qwerte.stash.KitNames;
+import com.porter.qwerte.stash.KitTemplate;
 import com.porter.qwerte.stash.KitRouting;
 import com.porter.qwerte.stash.KitScore;
 import com.porter.qwerte.stash.KitSettings;
@@ -1432,6 +1434,11 @@ public class StashSorter extends Module {
 
     // Building kits
     private final KitBuilder kitBuilder = new KitBuilder(new KitBuilder.Owner() {
+        @Override
+        public boolean dashboardKit(String name) {
+            return StashSorter.this.dashboardKit(name);
+        }
+
         @Override
         public Stash stash() {
             return stash;
@@ -6314,6 +6321,7 @@ public class StashSorter extends Module {
     private Stash kitViewStash;
     private int kitViewStore = -1, kitViewVersion = -1, kitViewBoxes = -1;
     private boolean kitViewOn;
+    private KitSettings kitStashSettings;
     // The kit-settings store version the warnings below belong to: they start over only when it changes
     private int kitWarnedVersion = -1;
     // A kit whose chest is missing or cannot take kits is said once per key and container until the settings change
@@ -6333,8 +6341,10 @@ public class StashSorter extends Module {
             kitViewOn = false;
             return null;
         }
-        int store = KitStore.shared().version(), boxes = st.boxes.size();
-        if (kitViewOn && st == kitViewStash && store == kitViewStore && version == kitViewVersion && boxes == kitViewBoxes) return kitViewCache;
+        int store = KitStore.shared().version(), boxes = st.boxes.changes();
+        // Not rebuilt on every version change: what the view holds (the settings, the boxes ids resolve to) only changes with the store, the stash or its
+        // boxes; whether a box can take kits, and its room, are asked live
+        if (kitViewOn && st == kitViewStash && store == kitViewStore && boxes == kitViewBoxes) return kitViewCache;
         KitSettings settings = KitStore.shared().get(st.server, st.name);
         kitViewCache = settings == null || settings.isEmpty() ? null : new KitRouting.View<>(new KitRouting.Resolver<Box>() {
             @Override
@@ -6346,7 +6356,13 @@ public class StashSorter extends Module {
             public boolean pickable(Box box) {
                 return StashIndex.kitPickable(box);
             }
+
+            @Override
+            public boolean usable(Box box) {
+                return StashIndex.kitPickable(box) && box.free() > 0;
+            }
         }, settings);
+        kitStashSettings = settings;
         kitViewStash = st;
         kitViewStore = store;
         kitViewVersion = version;
@@ -6386,17 +6402,46 @@ public class StashSorter extends Module {
     private KitRouting.Route<Box> kitRoute(KitRouting.View<Box> v, ItemStack stack) {
         if (stack.isEmpty() || !Utils.isShulker(stack.getItem())) return v.route(null, false);
         if (StashIndex.builderKit(stack) || kitBuilder.heldKit(stack) != null) return v.route(null, false);
-        KitScore.Result score = StashIndex.kitScore(stack, v.settings().scoring());
-        if (score == null || !score.kit()) return v.route(null, false);
-        return v.route(KitNames.keyOf(StashIndex.customName(stack)), true);
+        // KIT-CONTRACT v2: the classifier decides (a single kind of item is never a kit); the chain is rule, template chest, type chest, kits chest
+        KitClassifier.Result why = StashIndex.classify(stack, v.settings());
+        if (why == null || !why.kit()) return v.route(null, false);
+        String key = KitNames.keyOf(StashIndex.customName(stack));
+        return v.route(key, why, kitBoxOf(v.chainBoxes(key, why), stack));
+    }
+
+    /** The chain box that holds this very stack (by identity), or null: carried, or stored elsewhere. At most four boxes are looked at. */
+    private static Box kitBoxOf(List<Box> chain, ItemStack stack) {
+        for (Box b : chain) {
+            if (b.contents == null) continue;
+            for (ItemStack i : b.contents) if (i == stack) return b;
+        }
+        return null;
+    }
+
+    /** Whether the kit's chain (rule, template, type, kits chest) contains this container: where a kit may be put back. */
+    private boolean kitChainHas(KitRouting.View<Box> v, Box box, ItemStack stack) {
+        KitClassifier.Result why = StashIndex.classify(stack, v.settings());
+        if (why == null || !why.kit()) return false;
+        return v.chainBoxes(KitNames.keyOf(StashIndex.customName(stack)), why).contains(box);
+    }
+
+    /** A dashboard kit template has this name (normalised): the local build-kits leaves such a kit to the dashboard. */
+    private boolean dashboardKit(String name) {
+        Stash st = stash;
+        if (st == null || !kitSorting.get()) return false;
+        KitSettings settings = KitStore.shared().get(st.server, st.name);
+        if (settings == null || settings.types() == null) return false;
+        String norm = KitNames.normalize(name);
+        for (KitTemplate t : settings.types().templates()) if (KitNames.normalize(t.name()).equals(norm)) return true;
+        return false;
     }
 
     /** The stack is a kit that kit settings send to this very container (the only thing a reserved chest takes back). */
     private boolean kitRoutedTo(Box box, ItemStack stack) {
         KitRouting.View<Box> v = kitView();
         if (v == null || !kitRoutingOn()) return false;
-        KitRouting.Route<Box> r = kitRoute(v, stack);
-        return r.decision().routed() && r.box() == box;
+        // A kit goes back into a reserved chest it came from when that chest is anywhere in its chain
+        return kitChainHas(v, box, stack);
     }
 
     /** A kit shulker that has a say in where it goes (a chest, or none to take it). */
@@ -6410,7 +6455,28 @@ public class StashSorter extends Module {
         return cache.computeIfAbsent(DestKey.of(stack), k -> kitRoute(v, stack).decision().routed());
     }
 
-    private void kitMissing(KitRouting.Decision d) {
+    /** The category the classifier gave a kit shulker ("pvp", "c:shop"...), or "" . */
+    private String kitType(ItemStack stack) {
+        KitClassifier.Result why = StashIndex.classify(stack, kitStashSettings);
+        return why == null || why.type() == null ? "" : why.type();
+    }
+
+    // A fallback level in use is logged once per (key, type) until the settings change
+    private final Set<String> kitFellBack = new HashSet<>();
+
+    private void kitFallback(KitRouting.Decision d, String type) {
+        int store = KitStore.shared().version();
+        if (store != kitWarnedVersion) {
+            kitWarned.clear();
+            kitFellBack.clear();
+            kitWarnedVersion = store;
+        }
+        if (kitFellBack.add((d.key() == null ? "\u0000" : d.key()) + "|" + type)) {
+            QwerteAddon.LOG.info("[kit-sorting] a kit of type {} goes to its next chest ({}): the first one is full or missing.", type.isEmpty() ? "-" : type, d.kind());
+        }
+    }
+
+    private void kitMissing(KitRouting.Decision d, String type) {
         // The warnings start over only when the kit-settings store changes, not on every planning pass
         int store = KitStore.shared().version();
         if (store != kitWarnedVersion) {
@@ -6418,9 +6484,11 @@ public class StashSorter extends Module {
             kitWarnedVersion = store;
         }
         // An unnamed kit has no key: a sentinel, so it never meets a kit really named "null"
-        if (kitWarned.add((d.key() == null ? "\u0000" : d.key()) + "|" + d.container())) {
-            warning("The chest picked for %s (%s) is missing or can't take kits (not read yet, excluded, a drop-off or unreachable). Such a kit stays where it is, and one from a drop-off goes to overflow.",
-                d.key() == null ? "an unnamed kit" : "the kit \"" + d.key() + "\"", d.container());
+        if (kitWarned.add((d.key() == null ? "\u0000" : d.key()) + "|" + type + "|" + d.container())) {
+            warning("The chest picked for %s is missing or can't take kits (not read yet, excluded, a drop-off or unreachable). Such a kit stays where it is, and one from a drop-off goes to overflow.",
+                d.key() == null ? "an unnamed kit" : "the kit \"" + d.key() + "\"");
+            // The position is for the log only: chat may be on stream
+            QwerteAddon.LOG.info("[kit-sorting] chest {} (type {}) is missing or can't take kits.", d.container(), type.isEmpty() ? "-" : type);
         }
     }
 
@@ -8951,6 +9019,8 @@ public class StashSorter extends Module {
     private List<Box> destinationsFor(ItemStack stack) {
         if (stack.isEmpty() || orderRunner.claims(stack)) return List.of();
         if (destCache == null) return computeDestinations(stack);
+        // A routed kit's destination depends on where this very stack is stored (a stored kit only moves up its chain): never shared by content
+        if (kitRouted(stack)) return computeDestinations(stack);
         return destCache.computeIfAbsent(DestKey.of(stack), k -> computeDestinations(stack));
     }
 
@@ -8960,8 +9030,15 @@ public class StashSorter extends Module {
         KitRouting.View<Box> kitRules = kitView();
         if (kitRules != null && kitRoutingOn()) {
             KitRouting.Route<Box> route = kitRoute(kitRules, stack);
-            if (route.decision().routed()) {
-                if (route.kind() == KitRouting.Kind.MISSING) kitMissing(route.decision());
+            // A resolved chest that is not one of the stash's boxes any more: the view is stale, made again once
+            if (route.box() != null && !stash.boxes.contains(route.box())) {
+                kitViewOn = false;
+                kitRules = kitView();
+                route = kitRules == null ? route : kitRoute(kitRules, stack);
+            }
+            if (kitRules != null && route.decision().routed()) {
+                if (route.kind() == KitRouting.Kind.MISSING) kitMissing(route.decision(), kitType(stack));
+                else if (route.fallback()) kitFallback(route.decision(), kitType(stack));
                 return kitRules.destinations(route);
             }
         }

@@ -219,7 +219,8 @@ public class Stash {
     public InFlight inFlight;
     public final String name;
     public final String server;
-    public final List<Box> boxes = new ArrayList<>();
+    /** The containers. Counts its structural changes ({@code boxes.changes()}): a cache of what a position resolves to must follow them, not the size. */
+    public final ChangeCountingList<Box> boxes = new ChangeCountingList<>();
     private boolean dirty;
 
     // The perimeter: two corners (inclusive), either may be unset. It only applies once both are

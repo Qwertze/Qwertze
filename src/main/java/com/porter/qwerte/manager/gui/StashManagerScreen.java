@@ -16,6 +16,7 @@ import com.porter.qwerte.manager.gui.tabs.ActivityTab;
 import com.porter.qwerte.manager.gui.tabs.AppearanceCard;
 import com.porter.qwerte.manager.gui.tabs.BotsTab;
 import com.porter.qwerte.manager.gui.tabs.AreaTab;
+import com.porter.qwerte.manager.gui.tabs.BuilderTab;
 import com.porter.qwerte.manager.gui.tabs.KitsTab;
 import com.porter.qwerte.manager.gui.tabs.LocalAreaSource;
 import com.porter.qwerte.manager.gui.tabs.ServerAreaSource;
@@ -94,7 +95,9 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         // Reached from the stash page's creative tabs, not the page buttons: it belongs to the Stash page (never in local mode)
         KITS(NavPage.STASH),
         // The stash's area editor, also from the creative tabs: works for a server stash and for the local one
-        AREA(NavPage.STASH);
+        AREA(NavPage.STASH),
+        // The stash's kit templates (the Kit Builder): also from the creative tabs, server mode only
+        BUILDER(NavPage.STASH);
         // A page without an in-game version would show a note that points to the website. To add one: flip its
         // NavPage.inGame, add its tab object (null in local mode), and handle it in tickServerTabs, onSessionLost and buildMain.
 
@@ -138,6 +141,8 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
     private final BotsTab botsTab;
     /** The Kits page. Null in local mode. */
     private final KitsTab kitsTab;
+    /** The Kit Builder page. Null in local mode. */
+    private final BuilderTab builderTab;
     /** The Area page: the stash's area and its editor. In both modes. */
     private final AreaTab areaTab;
     private final ActivityTab activityTab;
@@ -221,6 +226,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             this.proxyTab = null;
             this.botsTab = null;
             this.kitsTab = null;
+            this.builderTab = null;
             this.activityTab = null;
             this.consoleTab = null;
             this.plannerTab = null;
@@ -233,6 +239,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             this.proxyTab = new SettingsTab(th, true);
             this.botsTab = new BotsTab(th);
             this.kitsTab = new KitsTab(th);
+            this.builderTab = new BuilderTab(th, () -> source.index());
             this.activityTab = new ActivityTab(th);
             this.consoleTab = new ConsoleTab(th);
             this.plannerTab = new PlannerTab(th);
@@ -434,6 +441,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         if (plannerTab != null) plannerTab.clearSecrets();
         if (botsTab != null) botsTab.reset();
         if (kitsTab != null) kitsTab.reset();
+        if (builderTab != null) builderTab.reset();
         areaTab.reset();
         areaDraftHint();
         dropConfirm();
@@ -506,6 +514,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             case PROXY -> proxyTab.tick(now);
             case BOTS -> botsTab.tick(now);
             case KITS -> kitsTab.tick(now);
+            case BUILDER -> builderTab.tick(now);
             case AREA -> areaTab.tick(now);
             case ACTIVITY -> activityTab.tick(now);
             case CONSOLE -> consoleTab.tick(now);
@@ -636,6 +645,24 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
     private boolean areaOffered() {
         if (local) return true;
         return auth != null && auth.loggedIn() && auth.can("view") && !auth.forcedStreamer();
+    }
+
+    /** The Kit Builder is offered: a window with a server and an account that may view stashes (a forced streamer gets it read-only, with the names the server gives). */
+    private boolean builderOffered() {
+        return !local && auth != null && auth.loggedIn() && auth.can("view");
+    }
+
+    @Override
+    public boolean builderTab() {
+        return builderOffered();
+    }
+
+    @Override
+    public void openBuilder() {
+        if (builderOffered() && tab != Tab.BUILDER) {
+            tab = Tab.BUILDER;
+            later(this::rebuild);
+        }
     }
 
     @Override
@@ -797,6 +824,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         proxyTab.reset();
         botsTab.reset();
         kitsTab.reset();
+        builderTab.reset();
         areaTab.reset();
         activityTab.reset();
         consoleTab.reset();
@@ -1385,7 +1413,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
         nav.gapY = 4;
         for (Tab t : navTabs()) {
             String title = local && t != Tab.BROWSE && t != Tab.ORDERS && t != Tab.SETTINGS ? t.title + " (server)" : t.title;
-            WNavPill pill = nav.add(new WNavPill(title, t == tab || (t == Tab.BROWSE && (tab == Tab.KITS || tab == Tab.AREA)))).widget();
+            WNavPill pill = nav.add(new WNavPill(title, t == tab || (t == Tab.BROWSE && (tab == Tab.KITS || tab == Tab.AREA || tab == Tab.BUILDER)))).widget();
             pill.action = () -> {
                 if (tab != t) {
                     dropConfirm();
@@ -1406,7 +1434,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
             return out;
         }
         List<NavPage> pages = NavPage.visible(auth, botHasActivity(), bots.selected() != null);
-        for (Tab t : Tab.values()) if (t != Tab.KITS && t != Tab.AREA && pages.contains(t.page)) out.add(t);
+        for (Tab t : Tab.values()) if (t != Tab.KITS && t != Tab.AREA && t != Tab.BUILDER && pages.contains(t.page)) out.add(t);
         // the website's order
         out.sort(java.util.Comparator.comparingInt(t -> t.page.ordinal()));
         return out;
@@ -1501,6 +1529,14 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
                 body.add(theme.label("Your account has no access to stashes. Ask the owner.")).expandX();
             } else {
                 kitsTab.build(body, theme);
+            }
+            return;
+        }
+        if (tab == Tab.BUILDER) {
+            if (!auth.can("view")) {
+                body.add(theme.label("Your account has no access to stashes. Ask the owner.")).expandX();
+            } else {
+                builderTab.build(body, theme);
             }
             return;
         }
@@ -1753,6 +1789,7 @@ public class StashManagerScreen extends WidgetScreen implements BrowseTab.Host {
     private boolean tabVisible(Tab t) {
         if (t == Tab.KITS) return kitsOffered();
         if (t == Tab.AREA) return areaOffered();
+        if (t == Tab.BUILDER) return builderOffered();
         return navTabs().contains(t);
     }
 

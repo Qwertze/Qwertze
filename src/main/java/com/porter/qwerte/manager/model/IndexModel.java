@@ -396,6 +396,8 @@ public final class IndexModel {
     public static final String TAB_KITS = "kits";
     /** The Area page (the stash's area editor): shown left of Kits and Orders. */
     public static final String TAB_AREA = "area";
+    /** The Kit Builder page (server mode only): shown left of Kits. */
+    public static final String TAB_BUILDER = "builder";
 
     /** The creative tab ids in the website's order. */
     public static List<String> creativeTabs() {
@@ -417,6 +419,11 @@ public final class IndexModel {
 
     /** As {@link #visibleTabs(boolean)}; {@code area} adds the Area tab before Kits. */
     public List<String> visibleTabs(boolean kits, boolean area) {
+        return visibleTabs(kits, area, false);
+    }
+
+    /** As {@link #visibleTabs(boolean, boolean)}; {@code builder} adds the Kit Builder tab before Kits. */
+    public List<String> visibleTabs(boolean kits, boolean area, boolean builder) {
         java.util.Set<String> present = new java.util.HashSet<>();
         for (Item item : items) present.add(item.tab());
         List<String> out = new ArrayList<>();
@@ -424,6 +431,7 @@ public final class IndexModel {
         for (String t : TABS) if (present.contains(t)) out.add(t);
         if (!shulkers.isEmpty()) out.add(TAB_SHULKERS);
         if (area) out.add(TAB_AREA);
+        if (builder) out.add(TAB_BUILDER);
         if (kits) out.add(TAB_KITS);
         out.add(TAB_ORDERS);
         return out;
