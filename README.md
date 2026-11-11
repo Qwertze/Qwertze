@@ -19,7 +19,7 @@ Qwerte adds eleven modules to [Meteor Client](https://meteorclient.com):
 - **Order Notifications** plays a sound and shows a toast when one of your Stash Manager orders is delivered, comes up short, fails or is cancelled.
 - **Reset Pearl** climbs out of a saved stasis chamber after you're pulled through it, throws a fresh pearl into the water
   and closes the cover again.
-- **Messenger** is a small chat window over the game: a Global view of public chat you can type into, a conversation per player for whispers with history and emoji, and a picker to start a new one.
+- **Messenger** is a small chat window over the game: a Global view of public chat you can type into, an optional read-only Console for server and system messages, a conversation per player for whispers with history and emoji, and a picker to start a new one.
 - **Stash Window** is a window to search your stash in game, and with a Stash Manager server, the server's pages too.
 - **Container Tweaks** shows what is inside a shulker box when you hover it, and draws its most common item on it. With
   Smart Shulker or Smart Echest turned on, right-clicking a shulker box or ender chest places it, opens it and picks it up again.
@@ -458,7 +458,8 @@ New in 0.4.0-dev and still being tested.
   `experimental-climb-throw` are off by default.
 
 ### Messenger
-New in 0.4.0-dev.16, extended in 0.4.0-dev.17 and in 0.5.0 (display, theme and chat replacement). Not tested in game yet.
+New in 0.4.0-dev.16, extended in 0.4.0-dev.17, in 0.5.0 (display, theme and chat replacement) and in 0.8.0 (the Console).
+Not tested in game yet.
 
 Messenger reads your whispers into a small chat window with a history per player and a Global view of the public chat,
 and sends from the window. Turn it on with the **Messenger** module (category Qwerte).
@@ -467,9 +468,9 @@ and sends from the window. Turn it on with the **Messenger** module (category Qw
   It takes the keyboard and mouse only when you focus it: with `focus-key` (Right Ctrl by default, from 0.5.0; a key you
   already set, or cleared, is kept), or by clicking it while the chat is open. Esc always lets go. The window has its own input line; a draft in the chat is not carried into it.
   `notification-sound` (on) plays a quiet sound when a whisper arrives that you are not reading.
-- **Left pane.** Global first (selected when the window opens), then your conversations: friends first, then the most
-  recent, each with an unread badge. Delete asks first. On Global the button is Clear, which empties the Global log after
-  a confirmation.
+- **Left pane.** Global first (selected when the window opens), then the Console when `separate-console` is on (see
+  Console below), then your conversations: friends first, then the most recent, each with an unread badge. Delete asks
+  first. On Global and on the Console the button is Clear, which empties that log after a confirmation.
 - **New.** Opens a search field and a list: Meteor friends, then players online (tab list), then past conversations, with
   no doubles and never yourself. Typing filters the list, names that start with the text first. A valid name you type
   (3 to 16 letters, digits or `_`) that is not in the list is offered as "Message <name>". Click it or press Enter to open
@@ -480,7 +481,24 @@ and sends from the window. Turn it on with the **Messenger** module (category Qw
   Meteor prefix (`.` by default) runs as a Meteor command, and chat modules such as BetterChat may change the text. A text
   starting with `/` is sent as a command; a space right after the `/` is refused. Global messages share the whisper queue
   and rate limit (`send-interval-ms`, at most 3 waiting, never retried, dropped when you change server), and a command's
-  arguments are never shown. `global-scrollback` (500 by default, 50 to 2000) is the most lines kept per server.
+  arguments are never shown. `global-scrollback` (500 by default, 50 to 2000) is the most lines kept per server in
+  Global; the Console keeps the same number.
+- **Console (New in 0.8.0).** `separate-console` (off by default) puts console lines in their own **Console** entry, right
+  after Global, with its own unread badge. Only lines that arrive while it is on go there; lines already in Global stay
+  in Global. Turning it off hides the entry and clears its unread count. The lines it already holds stay saved and show
+  again when it is turned back on.
+  - Console lines are notices from Meteor and Baritone (including your modules' notices), the Messenger's own notes
+    ("Ran Meteor command", "Not sent: ..."), joins and leaves, deaths, advancements, and other server and system lines.
+    Player chat stays in Global, and whispers are not affected.
+  - `global-keeps-joins-leaves` and `global-keeps-deaths` (both off) keep joins and leaves, or deaths, in Global, dimmed,
+    instead of the Console.
+  - Deaths are recognised only by the game's translation key (`death.*`). 2b2t sends deaths as plain text, so they count
+    as server lines and go to the Console even with `global-keeps-deaths` on.
+  - The Console is read only: typing there is refused. Its Clear button empties the Console log after a confirmation.
+  - `overlay-shows-console` (on) shows the Console lines in the overlay's Global view, dimmed and merged by time, while the
+    window is not focused. That view is shown only with `overlay-global` on (or `replace-chat`). With `overlay-global` off
+    the overlay shows whispers only, so no console lines appear there.
+  - `console-italic` (off) draws console lines in italics, in Global and in the Console.
 - **Whispers.** Found by the game's own translation key (vanilla), and by the text patterns `pattern-vanilla` ("X whispers
   to you: ..."), `pattern-2b2t` ("X whispers: ..." and "to X: ..."), `pattern-essentials` ("[X -> me] ...") and
   `pattern-from-to` ("From X: ..." and "To X: ..."), all on by default. A pattern must match the whole chat line. A decorated
@@ -498,9 +516,9 @@ and sends from the window. Turn it on with the **Messenger** module (category Qw
 - **Emoji.** Drawn as pictures in messages and in the emoji picker (see [Third-party](#third-party)).
 - **History.** Kept in memory for each server (its address, or `local` for singleplayer and LAN). `max-history` is the most
   messages kept per player (200 by default, from 10 to 500). "Clear history" forgets every conversation and the Global
-  log on every server, and deletes the file.
+  and Console logs on every server, and deletes the file.
 - **Saving.** `save-history` (off by default) keeps the history in `meteor-client/qwerte/messenger-history.json` (version 2:
-  the conversations and the Global log of each server). Saves run in the background: whispers at most every 20 seconds,
+  the conversations and the Global log of each server, and from 0.8.0 the Console too, as an optional `console` list). Saves run in the background: whispers at most every 20 seconds,
   Global every 5 minutes, and everything when you leave a world or turn the module off. The file is written owner-only
   where the system supports it. The Messenger's own notes, unsent messages and drafts are not saved. A version 1 file's
   conversations go to the server you are on when it is loaded, and older files without Global still load. A corrupt file
@@ -519,12 +537,14 @@ and sends from the window. Turn it on with the **Messenger** module (category Qw
   line (while the window is focused) or only the messages are shown; the first key you type brings the input line back.
   The title bar and the resize grip stay grabbable at 8 real pixels or more. A very small window starts a drag when you
   click near its top.
-  `system-message-opacity` (55 per cent, from 10 to 100) dims the console lines in Global (server messages, joins and
-  leaves, and notices from Meteor and its addons). Player chat is always at full opacity. `show-player-heads` (on) draws the
+  `system-message-opacity` (55 per cent, from 10 to 100) dims the console lines in Global and in the Console (server
+  messages, joins and leaves, and notices from Meteor and its addons). Player chat is always at full opacity. `show-player-heads` (on) draws the
   player's head in front of a public chat line written `<Name> text`.
 - **Theme (New in 0.5.0).** The window's colours are set in the Theme settings. `follow-meteor-theme` (off) uses the colours
   of Meteor's current GUI theme all the time, checked twice a second. The **Sync theme with Meteor** button copies them once
-  instead.
+  instead. The console colours (New in 0.8.0): `console-text` for console lines, `console-note` for the Messenger's notes
+  and `console-name` for the Console entry. They are unset (transparent) by default, so they follow `text` and `dim-text`.
+  Sync theme with Meteor leaves them unset, and Reset theme puts them back to unset.
 - **Replacing the chat (New in 0.5.0).** `replace-chat` (off) turns the game's chat list off: the normal chat lines are not
   drawn, the Messenger window is the only chat display, and Global shows in the overlay. The chat key opens the Messenger
   (as with `take-chat-key`); `/` still opens the normal input line, with its suggestions. The hidden lines can't be clicked
@@ -536,7 +556,9 @@ and sends from the window. Turn it on with the **Messenger** module (category Qw
   `extra-patterns` empty. Sending: `command-template` `/msg {name} {text}`, `send-interval-ms` 1500. History: `save-history`
   off, `max-history` 200, `global-scrollback` 500. Window: `show-overlay` on, `window-opacity` 75, `focus-key` Right Ctrl,
   `take-chat-key` off, `overlay-global` off, `notification-sound` on, `replace-chat` off, `auto-font-scale` on,
-  `system-message-opacity` 55, `show-player-heads` on. Theme: `follow-meteor-theme` off. Debug: `debug-lines` off.
+  `system-message-opacity` 55, `show-player-heads` on. Console (from 0.8.0): `separate-console` off, `global-keeps-joins-leaves`
+  off, `global-keeps-deaths` off, `overlay-shows-console` on, `console-italic` off. Theme: `follow-meteor-theme` off, and the
+  console colours unset. Debug: `debug-lines` off.
 
 ### Stash Manager
 New in 0.4.0-dev and still being tested.
@@ -1100,8 +1122,8 @@ Out of materials:
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) for Minecraft **1.21.11** or **1.21.4**.
 2. Put [Meteor Client](https://meteorclient.com) for the same Minecraft version in your `mods` folder.
 3. Download the `qwerte-addon` jar for your Minecraft version from the
-   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.7.1`, see
-   [Versioning](#versioning) and [Dev builds](#dev-builds)): `qwerte-addon-0.7.1+1.21.11.jar` or `qwerte-addon-0.7.1+1.21.4.jar`.
+   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.8.0`, see
+   [Versioning](#versioning) and [Dev builds](#dev-builds)): `qwerte-addon-0.8.0+1.21.11.jar` or `qwerte-addon-0.8.0+1.21.4.jar`.
    Put it in your `mods` folder. It needs Stash Manager server 1.1.0 or newer for kit v2, and works alongside Stash Sorter plugin 1.17.0.
 4. *(Optional, for auto-walk and refilling)* Download `baritone-api-fabric-1.3.0-<minecraft>.jar` for your version from
    [dekrom's Baritone releases](https://github.com/dekrom/baritone/releases) (for example
@@ -1128,7 +1150,7 @@ Qwerte uses `MAJOR.MINOR.PATCH` versions:
 The `0.4.0-dev.N` counting has ended. 0.5.0 is the first release under this scheme. 0.5.x releases are fixes, 0.6.0 is the
 next feature batch, and 1.0.0 will mark the first stable release.
 
-**Compatibility:** Qwerte **0.7.1** needs [Stash Manager server](stash-manager-server/README.md) **1.1.0** or newer for kit v2
+**Compatibility:** Qwerte **0.8.0** needs [Stash Manager server](stash-manager-server/README.md) **1.1.0** or newer for kit v2
 (**1.2.0** is current), and works alongside the Stash Sorter plugin **1.17.0** (see
 [Stash Sorter for AquariusProxy](https://github.com/Qwertze/Stash-Sorter)).
 

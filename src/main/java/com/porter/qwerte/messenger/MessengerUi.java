@@ -69,6 +69,15 @@ public final class MessengerUi {
         /** How opaque console lines (system messages, notices) are drawn in Global, 0 to 1. Player chat is always full. */
         float consoleOpacity();
 
+        /** The Console entry (console lines apart from Global) is on. */
+        boolean separateConsole();
+
+        /** Draw console lines in italics. */
+        boolean consoleItalic();
+
+        /** The always-on overlay also shows the Console lines, dimmed and interleaved by time with Global (separate-console on). */
+        boolean overlayShowsConsole();
+
         /** Draw the sender's head in front of a public chat line. */
         boolean showHeads();
     }
@@ -111,6 +120,8 @@ public final class MessengerUi {
     private static final int EMOJI_DRAW = 9;
     private static final int EMOJI_ADVANCE = 10;
     private static final String GLOBAL_DRAFT = "#global";
+    /** The selection key of the Console entry; no player name can start with a hash, so it never meets a conversation. */
+    static final String CONSOLE_KEY = "#console";
     private static final long WRAP_SETTLE_MS = 100;
     private static final int HEAD = 8;
     private static final int HEAD_ADVANCE = 10;
@@ -191,6 +202,21 @@ public final class MessengerUi {
     private Rect dlgNo = winRect;
     private int pickCols = 1;
     private List<Conversation> shownList = List.of();
+    /** The Console entry is in the list (separate-console on). */
+    private boolean consoleRow;
+    /** The Console is what the history area shows now. */
+    private boolean consoleShown;
+    /** The window is focused as this frame is drawn (the overlay is not). */
+    private boolean drawFocus;
+    // Global and Console lines in one list by time, for the overlay (one list object, changed in place so the wrapped blocks are kept)
+    private final List<Message> merged = new ArrayList<>();
+    private ConversationStore mergedStore;
+    private int mergedGlobalSize = -1;
+    private int mergedConsoleSize = -1;
+    private Message mergedGlobalLast;
+    private Message mergedConsoleLast;
+    // The italic form of each wrapped piece, made once (not every frame)
+    private final Map<TextLayout.Piece, Component> italics = new IdentityHashMap<>();
 
     // Wrapped history of the open list, remade only when it changes (a block is kept while its message is)
     private List<Block> blocks = List.of();
@@ -240,6 +266,7 @@ public final class MessengerUi {
         input.setFocused(true);
         Conversation c = selectedConversation();
         if (c != null) host.core().store().markRead(c.name());
+        if (consoleSelected()) host.core().store().markConsoleRead();
     }
 
     /** Called when the screen closes. */
@@ -291,8 +318,24 @@ public final class MessengerUi {
         return selected == null ? GLOBAL_DRAFT : selected;
     }
 
+    /** The Console entry is open (and exists). */
+    private boolean consoleSelected() {
+        return CONSOLE_KEY.equals(selected) && host.separateConsole();
+    }
+
+    /** Shows the Console. */
+    public void selectConsole() {
+        setSelected(CONSOLE_KEY);
+        if (focused) host.core().store().markConsoleRead();
+    }
+
+    /** The Console is open in front of the user (a new console line counts as read). */
+    public boolean isReadingConsole() {
+        return focused && consoleSelected();
+    }
+
     private void updateHint() {
-        String hint = selected == null ? "Say it in public chat (/ for a command)" : "Message";
+        String hint = consoleSelected() ? "The Console is read only" : selected == null ? "Say it in public chat (/ for a command)" : "Message";
         input.setHint(Component.literal(hint).withStyle(net.minecraft.ChatFormatting.DARK_GRAY));
     }
 
@@ -426,7 +469,10 @@ public final class MessengerUi {
         }
         List<Conversation> list = ordered;
         shownList = list;
-        if (selected != null && store.get(selected) == null) { // it was deleted (or this is another server)
+        consoleRow = host.separateConsole();
+        drawFocus = focus;
+        if (CONSOLE_KEY.equals(selected) && !consoleRow) setSelected(null); // separate-console was turned off
+        if (selected != null && !CONSOLE_KEY.equals(selected) && store.get(selected) == null) { // it was deleted (or this is another server)
             String dead = selected;
             setSelected(null);
             drafts.remove(dead);
@@ -435,11 +481,14 @@ public final class MessengerUi {
         if (focus && sel != null) store.markRead(sel.name());
         // The always-on overlay keeps to whispers unless overlay-global is on: a busy public chat is not shown over the game
         Conversation shown = sel;
-        boolean globalShown = sel == null;
+        boolean globalShown = sel == null; // Global, or the Console (drawn like it)
         if (!focus && sel == null && !host.overlayGlobal()) {
             shown = list.isEmpty() ? null : list.get(0);
             globalShown = false;
         }
+        // The overlay (not focused) never shows the Console alone: it shows Global, with the console lines mixed in when overlay-shows-console is on
+        consoleShown = focus && globalShown && consoleSelected();
+        if (focus && consoleShown) store.markConsoleRead();
 
         layout(w, focus, font);
 
@@ -447,8 +496,8 @@ public final class MessengerUi {
         g.fill(winRect.x1, winRect.y1, winRect.x2, winRect.y2, bg(ThemeColor.WINDOW));
         g.fill(titleRect.x1, titleRect.y1, titleRect.x2, titleRect.y2, bg(ThemeColor.HEADER));
         int total = store.totalUnread();
-        String title = "Messenger" + (shown != null ? " - " + shown.name() : globalShown ? " - Global" : "")
-            + (globalShown && core.globalQueued() ? " (sending...)" : "") + (total > 0 ? " (" + total + ")" : "");
+        String title = "Messenger" + (shown != null ? " - " + shown.name() : consoleShown ? " - Console" : globalShown ? " - Global" : "")
+            + (globalShown && !consoleShown && core.globalQueued() ? " (sending...)" : "") + (total > 0 ? " (" + total + ")" : "");
         if (!plan.history() && status != null && System.currentTimeMillis() <= statusUntil) title = status; // the messages (where it is shown) are hidden
         int titleX = btnList.w() > 0 ? btnList.x2 + 3 : titleRect.x1 + 4;
         int titleMax = (btnNew.w() > 0 ? btnNew.x1 : titleRect.x2) - titleX - 4;
@@ -462,7 +511,7 @@ public final class MessengerUi {
 
         if (listRect.w() > 0) {
             g.fill(listRect.x1, listRect.y1, listRect.x2, listRect.y2, bg(ThemeColor.LEFT_PANE));
-            drawList(g, font, list, focus, mx, my, shown == null ? null : shown.key(), globalShown);
+            drawList(g, font, list, focus, mx, my, shown == null ? null : shown.key(), globalShown && !consoleShown);
         }
         if (plan.history()) {
             if (focus && contactOpen) drawContacts(g, font, mx, my);
@@ -572,17 +621,32 @@ public final class MessengerUi {
 
     private void drawList(GuiGraphics g, Font font, List<Conversation> list, boolean focus, int mx, int my, String shownKey, boolean globalShown) {
         g.enableScissor(listRect.x1, listRect.y1, listRect.x2, listRect.y2);
-        int rowsTotal = 1 + list.size(); // Global is the first row
+        int specials = consoleRow ? 2 : 1; // Global is the first row, then the Console (when separate)
+        int rowsTotal = specials + list.size();
         int rows = Math.max(1, listRect.h() / ROW_H);
         listScroll = Math.max(0, Math.min(listScroll, Math.max(0, rowsTotal - rows)));
         for (int i = listScroll; i < rowsTotal; i++) {
             int y = listRect.y1 + (i - listScroll) * ROW_H;
             if (y >= listRect.y2) break;
-            Conversation c = i == 0 ? null : list.get(i - 1);
+            boolean consoleEntry = consoleRow && i == 1;
+            Conversation c = i < specials ? null : list.get(i - specials);
             Rect row = new Rect(listRect.x1, y, listRect.x2, y + ROW_H);
-            boolean isSel = c == null ? globalShown : c.key().equals(shownKey);
+            boolean isSel = consoleEntry ? consoleShown : c == null ? globalShown : c.key().equals(shownKey);
             if (isSel) g.fill(row.x1, row.y1, row.x2, row.y2, bg(ThemeColor.SELECTED));
             else if (focus && row.contains(mx, my)) g.fill(row.x1, row.y1, row.x2, row.y2, bg(ThemeColor.HOVER));
+            if (consoleEntry) {
+                int unread = host.core().store().consoleUnread();
+                int badgeW = 0;
+                if (unread > 0) {
+                    String n = unread > 99 ? "99+" : String.valueOf(unread);
+                    int bw = font.width(n) + 6;
+                    g.fill(row.x2 - bw - 2, row.y1 + 2, row.x2 - 2, row.y2 - 2, col(ThemeColor.BADGE));
+                    g.drawString(font, n, row.x2 - bw + 1, row.y1 + 2, MessengerTheme.textOn(col(ThemeColor.BADGE)), false);
+                    badgeW = bw + 3;
+                }
+                g.drawString(font, font.plainSubstrByWidth("Console", Math.max(8, row.w() - badgeW - 8)), row.x1 + 4, row.y1 + 2, col(ThemeColor.CONSOLE_NAME), false);
+                continue;
+            }
             if (c == null) {
                 g.drawString(font, "Global", row.x1 + 4, row.y1 + 2, col(ThemeColor.ACCENT), false);
                 continue;
@@ -602,7 +666,7 @@ public final class MessengerUi {
             g.drawString(font, name, dotX + DOT + DOT_GAP, row.y1 + 2, friend ? col(ThemeColor.FRIEND) : col(online(c.name()) ? ThemeColor.ONLINE_NAME : ThemeColor.TEXT), false);
         }
         if (list.isEmpty()) {
-            int y = listRect.y1 + (1 - listScroll) * ROW_H + 3;
+            int y = listRect.y1 + (specials - listScroll) * ROW_H + 3;
             if (y < listRect.y2) g.drawString(font, "No whispers yet", listRect.x1 + 5, y, col(ThemeColor.DIM), false);
         }
         g.disableScissor();
@@ -655,12 +719,12 @@ public final class MessengerUi {
             g.disableScissor();
             return;
         }
-        List<Message> msgs = global ? store.global() : sel.messages();
+        List<Message> msgs = consoleShown ? store.console() : global ? globalOrMerged(store) : sel.messages();
         int gap = global ? GLOBAL_GAP : GAP;
         int innerW = histRect.w() - 2 * PAD - 8;
         List<Block> bl = blocks(msgs, global, innerW, font);
         if (msgs.isEmpty() && global) {
-            g.drawString(font, "Public chat shows up here.", histRect.x1 + 6, histRect.y1 + 6, col(ThemeColor.DIM), false);
+            g.drawString(font, consoleShown ? "Console lines (server messages, notices) show up here." : "Public chat shows up here.", histRect.x1 + 6, histRect.y1 + 6, col(ThemeColor.DIM), false);
         }
         int total = 0;
         for (Block b : bl) total += b.height + gap;
@@ -687,6 +751,23 @@ public final class MessengerUi {
         g.disableScissor();
     }
 
+    /** Global, or (in the overlay with overlay-shows-console) Global and the Console by time. */
+    private List<Message> globalOrMerged(ConversationStore store) {
+        if (drawFocus || !host.separateConsole() || !host.overlayShowsConsole()) return store.global();
+        List<Message> g = store.global();
+        List<Message> c = store.console();
+        Message gl = g.isEmpty() ? null : g.get(g.size() - 1);
+        Message cl = c.isEmpty() ? null : c.get(c.size() - 1);
+        if (store == mergedStore && g.size() == mergedGlobalSize && c.size() == mergedConsoleSize && gl == mergedGlobalLast && cl == mergedConsoleLast) return merged;
+        TimeMerge.merge(g, c, merged);
+        mergedStore = store;
+        mergedGlobalSize = g.size();
+        mergedConsoleSize = c.size();
+        mergedGlobalLast = gl;
+        mergedConsoleLast = cl;
+        return merged;
+    }
+
     private void drawStatus(GuiGraphics g, Font font) {
         if (status == null) return;
         if (System.currentTimeMillis() > statusUntil) {
@@ -700,11 +781,24 @@ public final class MessengerUi {
         g.disableScissor();
     }
 
+    /** Draws a piece of message text with a shadow, optionally in italics. */
+    private void text(GuiGraphics g, Font font, TextLayout.Piece p, int x, int y, int color, boolean italic) {
+        if (italic) {
+            if (italics.size() > 4000) italics.clear();
+            Component c = italics.computeIfAbsent(p, k -> Component.literal(k.text()).withStyle(net.minecraft.ChatFormatting.ITALIC));
+            g.drawString(font, c, x, y, color, true);
+        } else {
+            g.drawString(font, p.text(), x, y, color, true);
+        }
+    }
+
     private void drawBlock(GuiGraphics g, Font font, Block b, int top, boolean global) {
         Message m = b.message;
         Direction d = m.direction();
         int color = d == Direction.IN ? col(ThemeColor.INCOMING) : d == Direction.OUT ? col(ThemeColor.OWN) : col(ThemeColor.DIM);
-        if (global && d == Direction.IN) color = col(ThemeColor.TEXT); // public chat is plain text, no bubbles
+        if (global && d == Direction.IN) color = col(b.console ? ThemeColor.CONSOLE_TEXT : ThemeColor.TEXT); // public chat is plain text, no bubbles
+        if (b.console && d == Direction.NOTE) color = col(ThemeColor.CONSOLE_NOTE);
+        boolean italic = b.console && host.consoleItalic();
         if (m.state() == Message.State.SENDING) color = 0xFF9FB3A5;
         if (m.state() == Message.State.FAILED) color = 0xFFB07070;
         if (b.console) color = MessengerTheme.scaleAlpha(color, host.consoleOpacity());
@@ -725,9 +819,9 @@ public final class MessengerUi {
             if (first && b.head != null) PlayerHeads.draw(g, b.head, left + 1, y + 1, HEAD);
             for (TextLayout.Piece p : line.pieces()) {
                 if (p.emojiFile() != null) {
-                    if (!textures.draw(g, p.emojiFile(), x, y + 1, EMOJI_DRAW)) g.drawString(font, p.text(), x, y + 1, color, true);
+                    if (!textures.draw(g, p.emojiFile(), x, y + 1, EMOJI_DRAW)) text(g, font, p, x, y + 1, color, italic);
                 } else {
-                    g.drawString(font, p.text(), x, y + 1, color, true);
+                    text(g, font, p, x, y + 1, color, italic);
                 }
                 x += p.width();
             }
@@ -753,6 +847,7 @@ public final class MessengerUi {
      * that was wrapped before keeps its block, so a busy public chat does not wrap everything again for each new line.
      */
     private List<Block> blocks(List<Message> msgs, boolean global, int width, Font font) {
+        boolean consoleView = consoleShown;
         Message last = msgs.isEmpty() ? null : msgs.get(msgs.size() - 1);
         boolean heads = global && host.showHeads(); // what the blocks are made with (whisper views never have heads)
         if (msgs == blocksSrc && msgs.size() == blocksSize && last == blocksLast && BlockCacheKey.same(width, scale, heads, blocksWidth, blocksScale, blocksHeads)) return blocks;
@@ -777,7 +872,10 @@ public final class MessengerUi {
                 return EMOJI_ADVANCE;
             }
         };
-        if (!BlockCacheKey.same(width, scale, heads, blocksWidth, blocksScale, blocksHeads) || msgs != blocksSrc) blockCache = new IdentityHashMap<>();
+        if (!BlockCacheKey.same(width, scale, heads, blocksWidth, blocksScale, blocksHeads) || msgs != blocksSrc) {
+            blockCache = new IdentityHashMap<>();
+            italics.clear(); // its pieces are gone with the old blocks
+        }
         Map<Message, Block> used = new IdentityHashMap<>();
         List<Block> out = new ArrayList<>(msgs.size());
         int bubble = global ? width : Math.max(40, width * 85 / 100);
@@ -785,7 +883,7 @@ public final class MessengerUi {
             Block b = blockCache.get(m);
             if (b == null) {
                 int wrap = m.direction() == Direction.NOTE ? width : bubble;
-                boolean console = global && isConsole(m);
+                boolean console = global && (consoleView || isConsole(m));
                 String head = heads && !console && m.direction() == Direction.IN ? LineKind.sender(m.text()) : null;
                 List<TextLayout.Line> lines = TextLayout.wrap(m.text(), head != null ? wrap - HEAD_ADVANCE : wrap, emoji, measure);
                 b = new Block(m, lines, lines.size() * LINE_H, console, head);
@@ -898,7 +996,7 @@ public final class MessengerUi {
     // ----- delete / clear -----
 
     private void drawConfirm(GuiGraphics g, Font font, int mx, int my) {
-        String question = confirm == Confirm.CLEAR ? "Clear the Global log?" : "Delete the conversation with " + confirmName + "?";
+        String question = confirm == Confirm.CLEAR ? (consoleSelected() ? "Clear the Console log?" : "Clear the Global log?") : "Delete the conversation with " + confirmName + "?";
         String yes = confirm == Confirm.CLEAR ? "Clear" : "Delete";
         String no = "Cancel";
         int w = Math.min(histRect.w() - 8, Math.max(font.width(question) + 16, 120));
@@ -919,9 +1017,11 @@ public final class MessengerUi {
     private void doConfirm() {
         ConversationStore store = host.core().store();
         if (confirm == Confirm.CLEAR) {
-            store.clearGlobal();
+            boolean console = consoleSelected();
+            if (console) store.clearConsole();
+            else store.clearGlobal();
             blocksSrc = null;
-            setStatus("Cleared the Global log.");
+            setStatus(console ? "Cleared the Console log." : "Cleared the Global log.");
         } else if (confirm == Confirm.DELETE && confirmName != null) {
             store.remove(confirmName);
             if (selected != null && selected.equals(Conversation.key(confirmName))) setSelected(null);
@@ -1001,7 +1101,8 @@ public final class MessengerUi {
         if (btnDelete.contains(x, y)) {
             Conversation c = selectedConversation();
             if (c == null) {
-                if (host.core().store().global().isEmpty()) setStatus("Nothing to clear.");
+                boolean none = consoleSelected() ? host.core().store().console().isEmpty() : host.core().store().global().isEmpty();
+                if (none) setStatus("Nothing to clear.");
                 else confirm = Confirm.CLEAR;
             } else {
                 confirm = Confirm.DELETE;
@@ -1017,13 +1118,18 @@ public final class MessengerUi {
         }
         if (listRect.contains(x, y)) {
             int idx = listScroll + ((int) y - listRect.y1) / ROW_H;
+            int specials = consoleRow ? 2 : 1;
             if (idx == 0) {
                 if (contactOpen) closeContacts();
                 selectGlobal();
                 listView = false;
-            } else if (idx <= shownList.size()) {
+            } else if (consoleRow && idx == 1) {
                 if (contactOpen) closeContacts();
-                select(shownList.get(idx - 1).name());
+                selectConsole();
+                listView = false;
+            } else if (idx - specials < shownList.size()) {
+                if (contactOpen) closeContacts();
+                select(shownList.get(idx - specials).name());
                 listView = false;
             }
             return true;
@@ -1201,6 +1307,10 @@ public final class MessengerUi {
         String text = input.getValue();
         if (text.isBlank()) return;
         long now = System.currentTimeMillis();
+        if (consoleSelected()) {
+            setStatus("The Console is read only. Pick Global or a player to write.");
+            return;
+        }
         Conversation c = selectedConversation();
         String error = c == null ? host.core().sendGlobal(text, now, host.meteorPrefix()) : host.core().send(c.name(), text, now);
         if (error != null) {

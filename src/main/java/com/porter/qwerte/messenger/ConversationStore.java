@@ -24,6 +24,11 @@ public final class ConversationStore {
     private final Map<String, Conversation> byKey = new HashMap<>();
     /** The public chat of this server, oldest first: lines from the chat feed (IN) and notes from the Messenger. */
     private final List<Message> global = new ArrayList<>();
+    /** The Console of this server (with separate-console on): console lines that arrived, and notes. Oldest first. */
+    private final List<Message> console = new ArrayList<>();
+    private int consoleUnread;
+    /** The Console is on (separate-console). Off: it has no unread count and adds nothing to the total. */
+    private boolean consoleVisible = true;
     private int globalCap = DEFAULT_GLOBAL_CAP;
     private int cap;
     private boolean dirty;
@@ -70,6 +75,65 @@ public final class ConversationStore {
         return m;
     }
 
+    /** The Console log, oldest first. Do not change from outside; use the store. */
+    public List<Message> console() {
+        return console;
+    }
+
+    /** A console line that arrived. {@code reading}: the Console is open in front of the user, so it counts as read. */
+    public Message addConsole(String text, long now, boolean reading) {
+        Message m = new Message(Direction.IN, text, now, Message.State.SENT);
+        m.console(true);
+        console.add(m);
+        trimConsole();
+        globalDirty = true;
+        if (!reading && consoleVisible) consoleUnread++;
+        return m;
+    }
+
+    /** A line from the Messenger itself in the Console (not saved, not unread). */
+    public Message addConsoleNote(String text, long now) {
+        Message m = new Message(Direction.NOTE, text, now, Message.State.SENT);
+        console.add(m);
+        trimConsole();
+        return m;
+    }
+
+    /** Loading from a file: adds a console line without marking anything to save. */
+    Message addConsoleLoaded(String text, long time) {
+        Message m = new Message(Direction.IN, text, time, Message.State.SENT);
+        m.console(true);
+        console.add(m);
+        trimConsole();
+        return m;
+    }
+
+    public int consoleUnread() {
+        return consoleVisible ? consoleUnread : 0;
+    }
+
+    /** Whether the Console is shown. Turning it off forgets its unread count, so no stale "(5)" is left in the title. */
+    public void consoleVisible(boolean visible) {
+        consoleVisible = visible;
+        if (!visible) consoleUnread = 0;
+    }
+
+    public void markConsoleRead() {
+        consoleUnread = 0;
+    }
+
+    /** Forgets the Console log. */
+    public void clearConsole() {
+        if (console.stream().anyMatch(m -> m.direction() != Direction.NOTE)) globalDirty = true;
+        console.clear();
+        consoleUnread = 0;
+    }
+
+    private void trimConsole() {
+        int over = console.size() - globalCap;
+        if (over > 0) console.subList(0, over).clear();
+    }
+
     /** A line from the Messenger itself in the public log (not saved). */
     public Message addGlobalNote(String text, long now) {
         Message m = new Message(Direction.NOTE, text, now, Message.State.SENT);
@@ -95,6 +159,7 @@ public final class ConversationStore {
     private void trimGlobal() {
         int over = global.size() - globalCap;
         if (over > 0) global.subList(0, over).clear();
+        trimConsole();
     }
 
     /** Changes the per-player cap; longer histories are cut at once. */
@@ -218,6 +283,20 @@ public final class ConversationStore {
             global.sort(Comparator.comparingLong(Message::time));
             trimGlobal();
         }
+        Set<String> seenConsole = new HashSet<>();
+        for (Message m : console) seenConsole.add(signature(m));
+        boolean addedConsole = false;
+        for (Message m : other.console) {
+            if (m.direction() != Direction.IN || !seenConsole.add(signature(m))) continue;
+            Message copy = new Message(Direction.IN, m.text(), m.time(), Message.State.SENT);
+            copy.console(true);
+            console.add(copy);
+            addedConsole = true;
+        }
+        if (addedConsole) {
+            console.sort(Comparator.comparingLong(Message::time));
+            trimConsole();
+        }
         version++;
     }
 
@@ -247,7 +326,7 @@ public final class ConversationStore {
     public int totalUnread() {
         int n = 0;
         for (Conversation c : byKey.values()) n += c.unread();
-        return n;
+        return n + (consoleVisible ? consoleUnread : 0);
     }
 
     /** Forgets one conversation. */
@@ -259,9 +338,11 @@ public final class ConversationStore {
     }
 
     public void clear() {
-        if (!byKey.isEmpty() || !global.isEmpty()) { dirty = true; globalDirty = true; }
+        if (!byKey.isEmpty() || !global.isEmpty() || !console.isEmpty()) { dirty = true; globalDirty = true; }
         byKey.clear();
         global.clear();
+        console.clear();
+        consoleUnread = 0;
         version++;
     }
 

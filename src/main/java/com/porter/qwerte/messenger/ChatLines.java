@@ -23,6 +23,13 @@ public final class ChatLines {
         return LineKind.isConsole(tag == null ? null : tag.logTag(), key, ComponentText.plain(message), prefixes);
     }
 
+    /** The type of a chat line for the Console routing. See {@link LineKind#type}. */
+    public static LineKind.Type type(Component message, GuiMessageTag tag, List<String> prefixes) {
+        if (message == null) return LineKind.Type.PLAYER;
+        String key = message.getContents() instanceof TranslatableContents tc ? tc.getKey() : null;
+        return LineKind.type(tag == null ? null : tag.logTag(), key, ComponentText.plain(message), prefixes);
+    }
+
     /**
      * @param isOnline whether a player of that name is on the server (used to pick the name out of a decorated display
      *                 name like "[Mod] Steve")

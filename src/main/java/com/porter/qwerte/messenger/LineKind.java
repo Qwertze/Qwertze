@@ -60,6 +60,41 @@ public final class LineKind {
         return false;
     }
 
+    /** What a public chat line is, for the Console routing ({@link ConsoleRoute}). */
+    public enum Type {
+        /** Player chat. */
+        PLAYER,
+        /** A notice of the client: Meteor, Baritone, a module or addon. */
+        NOTICE,
+        /** A player joined or left. */
+        JOIN_LEAVE,
+        /** A death message. Only recognised by its translation key (2b2t sends deaths as plain text). */
+        DEATH,
+        /** An advancement, challenge or goal. */
+        ADVANCEMENT,
+        /** Any other server or system line. */
+        SERVER
+    }
+
+    private static final Pattern JOIN_LEAVE_TEXT = Pattern.compile("^\\S{1,32} (joined|left) the game$");
+    private static final Pattern ADVANCEMENT_TEXT = Pattern.compile("^\\S{1,32} has (made the advancement|completed the challenge|reached the goal) \\[.*", Pattern.DOTALL);
+
+    /** The type of a line; {@link Type#PLAYER} exactly when {@link #isConsole} is false. */
+    public static Type type(String tag, String key, String text, List<String> prefixes) {
+        if (!isConsole(tag, key, text, prefixes)) return Type.PLAYER;
+        if (key != null) {
+            if (key.startsWith("multiplayer.player.joined") || key.startsWith("multiplayer.player.left")) return Type.JOIN_LEAVE;
+            if (key.startsWith("death.")) return Type.DEATH;
+            if (key.startsWith("chat.type.advancement.")) return Type.ADVANCEMENT;
+            return Type.SERVER;
+        }
+        String t = ChatText.stripClientPrefix(ChatText.clean(text, 200)).strip();
+        if (isNotice(t, prefixes) || (tag != null && tag.equalsIgnoreCase("Meteor"))) return Type.NOTICE;
+        if (JOIN_LEAVE_TEXT.matcher(t).matches()) return Type.JOIN_LEAVE;
+        if (ADVANCEMENT_TEXT.matcher(t).matches()) return Type.ADVANCEMENT;
+        return Type.SERVER;
+    }
+
     /** Whether the line starts with one of the client's notice prefixes ("[Meteor]", ...): a line the client itself made. */
     public static boolean isNotice(String text, List<String> prefixes) {
         String t = ChatText.stripClientPrefix(ChatText.clean(text, 200)).strip();

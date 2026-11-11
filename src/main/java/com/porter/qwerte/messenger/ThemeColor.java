@@ -23,6 +23,9 @@ public enum ThemeColor {
     OWN_BAR("own-message-bar", "The bar beside your messages.", 0x5BD16E),
     INCOMING_BAR("incoming-message-bar", "The bar beside whispers you got.", 0x4FA3FF),
     ACCENT("accent", "Global in the list, dialog and tooltip borders.", 0x4FA3FF),
+    CONSOLE_TEXT("console-text", "Console lines: server and system messages, deaths, joins and leaves, notices (drawn at system-message-opacity). Transparent (alpha 0, the default) uses the text colour.", 0xE6EAF0, TEXT),
+    CONSOLE_NOTE("console-note", "The Messenger's own notes in the console and in Global (\"Ran Meteor command\"). Transparent (alpha 0, the default) uses the dim-text colour.", 0x8A94A0, DIM),
+    CONSOLE_NAME("console-name", "The Console entry in the list. Transparent (alpha 0, the default) uses the dim-text colour.", 0x8A94A0, DIM),
     WARNING("warning", "The \"sending...\" tag.", 0xE0C060),
     ERROR("error", "Errors and \"not sent\".", 0xE06868);
 
@@ -30,10 +33,30 @@ public enum ThemeColor {
     private final String description;
     private final int rgb;
 
+    private final ThemeColor fallback;
+
     ThemeColor(String settingName, String description, int rgb) {
+        this(settingName, description, rgb, null);
+    }
+
+    ThemeColor(String settingName, String description, int rgb, ThemeColor fallback) {
         this.settingName = settingName;
         this.description = description;
         this.rgb = rgb;
+        this.fallback = fallback;
+    }
+
+    /**
+     * The colour used while this one is "unset" (transparent, alpha 0, which is its default), or null if it always has
+     * a value of its own. A user who changed the text colours so sees the same colours on the new parts of the window.
+     */
+    public ThemeColor fallback() {
+        return fallback;
+    }
+
+    /** The alpha of the default: 0 (unset) for a colour with a fallback, else 255. */
+    public int defaultAlpha() {
+        return fallback == null ? 255 : 0;
     }
 
     public String settingName() {
@@ -49,8 +72,8 @@ public enum ThemeColor {
         return rgb;
     }
 
-    /** The default as 0xAARRGGBB (opaque). */
+    /** The default as 0xAARRGGBB: opaque, or (a colour with a fallback) transparent, meaning unset. */
     public int defaultArgb() {
-        return 0xFF000000 | rgb;
+        return (defaultAlpha() << 24) | rgb;
     }
 }

@@ -55,6 +55,14 @@ public final class ServerStores {
         return key != null && VALID.matcher(key).matches();
     }
 
+    private boolean consoleVisible = true;
+
+    /** The Console is on or off for every server (off: no unread count). */
+    public void consoleVisible(boolean visible) {
+        consoleVisible = visible;
+        for (ConversationStore s : byServer.values()) s.consoleVisible(visible);
+    }
+
     public ConversationStore current() {
         return store(current);
     }
@@ -75,6 +83,7 @@ public final class ServerStores {
             if (byServer.size() >= MAX_SERVERS) evict();
             s = new ConversationStore(cap);
             s.globalCap(globalCap);
+            s.consoleVisible(consoleVisible);
             byServer.put(key, s);
         }
         return s;

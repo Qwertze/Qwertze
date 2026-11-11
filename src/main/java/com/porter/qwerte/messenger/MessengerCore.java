@@ -159,17 +159,50 @@ public final class MessengerCore {
      * @return true if the line was added; false if it was empty or a repeat of the line just before
      */
     public boolean receiveGlobal(String line, long now, Boolean console) {
+        String text = acceptPublic(line, now);
+        if (text == null) return false;
+        store().addGlobal(text, now).console(console);
+        return true;
+    }
+
+    /**
+     * A console line for the Console entry (separate-console on). The same repeat check as {@link #receiveGlobal}.
+     *
+     * @param reading the Console is open in front of the user (counts as read)
+     * @return true if the line was added
+     */
+    public boolean receiveConsole(String line, long now, boolean reading) {
+        String text = acceptPublic(line, now);
+        if (text == null) return false;
+        store().addConsole(text, now, reading);
+        return true;
+    }
+
+    /** With separate-console on the Messenger's own notes go to the Console, else to Global. */
+    public void separateConsole(boolean separate) {
+        this.separateConsole = separate;
+        stores.consoleVisible(separate);
+    }
+
+    private boolean separateConsole;
+
+    private void note(String text, long now) {
+        if (ConsoleRoute.routeNote(separateConsole) == ConsoleRoute.Target.CONSOLE) store().addConsoleNote(text, now);
+        else store().addGlobalNote(text, now);
+    }
+
+    /** The cleaned text of a public line, or null if it is empty or a repeat of the line just before. */
+    private String acceptPublic(String line, long now) {
         String text = ChatText.message(line);
-        if (text.isEmpty()) return false;
+        if (text.isEmpty()) return null;
         // The same line delivered twice at once (a mod that re-adds a line it changed): show it once. The comparison
         // ignores a timestamp or icon in front, so the two copies need not be identical.
         String key = ChatText.stripClientPrefix(text).strip();
         key = WHITESPACE.matcher(key).replaceAll(" ");
-        if (key.equals(lastGlobalKey) && now - lastGlobalAt >= 0 && now - lastGlobalAt <= DUPLICATE_WINDOW_MS) return false;
+        if (key.equals(lastGlobalKey) && now - lastGlobalAt >= 0 && now - lastGlobalAt <= DUPLICATE_WINDOW_MS) return null;
         lastGlobalKey = key;
         lastGlobalAt = now;
-        store().addGlobal(text, now).console(console);
-        return true;
+        return text;
     }
 
     /** Two public lines this close with the same text are one line delivered twice. */
@@ -236,9 +269,9 @@ public final class MessengerCore {
         boolean ok = p.kind() == Kind.CHAT ? sender.chat(p.payload()) : sender.command(p.payload());
         p.message().state(ok ? Message.State.SENT : Message.State.FAILED);
         if (ok) p.message().sentAt(now);
-        if (p.meteor()) store().addGlobalNote(ok ? "Ran Meteor command" : "Not sent: " + p.label(), now);
-        else if (p.kind() == Kind.COMMAND) store().addGlobalNote(ok ? "Sent " + p.label() : "Not sent: " + p.label(), now);
-        else if (p.kind() == Kind.CHAT && !ok) store().addGlobalNote("Not sent: " + p.label(), now);
+        if (p.meteor()) note(ok ? "Ran Meteor command" : "Not sent: " + p.label(), now);
+        else if (p.kind() == Kind.COMMAND) note(ok ? "Sent " + p.label() : "Not sent: " + p.label(), now);
+        else if (p.kind() == Kind.CHAT && !ok) note("Not sent: " + p.label(), now);
         if (p.kind() == Kind.WHISPER) stores.touch(); // only whispers are worth a save
     }
 
@@ -248,7 +281,7 @@ public final class MessengerCore {
         long now = System.currentTimeMillis();
         for (Pending p : dropped) {
             p.message().state(Message.State.FAILED);
-            if (p.kind() != Kind.WHISPER) store().addGlobalNote("Not sent: " + p.label(), now);
+            if (p.kind() != Kind.WHISPER) note("Not sent: " + p.label(), now);
         }
         if (!dropped.isEmpty()) stores.touch();
     }

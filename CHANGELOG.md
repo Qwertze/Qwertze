@@ -19,6 +19,48 @@ next feature batch, and 1.0.0 will mark the first stable release. The version is
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-11
+
+A pre-release build from the `dev` branch. Nothing in it has been tested in game yet. It is a feature release on 0.7.1 and
+adds one feature: the Messenger Console.
+Works with the same Stash Manager server and Stash Sorter plugin as 0.7.x: Stash Manager server 1.1.0 (kit2) or newer
+(1.2.0 is current), and Stash Sorter plugin 1.17.0.
+
+### Added
+- **Messenger Console (`separate-console`, off by default).** With it on, console and system lines go to their own
+  read-only **Console** entry, placed right after Global in the list, with its own unread badge. Turning it off clears
+  that count.
+  - Console lines are: notices from Meteor and Baritone (including your modules' notices), joins and leaves, deaths,
+    advancements, other server and system lines, and the Messenger's own notes ("Ran Meteor command", "Not sent: ...").
+  - Player chat stays in Global. Whispers are not affected.
+  - Deaths are recognised by the game's translation key (`death.*`) only.
+  - Only lines that arrive while the setting is on go to the Console. Lines already in Global stay there.
+  - The Console keeps as many lines as Global (`global-scrollback`), is saved with `save-history`, and its Clear button
+    empties it after a confirmation. Typing in it is refused.
+- **`global-keeps-joins-leaves`** and **`global-keeps-deaths`** (both off, shown while `separate-console` is on): keep
+  joins and leaves, or deaths, in Global, dimmed, instead of the Console.
+- **`overlay-shows-console`** (on by default, shown while `separate-console` is on): the always-on overlay shows Global
+  and Console merged by time, with Console lines dimmed. This applies while the window is not focused and the overlay
+  shows Global (`overlay-global` on, or `replace-chat`).
+- **`console-italic`** (off): draws console lines in italics, in Global and in the Console.
+- **Theme colours `console-text`, `console-note` and `console-name`.** They default to unset (transparent) and follow
+  `text` (console lines) and `dim-text` (the Messenger's notes and the Console entry). Sync theme with Meteor leaves them
+  unset, and Reset theme puts them back to unset.
+- **Console history.** `save-history` writes an optional `"console"` list for each server in
+  `meteor-client/qwerte/messenger-history.json`, next to its `"global"` list.
+
+### Changed
+- **`system-message-opacity`** now also applies to the Console, not only to Global.
+
+### Known limits
+- 2b2t sends deaths as plain text, so they count as server lines and go to the Console even with `global-keeps-deaths`
+  on.
+- Downgrading to 0.7.x drops the saved Console history on its next save.
+
+### Not tested in game
+- Everything in this release: the Console entry and its routing, the two keep settings, the overlay merge, the italics,
+  the console colours, the Console history and the Clear button.
+
 ## [0.7.1] - 2026-11-11
 
 A pre-release build from the `dev` branch. Nothing in it has been tested in game yet. It is a patch on 0.7.0 and changes

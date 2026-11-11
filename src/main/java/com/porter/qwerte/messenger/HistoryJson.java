@@ -64,7 +64,7 @@ public final class HistoryJson {
     private record Conv(String name, List<Entry> entries) {
     }
 
-    private record Server(String key, List<Conv> convs, List<Entry> global) {
+    private record Server(String key, List<Conv> convs, List<Entry> global, List<Entry> console) {
     }
 
     /** A copy of what would be saved, taken on the client thread; it can be turned into JSON and written on any thread. */
@@ -82,7 +82,7 @@ public final class HistoryJson {
             for (Server s : model) {
                 List<Conv> convs = new ArrayList<>(s.convs().size());
                 for (Conv c : s.convs()) convs.add(new Conv(c.name(), new ArrayList<>(c.entries())));
-                copy.add(new Server(s.key(), convs, new ArrayList<>(s.global())));
+                copy.add(new Server(s.key(), convs, new ArrayList<>(s.global()), new ArrayList<>(s.console())));
             }
             return HistoryJson.render(copy, maxBytes);
         }
@@ -111,7 +111,12 @@ public final class HistoryJson {
             for (Message m : stores.store(key).global()) {
                 if (m.direction() == Direction.IN && m.state() == Message.State.SENT) pub.add(new Entry(Direction.IN, m.text(), m.time()));
             }
-            if (!convs.isEmpty() || !pub.isEmpty()) model.add(new Server(key, convs, pub));
+            // The Console (separate-console): the same, under its own key
+            List<Entry> con = new ArrayList<>();
+            for (Message m : stores.store(key).console()) {
+                if (m.direction() == Direction.IN && m.state() == Message.State.SENT) con.add(new Entry(Direction.IN, m.text(), m.time()));
+            }
+            if (!convs.isEmpty() || !pub.isEmpty() || !con.isEmpty()) model.add(new Server(key, convs, pub, con));
         }
         return new Snapshot(model);
     }
@@ -131,7 +136,7 @@ public final class HistoryJson {
     private static int count(List<Server> model) {
         int n = 0;
         for (Server s : model) {
-            n += s.global().size();
+            n += s.global().size() + s.console().size();
             for (Conv c : s.convs()) n += c.entries().size();
         }
         return n;
@@ -139,7 +144,7 @@ public final class HistoryJson {
 
     private static int countGlobal(List<Server> model) {
         int n = 0;
-        for (Server s : model) n += s.global().size();
+        for (Server s : model) n += s.global().size() + s.console().size(); // the public group: Global and Console
         return n;
     }
 
@@ -161,6 +166,7 @@ public final class HistoryJson {
         for (Server s : model) {
             if (global) {
                 for (Entry e : s.global()) times[i++] = e.at;
+                for (Entry e : s.console()) times[i++] = e.at;
             } else {
                 for (Conv c : s.convs()) {
                     for (Entry e : c.entries()) times[i++] = e.at;
@@ -172,12 +178,13 @@ public final class HistoryJson {
         for (Server s : model) {
             if (global) {
                 s.global().removeIf(e -> e.at <= cutoff);
+                s.console().removeIf(e -> e.at <= cutoff);
             } else {
                 for (Conv c : s.convs()) c.entries().removeIf(e -> e.at <= cutoff);
                 s.convs().removeIf(c -> c.entries().isEmpty());
             }
         }
-        model.removeIf(s -> s.convs().isEmpty() && s.global().isEmpty());
+        model.removeIf(s -> s.convs().isEmpty() && s.global().isEmpty() && s.console().isEmpty());
     }
 
     private static String build(List<Server> model) {
@@ -196,6 +203,7 @@ public final class HistoryJson {
             so.addProperty("server", s.key());
             so.add("conversations", convs);
             if (!s.global().isEmpty()) so.add("global", entries(s.global()));
+            if (!s.console().isEmpty()) so.add("console", entries(s.console()));
             servers.add(so);
         }
         root.add("servers", servers);
@@ -248,7 +256,8 @@ public final class HistoryJson {
                 if (!ServerStores.validKey(key) || convs == null || !convs.isJsonArray()) continue;
                 ConversationStore store = into.store(key);
                 loaded += loadConversations(convs.getAsJsonArray(), store);
-                loadGlobal(so.get("global"), store);
+                loadGlobal(so.get("global"), store, false);
+                loadGlobal(so.get("console"), store, true);
             }
         } else {
             return -1;
@@ -258,7 +267,7 @@ public final class HistoryJson {
     }
 
     /** The optional public chat of a server: only lines that arrived ("in"), cleaned, in time order; the store cuts it to its cap. */
-    private static void loadGlobal(JsonElement element, ConversationStore into) {
+    private static void loadGlobal(JsonElement element, ConversationStore into, boolean console) {
         if (element == null || !element.isJsonArray()) return;
         List<Entry> list = new ArrayList<>();
         for (JsonElement me : element.getAsJsonArray()) {
@@ -271,7 +280,10 @@ public final class HistoryJson {
             if (!clean.isEmpty()) list.add(new Entry(Direction.IN, clean, at));
         }
         list.sort(Comparator.comparingLong(e -> e.at));
-        for (Entry en : list) into.addGlobalLoaded(en.text, en.at);
+        for (Entry en : list) {
+            if (console) into.addConsoleLoaded(en.text, en.at);
+            else into.addGlobalLoaded(en.text, en.at);
+        }
     }
 
     private static int loadConversations(JsonArray convs, ConversationStore into) {
@@ -341,7 +353,7 @@ public final class HistoryJson {
             boolean wasDirty = into.anyDirty();
             for (String key : scratch.keys()) {
                 ConversationStore s = scratch.store(key);
-                if (!s.isEmpty() || !s.global().isEmpty()) into.store(key).mergeFrom(s);
+                if (!s.isEmpty() || !s.global().isEmpty() || !s.console().isEmpty()) into.store(key).mergeFrom(s);
             }
             if (!wasDirty) into.clean();
             return new Loaded(Status.OK, n);

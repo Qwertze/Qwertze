@@ -49,6 +49,9 @@ public final class MessengerTheme {
         m.put(ThemeColor.OWN_BAR, opaque(p.plus()));
         m.put(ThemeColor.INCOMING_BAR, opaque(p.accent()));
         m.put(ThemeColor.ACCENT, opaque(p.accent()));
+        m.put(ThemeColor.CONSOLE_TEXT, opaque(p.text()));
+        m.put(ThemeColor.CONSOLE_NOTE, opaque(p.textSecondary()));
+        m.put(ThemeColor.CONSOLE_NAME, opaque(p.textSecondary()));
         m.put(ThemeColor.WARNING, opaque(p.favorite()));
         m.put(ThemeColor.ERROR, opaque(p.minus()));
         return m;

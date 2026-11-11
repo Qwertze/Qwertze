@@ -8,6 +8,7 @@ import com.porter.qwerte.messenger.ChatLines;
 import com.porter.qwerte.messenger.ChatReplace;
 import com.porter.qwerte.messenger.ChatText;
 import com.porter.qwerte.messenger.ComponentText;
+import com.porter.qwerte.messenger.ConsoleRoute;
 import com.porter.qwerte.messenger.ConversationStore;
 import com.porter.qwerte.messenger.DmFormat;
 import com.porter.qwerte.messenger.DmParser;
@@ -104,7 +105,47 @@ public class Messenger extends Module {
     private final SettingGroup sgHistory = settings.createGroup("History");
     private final SettingGroup sgWindow = settings.createGroup("Window");
     private final SettingGroup sgTheme = settings.createGroup("Theme");
+    private final SettingGroup sgConsole = settings.createGroup("Console");
     private final SettingGroup sgDebug = settings.createGroup("Debug");
+
+    private final Setting<Boolean> separateConsole = sgConsole.add(new BoolSetting.Builder()
+        .name("separate-console")
+        .description("Puts the console lines in their own Console entry next to Global, so they never mix into Global or your whispers: notices from Meteor, Baritone, your modules and addons (including the Messenger's own notes), server and system messages, advancements, and (unless kept below) joins, leaves and deaths. Player chat stays in Global. Off: console lines stay in Global, dimmed as before. Lines already in Global stay there; the Console is read only. When the always-on overlay is showing Global (overlay-global or replace-chat on) and overlay-shows-console is on, it mixes the console lines into Global by time (dimmed); when it shows whispers it has none. The Console entry itself shows only in the focused window.")
+        .defaultValue(false)
+        .onChanged(v -> this.core.separateConsole(v))
+        .build()
+    );
+
+    private final Setting<Boolean> keepJoinsLeaves = sgConsole.add(new BoolSetting.Builder()
+        .name("global-keeps-joins-leaves")
+        .description("With separate-console on: joins and leaves stay in Global (dimmed) instead of the Console.")
+        .defaultValue(false)
+        .visible(() -> separateConsole.get())
+        .build()
+    );
+
+    private final Setting<Boolean> keepDeaths = sgConsole.add(new BoolSetting.Builder()
+        .name("global-keeps-deaths")
+        .description("With separate-console on: death messages stay in Global (dimmed) instead of the Console. Only deaths the server sends as a translated message are recognised; a server that sends them as plain text (2b2t) counts them as server lines.")
+        .defaultValue(false)
+        .visible(() -> separateConsole.get())
+        .build()
+    );
+
+    private final Setting<Boolean> overlayShowsConsole = sgConsole.add(new BoolSetting.Builder()
+        .name("overlay-shows-console")
+        .description("With separate-console on: the always-on overlay also shows the console lines, dimmed and interleaved by time with Global, so server and system messages (and your replace-chat alerts) are not lost from view. The Console entry stays separate when the window is focused. Off: the overlay shows Global only.")
+        .defaultValue(true)
+        .visible(() -> separateConsole.get())
+        .build()
+    );
+
+    private final Setting<Boolean> consoleItalic = sgConsole.add(new BoolSetting.Builder()
+        .name("console-italic")
+        .description("Draws console lines in italics (in Global when they are not separate, and in the Console). The colours are in the Theme group: console-text, console-note, console-name; the opacity is system-message-opacity.")
+        .defaultValue(false)
+        .build()
+    );
 
     private final Setting<Boolean> debugLines = sgDebug.add(new BoolSetting.Builder()
         .name("debug-lines")
@@ -290,7 +331,7 @@ public class Messenger extends Module {
 
     private final Setting<Integer> consoleOpacity = sgWindow.add(new IntSetting.Builder()
         .name("system-message-opacity")
-        .description("How opaque the console lines are drawn in Global, in percent: server messages, deaths, joins and leaves, and notices from Meteor and its addons (like \"[Meteor] Toggled ...\"). Player chat is always at full opacity.")
+        .description("How opaque the console lines are drawn, in Global or in the Console, in percent: server messages, deaths, joins and leaves, and notices from Meteor and its addons (like \"[Meteor] Toggled ...\"). Player chat is always at full opacity.")
         .defaultValue(55)
         .range(10, 100)
         .sliderRange(10, 100)
@@ -324,7 +365,7 @@ public class Messenger extends Module {
             themeColors.put(c, sgTheme.add(new ColorSetting.Builder()
                 .name(c.settingName())
                 .description(c.description())
-                .defaultValue(new SettingColor((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, 255))
+                .defaultValue(new SettingColor((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, c.defaultAlpha()))
                 .build()));
         }
     }
@@ -393,6 +434,21 @@ public class Messenger extends Module {
         @Override
         public int color(ThemeColor color) {
             return themeColor(color);
+        }
+
+        @Override
+        public boolean separateConsole() {
+            return separateConsole.get();
+        }
+
+        @Override
+        public boolean overlayShowsConsole() {
+            return overlayShowsConsole.get();
+        }
+
+        @Override
+        public boolean consoleItalic() {
+            return consoleItalic.get();
         }
 
         @Override
@@ -490,6 +546,7 @@ public class Messenger extends Module {
     public void onActivate() {
         core.template(template.get());
         core.intervalMs(interval.get());
+        core.separateConsole(separateConsole.get());
         core.stores().cap(maxHistory.get());
         core.stores().globalCap(globalScrollback.get());
         core.switchServer(serverKey());
@@ -563,19 +620,24 @@ public class Messenger extends Module {
         boolean whisper = lastWasWhisper;
         lastWasWhisper = false;
         if (whisper || event.isCancelled() || event.getMessage() == null) return;
-        boolean console = ChatLines.isConsole(event.getMessage(), event.getIndicator(), LineKind.NOTICE_PREFIXES);
+        LineKind.Type type = ChatLines.type(event.getMessage(), event.getIndicator(), LineKind.NOTICE_PREFIXES);
+        boolean console = type != LineKind.Type.PLAYER;
+        ConsoleRoute.Target target = ConsoleRoute.route(separateConsole.get(), type, new ConsoleRoute.Keep(keepJoinsLeaves.get(), keepDeaths.get()));
         String shown = ComponentText.plain(event.getMessage()); // no "[Name head]" text of an inline head
-        boolean added = core.receiveGlobal(shown, System.currentTimeMillis(), console);
-        if (debugLines.get()) debugLine(event, shown, console, added);
+        long now = System.currentTimeMillis();
+        boolean added = target == ConsoleRoute.Target.CONSOLE
+            ? core.receiveConsole(shown, now, ui.isReadingConsole())
+            : core.receiveGlobal(shown, now, console);
+        if (debugLines.get()) debugLine(event, shown, console, added, type, target);
     }
 
     /** debug-lines: one line per public chat line in latest.log. Only called when the setting is on. */
-    private void debugLine(ReceiveMessageEvent event, String shown, boolean console, boolean added) {
+    private void debugLine(ReceiveMessageEvent event, String shown, boolean console, boolean added, LineKind.Type type, ConsoleRoute.Target target) {
         String display = ChatText.message(shown);
         if (LineKind.isNotice(display, LineKind.NOTICE_PREFIXES)) return; // made by the client itself (Meteor, addons): not logged
         String tag = event.getIndicator() == null ? "none" : ComponentText.escape(String.valueOf(event.getIndicator().logTag()), 32);
-        LOG.info("[messenger-debug] source=ReceiveMessageEvent tag={} modified={} console={} getString=\"{}\" display=\"{}\" sender={} dedupeDropped={} component={}",
-            tag, event.isModified(), console, ComponentText.escape(event.getMessage().getString(), 512), ComponentText.escape(display, 512),
+        LOG.info("[messenger-debug] source=ReceiveMessageEvent tag={} modified={} console={} type={} target={} getString=\"{}\" display=\"{}\" sender={} dedupeDropped={} component={}",
+            tag, event.isModified(), console, type, target, ComponentText.escape(event.getMessage().getString(), 512), ComponentText.escape(display, 512),
             LineKind.sender(display), !added, ComponentText.structure(event.getMessage(), 2048));
     }
 
@@ -780,6 +842,7 @@ public class Messenger extends Module {
             return followed[c.ordinal()];
         }
         SettingColor s = themeColors.get(c).get();
+        if (s.a == 0 && c.fallback() != null) return themeColor(c.fallback()); // unset: the colour it falls back to
         return (s.a << 24) | (s.r << 16) | (s.g << 8) | s.b;
     }
 
@@ -806,6 +869,11 @@ public class Messenger extends Module {
     public void syncWithMeteorTheme() {
         for (var e : MessengerTheme.fromMeteor(meteorPalette()).entrySet()) {
             int argb = e.getValue();
+            // A colour with a fallback is put back to unset: it then follows the text colours that were just copied
+            if (e.getKey().fallback() != null) {
+                themeColors.get(e.getKey()).set(new SettingColor(0, 0, 0, 0));
+                continue;
+            }
             themeColors.get(e.getKey()).set(new SettingColor((argb >> 16) & 0xFF, (argb >> 8) & 0xFF, argb & 0xFF, 255));
         }
     }
