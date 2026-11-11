@@ -16,6 +16,7 @@ import com.porter.qwerte.messenger.Geometry;
 import com.porter.qwerte.messenger.HistoryJson;
 import com.porter.qwerte.messenger.LineKind;
 import com.porter.qwerte.messenger.MessengerCore;
+import com.porter.qwerte.messenger.MessengerScale;
 import com.porter.qwerte.messenger.MessengerTheme;
 import com.porter.qwerte.messenger.ThemeColor;
 import com.porter.qwerte.messenger.MessengerScreen;
@@ -272,17 +273,17 @@ public class Messenger extends Module {
 
     private final Setting<Boolean> autoFontScale = sgWindow.add(new BoolSetting.Builder()
         .name("auto-font-scale")
-        .description("The text, rows, badges and emoji grow and shrink with the window: its size against the default size (330 x 190), from 0.75x to 2x. Off: font-scale is used.")
+        .description("The text, rows, badges and emoji grow and shrink with the window: its size against the default size (330 x 190), from 0.1x to 2x, with no minimum window size. Very small windows start a drag when clicked near the top. In a narrow window the conversation list collapses (a button in the header shows it), and in a very short one only the messages or the input line is shown. Off: font-scale is used.")
         .defaultValue(true)
         .build()
     );
 
     private final Setting<Double> fontScale = sgWindow.add(new DoubleSetting.Builder()
         .name("font-scale")
-        .description("The scale of the whole window when auto-font-scale is off.")
+        .description("The scale of the whole window when auto-font-scale is off (0.1x to 2x).")
         .defaultValue(1.0)
-        .range(0.75, 2.0)
-        .sliderRange(0.75, 2.0)
+        .range(MessengerScale.MIN, MessengerScale.MAX)
+        .sliderRange(MessengerScale.MIN, MessengerScale.MAX)
         .visible(() -> !autoFontScale.get())
         .build()
     );

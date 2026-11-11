@@ -16,7 +16,7 @@ import java.util.TreeMap;
  * into shulker loads. Nothing here touches Minecraft types, so it can be tested and ported on its own.
  */
 public final class Order {
-    public static final String ITEM = "item", SHULKER = "shulker", CRAFT = "craft";
+    public static final String ITEM = "item", SHULKER = "shulker", CRAFT = "craft", KIT = "kit";
     /** The most steps and take entries a craft block may have (CRAFT-CONTRACT.md "Orders"). */
     public static final int MAX_CRAFT_STEPS = 64, MAX_CRAFT_TAKE = 64;
     /** A line asking for more than this is not read (it shows up as undelivered); the server caps them as well. */
@@ -170,6 +170,8 @@ public final class Order {
     public final RepairEstimate.Estimate repairEstimate;
     /** The craft block (0.4.0-dev.18), or null when the order has no craft lines (or an older server sent none). */
     public final Craft craft;
+    /** The kit block (kit sorting v2, kit orders): the templates ordered and the items they may take; null when the order has no kit lines or an older server sent none. */
+    public final KitOrder.Snapshot kit;
 
     public Order(String id, List<Line> lines) {
         this(id, lines, null);
@@ -184,6 +186,11 @@ public final class Order {
     }
 
     public Order(String id, List<Line> lines, Names names, boolean repairAll, RepairEstimate.Estimate repairEstimate, Craft craft) {
+        this(id, lines, names, repairAll, repairEstimate, craft, null);
+    }
+
+    public Order(String id, List<Line> lines, Names names, boolean repairAll, RepairEstimate.Estimate repairEstimate, Craft craft, KitOrder.Snapshot kit) {
+        this.kit = kit;
         this.id = id;
         this.lines = lines;
         this.names = names;
@@ -202,6 +209,12 @@ public final class Order {
     /** Any line is a craft line. */
     public boolean hasCraft() {
         for (Line l : lines) if (l.type().equals(CRAFT)) return true;
+        return false;
+    }
+
+    /** Any line is a kit line. */
+    public boolean hasKit() {
+        for (Line l : lines) if (l.type().equals(KIT)) return true;
         return false;
     }
 
@@ -231,14 +244,19 @@ public final class Order {
                 String key = l.get("key").getAsString();
                 int count = l.get("count").getAsInt();
                 boolean repair = l.has("repair") && l.get("repair").isJsonPrimitive() && l.get("repair").getAsJsonPrimitive().isBoolean() && l.get("repair").getAsBoolean();
-                if ((type.equals(ITEM) || type.equals(SHULKER) || type.equals(CRAFT)) && !key.isEmpty() && count >= 1 && count <= MAX_LINE_COUNT) lines.add(new Line(type, key, count, repair));
+                if ((type.equals(ITEM) || type.equals(SHULKER) || type.equals(CRAFT) || type.equals(KIT)) && !key.isEmpty() && count >= 1 && count <= MAX_LINE_COUNT) lines.add(new Line(type, key, count, repair));
             } catch (RuntimeException ex) {
                 // A broken line is left out and shows up as undelivered
             }
         }
         String id = o.get("id").getAsString();
         boolean repairAll = o.has("repairAll") && o.get("repairAll").isJsonPrimitive() && o.get("repairAll").getAsJsonPrimitive().isBoolean() && o.get("repairAll").getAsBoolean();
-        return id.isEmpty() || lines.isEmpty() ? null : new Order(id, lines, parseNames(o), repairAll, RepairEstimate.parseEstimate(o.get("repairEstimate")), parseCraft(o.get("craft")));
+        boolean kitLines = false;
+        for (Line l : lines) if (l.type().equals(KIT)) kitLines = true;
+        // Kit lines without a readable kit block: every kit is short (template_mismatch), the rest of the order goes on
+        KitOrder.Snapshot kit = kitLines ? KitOrder.parse(o.get("kit")) : null;
+        if (kitLines && kit == null) kit = KitOrder.Snapshot.unreadable();
+        return id.isEmpty() || lines.isEmpty() ? null : new Order(id, lines, parseNames(o), repairAll, RepairEstimate.parseEstimate(o.get("repairEstimate")), parseCraft(o.get("craft")), kit);
     }
 
     /** The craft block: null for none (absent or null), {@link Craft#unreadable()} for one that is there but not what the contract says. */
@@ -312,7 +330,8 @@ public final class Order {
     /** The total asked for per line key and type, lines with the same type and key merged. */
     public Map<String, Integer> requested() {
         Map<String, Integer> out = new LinkedHashMap<>();
-        for (Line l : lines) out.merge(l.key, l.count, Integer::sum);
+        // A kit line's key is a template id, not an item: kits are counted in result.kit
+        for (Line l : lines) if (!l.type().equals(KIT)) out.merge(l.key, l.count, Integer::sum);
         return out;
     }
 

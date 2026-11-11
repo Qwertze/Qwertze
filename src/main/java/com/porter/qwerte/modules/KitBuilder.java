@@ -77,6 +77,11 @@ final class KitBuilder {
             return false;
         }
 
+        /** This shulker is a routed kit (a copy of a template): it is never taken apart as a source. */
+        default boolean keptKit(ItemStack shulker) {
+            return false;
+        }
+
         /** A dashboard kit template has this name (normalised): the saved kit of that name is left to the dashboard Kit Builder (kit sorting v2). */
         default boolean dashboardKit(String name) {
             return false;
@@ -310,7 +315,30 @@ final class KitBuilder {
     /** The base is a crafted shulker already in the inventory, not one in a container. */
     private static final Spot CRAFTED = new Spot(null, -1);
 
-    private record Plan(Kit kit, Spot base, double distance) {}
+    private record Plan(Kit kit, Spot base, double distance, boolean substituted) {}
+
+    /**
+     * The shulker an order kit is built on: the first one in stash order (then the lowest slot) with this group key that this builder can take from.
+     * Identical incomplete copies share a key, so every user of a base (the plan, the supply, the order runner) picks it here.
+     */
+    private Spot baseSpot(String group) {
+        Stash stash = owner.stash();
+        if (stash == null || group == null) return null;
+        for (Box box : stash.boxes) {
+            if (!box.sortable() || box.stale || !owner.usable(box) || box.contents == null) continue;
+            for (int i = 0; i < box.contents.length; i++) {
+                ItemStack s = box.contents[i];
+                if (!s.isEmpty() && Utils.isShulker(s.getItem()) && group.equals(StashIndex.groupKey(s))) return new Spot(box, i);
+            }
+        }
+        return null;
+    }
+
+    /** The stack of {@link #baseSpot}, or null. */
+    ItemStack baseStack(String group) {
+        Spot spot = baseSpot(group);
+        return spot == null ? null : spot.box.contents[spot.slot];
+    }
 
     /**
      * What the stash has to build with: loose stacks and shulkers of the right items, and empty shulkers. Chests
@@ -350,7 +378,7 @@ final class KitBuilder {
                             // A named empty shulker is left alone, only unnamed ones are built in
                             if (!named) empties.add(new Spot(box, i));
                         }
-                        else if (!entries.isEmpty() && !Kits.claims(s) && !owner.claims(s) && heldKit(s) == null) packed.add(new Packed(box, i, entries));
+                        else if (!entries.isEmpty() && !Kits.claims(s) && !owner.claims(s) && !owner.keptKit(s) && heldKit(s) == null) packed.add(new Packed(box, i, entries));
                     }
                     else if (relevant(kits, s)) loose.add(new Loose(box, i, keys.key(s), s.getCount()));
                 }
@@ -410,16 +438,33 @@ final class KitBuilder {
             }
         }
 
+        // An order kit built on an incomplete copy of its template (kit orders): that very shulker, wherever the stash keeps it. Identical copies share
+        // a group key: the first in stash order is the one, here, in the supply and in the order runner (baseSpot)
+        if (base == null && k.exact && k.baseGroup != null && stash != null) {
+            Spot found = baseSpot(k.baseGroup);
+            if (found != null) {
+                ItemStack[] in = Kits.inside(found.box.contents[found.slot]);
+                if (k.matchesPartial(in)) {
+                    base = found;
+                    have = k.totalsOf(in);
+                }
+            }
+        }
+
         // The finished kit needs a place to go
         if (base == null && !room && !k.exact) return null;
 
+        boolean colourMissed = false;
         if (base == null) {
             for (Spot spot : scan.empties) {
                 if (k.exact && badBases.contains(spot)) continue;
-                if (base == null || emptyRank(spot) < emptyRank(base)) base = spot;
+                if (base == null || emptyRank(spot, k) < emptyRank(base, k)) base = spot;
             }
             if (base == null && k.exact && owner.craftedBase() >= 0) base = CRAFTED;
             if (base == null) return null;
+            // A colour was asked for and none of that colour is left: any colour is used (and noted on the order)
+            // A crafted base is a plain shulker box
+            colourMissed = k.exact && k.shulkerColor != null && (base == CRAFTED ? !k.shulkerColor.equals("plain") : colourMiss(base, k));
         }
 
         Map<Key, Integer> avail = scan.available(k);
@@ -430,13 +475,32 @@ final class KitBuilder {
 
         double distance = k.exact ? 0 : Double.MAX_VALUE;
         for (Box home : homes) distance = Math.min(distance, owner.distance(home));
-        return new Plan(k, base, distance);
+        return new Plan(k, base, distance, colourMissed);
     }
 
     /** Boxes signed for empty shulkers first, then the nearest. */
-    private double emptyRank(Spot spot) {
+    private double emptyRank(Spot spot, Kit k) {
         boolean signed = spot.box.labels.stream().anyMatch(l -> Categories.normalize(l).startsWith("empty shulker"));
-        return (signed ? 0 : 1_000_000_000.0) + owner.distance(spot.box);
+        // The colour asked for first, whatever the signs and the distance say
+        return (k.exact && k.shulkerColor != null && colourMiss(spot, k) ? 4_000_000_000.0 : 0) + (signed ? 0 : 1_000_000_000.0) + owner.distance(spot.box);
+    }
+
+    /** The item id of a template's shulker colour: "plain" is the plain box, a dye colour its coloured box. */
+    static String colourItem(String colour) {
+        return "minecraft:" + (colour.equals("plain") ? "shulker_box" : colour + "_shulker_box");
+    }
+
+    private boolean colourMiss(Spot spot, Kit k) {
+        ItemStack s = spot.box.contents[spot.slot];
+        return !colourItem(k.shulkerColor).equals(net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(s.getItem()).toString());
+    }
+
+    // The base picked when the order kit began was not of the colour asked for
+    private boolean colourMissed;
+
+    /** The empty shulker picked when the order kit began is not of the colour its template asks for (the order notes colour_substituted). */
+    boolean colourSubstituted() {
+        return colourMissed;
     }
 
     /**
@@ -444,6 +508,9 @@ final class KitBuilder {
      * @return true when a kit was started
      */
     boolean begin() {
+        // Retired (kit sorting v2, addon 0.7.0): kits are built from the dashboard's templates through orders and restock; the saved local kits are
+        // only read, for the import into the Kit Builder
+        if (true) return false;
         if (kit != null) return true;
         Stash stash = owner.stash();
         if (stash == null || mc.player == null) return false;
@@ -500,6 +567,7 @@ final class KitBuilder {
         if (kit != null || owner.stash() == null || mc.player == null) return false;
         Plan planned = plan(orderKit, new Scan(List.of(orderKit)));
         if (planned == null) return false;
+        colourMissed = planned.substituted();
 
         kit = orderKit;
         baseSlot = -1;
@@ -545,6 +613,17 @@ final class KitBuilder {
     /** How much of each of the kit's items this builder could take from the stash right now (by its own scan). */
     Map<Key, Integer> supply(Kit k) {
         Map<Key, Integer> avail = new Scan(List.of(k)).available(k);
+        // The incomplete copy an order kit is built on holds part of it already
+        if (k.exact && k.baseGroup != null) {
+            ItemStack baseShulker = baseStack(k.baseGroup);
+            if (baseShulker != null) {
+                for (ItemStack in : Kits.inside(baseShulker)) {
+                    if (in == null || in.isEmpty()) continue;
+                    Key key = k.key(in);
+                    if (k.need(key) != null) avail.merge(key, in.getCount(), Integer::sum);
+                }
+            }
+        }
         // What is carried already counts too (items repaired for an order are carried, no longer in the stash)
         if (mc.player != null) {
             for (int slot : owner.carry()) {

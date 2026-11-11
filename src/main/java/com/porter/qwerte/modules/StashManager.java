@@ -362,6 +362,8 @@ public class StashManager extends Module {
 
     // Orders
     private int pendingOrders;
+    // The first reply of this connection was read (it says whether orders wait): restock never starts before
+    private boolean replyHeard;
     private long lastClaim, lastStatusAt;
     private String lastStatusSig = "";
     private String rejectedId, rejectedWhy, rejectedStatus = "failed";
@@ -593,6 +595,7 @@ public class StashManager extends Module {
         status = "idle";
         lastLogged = "";
         pendingOrders = 0;
+        replyHeard = false;
         lastClaim = lastStatusAt = 0;
         lastStatusSig = "";
         rejectedId = rejectedWhy = null;
@@ -734,7 +737,7 @@ public class StashManager extends Module {
         com.porter.qwerte.stash.KitReport.Built report = kitReport;
         // v2: the cached v2 hash (null with no cache or no types: the server then sends the settings), and what this bot can do with kits
         return new StashIndex.KitsHashes(cached == null ? null : cached.hash(), report == null ? null : report.hash(),
-            cached == null || cached.types() == null ? null : cached.types().hash(), StashIndex.KitOrdersCap.IMPORT_ONLY);
+            cached == null || cached.types() == null ? null : cached.types().hash(), kitCapability());
     }
 
     /** What a heartbeat reply says about kits: new settings are checked and cached (the sorter notices and plans again); the report is asked for or not. */
@@ -783,7 +786,8 @@ public class StashManager extends Module {
             kitBuiltAt = now;
             kitBuiltValid = true;
             com.porter.qwerte.stash.KitSettings cached = com.porter.qwerte.stash.KitStore.shared().get(built.server(), built.stash());
-            kitReport = StashIndex.kitReportV2(stash, includeExcluded.get(), built.player(), inv, cached, sorter == null ? null : sorter::buildingKit);
+            kitReport = StashIndex.kitReportV2(stash, includeExcluded.get(), built.player(), inv, cached, sorter == null ? null : sorter::buildingKit,
+                sorter == null ? null : sorter.restockDecision());
         } catch (RuntimeException e) {
             QwerteAddon.LOG.debug("stash-manager: couldn't build the kit report: {}", e.toString());
             kitReport = null;
@@ -996,13 +1000,15 @@ public class StashManager extends Module {
         }
 
         // Nothing in hand: take the oldest pending order, or the one still held from before a restart
-        if (acceptOrders.get() && blocker == null && stash != null && now - lastClaim >= CLAIM_MS && (pendingOrders > 0 || runner.resumeId() != null)) {
+        if (acceptOrders.get() && blocker == null && stash != null && !runner.restocking() && now - lastClaim >= CLAIM_MS && (pendingOrders > 0 || runner.resumeId() != null)) {
             lastClaim = now;
             JsonObject o = new JsonObject();
             o.addProperty("server", server);
             o.addProperty("stash", name);
             // Said when the claim is made, never earlier: without the flag the server skips orders with craft lines and fails a held one
             com.porter.qwerte.craft.CraftCapability.claimFlag(o, sorter.craftOrdersCapable(), runner.resumeHasCraft());
+            // Kit orders (KIT-CONTRACT v2): without the flag the server skips pending kit orders
+            if (sorter.kitOrdersCapable()) o.addProperty("kitOrders", 1);
             send(base, "/api/v1/orders/claim", bytes(o), key, (code, body) -> {
                 if (code == 204) {
                     pendingOrders = 0;
@@ -1025,6 +1031,36 @@ public class StashManager extends Module {
     // The stash area (0.4.0-dev.20, AREA-CONTRACT.md)
 
     private String areaIgnored;
+
+    /**
+     * What this bot can do with kits (the heartbeat's {@code kitOrders}): the real values. Kit orders and restock are settings (on by default); craft is
+     * true only when the bot also carries out craft orders; the import of the local kits into the Kit Builder is always possible.
+     */
+    /** A heartbeat reply was read on this connection. */
+    boolean replyHeard() {
+        return replyHeard;
+    }
+
+    /** Orders waiting for this bot, by the last reply. */
+    int pendingOrderCount() {
+        return pendingOrders;
+    }
+
+    /** The next loop sends a heartbeat now (restock asks, to hear of waiting orders sooner). */
+    void requestHeartbeat() {
+        lastHeartbeat = 0;
+    }
+
+    boolean ordersAccepted() {
+        return acceptOrders.get();
+    }
+
+    private StashIndex.KitOrdersCap kitCapability() {
+        StashSorter sorter = Modules.get().get(StashSorter.class);
+        boolean orders = sorter != null && sorter.kitOrdersCapable() && acceptOrders.get();
+        // craft is false: kit shortfalls are not crafted (a known limit), so the server must not plan craft steps for a kit order
+        return StashIndex.KitOrdersCap.of(orders, orders && sorter.kitRestockOn());
+    }
 
     private StashIndex.AreaReport areaBody() {
         StashSorter sorter = Modules.get().get(StashSorter.class);
@@ -1427,7 +1463,8 @@ public class StashManager extends Module {
 
         runner.dropSaved(order.id);
         // A craft order is only given to a bot that said it can carry them out (the claim flag); one that arrives anyway is failed, not half done
-        String why = (order.hasCraft() || order.craft != null) && !sorter.craftOrdersCapable() ? "this bot can't carry out craft orders" : runner.offer(order);
+        String why = (order.hasCraft() || order.craft != null) && !sorter.craftOrdersCapable() ? "this bot can't carry out craft orders"
+            : order.hasKit() && !sorter.kitOrdersCapable() ? "this bot can't build kits" : runner.offer(order);
         if (why == null) {
             sorter.orderTaken();
             pendingOrders = Math.max(0, pendingOrders - 1);
@@ -1446,10 +1483,13 @@ public class StashManager extends Module {
             JsonElement e = JsonParser.parseString(body);
             if (!e.isJsonObject() || !e.getAsJsonObject().has("orders")) {
                 pendingOrders = 0;
+                // A server that says nothing about orders has none waiting
+                replyHeard = true;
                 return;
             }
             JsonObject orders = e.getAsJsonObject().getAsJsonObject("orders");
             pendingOrders = orders.has("pending") ? orders.get("pending").getAsInt() : 0;
+            replyHeard = true;
             StashSorter sorter = Modules.get().get(StashSorter.class);
             if (sorter != null && orders.has("cancel") && orders.get("cancel").isJsonArray()) {
                 for (JsonElement id : orders.getAsJsonArray("cancel")) {
@@ -1482,7 +1522,7 @@ public class StashManager extends Module {
         o.add("progress", progress);
         o.addProperty("message", StashIndex.clamp(r.message(), 300));
         // A cancelled craft order still reports what it made and gave back (result.craft); other cancelled orders send no result
-        if (r.terminal() && (!r.status().equals("cancelled") || r.craft() != null)) {
+        if (r.terminal() && (!r.status().equals("cancelled") || r.craft() != null || r.kit() != null)) {
             JsonObject result = new JsonObject();
             result.addProperty("shulkers", r.shulkers());
             JsonArray lines = new JsonArray();
@@ -1498,6 +1538,8 @@ public class StashManager extends Module {
             if (r.repair() != null) result.add("repair", r.repair().toJson());
             // Only when the order had craft lines (CRAFT-CONTRACT.md): numbers, item ids and reason codes only
             if (r.craft() != null) result.add("craft", r.craft());
+            // Only when the order had kit lines (KIT-CONTRACT v2): numbers, template ids, item keys and reason codes only
+            if (r.kit() != null) result.add("kit", r.kit());
             o.add("result", result);
         }
         return o;

@@ -4,8 +4,9 @@ package com.porter.qwerte.messenger;
  * Where the Messenger window is, in GUI pixels. Saved with the module as {@code v1:x,y,w,h}. No Minecraft classes.
  */
 public record Geometry(int x, int y, int w, int h) {
-    public static final int MIN_W = 220;
-    public static final int MIN_H = 130;
+    /** The smallest window: only so that the title bar and the resize grip can still be grabbed and the window grown back. */
+    public static final int MIN_W = 24;
+    public static final int MIN_H = 12;
     /** At least this much of the title bar stays on screen, so the window can always be grabbed. */
     private static final int KEEP = 40;
     private static final String VERSION = "v1:";
@@ -15,14 +16,15 @@ public record Geometry(int x, int y, int w, int h) {
         return new Geometry(6, 6, 330, 190).clamp(screenW, screenH);
     }
 
-    /** Size within the minimum and the screen, position so that the title bar can be reached. */
+    /** Size within the (tiny) minimum and the screen, position so that the title bar can be reached. */
     public Geometry clamp(int screenW, int screenH) {
         int sw = Math.max(1, screenW);
         int sh = Math.max(1, screenH);
         int nw = Math.max(Math.min(MIN_W, sw), Math.min(w, sw));
         int nh = Math.max(Math.min(MIN_H, sh), Math.min(h, sh));
-        int nx = Math.max(KEEP - nw, Math.min(x, sw - KEEP));
-        int ny = Math.max(0, Math.min(y, sh - 14));
+        int keep = Math.min(KEEP, nw);
+        int nx = Math.max(keep - nw, Math.min(x, sw - keep));
+        int ny = Math.max(0, Math.min(y, sh - Math.min(14, nh)));
         return new Geometry(nx, ny, nw, nh);
     }
 

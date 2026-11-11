@@ -171,6 +171,19 @@ public final class MessengerUi {
     private Rect inputRect = winRect;
     private Rect sendRect = winRect;
     private Rect gripRect = winRect;
+    private Rect btnList = winRect;
+    /** The title bar as the mouse sees it: at least 8 real pixels tall, however small the text is. */
+    private Rect titleHit = winRect;
+    private static final Rect NONE = new Rect(0, 0, 0, 0);
+    // The last plan, kept while the size and the flags are the same
+    private int planW = -1;
+    private int planH = -1;
+    private boolean planFocus;
+    private boolean planListView;
+    /** What fits at the current size (see {@link MessengerLayout}). */
+    private MessengerLayout.Plan plan = MessengerLayout.plan(MessengerScale.DEFAULT_W, MessengerScale.DEFAULT_H, false, false);
+    /** The list is collapsed (narrow window) and the user switched to it: it shows instead of the messages. */
+    private boolean listView;
     private Rect searchRect = winRect;
     private Rect contactRect = winRect;
     private Rect dlgRect = winRect;
@@ -232,6 +245,7 @@ public final class MessengerUi {
     /** Called when the screen closes. */
     public void unfocus() {
         focused = false;
+        listView = false;
         drag = Drag.NONE;
         contactOpen = false;
         confirm = Confirm.NONE;
@@ -435,31 +449,40 @@ public final class MessengerUi {
         int total = store.totalUnread();
         String title = "Messenger" + (shown != null ? " - " + shown.name() : globalShown ? " - Global" : "")
             + (globalShown && core.globalQueued() ? " (sending...)" : "") + (total > 0 ? " (" + total + ")" : "");
-        int titleMax = (focus ? btnNew.x1 : titleRect.x2) - titleRect.x1 - 8;
-        g.drawString(font, font.plainSubstrByWidth(title, Math.max(10, titleMax)), titleRect.x1 + 4, titleRect.y1 + 3, col(ThemeColor.TEXT), true);
-        if (focus) {
+        if (!plan.history() && status != null && System.currentTimeMillis() <= statusUntil) title = status; // the messages (where it is shown) are hidden
+        int titleX = btnList.w() > 0 ? btnList.x2 + 3 : titleRect.x1 + 4;
+        int titleMax = (btnNew.w() > 0 ? btnNew.x1 : titleRect.x2) - titleX - 4;
+        if (titleMax > 6 && titleRect.h() >= 9) g.drawString(font, font.plainSubstrByWidth(title, titleMax), titleX, titleRect.y1 + 3, col(ThemeColor.TEXT), true);
+        if (btnList.w() > 0) button(g, font, btnList, listView ? "<" : "=", mx, my, listView);
+        if (focus && btnNew.w() > 0) {
             button(g, font, btnNew, contactOpen ? "Cancel" : "New", mx, my, contactOpen);
             button(g, font, btnEmoji, "Emoji", mx, my, pickerOpen);
             button(g, font, btnDelete, sel == null ? "Clear" : "Delete", mx, my, confirm != Confirm.NONE);
         }
 
-        g.fill(listRect.x1, listRect.y1, listRect.x2, listRect.y2, bg(ThemeColor.LEFT_PANE));
-        drawList(g, font, list, focus, mx, my, shown == null ? null : shown.key(), globalShown);
-        if (focus && contactOpen) drawContacts(g, font, mx, my);
-        else drawHistory(g, font, shown, globalShown, store);
-        drawStatus(g, font);
+        if (listRect.w() > 0) {
+            g.fill(listRect.x1, listRect.y1, listRect.x2, listRect.y2, bg(ThemeColor.LEFT_PANE));
+            drawList(g, font, list, focus, mx, my, shown == null ? null : shown.key(), globalShown);
+        }
+        if (plan.history()) {
+            if (focus && contactOpen) drawContacts(g, font, mx, my);
+            else drawHistory(g, font, shown, globalShown, store);
+            drawStatus(g, font);
+        }
 
         if (focus) {
-            if (pickerOpen) drawPicker(g, mx, my);
-            drawInput(g, font, mx, my);
+            if (pickerOpen && pickRect.w() > 0) drawPicker(g, mx, my);
+            if (plan.input()) drawInput(g, font, mx, my);
             if (confirm != Confirm.NONE) drawConfirm(g, font, mx, my);
             // grip
+            // the grip is at least 8 real pixels; its dots grow with it
+            int k = Math.max(1, Math.round(gripRect.w() / (float) GRIP));
             for (int i = 0; i < 3; i++) {
-                int o = 2 + i * 3;
-                g.fill(gripRect.x2 - o - 1, gripRect.y2 - 2, gripRect.x2 - o, gripRect.y2 - 1, col(ThemeColor.DIM));
-                g.fill(gripRect.x2 - 2, gripRect.y2 - o - 1, gripRect.x2 - 1, gripRect.y2 - o, col(ThemeColor.DIM));
+                int o = (2 + i * 3) * k;
+                g.fill(gripRect.x2 - o - k, gripRect.y2 - 2 * k, gripRect.x2 - o, gripRect.y2 - k, col(ThemeColor.DIM));
+                g.fill(gripRect.x2 - 2 * k, gripRect.y2 - o - k, gripRect.x2 - k, gripRect.y2 - o, col(ThemeColor.DIM));
             }
-        } else {
+        } else if (plan.input()) {
             g.fill(inputRect.x1, inputRect.y1, inputRect.x2, inputRect.y2, bg(ThemeColor.INPUT));
             g.drawString(font, font.plainSubstrByWidth(host.hint(), Math.max(10, inputRect.w() - 8)), inputRect.x1 + 4, inputRect.y1 + 4, col(ThemeColor.DIM), false);
         }
@@ -468,30 +491,63 @@ public final class MessengerUi {
 
     private void layout(Geometry w, boolean focus, Font font) {
         winRect = new Rect(w.x(), w.y(), w.x() + MessengerScale.logical(w.w(), scale), w.y() + MessengerScale.logical(w.h(), scale));
-        titleRect = new Rect(winRect.x1, winRect.y1, winRect.x2, winRect.y1 + TITLE_H);
-        // Buttons, right to left
-        int bx = winRect.x2 - 3;
-        int by1 = winRect.y1 + 2;
-        int by2 = winRect.y1 + TITLE_H - 2;
-        int dw = font.width("Delete") + 8;
-        btnDelete = new Rect(bx - dw, by1, bx, by2);
-        bx -= dw + 2;
-        int ew = font.width("Emoji") + 8;
-        btnEmoji = new Rect(bx - ew, by1, bx, by2);
-        bx -= ew + 2;
-        int nw = font.width("Cancel") + 8;
-        btnNew = new Rect(bx - nw, by1, bx, by2);
+        titleRect = new Rect(winRect.x1, winRect.y1, winRect.x2, winRect.y1 + Math.min(TITLE_H, winRect.h()));
+        // What fits at this size. The New list needs the messages' area, so it shows them whatever the size.
+        boolean planFocus2 = contactOpen && focus ? false : focus;
+        boolean planList2 = contactOpen && focus ? false : listView;
+        if (winRect.w() != planW || winRect.h() != planH || planFocus2 != planFocus || planList2 != planListView) {
+            planW = winRect.w();
+            planH = winRect.h();
+            planFocus = planFocus2;
+            planListView = planList2;
+            plan = MessengerLayout.plan(planW, planH, planFocus, planListView);
+        }
+        Rect none = NONE;
+        if (plan.sidebar()) listView = false; // the list is beside the messages again: forget the switch
+        if (!plan.history() && confirm != Confirm.NONE) {
+            confirm = Confirm.NONE;
+            setStatus("Cancelled: window too small");
+        }
+        // Header, left to right: the list toggle; right to left: the buttons
+        int by1 = titleRect.y1 + 2;
+        int by2 = titleRect.y2 - 2;
+        btnList = focus && plan.toggle() && !contactOpen ? new Rect(titleRect.x1 + 2, by1, titleRect.x1 + 2 + (by2 - by1) + 4, by2) : none;
+        if (focus && plan.buttons()) {
+            int bx = winRect.x2 - 3;
+            int dw = font.width("Delete") + 8;
+            btnDelete = new Rect(bx - dw, by1, bx, by2);
+            bx -= dw + 2;
+            int ew = font.width("Emoji") + 8;
+            btnEmoji = new Rect(bx - ew, by1, bx, by2);
+            bx -= ew + 2;
+            int nw = font.width("Cancel") + 8;
+            btnNew = new Rect(bx - nw, by1, bx, by2);
+        } else {
+            btnDelete = none;
+            btnEmoji = none;
+            btnNew = none;
+        }
 
+        // The list: beside the messages, or (collapsed and asked for) instead of them
         int listW = Math.max(60, Math.min(110, winRect.w() * 3 / 10));
-        listRect = new Rect(winRect.x1, titleRect.y2, winRect.x1 + listW, winRect.y2);
-        inputRect = new Rect(listRect.x2 + 1 + PAD, winRect.y2 - INPUT_H, winRect.x2 - PAD, winRect.y2 - 1);
+        if (plan.sidebar()) listRect = new Rect(winRect.x1, titleRect.y2, winRect.x1 + listW, winRect.y2);
+        else if (plan.listView()) listRect = new Rect(winRect.x1, titleRect.y2, winRect.x2, winRect.y2);
+        else listRect = none;
+        int left = plan.sidebar() ? listRect.x2 + 1 : winRect.x1; // where the messages and the input start
+        int inputH = plan.input() ? INPUT_H : 0;
+        if (plan.input()) inputRect = new Rect(left + PAD, winRect.y2 - INPUT_H, winRect.x2 - PAD, winRect.y2 - 1);
+        else inputRect = none;
         int sendW = font.width("Send") + 10;
-        sendRect = focus ? new Rect(inputRect.x2 - sendW, inputRect.y1, inputRect.x2, inputRect.y2) : inputRect;
-        pickCols = Math.max(1, (winRect.x2 - listRect.x2 - 2 * PAD - 6) / CELL);
-        int pickH = focus && pickerOpen ? PICK_ROWS * CELL + 4 : 0;
-        pickRect = new Rect(listRect.x2 + 1, winRect.y2 - INPUT_H - pickH, winRect.x2, winRect.y2 - INPUT_H);
-        histRect = new Rect(listRect.x2 + 1, titleRect.y2, winRect.x2, pickRect.y1);
-        gripRect = new Rect(winRect.x2 - GRIP, winRect.y2 - GRIP, winRect.x2, winRect.y2);
+        sendRect = !plan.input() ? none : focus ? new Rect(inputRect.x2 - sendW, inputRect.y1, inputRect.x2, inputRect.y2) : inputRect;
+        pickCols = Math.max(1, (winRect.x2 - left - 2 * PAD - 6) / CELL);
+        int pickH = focus && pickerOpen && plan.input() && plan.history() ? PICK_ROWS * CELL + 4 : 0;
+        pickRect = pickH > 0 ? new Rect(left, winRect.y2 - INPUT_H - pickH, winRect.x2, winRect.y2 - INPUT_H) : none;
+        histRect = plan.history() ? new Rect(left, titleRect.y2, winRect.x2, winRect.y2 - inputH - pickH) : none;
+        int gripSize = MessengerLayout.hitSize(GRIP, scale, Math.min(winRect.w(), winRect.h()));
+        gripRect = new Rect(winRect.x2 - gripSize, winRect.y2 - gripSize, winRect.x2, winRect.y2);
+        // Above scale 0.4 only the part of the header left of the buttons starts a drag; at tiny scales all of it, and taller
+        int titleRight = scale > MessengerLayout.GRAB_SCALE && btnNew.w() > 0 ? btnNew.x1 : winRect.x2;
+        titleHit = new Rect(winRect.x1, winRect.y1, titleRight, winRect.y1 + MessengerLayout.titleHitHeight(TITLE_H, scale, winRect.h()));
         searchRect = new Rect(histRect.x1 + PAD, histRect.y1 + PAD, histRect.x2 - PAD, histRect.y1 + PAD + 14);
         contactRect = new Rect(histRect.x1, searchRect.y2 + PAD, histRect.x2, histRect.y2);
         if (focus) {
@@ -929,6 +985,10 @@ public final class MessengerUi {
             dragDy = w.y() + w.h() - (int) realY;
             return true;
         }
+        if (btnList.contains(x, y)) {
+            listView = !listView;
+            return true;
+        }
         if (btnNew.contains(x, y)) {
             if (contactOpen) closeContacts();
             else openContacts();
@@ -949,7 +1009,7 @@ public final class MessengerUi {
             }
             return true;
         }
-        if (titleRect.contains(x, y)) {
+        if (titleHit.contains(x, y)) {
             drag = Drag.MOVE;
             dragDx = (int) realX - w.x();
             dragDy = (int) realY - w.y();
@@ -960,9 +1020,11 @@ public final class MessengerUi {
             if (idx == 0) {
                 if (contactOpen) closeContacts();
                 selectGlobal();
+                listView = false;
             } else if (idx <= shownList.size()) {
                 if (contactOpen) closeContacts();
                 select(shownList.get(idx - 1).name());
+                listView = false;
             }
             return true;
         }
@@ -1056,6 +1118,7 @@ public final class MessengerUi {
                 return true;
             }
             case 257, 335 -> { // enter
+                if (inputHidden()) return true;
                 if (contactOpen) pickContact(contactSel);
                 else submit();
                 return true;
@@ -1086,7 +1149,13 @@ public final class MessengerUi {
         }
     }
 
+    /** The window is focused but the input line is not drawn (the list is showing in a short window). */
+    private boolean inputHidden() {
+        return focused && !plan.input() && !contactOpen;
+    }
+
     private boolean typeKey(int key, int scancode, int modifiers) {
+        if (inputHidden()) return true; // not into a box the user can not see
         EditBox box = activeBox();
         box.setFocused(true);
         EditInput.key(box, key, scancode, modifiers);
@@ -1111,6 +1180,10 @@ public final class MessengerUi {
     public boolean charTyped(int codepoint, int modifiers) {
         if (confirm != Confirm.NONE) return true;
         if (codepoint == '§' || codepoint < 32 || codepoint == 127) return true;
+        if (inputHidden()) { // the first printable key brings the input back: the messages show again, with the input line
+            listView = false;
+            planW = -1; // plan again at the next frame
+        }
         EditBox box = activeBox();
         box.setFocused(true);
         EditInput.typed(box, codepoint, modifiers);

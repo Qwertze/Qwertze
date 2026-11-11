@@ -147,6 +147,8 @@ public final class Kits {
      * left as they are).
      */
     public static Match match(ItemStack shulker) {
+        // Retired (kit sorting v2, addon 0.7.0): saved local kits no longer route shulkers; the dashboard's kit templates do
+        if (RETIRED) return null;
         if (shulker == null || shulker.isEmpty() || !Utils.isShulker(shulker.getItem()) || shulker.has(DataComponents.CUSTOM_NAME)) return null;
         ensureLoaded();
         if (kits.isEmpty()) return null;
@@ -232,7 +234,11 @@ public final class Kits {
     /**
      * Whether a sign line names the chest of some saved kit.
      */
+    /** The local saved kits no longer build, route or claim shulkers; the list is only read (for the import into the Kit Builder). */
+    private static final boolean RETIRED = true;
+
     public static boolean isKitLabel(String label) {
+        if (RETIRED) return false;
         ensureLoaded();
         if (kits.isEmpty()) return false;
         return labels.computeIfAbsent(label, l -> {
@@ -247,6 +253,7 @@ public final class Kits {
     }
 
     public static boolean isHome(Box box, Kit kit) {
+        if (RETIRED) return false;
         for (String label : box.labels) if (kit.labelMatches(label)) return true;
         return false;
     }
@@ -256,7 +263,7 @@ public final class Kits {
      */
     public static List<Box> homes(Kit kit, Stash stash) {
         List<Box> homes = new ArrayList<>();
-        if (stash == null) return homes;
+        if (stash == null || RETIRED) return homes;
         for (Box box : stash.boxes) if (box.sortable() && !box.dropOff && isHome(box, kit)) homes.add(box);
         return homes;
     }

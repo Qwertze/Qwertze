@@ -261,6 +261,14 @@ public final class StashIndex {
 
     /** The heartbeat's {@code kitOrders}: what this bot can do with kits. The addon's first release can only import its local kits. */
     public record KitOrdersCap(boolean enabled, boolean restock, boolean craft, boolean importer) {
+        /**
+         * What a bot says it can do with kits. {@code craft} is false: crafted loads do not feed kits in this addon yet (a shortfall of a kit is not crafted;
+         * the contract's craft shortfalls for kits are a known limit), so the server must not plan craft steps for a kit order.
+         */
+        public static KitOrdersCap of(boolean ordersOn, boolean restockOn) {
+            return new KitOrdersCap(ordersOn, ordersOn && restockOn, false, true);
+        }
+
         /** Release 1: sorts by type and template, can't carry out kit orders or restock, can import its local kits. */
         public static final KitOrdersCap IMPORT_ONLY = new KitOrdersCap(false, false, false, true);
     }
@@ -630,6 +638,12 @@ public final class StashIndex {
      */
     public static KitReport.Built kitReportV2(Stash stash, boolean includeExcluded, String player, Iterable<ItemStack> inventory, KitSettings settings,
                                               java.util.function.Predicate<ItemStack> notCarried) {
+        return kitReportV2(stash, includeExcluded, player, inventory, settings, notCarried, null);
+    }
+
+    /** As above, with what kit restock is doing (null: off). */
+    public static KitReport.Built kitReportV2(Stash stash, boolean includeExcluded, String player, Iterable<ItemStack> inventory, KitSettings settings,
+                                              java.util.function.Predicate<ItemStack> notCarried, KitRestock.Decision restock) {
         if (stash == null) return null;
         KitTypes table = KitTypes.shared();
         if (table == null) return null;
@@ -661,7 +675,7 @@ public final class StashIndex {
             KitReport.Shulker sh = reportShulkerV2(stack, scoring, settings);
             if (sh != null) carried.add(sh);
         }
-        return KitReport.buildV2(stash.server, stash.name, player, boxes, carried, table.fingerprint(), settings);
+        return KitReport.buildV2(stash.server, stash.name, player, boxes, carried, table.fingerprint(), settings, restock);
     }
 
     /**

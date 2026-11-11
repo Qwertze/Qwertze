@@ -15,6 +15,7 @@ import com.porter.qwerte.craft.CraftResume;
 import com.porter.qwerte.craft.Recipes;
 import com.porter.qwerte.stash.DeliveryRoom;
 import com.porter.qwerte.stash.Kit;
+import com.porter.qwerte.stash.KitResult;
 import com.porter.qwerte.stash.Kits;
 import com.porter.qwerte.stash.Mending;
 import com.porter.qwerte.stash.RepairEstimate;
@@ -131,6 +132,21 @@ final class OrderRunner {
         default boolean craftBusy() {
             return false;
         }
+
+        /** This shulker is a routed kit (a copy of a template, complete or not): it is never taken apart as a source. */
+        default boolean keptKit(ItemStack shulker) {
+            return false;
+        }
+
+        /** The cached kit settings of this stash (templates, chests), or null. */
+        default com.porter.qwerte.stash.KitSettings kitSettings() {
+            return null;
+        }
+
+        /** Kit orders are on (the setting, and kit sorting). */
+        default boolean kitOrdersOn() {
+            return true;
+        }
     }
 
     sealed interface Intent permits Idle, Build, Fetch, Deliver, Rename, Craft, FindAnvil, Expand, Recheck, Repair, CraftChunk {}
@@ -179,9 +195,14 @@ final class OrderRunner {
 
     /** A snapshot of the order for the server. */
     record Report(String id, String status, String phase, int done, int total, String message, int shulkers, Map<String, Integer> delivered,
-                  RepairEstimate.Result repair, com.google.gson.JsonObject craft) {
+                  RepairEstimate.Result repair, com.google.gson.JsonObject craft, com.google.gson.JsonObject kit) {
+        Report(String id, String status, String phase, int done, int total, String message, int shulkers, Map<String, Integer> delivered,
+               RepairEstimate.Result repair, com.google.gson.JsonObject craft) {
+            this(id, status, phase, done, total, message, shulkers, delivered, repair, craft, null);
+        }
+
         Report(String id, String status, String phase, int done, int total, String message, int shulkers, Map<String, Integer> delivered) {
-            this(id, status, phase, done, total, message, shulkers, delivered, null, null);
+            this(id, status, phase, done, total, message, shulkers, delivered, null, null, null);
         }
 
         Report(String id, String status, String phase, int done, int total, String message, int shulkers, Map<String, Integer> delivered,
@@ -238,6 +259,12 @@ final class OrderRunner {
         Map<String, Integer> content = Map.of();
         // Lot totals by key, to recognise a finished shulker before the kit exists
         Map<String, Integer> lotTotals;
+        // Kit orders: the template this unit is a copy of ("" none), a complete copy to deliver as it is, a kit that can't be completed (stored, never
+        // delivered), the colour of the shulker to build in, the incomplete copy built on, what is short, and whether it was stored
+        String kitTemplate, kitColor, kitBase;
+        boolean kitReady, kitShort, kitStored;
+        com.porter.qwerte.stash.KitTemplate kitTpl;
+        List<KitResult.Miss> kitMissing = List.of();
 
         Unit(Kind kind, String key, List<Order.Lot> lots) {
             this.kind = kind;
@@ -304,6 +331,11 @@ final class OrderRunner {
     // The keys of item lines with their own repair toggle (they are always counted); the others are wanted only when damaged
     private final Set<String> repairExplicit = new HashSet<>();
     private String phase = "starting";
+    // What the kit lines of this order made (result.kit), or null when it has none
+    private KitResult kitResult;
+    // A restock job (kit restock, an idle job of the sorter): an order of one kit that is built and kept, never delivered and never told to the server.
+    // restockTopUp: it tops up the fullest incomplete copy; otherwise it builds a new one
+    private boolean restock, restockTopUp, restockOffer;
     private boolean cancelRequested, parked;
     private long pausedSince;
     private boolean full;
@@ -405,6 +437,7 @@ final class OrderRunner {
     /** Forgets the order here (leaving the world, parking). The saved state is kept for a resume. */
     void reset() {
         kits.dropOrderKit();
+        restock = restockTopUp = false;
         order = null;
         units.clear();
         index = 0;
@@ -416,6 +449,7 @@ final class OrderRunner {
         craftedTotal = 0;
         craftFailure = null;
         anvilNone = false;
+        kitResult = null;
         endCrafting("the order was left");
         owner.crafter().release();
         clearRepair();
@@ -465,13 +499,18 @@ final class OrderRunner {
      *         reconnect the plan waits for them, and nothing is rejected for what is not known yet.
      */
     String offer(Order o) {
+        // A restock job gives way to a real order
+        if (order != null && restock && !restockOffer) {
+            restock = restockTopUp = false;
+            reset();
+        }
         if (order != null) return order.id.equals(o.id) ? null : "already working on another order";
         // A craft block that is missing, can't be read, or has no craft line is refused (the server then releases its reservations). Everything else
         // about the craft lines (the bot's own table, the caps) is checked in the plan and makes the lines short instead
         if ((o.hasCraft() || o.craft != null) && (o.craft == null || o.craft.malformed() || !o.hasCraft())) return "the craft block can't be read";
         Stash stash = owner.stash();
         if (stash == null || mc.level == null) return "no stash is loaded";
-        if (deliveryBox() == null) return "no delivery container is set";
+        if (!restock && deliveryBox() == null) return "no delivery container is set";
 
         order = o;
         state = State.Running;
@@ -486,6 +525,7 @@ final class OrderRunner {
         craftedTotal = 0;
         craftFailure = null;
         anvilNone = false;
+        kitResult = null;
         clearRepair();
         clearCraft();
         for (Order.Line l : o.lines) {
@@ -539,6 +579,8 @@ final class OrderRunner {
         Stash.ActiveOrder saved = stash.activeOrder;
         List<String> notes = new ArrayList<>();
         boolean resumed = saved != null && saved.id.equals(o.id) && !saved.units.isEmpty();
+        // The plan of a kit order is not saved with its kits' state: after a restart it is failed, and the order is retried from the website
+        if (resumed && o.hasKit()) return "the bot restarted while building kits; retry the order";
 
         if (resumed) {
             // A save of a craft order that lists no craft states is from before they were kept: its loads of a craft line's item (that no item line
@@ -613,7 +655,11 @@ final class OrderRunner {
 
         // The names follow the plan by position; a resume keeps the names it saved
         Order.Names names = resumed && !saved.namesMode.isEmpty() ? Order.Names.of(saved.namesMode, saved.namesAll, saved.namesEach) : o.names;
-        for (int i = 0; i < plan.size(); i++) plan.get(i).name = names == null ? null : names.nameFor(i);
+        for (int i = 0; i < plan.size(); i++) {
+            // A kit is named with its template's name, whatever the order's names say for its position
+            if (plan.get(i).kitTemplate != null) continue;
+            plan.get(i).name = names == null ? null : names.nameFor(i);
+        }
 
         units.clear();
         units.addAll(plan);
@@ -625,7 +671,7 @@ final class OrderRunner {
         phase = "starting";
         epoch++;
 
-        if (!resumed) {
+        if (!resumed && !restock) {
             Stash.ActiveOrder active = new Stash.ActiveOrder();
             active.id = o.id;
             for (Order.Line l : o.lines) active.lines.add(new String[] { l.type(), l.key(), String.valueOf(l.count()) });
@@ -732,9 +778,21 @@ final class OrderRunner {
         List<List<Order.Lot>> bins = Order.pack(lots);
         if (shulkerUnits.size() + emptyUnits.size() + bins.size() > Order.MAX_BINS) return "too big: that is more than " + Order.MAX_BINS + " shulkers";
 
+        // The kit lines (kit sorting v2): ready copies to deliver, kits to build; what is short is told in result.kit
+        List<Unit> kitUnits = new ArrayList<>();
+        if (o.hasKit()) {
+            int usedUnits = shulkerUnits.size() + emptyUnits.size() + bins.size();
+            int totalEmpties = kits.emptyShulkers().size();
+            if (o.kit == null || o.kit.malformed()) kitsRefused(o, "the kit block can't be read");
+            else planKits(stash, o, kitUnits, usedUnits, totalEmpties - emptyUnits.size() - bins.size());
+        }
+
         plan.addAll(shulkerUnits);
         plan.addAll(emptyUnits);
+        plan.addAll(kitUnits);
         for (List<Order.Lot> bin : bins) plan.add(new Unit(Kind.Bin, "", bin));
+        if (plan.size() > Order.MAX_BINS) return "too big: that is more than " + Order.MAX_BINS + " shulkers";
+        if (plan.isEmpty() && kitResult != null && kitResult.any()) return null;
         if (plan.isEmpty()) {
             String craftNote = ledger == null ? null : ledger.note();
             if (craftNote != null) return craftNote;
@@ -751,7 +809,7 @@ final class OrderRunner {
         int bins = 0;
         Map<String, Integer> need = new HashMap<>();
         for (Unit u : remaining) {
-            if (u.kind == Kind.Bin) bins++;
+            if (u.kind == Kind.Bin && u.kitBase == null) bins++;
             else if (u.kind == Kind.Empty) need.merge(u.key, 1, Integer::sum);
         }
         if (bins == 0 && need.isEmpty()) return null;
@@ -929,6 +987,38 @@ final class OrderRunner {
         if (!owner.gate() && !kits.active()) reset();
     }
 
+    /** A restock job is being run (it is an order here, but nobody is told about it). */
+    boolean restocking() {
+        return restock && order != null;
+    }
+
+    /**
+     * Starts a restock job: one kit of the template in {@code o}'s kit block, kept in the stash (never delivered). {@code topUp}: it tops up the
+     * fullest incomplete copy; otherwise it builds a new copy.
+     * @return null when it was taken, else why not
+     */
+    String offerRestock(Order o, boolean topUp) {
+        if (order != null) return "busy";
+        restock = true;
+        restockTopUp = topUp;
+        restockOffer = true;
+        String why;
+        try {
+            why = offer(o);
+        } finally {
+            restockOffer = false;
+        }
+        if (why != null) restock = restockTopUp = false;
+        return why;
+    }
+
+    /** A restock job is over (or given up on): its state is forgotten. */
+    private void endRestock() {
+        com.porter.qwerte.QwerteAddon.LOG.info("[kit-restock] {}", message.isEmpty() ? phase : message);
+        restock = restockTopUp = false;
+        reset();
+    }
+
     /** The server has the end of the order: it can be forgotten, and the next one claimed. */
     void ack(String id) {
         if (order == null || !order.id.equals(id) || state == State.Running) return;
@@ -957,6 +1047,11 @@ final class OrderRunner {
 
     Report report() {
         if (order == null) return null;
+        if (restock) {
+            // Nothing is told to the server: when the job is over it is forgotten here
+            if (state != State.Running) endRestock();
+            return null;
+        }
         // The wait for the re-read only runs out when it has stopped making progress: a big rescan can take long
         if (state == State.Running && !planned) {
             long now = System.currentTimeMillis();
@@ -989,7 +1084,8 @@ final class OrderRunner {
                 new LinkedHashMap<>(delivered));
         }
         return new Report(order.id, status, shown, Math.min(index, units.size()), units.size(), message, shulkersDelivered, new LinkedHashMap<>(delivered),
-            state == State.Running ? null : repairTally.result(), state == State.Running ? null : craftResult);
+            state == State.Running ? null : repairTally.result(), state == State.Running ? null : craftResult,
+            state == State.Running || kitResult == null || !kitResult.any() ? null : kitResult.toJson());
     }
 
     /**
@@ -1246,7 +1342,7 @@ final class OrderRunner {
             }
 
             Box delivery = deliveryBox();
-            if (delivery == null || delivery.unreachable) {
+            if (!restock && (delivery == null || delivery.unreachable)) {
                 finish(shulkersDelivered > 0 ? State.Delivered : State.Failed, delivery == null ? "the delivery container is gone" : "couldn't reach the delivery container");
                 return new Idle();
             }
@@ -1267,6 +1363,36 @@ final class OrderRunner {
                 if (!u.nameDone) {
                     Intent rename = naming(u, slot);
                     if (rename != null) return rename;
+                }
+                // A kit that could not be completed is never delivered: named, it is kept as an incomplete copy (the sorter files it in its chest, and a
+                // restock or a later order tops it up); unnamed, it is left to the normal sorting, which takes mixed shulkers apart. The order goes on
+                // The final check before delivery: the box in hand is a complete copy of its template, whatever the plan said; else the kit is short
+                if (u.kitTemplate != null && !restock && !u.kitShort && u.kitTpl != null) {
+                    ItemStack carried = mc.player.getInventory().getItem(slot);
+                    var m = com.porter.qwerte.stash.KitTemplates.match(u.kitTpl, StashIndex.boxStacks(carried), StashIndex.normalizedName(carried));
+                    if (m.state() != com.porter.qwerte.stash.KitTemplates.State.COMPLETE) {
+                        u.kitShort = true;
+                        if (u.kitMissing.isEmpty()) {
+                            List<KitResult.Miss> miss = new ArrayList<>();
+                            for (var x : m.missing()) miss.add(new KitResult.Miss(x.match(), x.key(), x.count()));
+                            u.kitMissing = miss;
+                        }
+                    }
+                }
+                if (restock && u.kitTemplate != null && !u.kitStored) {
+                    // A restock copy is filed by the sorter in its chain chest, complete or incomplete; the job ends
+                    u.kitStored = true;
+                    if (kitResult != null) kitResult.built(u.kitTemplate);
+                    advance();
+                    continue;
+                }
+                if (u.kitShort && u.kitTemplate != null && !u.kitStored) {
+                    u.kitStored = true;
+                    boolean stored = u.named;
+                    if (kitResult != null) kitResult.addShort(u.kitTemplate, 1, u.kitMissing, com.porter.qwerte.stash.KitOrder.ITEMS_SHORT, stored ? KitResult.STORED_INCOMPLETE : KitResult.STORED_RETURNED);
+                    problems.add("a kit could not be completed and was " + (stored ? "kept as an incomplete copy" : "left to be sorted"));
+                    advance();
+                    continue;
                 }
                 if (full) {
                     full = false;
@@ -1338,6 +1464,11 @@ final class OrderRunner {
                 if (u.confirmed) {
                     for (var e : u.content.entrySet()) delivered.merge(e.getKey(), e.getValue(), Integer::sum);
                     shulkersDelivered++;
+                    if (u.kitTemplate != null && kitResult != null) {
+                        if (u.kitReady) kitResult.ready(u.kitTemplate);
+                        else kitResult.built(u.kitTemplate);
+                        kitResult.delivered(u.kitTemplate);
+                    }
                     if (u.name != null && !u.named) {
                         unnamed++;
                         String reason = u.unnamedReason == null ? "naming didn't finish" : u.unnamedReason;
@@ -1372,7 +1503,7 @@ final class OrderRunner {
                 if (repair != null) return repair;
                 if (!kits.active()) {
                     // No empty shulker to build in: one is crafted, when crafting is on
-                    if (owner.craftingOn() && owner.crafter().craftedBase() < 0 && kits.emptyShulkers().isEmpty()) {
+                    if (!restock && owner.craftingOn() && owner.crafter().craftedBase() < 0 && kits.emptyShulkers().isEmpty()) {
                         Intent craft = craftFor(u, pendingEmpties());
                         if (craft instanceof Idle) continue;
                         if (craft != null) return craft;
@@ -1387,6 +1518,8 @@ final class OrderRunner {
                         skip("couldn't start building a shulker (" + u.kit.name + ")");
                         continue;
                     }
+                    // The colour of the template had no empty shulker: any colour is used, and the order says so
+                    if (u.kitTemplate != null && u.kitColor != null && kits.colourSubstituted() && kitResult != null) kitResult.note(KitResult.COLOUR_SUBSTITUTED);
                 }
                 else if (kits.kit() != u.kit) {
                     // Left over from another unit
@@ -1560,6 +1693,14 @@ final class OrderRunner {
         Map<String, Integer> dropped = new LinkedHashMap<>();
         Map<String, Integer> missing = new LinkedHashMap<>();
         Set<Integer> carriedUsed = new HashSet<>();
+        // A kit built on an incomplete copy keeps what that copy holds: its stacks come first, and the lots add to them
+        if (u.kitBase != null) {
+            // The very copy the kit builder will use (the first of identical ones), not every copy with that key
+            ItemStack baseShulker = kits.baseStack(u.kitBase);
+            if (baseShulker != null) {
+                for (ItemStack in : Kits.inside(baseShulker)) if (in != null && !in.isEmpty() && n < Kit.SLOTS) stacks[n++] = in.copy();
+            }
+        }
         for (int li = 0; li < u.lots.size(); li++) {
             Order.Lot lot = u.lots.get(li);
             int want = lot.count();
@@ -1607,6 +1748,8 @@ final class OrderRunner {
         // What the kit builder can really take may differ from this survey (it has its own scan of the same stash): a lot it
         // cannot supply is dropped, so the lots that can be supplied still pack and ship short, with a note
         Kit probe = new Kit("order " + order.id + " #" + (index + 1), stacks, true);
+        probe.baseGroup = u.kitBase;
+        probe.shulkerColor = u.kitColor;
         Map<Kit.Key, Integer> supply = kits.supply(probe);
         Map<Kit.Key, Integer> left = new HashMap<>(supply);
         ItemStack[] trimmed = new ItemStack[Kit.SLOTS];
@@ -1623,7 +1766,234 @@ final class OrderRunner {
         }
         for (var e : cut.entrySet()) problems.add(e.getKey() + ": " + e.getValue() + " couldn't be taken out of the stash, shipped short");
         if (m == 0) return null;
-        return m == n && cut.isEmpty() ? probe : new Kit(probe.name, trimmed, true);
+        Kit built = m == n && cut.isEmpty() ? probe : new Kit(probe.name, trimmed, true);
+        built.baseGroup = u.kitBase;
+        built.shulkerColor = u.kitColor;
+        // A kit of a template that came out smaller than planned is short: never delivered, kept as an incomplete copy when it holds two kinds
+        if (u.kitTemplate != null && (!missing.isEmpty() || !dropped.isEmpty() || !cut.isEmpty())) {
+            u.kitShort = true;
+            if (u.kitMissing.isEmpty()) {
+                List<KitResult.Miss> miss = new ArrayList<>();
+                for (var e : missing.entrySet()) miss.add(new KitResult.Miss(e.getKey(), e.getKey(), e.getValue()));
+                u.kitMissing = miss;
+            }
+            Set<String> kinds = new HashSet<>();
+            for (int i = 0; i < m; i++) kinds.add(idOf(trimmed[i] != null ? trimmed[i] : stacks[i]));
+            if (kinds.size() < 2) return null;
+        }
+        return built;
+    }
+
+
+    // ---- Kit orders (KIT-CONTRACT v2, revision 4, "Kit orders: bot execution")
+
+    private static Map<String, net.minecraft.world.item.Item> itemsById;
+
+    /** The stack size of an item id, 64 when the id is unknown to this game version. */
+    static int maxStackOf(String id) {
+        if (itemsById == null) {
+            itemsById = new HashMap<>();
+            for (net.minecraft.world.item.Item item : net.minecraft.core.registries.BuiltInRegistries.ITEM) {
+                itemsById.put(net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(item).toString(), item);
+            }
+        }
+        net.minecraft.world.item.Item item = itemsById.get(id.contains(":") ? id : "minecraft:" + id);
+        return item == null ? 64 : Math.max(1, new ItemStack(item).getMaxStackSize());
+    }
+
+    /** What is said when the kit block can't be used: every kit of the order is short. */
+    private void kitsRefused(Order o, String why) {
+        kitResult = new KitResult();
+        if (o.kit != null && !o.kit.malformed()) {
+            for (com.porter.qwerte.stash.KitOrder.Line l : o.kit.lines()) {
+                kitResult.line(l.template().id(), l.template().name(), l.count());
+                kitResult.addShort(l.template().id(), l.count(), List.of(), com.porter.qwerte.stash.KitOrder.TEMPLATE_MISMATCH, null);
+            }
+        } else {
+            for (Order.Line l : o.lines) {
+                if (!l.type().equals(Order.KIT)) continue;
+                kitResult.line(l.key(), "", l.count());
+                kitResult.addShort(l.key(), l.count(), List.of(), com.porter.qwerte.stash.KitOrder.TEMPLATE_MISMATCH, null);
+            }
+        }
+        com.porter.qwerte.QwerteAddon.LOG.warn("orders: the kit lines of order {} are not made: {}", o.id, why);
+    }
+
+    /**
+     * Plans the kit lines into units (ready copies to deliver, kits to build) and notes what is short. The units come after the shulker and empty-shulker
+     * lines and before the packed bins.
+     * @param usedUnits the units the other lines already need; {@code empties} the empty shulkers left for builds
+     */
+    private void planKits(Stash stash, Order o, List<Unit> out, int usedUnits, int empties) {
+        com.porter.qwerte.stash.KitOrder.Snapshot snap = o.kit;
+        String bad = com.porter.qwerte.stash.KitOrder.check(snap, OrderRunner::maxStackOf);
+        if (bad != null || !owner.kitOrdersOn()) {
+            kitsRefused(o, bad == null ? "kit orders are off" : bad);
+            return;
+        }
+        kitResult = new KitResult();
+        for (com.porter.qwerte.stash.KitOrder.Line l : snap.lines()) kitResult.line(l.template().id(), l.template().name(), l.count());
+        com.porter.qwerte.stash.KitPlan.Scan scan = kitScan(stash, snap);
+        // A restock job that builds a new copy starts from an empty shulker, not from an incomplete copy
+        if (restock && !restockTopUp) scan = scan.withoutBases();
+        com.porter.qwerte.stash.KitPlan.Plan plan = com.porter.qwerte.stash.KitPlan.plan(snap, scan, OrderRunner::maxStackOf, Math.max(0, empties), Set.of(),
+            Math.max(0, Order.MAX_BINS - usedUnits), restock);
+        kitUnits(plan, out);
+    }
+
+    /**
+     * What a plan of this snapshot would be, from the stash as it is (the restock decision asks this for each template without starting anything).
+     * @param withBases whether incomplete copies in the chain target may be built on
+     */
+    com.porter.qwerte.stash.KitPlan.Plan probeKits(com.porter.qwerte.stash.KitOrder.Snapshot snap, boolean withBases, int empties) {
+        Stash stash = owner.stash();
+        if (stash == null) return new com.porter.qwerte.stash.KitPlan.Plan(List.of(), List.of(), List.of());
+        com.porter.qwerte.stash.KitPlan.Scan scan = kitScan(stash, snap);
+        if (!withBases) scan = scan.withoutBases();
+        return com.porter.qwerte.stash.KitPlan.plan(snap, scan, OrderRunner::maxStackOf, Math.max(0, empties), Set.of(), Order.MAX_BINS, true);
+    }
+
+    /** The scan of the stash for the templates of this snapshot, for the restock decision (one scan, shared by every candidate); null with no stash. */
+    com.porter.qwerte.stash.KitPlan.Scan probeScan(com.porter.qwerte.stash.KitOrder.Snapshot snap) {
+        Stash stash = owner.stash();
+        return stash == null ? null : kitScan(stash, snap);
+    }
+
+    /** How many of an item (by id) the stash holds loose or in shulkers that are not kits, for the bottle reserve of restock. */
+    long stashCount(String id) {
+        Stash stash = owner.stash();
+        if (stash == null) return 0;
+        long n = 0;
+        for (Box box : stash.boxes) {
+            if (box.contents == null || box.foreign || box.excluded || box.delivery || box.dropOff || !box.known()) continue;
+            for (ItemStack s : box.contents) {
+                if (s.isEmpty()) continue;
+                if (Utils.isShulker(s.getItem())) {
+                    if (owner.keptKit(s)) continue;
+                    for (ItemStack in : Kits.inside(s)) if (in != null && !in.isEmpty() && idOf(in).equals(id)) n += in.getCount();
+                } else if (idOf(s).equals(id)) {
+                    n += s.getCount();
+                }
+            }
+        }
+        return n;
+    }
+
+    /** The scan the kit plan works from: complete copies, incomplete copies in the chain target, and the stacks that can serve a slot. */
+    private com.porter.qwerte.stash.KitPlan.Scan kitScan(Stash stash, com.porter.qwerte.stash.KitOrder.Snapshot snap) {
+        // The index keys that can serve a slot (loose, or inside shulkers that are not themselves kits), with what the plan sorts them by
+        Set<String> exact = new HashSet<>(), wild = new HashSet<>();
+        for (com.porter.qwerte.stash.KitOrder.Line l : snap.lines()) {
+            for (com.porter.qwerte.stash.KitTemplate.Slot s : l.template().slots()) {
+                if (s == null) continue;
+                if (s.any()) wild.add(s.base());
+                else exact.add(s.match());
+            }
+        }
+        Map<String, String> matchOf = new HashMap<>();
+        Map<String, Integer> damage = new HashMap<>();
+        Set<String> named = new HashSet<>(), enchanted = new HashSet<>();
+        Map<String, List<com.porter.qwerte.stash.KitPlan.Copy>> ready = new LinkedHashMap<>(), bases = new LinkedHashMap<>();
+        com.porter.qwerte.stash.KitSettings settings = owner.kitSettings();
+        for (Box box : stash.boxes) {
+            if (box.contents == null || box.foreign || box.excluded || box.delivery || box.dropOff || box.unreachable || !owner.usable(box) || !box.known() || box.stale) continue;
+            String id = StashIndex.kitId(box);
+            for (ItemStack s : box.contents) {
+                if (s.isEmpty()) continue;
+                if (Utils.isShulker(s.getItem())) {
+                    boolean claimed = owner.keptKit(s);
+                    {
+                        List<com.porter.qwerte.stash.KitTemplates.BoxStack> stacks = StashIndex.boxStacks(s);
+                        String group = stacks.isEmpty() ? null : StashIndex.groupKey(s);
+                        if (group != null) {
+                            String nm = StashIndex.normalizedName(s);
+                            for (com.porter.qwerte.stash.KitOrder.Line l : snap.lines()) {
+                                com.porter.qwerte.stash.KitTemplates.Match m = com.porter.qwerte.stash.KitTemplates.match(l.template(), stacks, nm);
+                                if (m.state() == com.porter.qwerte.stash.KitTemplates.State.COMPLETE) {
+                                    ready.computeIfAbsent(l.template().id(), k -> new ArrayList<>()).add(new com.porter.qwerte.stash.KitPlan.Copy(group, copyStacks(s)));
+                                } else if (m.state() == com.porter.qwerte.stash.KitTemplates.State.INCOMPLETE && settings != null
+                                    && id.equals(com.porter.qwerte.stash.KitRouting.templateTarget(l.template(), settings))) {
+                                    bases.computeIfAbsent(l.template().id(), k -> new ArrayList<>()).add(new com.porter.qwerte.stash.KitPlan.Copy(group, copyStacks(s)));
+                                }
+                            }
+                        }
+                    }
+                    // A kit (a copy of a template, routed) is never taken apart as a source
+                    if (claimed || claims(s) || kits.heldKit(s) != null) continue;
+                    for (ItemStack in : Kits.inside(s)) if (in != null && !in.isEmpty()) noteKitKey(in, exact, wild, matchOf, damage, named, enchanted);
+                } else {
+                    noteKitKey(s, exact, wild, matchOf, damage, named, enchanted);
+                }
+            }
+        }
+        for (List<com.porter.qwerte.stash.KitPlan.Copy> list : bases.values()) list.sort(java.util.Comparator.comparingInt((com.porter.qwerte.stash.KitPlan.Copy c) -> -c.filled()).thenComparing(com.porter.qwerte.stash.KitPlan.Copy::group));
+        Survey sv = survey(stash, new HashSet<>(matchOf.keySet()));
+        return new com.porter.qwerte.stash.KitPlan.Scan(sv.available(), matchOf, damage, named, enchanted, ready, bases);
+    }
+
+    private void kitUnits(com.porter.qwerte.stash.KitPlan.Plan plan, List<Unit> out) {
+        for (com.porter.qwerte.stash.KitPlan.ReadyUnit r : plan.ready()) {
+            Unit u = new Unit(Kind.Shulker, r.group(), List.of());
+            u.kitTemplate = r.template();
+            u.kitTpl = templateOf(plan, r.template());
+            u.kitReady = true;
+            u.name = r.name();
+            out.add(u);
+        }
+        for (com.porter.qwerte.stash.KitPlan.BuildUnit b : plan.builds()) {
+            List<Order.Lot> lots = new ArrayList<>();
+            for (com.porter.qwerte.stash.KitPlan.Lot l : b.lots()) lots.add(new Order.Lot(l.key(), l.count()));
+            Unit u = new Unit(Kind.Bin, "", lots);
+            u.kitTemplate = b.template();
+            u.kitTpl = templateOf(plan, b.template());
+            u.name = b.name();
+            u.kitColor = b.color();
+            u.kitBase = b.base();
+            u.kitShort = b.kitShort();
+            u.kitMissing = b.missing();
+            out.add(u);
+        }
+        for (KitResult.Short s : plan.shorts()) kitResult.addShort(s.template(), s.kits(), s.items(), s.reason(), s.stored());
+    }
+
+    /** The template object of a unit, found by id among the plan's own (the snapshot holds them). */
+    private com.porter.qwerte.stash.KitTemplate templateOf(com.porter.qwerte.stash.KitPlan.Plan plan, String id) {
+        if (order != null && order.kit != null) {
+            for (com.porter.qwerte.stash.KitOrder.Line l : order.kit.lines()) if (l.template().id().equals(id)) return l.template();
+        }
+        return null;
+    }
+
+    private static List<com.porter.qwerte.stash.KitPlan.Stack> copyStacks(ItemStack shulker) {
+        List<com.porter.qwerte.stash.KitPlan.Stack> out = new ArrayList<>();
+        for (ItemStack in : Kits.inside(shulker)) {
+            if (in == null || in.isEmpty()) continue;
+            String key = StashIndex.keyOf(in), match = StashIndex.matchKeyOf(in);
+            if (key == null || match == null) continue;
+            out.add(new com.porter.qwerte.stash.KitPlan.Stack(key, match, idOf(in), in.getCount()));
+        }
+        return out;
+    }
+
+    /** Notes an index key a slot of the ordered templates can take, with what the plan sorts candidates by. */
+    private static void noteKitKey(ItemStack in, Set<String> exact, Set<String> wild, Map<String, String> matchOf, Map<String, Integer> damage, Set<String> named,
+                                   Set<String> enchanted) {
+        String match = StashIndex.matchKeyOf(in);
+        if (match == null) return;
+        if (!exact.contains(match) && !wild.contains(idOf(in))) return;
+        String key = StashIndex.keyOf(in);
+        if (key == null || (!Utils.isShulker(in.getItem()) && holdsItems(in))) return;
+        matchOf.put(key, match);
+        damage.merge(key, in.getDamageValue(), Math::min);
+        if (in.has(DataComponents.CUSTOM_NAME)) named.add(key);
+        if (in.isEnchanted()) enchanted.add(key);
+    }
+
+    /** A unit of a kit order is skipped: the kit is short, nothing was stored. */
+    private void kitSkipped(Unit u, String why) {
+        if (u.kitTemplate == null || u.kitStored || kitResult == null) return;
+        String reason = why.contains("shulker is left") || why.contains("empty shulker") ? com.porter.qwerte.stash.KitOrder.NO_SHULKER : com.porter.qwerte.stash.KitOrder.ITEMS_SHORT;
+        kitResult.addShort(u.kitTemplate, 1, u.kitMissing, reason, u.kitReady ? null : KitResult.STORED_RETURNED);
     }
 
     // ---- Craft orders (CRAFT-CONTRACT.md "Bot execution")
@@ -2325,6 +2695,7 @@ final class OrderRunner {
     private void skip(String why) {
         skips++;
         problems.add(why);
+        if (index < units.size()) kitSkipped(units.get(index), why);
         advance();
     }
 
@@ -2439,6 +2810,7 @@ final class OrderRunner {
                 count(targetSamples, targetAvailable, targetRaw, filled, wanted, ids, s);
                 if (Utils.isShulker(s.getItem())) {
                     if (s.has(DataComponents.CUSTOM_NAME) && !named) why(why, wanted, ids, s, "in a named shulker (use-named-shulkers is off)");
+                    else if (owner.keptKit(s)) why(why, wanted, ids, s, "in a kit");
                     else if (Kits.claims(s) || claims(s) || kits.heldKit(s) != null) why(why, wanted, ids, s, "in a shulker claimed by a saved kit");
                     else {
                         for (ItemStack in : Kits.inside(s)) if (in != null && !in.isEmpty()) count(targetSamples, targetAvailable, targetRaw, filled, wanted, ids, in);
@@ -2514,6 +2886,8 @@ final class OrderRunner {
         }
 
         String note = shortLines.isEmpty() ? "" : "delivered less than asked: " + String.join(", ", shortLines.size() > 6 ? shortLines.subList(0, 6) : shortLines) + (shortLines.size() > 6 ? ", ..." : "");
+        String kitNote = kitResult == null ? null : kitResult.note();
+        if (kitNote != null) note += (note.isEmpty() ? "" : "; ") + kitNote;
         if (!problems.isEmpty()) note += (note.isEmpty() ? "" : "; ") + String.join(", ", problems.size() > 3 ? problems.subList(0, 3) : problems);
         boolean anything = shulkersDelivered > 0;
         finish(anything ? State.Delivered : State.Failed, anything ? note : (note.isEmpty() ? "nothing could be delivered" : "nothing could be delivered: " + note));

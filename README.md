@@ -10,7 +10,7 @@ Qwerte adds eleven modules to [Meteor Client](https://meteorclient.com):
   never places dirt on top of dirt, and restocks its own dirt. With Baritone installed it can also walk to uncovered
   ground by itself.
 - **Stash Sorter** sorts the chests and barrels around you, either into tiers or by the signs on them. It repacks
-  mixed shulkers, merges partial stacks, empties drop-off chests, builds saved kits, sends kit shulkers to their own chests and can be searched. Want it on a
+  mixed shulkers, merges partial stacks, empties drop-off chests, carries out kit orders, keeps kits stocked, sends kit shulkers to their own chests and can be searched. Want it on a
   proxy bot instead?
   See [Stash Sorter for AquariusProxy](https://github.com/Qwertze/Stash-Sorter).
 - **Stash Overlay** shows what each container in a saved stash mostly holds, as an item icon on the container.
@@ -242,33 +242,18 @@ are in the [Stash Manager](#stash-manager) module's Crafting and Crafting table 
     - A broken website table does not fall back to the bot's own table.
 
 #### Kits
-A kit is a set of items packed together in one shulker, slot for slot with the same counts, like a PvP kit. These are the
-saved kits that `build-kits` builds. To send kit shulkers that are already in your stash to their own chests, see
-[Kit sorting](#kit-sorting) below.
+A kit is a set of items packed together in one shulker, slot for slot with the same counts, like a PvP kit. The saved
+kits in this section are no longer built or routed (`build-kits` was removed in 0.7.0). They are kept so that **Import
+local kits** on the Kit Builder tab can make templates from them. Kit shulkers are sent to their own chests by
+[Kit sorting](#kit-sorting), and kit orders and restock are in [Kit orders and restock](#kit-orders-and-restock).
 
 - **Saving:** put the kit in your 27 main inventory slots (not the hotbar, offhand or armor), type a name in the **Kits**
   section of the module's settings and press **Save kit**. The name needs letters or numbers, must be unique on the
   server (case and punctuation don't count), and a kit can't contain shulker boxes.
-- **The list:** each kit shows its slot count, how many are built and how many more the stash could build. **View**
-  opens a look-only preview. Click the minus twice to delete a kit.
+- **The list:** **View** opens a look-only preview of a saved kit. Click the minus twice to delete a kit.
 - Kits are saved per server in `meteor-client/qwerte/kits/`. A file that this version can't read (for example one saved
   on the other Minecraft version) is kept untouched and its kits are unavailable. A file that can't be read at all is
   moved aside as `<server>.corrupt-<time>.nbt`.
-- **Building** with `build-kits` (off by default, Signs mode only): it builds as many copies as the stash allows. It
-  takes an empty shulker, preferring boxes signed "empty shulkers", gathers the items and fills the shulker with the
-  exact saved counts. Durability and anvil cost are ignored, but everything else must match: names, enchantments,
-  potions and trims. A saved kit whose name is a Kit Builder template is skipped here (from 0.6.0); the Kit Builder's
-  **Import local kits** button can turn it into a template instead.
-- **Where kits go:** a finished kit goes to the chest whose sign is the kit's name, "<name> kit" or "<name> kits". With
-  no such chest the kit isn't built, and the chat says so once.
-- **Kit chests are reserved:** a sign naming a kit's chest keeps loose items out of it, even with `build-kits` off. So
-  don't name kits after categories, like `pvp` or `totems`.
-- Finished kits are never unpacked or topped up, and neither is a part-built kit holding more than one kind of item. A
-  part-built kit in its own chest is carried on with. A part-built kit holding only one kind of item, outside its kit's
-  chest, is treated as an ordinary bulk shulker.
-- Each step makes up to two inventory clicks, then waits `delay` ticks. Raise `delay` if the server complains about
-  clicks.
-
 #### Kit sorting
 New in 0.6.0 (kit sorting v2) and not tested in game yet. With the `kit-sorting` setting on (the default), a shulker box that
 is a kit goes to a chest you pick on the [Stash Manager](#stash-manager) website or in the Stash Window's Kits tab, and the
@@ -309,6 +294,38 @@ sorter moves it there when it finds it somewhere else. Stash Manager server 1.1.
   item, so it is stock and not a kit. While an older bot reports, the Kits tab's Advanced section still shows the v1 points.
 - The settings and the report travel in the [stash-manager](#stash-manager) module's heartbeat, so that module needs to be
   on, with `server-url` and `api-key` set and a stash loaded. Without it the bot has no kit settings and sorts kits as before.
+
+#### Kit orders and restock
+New in 0.7.0 (kit sorting release 2) and not tested in game yet. The bot carries out the kit lines of
+[Stash Manager](#stash-manager) orders, and keeps the Kit Builder's kits with a keep count stocked. It needs `kit-sorting`,
+`accept-orders` on the stash-manager module, and Stash Manager server 1.1.0 or newer.
+
+- **Kit orders** (`kit-orders`, on): the bot takes orders with kit lines, for the templates in the Kit Builder. It delivers
+  complete copies, ready ones first: complete copies already in the stash, several identical ones included. The rest are
+  built on the fullest incomplete copy that fits, or in an empty shulker of the template's colour. With no empty shulker of
+  that colour, another colour is used and the result says so (`colour_substituted`). Items are gathered by match key within
+  the order's budget, and a built box is named after its template. Each order's result (`result.kit`) lists what was ready,
+  built and delivered, and what came short.
+- **Only complete kits are delivered.** Before delivery the bot checks the kit again. A short kit that is named is kept as
+  an incomplete copy in its chest, where a restock or a later order can top it up. A short kit that is not named is left to
+  normal sorting, which takes mixed shulkers apart. A short kit of fewer than two kinds of item is not started at all.
+- **Restock** (`kit-restock`, on; needs `kit-orders`): while the bot is idle, it keeps the templates with a keep count
+  (set in the Kit Builder) stocked. It looks at the first 16 such templates, by id. Incomplete copies are topped up first,
+  then new copies are built. It uses only unreserved stock in the stash and never crafts, and it keeps the 1728 experience
+  bottles of the repair reserve. It starts nothing before the first heartbeat reply on the connection, and it stops when an
+  order arrives.
+- **Limits:** `kit-restock-per-hour` (12, from 0 to 120) caps the restock jobs started in an hour. The start times are kept
+  in `meteor-client/qwerte/kit-restock.json`, so a restart does not reset the cap. `kit-restock-min-empty` (2, from 0 to 54)
+  keeps that many empty shulkers in the stash after each job.
+- **Heartbeat.** The bot tells the server what it can do with kits: `enabled`, `restock`, and `importer` (always true).
+  `craft` is always false, so kit shortfalls are never crafted.
+
+**Known limits:**
+- A kit order isn't resumable. After a restart it fails with "the bot restarted while building kits; retry the order".
+- Kit shortfalls aren't crafted.
+- Kit orders ignore the bottle reserve, as the contract says. Restock keeps it.
+- Restock can't see reservations held by other bots' orders on a shared stash.
+- Restock doesn't stop for a nearby player.
 
 #### Excluded and drop-off containers
 - Set `pick` to **Exclude** and right-click containers it should never sort into or out of. Right-click again to undo.
@@ -494,7 +511,14 @@ and sends from the window. Turn it on with the **Messenger** module (category Qw
   still opens the normal chat. `overlay-global` (off by default) puts Global in the overlay while the window isn't focused;
   off, the overlay shows your conversations instead.
 - **Display (New in 0.5.0).** `auto-font-scale` (on) grows and shrinks the text, rows, badges and emoji with the window: its
-  size against the default 330 x 190, from 0.75x to 2x. Off, `font-scale` (1.0, from 0.75 to 2.0) is used instead.
+  size against the default 330 x 190, from 0.1x to 2x. Off, `font-scale` (1.0, from 0.1 to 2.0) is used instead.
+- **Size (New in 0.7.0).** The window has no minimum size. It can be made as small as 24 x 12 GUI units, and the text
+  shrinks with it. The limits below are in the window's own units (its size divided by the text scale). Under 190 wide,
+  the conversation list collapses, and an `=` button in the title bar (shown while the window has focus) switches between
+  the messages and the list. Under 140 wide, the header buttons (New, Emoji, Delete) hide. Under 60 high, only the input
+  line (while the window is focused) or only the messages are shown; the first key you type brings the input line back.
+  The title bar and the resize grip stay grabbable at 8 real pixels or more. A very small window starts a drag when you
+  click near its top.
   `system-message-opacity` (55 per cent, from 10 to 100) dims the console lines in Global (server messages, joins and
   leaves, and notices from Meteor and its addons). Player chat is always at full opacity. `show-player-heads` (on) draws the
   player's head in front of a public chat line written `<Name> text`.
@@ -524,6 +548,8 @@ New in 0.4.0-dev and still being tested.
   shulkers go back where they came from. stash-sorter doesn't need to be on; to stop the bot, turn off `accept-orders`
   or this module.
 - Pick the delivery container with `select-delivery` and a right-click on the container. It is never sorted into.
+- Kit lines (from 0.7.0): the bot also carries out the kit lines of an order, and keeps kits stocked. See
+  [Kit orders and restock](#kit-orders-and-restock).
 - An order in progress is saved with the stash, so it carries on after a disconnect.
 - **Repairing items.** An order can ask for "Repair all items" (only damaged Mending items are repaired) or a "Repair"
   toggle on a single line. The bot repairs those items with Bottles o' Enchanting from the stash before it packs them
@@ -589,7 +615,8 @@ New in 0.4.0-dev and still being tested.
   below to put it in the picked slot. Each slot is either an exact item or any variant of it, and a slot the stash no longer
   has is shown in red. The editor also has presets, a shulker colour, and the restock keep (0 is off). Saving needs
   `settings`, and deleting a template keeps its boxes, which are no longer copies of it. **Order** needs `order`, and shows
-  only where the stash's bot can carry out kit orders, which the addon's bot can't yet.
+  only where the stash's bot can carry out kit orders (the addon's bot can, from 0.7.0, with `kit-orders` on; see
+  [Kit orders and restock](#kit-orders-and-restock)).
 - **Import local kits** (on the Kit Builder tab, when this client has saved kits): makes a template from each kit you saved
   in stash-sorter's Kits section. Press it once, then **Confirm import?** to go ahead. Kits of one kind of item, and copies
   of a template already on the server, are skipped, and the import stops at the server's template limit (50 templates).
@@ -625,6 +652,11 @@ New in 0.4.0-dev and still being tested.
 ### Container Tweaks
 New in 0.4.0-dev and still being tested.
 
+**Renamed in 0.7.0:** the module is now `qwerte-container-tweaks`. Musheor's addon has a module named `container-tweaks`,
+and Meteor keeps only one module per name. Saved settings and the keybind carry over from an old `container-tweaks` entry
+(or `container-tweaks-porter`), but only when that entry has Qwerte's own settings, such as `freeze-key` or `smart-shulker`.
+If another addon replaces any Qwerte module, the game log names it and chat warns once.
+
 #### Shulker preview
 - Hover a shulker box in a container or your inventory to see what is inside as a grid, in the box's colour.
 - Hold `freeze-key` (Left Alt by default) to freeze the grid where it is. Hover an item in the frozen grid to see its full
@@ -637,6 +669,10 @@ New in 0.4.0-dev and still being tested.
 - `icon` (on) draws the item a shulker box holds the most of on top of it, in containers and your inventory, and with
   `hotbar-icon` (on) on your hotbar too. It counts items by type across the whole box, and empty shulker boxes get no icon.
   `icon-scale` sets its size (0.5 of a slot by default, from 0.3 to 1) and `icon-corner` its corner (top left by default).
+
+- `debug-freeze` (off; in the Shulker Preview group, shown while `preview` is on) is temporary. While it is on, each change of
+  the freeze key, the hovered box or the freeze decision is written to the game log, at most 200 lines each time the module
+  is turned on. Leave it off unless you are testing the freeze.
 
 #### Smart Shulker and Smart Echest
 Both are off by default. Turn on `smart-shulker` for shulker boxes and `smart-echest` for ender chests.
@@ -1056,8 +1092,8 @@ Out of materials:
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) for Minecraft **1.21.11** or **1.21.4**.
 2. Put [Meteor Client](https://meteorclient.com) for the same Minecraft version in your `mods` folder.
 3. Download the `qwerte-addon` jar for your Minecraft version from the
-   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.6.0`, see
-   [Versioning](#versioning) and [Dev builds](#dev-builds)): `qwerte-addon-0.6.0+1.21.11.jar` or `qwerte-addon-0.6.0+1.21.4.jar`.
+   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.7.0`, see
+   [Versioning](#versioning) and [Dev builds](#dev-builds)): `qwerte-addon-0.7.0+1.21.11.jar` or `qwerte-addon-0.7.0+1.21.4.jar`.
    Put it in your `mods` folder. It needs Stash Manager server 1.1.0 or newer for kit v2, and works alongside Stash Sorter plugin 1.17.0.
 4. *(Optional, for auto-walk and refilling)* Download `baritone-api-fabric-1.3.0-<minecraft>.jar` for your version from
    [dekrom's Baritone releases](https://github.com/dekrom/baritone/releases) (for example
@@ -1084,7 +1120,7 @@ Qwerte uses `MAJOR.MINOR.PATCH` versions:
 The `0.4.0-dev.N` counting has ended. 0.5.0 is the first release under this scheme. 0.5.x releases are fixes, 0.6.0 is the
 next feature batch, and 1.0.0 will mark the first stable release.
 
-**Compatibility:** Qwerte **0.6.0** needs [Stash Manager server](stash-manager-server/README.md) **1.1.0** or newer for kit v2
+**Compatibility:** Qwerte **0.7.0** needs [Stash Manager server](stash-manager-server/README.md) **1.1.0** or newer for kit v2
 (**1.2.0** is current), and works alongside the Stash Sorter plugin **1.17.0** (see
 [Stash Sorter for AquariusProxy](https://github.com/Qwertze/Stash-Sorter)).
 
@@ -1155,8 +1191,8 @@ around. The purple boxes are the blocks it's about to till.
 5. Turn on `stay-on` to keep it running as a sorting bot.
 6. Search the stash anytime from the module's settings.
 7. Turn on **stash-overlay** to see what each container holds.
-8. *(Optional)* To build kits, save them in the **Kits** section of the module's settings, put a chest signed with each
-   kit's name, then turn on `build-kits` in Signs mode. Saved kits that are also Kit Builder templates are skipped here.
+8. *(Optional)* To have the bot carry out kit orders and keep kits stocked, turn on `kit-sorting` and `accept-orders`, and
+   leave `kit-orders` and `kit-restock` on (both are on by default). See [Kit orders and restock](#kit-orders-and-restock).
 9. *(Optional, not tested in game yet)* For kit sorting, link the addon to your Stash Manager server (see
    `stash-manager` above), then pick a kits chest on the website or in the Stash Window's Kits tab, a chest for each kit
    type you want, and a chest for any
@@ -1314,7 +1350,10 @@ station. If you'd rather work hands-on, turn off `auto-walk`, `auto-water` and `
 | Shulkers | `compact-exclude` | empty | Items that are never compacted, like ender pearls. |
 | Shulkers | `repack` | on | Signs mode: clean mixed shulkers and pack loose items into bulk shulkers. |
 | Shulkers | `new-bulk-at` | 9 | Start a new bulk shulker from an empty one at this many stacks of one item. 0 only tops up existing ones. Only used while `compact` is off. |
-| Kits | `build-kits` | off | Signs mode only: build the saved kits out of the stash, into chests signed with the kit's name. Saved kits whose name is a Kit Builder template are skipped (from 0.6.0). |
+| Kits | `kit-orders` | on | Carry out the kit lines of Stash Manager orders (see Kit orders and restock). Needs `kit-sorting` and `accept-orders` on the stash-manager module. Replaces the removed `build-kits`. |
+| Kits | `kit-restock` | on | While idle, keep the Kit Builder's kits with a keep count stocked, from unreserved stock only. Shown while `kit-orders` is on. |
+| Kits | `kit-restock-per-hour` | 12 | The most restock jobs started in an hour, kept across restarts (0 to 120). Shown while `kit-orders` is on. |
+| Kits | `kit-restock-min-empty` | 2 | Restock leaves at least this many empty shulkers in the stash after taking one (0 to 54). Shown while `kit-orders` is on. |
 | Slots | `carry-slots` | blank | Slots to carry items in. Blank uses every slot that's empty when sorting starts. |
 | Slots | `keep-slots` | blank | Slots never to touch. |
 | Search | `whisper-search` | off | Let whitelisted players search by whisper. |
@@ -1371,7 +1410,7 @@ src/main/java/com/porter/qwerte/
 │   ├── ResetPearl.java       The reset-pearl module: climbs out of a stasis chamber and re-arms it
 │   ├── Messenger.java        The messenger module: the whisper window, its patterns, sending and history
 │   ├── StashWindow.java      The stash-window module: the in-game Stash Window and its local index
-│   ├── ContainerTweaks.java  The container-tweaks module: shulker previews and icons, Smart Shulker and Smart Echest
+│   ├── ContainerTweaks.java  The qwerte-container-tweaks module: shulker previews and icons, Smart Shulker and Smart Echest
 │   ├── Printer.java          The printer module: builds a schematic block by block, fetching or ordering its materials
 │   ├── PrinterActions.java   The printer's clicks: placing, breaking, sneaking, checking blocks and quick-moves out of containers
 │   ├── FlyController.java    The printer's flight: flies with a flight module to a hover point, and lands before trips (a helper, not a module)

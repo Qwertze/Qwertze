@@ -305,6 +305,12 @@ public final class KitReport {
      * @param settings    the cached kit settings (templates, categories), or null
      */
     public static Built buildV2(String server, String stash, String player, List<BoxInfo> boxes, List<Shulker> carried, String fingerprint, KitSettings settings) {
+        return buildV2(server, stash, player, boxes, carried, fingerprint, settings, null);
+    }
+
+    /** As above, with what kit restock is doing for the report's {@code restock} (null: off). */
+    public static Built buildV2(String server, String stash, String player, List<BoxInfo> boxes, List<Shulker> carried, String fingerprint, KitSettings settings,
+                                KitRestock.Decision restock) {
         Map<String, String> memo = new java.util.HashMap<>();
         Map<String, Container> containers = new LinkedHashMap<>();
         Map<String, Agg> kits = new LinkedHashMap<>();
@@ -370,12 +376,12 @@ public final class KitReport {
         Set<String> pickable = new HashSet<>();
         for (Container c : list) if (c.pickable()) pickable.add(c.id());
         JsonArray templatesJson = templatesJson(templates, hits, pickable, settings);
-        Built built = assembleV2(server, stash, player, list, limit, kitList, carriedAgg, fingerprint, otherList, templatesJson);
+        Built built = assembleV2(server, stash, player, list, limit, kitList, carriedAgg, fingerprint, otherList, templatesJson, restock);
         while (built.json().length > MAX_BYTES && (limit > 0 || !otherList.isEmpty())) {
             // The named non-kits go first, then containers
             if (!otherList.isEmpty()) otherList = new ArrayList<>(otherList.subList(0, otherList.size() / 2));
             else limit = limit * 3 / 4;
-            built = assembleV2(server, stash, player, list, limit, kitList, carriedAgg, fingerprint, otherList, templatesJson);
+            built = assembleV2(server, stash, player, list, limit, kitList, carriedAgg, fingerprint, otherList, templatesJson, restock);
         }
         return built;
     }
@@ -428,7 +434,7 @@ public final class KitReport {
     }
 
     private static Built assembleV2(String server, String stash, String player, List<Container> priority, int limit, List<Agg> allKits, Map<String, Agg> carriedAgg,
-                                    String fingerprint, List<Other> otherList, JsonArray templates) {
+                                    String fingerprint, List<Other> otherList, JsonArray templates, KitRestock.Decision rd) {
         List<Container> list = new ArrayList<>(priority.subList(0, limit));
         list.sort(Comparator.comparing(Container::id));
         Set<String> ids = new HashSet<>();
@@ -492,11 +498,13 @@ public final class KitReport {
             oo.add("why", whyJson(o.why));
             othersJson.add(oo);
         }
-        // The addon has no restock yet (release 2): the state is off
+        // What restock is doing: the state, the template it works on and why it waits
         JsonObject restock = new JsonObject();
-        restock.addProperty("state", "off");
-        restock.add("template", JsonNull.INSTANCE);
-        restock.add("reason", JsonNull.INSTANCE);
+        restock.addProperty("state", rd == null ? "off" : rd.state().name().toLowerCase(java.util.Locale.ROOT));
+        if (rd == null || rd.template() == null) restock.add("template", JsonNull.INSTANCE);
+        else restock.addProperty("template", rd.template());
+        if (rd == null || rd.reason() == null) restock.add("reason", JsonNull.INSTANCE);
+        else restock.addProperty("reason", rd.reason());
 
         // The hash leaves every readAt out: a read that found nothing changed is not a change
         JsonObject body = new JsonObject();

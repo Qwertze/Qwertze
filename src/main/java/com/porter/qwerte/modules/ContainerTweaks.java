@@ -12,6 +12,7 @@ import com.porter.qwerte.events.HotbarSlotRenderEvent;
 import com.porter.qwerte.events.ShulkerTooltipLinesEvent;
 import com.porter.qwerte.tweaks.FreezeDecision;
 import com.porter.qwerte.tweaks.FrozenGrid;
+import com.porter.qwerte.tweaks.MigrationSource;
 import com.porter.qwerte.tweaks.Orphans;
 import com.porter.qwerte.tweaks.ShulkerSummaries;
 import com.porter.qwerte.tweaks.SmartPlaceFlow;
@@ -141,6 +142,14 @@ public class ContainerTweaks extends Module {
         .build()
     );
 
+    private final Setting<Boolean> debugFreeze = sgPreview.add(new BoolSetting.Builder()
+        .name("debug-freeze")
+        .description("Temporary: writes a line to the game log each time the freeze key, the hovered shulker box or the freeze decision changes. Leave off unless asked to test the freeze.")
+        .defaultValue(false)
+        .visible(preview::get)
+        .build()
+    );
+
     // Smart shulker and echest
 
     private final Setting<Boolean> smartShulker = sgShulker.add(new BoolSetting.Builder()
@@ -253,7 +262,7 @@ public class ContainerTweaks extends Module {
     private int orphanTick;
 
     public ContainerTweaks() {
-        super(QwerteAddon.CATEGORY, "container-tweaks", "Shulker box preview with a freeze key, the most common item drawn on shulker boxes, and right-click to place, open and pick up a shulker box or ender chest.");
+        super(QwerteAddon.CATEGORY, MigrationSource.NEW_NAME, "Shulker box preview with a freeze key, the most common item drawn on shulker boxes, and right-click to place, open and pick up a shulker box or ender chest.");
     }
 
     @Override
@@ -263,6 +272,8 @@ public class ContainerTweaks extends Module {
 
     @Override
     public void onDeactivate() {
+        lastDebug = "";
+        debugLines = 0;
         session.shutdown();
         unfreeze();
         ShulkerSummaries.clear();
@@ -337,7 +348,9 @@ public class ContainerTweaks extends Module {
         boolean held = freezeHeld();
         ItemStack hovered = event.hoveredSlot == null ? ItemStack.EMPTY : event.hoveredSlot.getItem();
         ShulkerSummaries.Summary hoveredSummary = event.hoveredSlot == null ? null : ShulkerSummaries.of(hovered);
-        switch (FreezeDecision.decide(held, hoveredSummary != null, frozen, event.screen == frozenScreen)) {
+        FreezeDecision.Action action = FreezeDecision.decide(held, hoveredSummary != null, frozen, event.screen == frozenScreen);
+        if (debugFreeze.get()) debugFreeze(held, hoveredSummary != null, action);
+        switch (action) {
             case UNFREEZE -> unfreeze();
             case FREEZE -> {
                 frozen = true;
@@ -375,6 +388,19 @@ public class ContainerTweaks extends Module {
     @EventHandler
     private void onContainerTooltip(ContainerTooltipEvent event) {
         if (frozen) event.setCancelled(true);
+    }
+
+    private static final int MAX_DEBUG_LINES = 200;
+    private String lastDebug = "";
+    private int debugLines;
+
+    /** One line per change of the key, the hovered shulker box, the decision or the frozen state. */
+    private void debugFreeze(boolean held, boolean hovered, FreezeDecision.Action action) {
+        String now = "held=" + held + " hovered=" + hovered + " action=" + action + " frozen=" + frozen;
+        if (now.equals(lastDebug) || debugLines >= MAX_DEBUG_LINES) return;
+        lastDebug = now;
+        debugLines++;
+        QwerteAddon.LOG.info("container-tweaks freeze: {} key={} screen={}", now, freezeKey.get(), mc.screen == null ? "none" : mc.screen.getClass().getSimpleName());
     }
 
     private void unfreeze() {

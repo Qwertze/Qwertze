@@ -46,6 +46,11 @@ public final class Kit {
     }
 
     public final String name;
+    /**
+     * An order kit built from a template (kit orders): the colour of the empty shulker to build in (null any, "plain" or a dye colour), and the group
+     * key of the incomplete copy to build on (null: an empty shulker). Set by the order runner before the kit is begun.
+     */
+    public String shulkerColor, baseGroup;
     /** A transient kit made for an order: items match exactly, damage and repair cost included. Not a saved kit. */
     public final boolean exact;
     private final ItemStack[] layout = new ItemStack[SLOTS];

@@ -469,10 +469,38 @@ public class StashSorter extends Module {
 
     // Kits
 
-    private final Setting<Boolean> buildKits = sgKits.add(new BoolSetting.Builder()
-        .name("build-kits")
-        .description("Signs mode: builds the kits saved below out of the stash, as many as it can. Takes an empty shulker, gathers the items, and fills it slot for slot with the saved counts, then files it in the chest signed with the kit's name (or \"<name> kit\"). A kit with no such chest isn't built. Uses every empty shulker in the stash.")
-        .defaultValue(false)
+    private final Setting<Boolean> kitOrders = sgKits.add(new BoolSetting.Builder()
+        .name("kit-orders")
+        .description("Take orders with kit lines from the Stash Manager server: the kits of the dashboard's Kit Builder, delivered as complete copies (ready ones first, the rest built from an empty shulker or from the fullest incomplete copy). A kit that can't be completed is never delivered; it is kept as an incomplete copy. Needs kit-sorting. The saved local kits (build-kits) are retired: import them into the Kit Builder from the Stash Window.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Boolean> kitRestock = sgKits.add(new BoolSetting.Builder()
+        .name("kit-restock")
+        .description("While idle, keeps the dashboard kits that have a keep count stocked: tops up incomplete copies first, then builds new ones, from unreserved stock only (never crafts, never takes the repair reserve of experience bottles). Needs kit-orders.")
+        .defaultValue(true)
+        .visible(kitOrders::get)
+        .build()
+    );
+
+    private final Setting<Integer> kitRestockPerHour = sgKits.add(new IntSetting.Builder()
+        .name("kit-restock-per-hour")
+        .description("The most restock jobs started in an hour (kept across restarts).")
+        .defaultValue(12)
+        .range(0, 120)
+        .sliderRange(0, 60)
+        .visible(kitOrders::get)
+        .build()
+    );
+
+    private final Setting<Integer> kitRestockMinEmpty = sgKits.add(new IntSetting.Builder()
+        .name("kit-restock-min-empty")
+        .description("Restock leaves at least this many empty shulkers in the stash after taking one.")
+        .defaultValue(2)
+        .range(0, 54)
+        .sliderRange(0, 20)
+        .visible(kitOrders::get)
         .build()
     );
 
@@ -1499,13 +1527,194 @@ public class StashSorter extends Module {
         public boolean namedShulkers() {
             return namedForOrders();
         }
+
+        @Override
+        public boolean keptKit(ItemStack shulker) {
+            return keptWholeKit(shulker);
+        }
     });
+
+
+    // Kit restock (KIT-CONTRACT v2, revision 4, "Restock"): an idle job, after the sorting and before compaction. Per template with a keep count, counted in
+    // its chain target: top up the fullest incomplete copy first (across all templates), else build a new copy, from unreserved stock only, never crafting
+    // and never below the experience-bottle reserve. One kit per job: an order of one kit that the order runner builds, names and leaves for the sorting
+    // to file; a waiting order, a pause or a switch stops it.
+
+    private volatile com.porter.qwerte.stash.KitRestock.Decision restockDecision = new com.porter.qwerte.stash.KitRestock.Decision(
+        com.porter.qwerte.stash.KitRestock.State.OFF, null, null, false);
+    private long restockCheckedAt;
+
+    /** What restock is doing, for the kit report. */
+    public com.porter.qwerte.stash.KitRestock.Decision restockDecision() {
+        return kitRestockOn() ? restockDecision : new com.porter.qwerte.stash.KitRestock.Decision(com.porter.qwerte.stash.KitRestock.State.OFF, null, null, false);
+    }
+
+    private static com.porter.qwerte.stash.KitOrder.Snapshot restockSnapshot(com.porter.qwerte.stash.KitTemplate t, long bottlesUsable) {
+        return new com.porter.qwerte.stash.KitOrder.Snapshot(1, List.of(new com.porter.qwerte.stash.KitOrder.Line(t, 1, 0, 1)),
+            com.porter.qwerte.stash.KitRestock.takeFor(t, bottlesUsable), false);
+    }
+
+    /** The counts of one template in its chain target (cheap: only that chest is looked at); what a plan could do is filled in later, when it matters. */
+    private com.porter.qwerte.stash.KitRestock.Candidate restockCandidate(KitSettings settings, KitRouting.View<Box> view, com.porter.qwerte.stash.KitTemplate t) {
+        String target = com.porter.qwerte.stash.KitRouting.templateTarget(t, settings);
+        Box box = target == null || view == null ? null : view.box(target);
+        boolean pickable = box != null && StashIndex.kitPickable(box);
+        boolean free = pickable && box.free() > 0;
+        int complete = 0, incomplete = 0;
+        if (box != null && box.contents != null) {
+            for (ItemStack s : box.contents) {
+                if (s.isEmpty() || !Utils.isShulker(s.getItem())) continue;
+                var m = com.porter.qwerte.stash.KitTemplates.match(t, StashIndex.boxStacks(s), StashIndex.normalizedName(s));
+                if (m.state() == com.porter.qwerte.stash.KitTemplates.State.COMPLETE) complete++;
+                else if (m.state() == com.porter.qwerte.stash.KitTemplates.State.INCOMPLETE) incomplete++;
+            }
+        }
+        return new com.porter.qwerte.stash.KitRestock.Candidate(t, target, pickable, free, complete, incomplete, false, false, false, false);
+    }
+
+    /** What the plan can do for a candidate, from the one scan all candidates share: top up an incomplete copy, build a new one (whole or partly), or not for bottles. */
+    private com.porter.qwerte.stash.KitRestock.Candidate restockFlags(com.porter.qwerte.stash.KitRestock.Candidate c, com.porter.qwerte.stash.KitPlan.Scan scan, long bottles,
+                                                                       int empties) {
+        var t = c.template();
+        var snap = restockSnapshot(t, bottles);
+        var withBases = com.porter.qwerte.stash.KitPlan.plan(snap, scan, OrderRunner::maxStackOf, empties, Set.of(), com.porter.qwerte.stash.Order.MAX_BINS, true);
+        boolean topUp = false;
+        for (var b : withBases.builds()) if (b.base() != null && !b.lots().isEmpty()) topUp = true;
+        var fresh = com.porter.qwerte.stash.KitPlan.plan(snap, scan.withoutBases(), OrderRunner::maxStackOf, empties, Set.of(), com.porter.qwerte.stash.Order.MAX_BINS, true);
+        boolean build = false, partial = false;
+        for (var b : fresh.builds()) {
+            if (b.base() != null) continue;
+            if (b.kitShort()) partial = true;
+            else build = true;
+        }
+        // What is missing is bottles, and taking them would go below the reserve
+        boolean bottleBlocked = false;
+        for (var take : com.porter.qwerte.stash.KitRestock.takeFor(t, Long.MAX_VALUE / 4)) {
+            if (com.porter.qwerte.stash.KitTemplate.baseOf(take.match()).equals(com.porter.qwerte.stash.KitRestock.BOTTLE) && bottles < take.count()) bottleBlocked = true;
+        }
+        return new com.porter.qwerte.stash.KitRestock.Candidate(t, c.target(), c.targetPickable(), c.targetFree(), c.complete(), c.incomplete(), topUp, build, partial, bottleBlocked);
+    }
+
+    // One scan per decision, shared by every candidate and by the plans with and without bases; kept while the stash, its boxes and the settings are as they were
+    private String restockScanKey = "";
+    private long restockScanAt;
+    private com.porter.qwerte.stash.KitPlan.Scan restockScan;
+    private long restockBottles;
+
+    /** Looks at the templates now and then (every 30 s) and starts one restock job when the decision says so. */
+    private boolean kitRestockStep() {
+        if (!kitRestockOn() || stash == null || mc.player == null || mc.level == null) return false;
+        long now = System.currentTimeMillis();
+        if (now - restockCheckedAt < 30_000) return false;
+        restockCheckedAt = now;
+        StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+        if (manager == null) return false;
+        if (!com.porter.qwerte.stash.KitRestock.mayStart(orderRunner.holdsOrder(), orderRunner.resumeId() != null, manager.replyHeard(), manager.ordersAccepted(), !ordersOn())) {
+            return false;
+        }
+        KitSettings settings = KitStore.shared().get(stash.server, stash.name);
+        if (settings == null || settings.types() == null) return false;
+        List<com.porter.qwerte.stash.KitTemplate> templates = com.porter.qwerte.stash.KitRestock.candidates(settings.types().templates());
+        if (templates.isEmpty()) {
+            restockDecision = new com.porter.qwerte.stash.KitRestock.Decision(com.porter.qwerte.stash.KitRestock.State.IDLE, null, null, false);
+            return false;
+        }
+        KitRouting.View<Box> view = kitView();
+        int empties = kitBuilder.emptyShulkers().size();
+        List<com.porter.qwerte.stash.KitRestock.Candidate> candidates = new ArrayList<>();
+        for (com.porter.qwerte.stash.KitTemplate t : templates) candidates.add(restockCandidate(settings, view, t));
+
+        // The decision stops early when it can't change: orders wait or the hour's cap is reached (nothing is scanned), or nothing is below its keep
+        int builtHour = com.porter.qwerte.stash.KitRestockStamps.shared().lastHour(now), cap = kitRestockPerHour.get();
+        boolean stopped = manager.pendingOrderCount() > 0 || cap <= 0 || builtHour >= cap;
+        boolean below = false;
+        for (var c : candidates) if (c.template().keep() > c.complete()) below = true;
+        long bottles = 0;
+        if (!stopped && below) {
+            // A container read again with other contents changes the stamp (its array is replaced); a scan is never older than a minute either
+            long stamp = 17;
+            for (Box b : stash.boxes) stamp = com.porter.qwerte.stash.KitRestock.mix(stamp, b.contents, b.lastRead);
+            String key = com.porter.qwerte.stash.KitRestock.scanKey(stash.server, stash.name, version, stash.boxes.changes(), stamp, settings.types().hash());
+            if (restockScan == null || !com.porter.qwerte.stash.KitRestock.scanUsable(key, restockScanKey, restockScanAt, now)) {
+                var combined = new ArrayList<com.porter.qwerte.stash.KitOrder.Line>();
+                for (var t : templates) combined.add(new com.porter.qwerte.stash.KitOrder.Line(t, 1, 0, 1));
+                // Every template's slots are wanted, with a take large enough that the scan never limits what a plan may draw
+                restockScan = orderRunner.probeScan(new com.porter.qwerte.stash.KitOrder.Snapshot(1, combined, List.of(), false));
+                restockBottles = com.porter.qwerte.stash.KitRestock.bottlesUsable(orderRunner.stashCount(com.porter.qwerte.stash.KitRestock.BOTTLE));
+                restockScanKey = key;
+                restockScanAt = now;
+            }
+            bottles = restockBottles;
+            if (restockScan != null) {
+                List<com.porter.qwerte.stash.KitRestock.Candidate> flagged = new ArrayList<>();
+                for (var c : candidates) flagged.add(c.template().keep() > c.complete() ? restockFlags(c, restockScan, bottles, empties) : c);
+                candidates = flagged;
+            }
+        }
+        var in = new com.porter.qwerte.stash.KitRestock.Inputs(true, manager.pendingOrderCount() > 0, builtHour, cap, empties - 1, kitRestockMinEmpty.get(),
+            anvilProblem() == null, candidates);
+        var d = com.porter.qwerte.stash.KitRestock.decide(in);
+        restockDecision = d;
+        if (d.state() != com.porter.qwerte.stash.KitRestock.State.BUILDING || d.template() == null) return false;
+        com.porter.qwerte.stash.KitTemplate t = settings.types().template(d.template());
+        if (t == null) return false;
+        com.porter.qwerte.stash.Order synthetic = new com.porter.qwerte.stash.Order("restock-" + now, List.of(new com.porter.qwerte.stash.Order.Line(com.porter.qwerte.stash.Order.KIT, t.id(), 1)), null, false, null, null, restockSnapshot(t, bottles));
+        String why = orderRunner.offerRestock(synthetic, d.topUp());
+        if (why != null) {
+            QwerteAddon.LOG.info("[kit-restock] not started: {}", why);
+            return false;
+        }
+        com.porter.qwerte.stash.KitRestockStamps.shared().add(now);
+        orderTaken();
+        // Orders waiting are heard sooner: a heartbeat goes out now
+        manager.requestHeartbeat();
+        info("Kit restock: %s a copy of a kit.", d.topUp() ? "topping up" : "building");
+        return true;
+    }
+
+    /** Every tick: a restock job stops when an order waits, restock or kit orders or orders are switched off, or the sorter can't work. */
+    private void restockWatch() {
+        if (!orderRunner.restocking()) return;
+        // The job reports nothing to the server: its end is noticed here
+        orderRunner.report();
+        if (!orderRunner.restocking()) return;
+        StashManager manager = meteordevelopment.meteorclient.systems.modules.Modules.get().get(StashManager.class);
+        boolean waiting = manager != null && manager.pendingOrderCount() > 0;
+        if (com.porter.qwerte.stash.KitRestock.mustStop(waiting, kitRestock.get(), kitOrders.get(), manager != null && manager.ordersAccepted(), !ordersOn())) {
+            orderRunner.park();
+        }
+    }
+
+    /** Kit orders may be taken: the setting and kit sorting are on (the heartbeat says so, and the claim carries the flag). */
+    boolean kitOrdersCapable() {
+        return kitSorting.get() && kitOrders.get();
+    }
+
+    boolean kitRestockOn() {
+        return kitOrdersCapable() && kitRestock.get();
+    }
 
     // Orders from the Stash Manager server: kits built from exact items, delivered to the delivery container
     private final OrderRunner orderRunner = new OrderRunner(kitBuilder, new OrderRunner.Owner() {
         @Override
         public Stash stash() {
             return stash;
+        }
+
+        @Override
+        public boolean keptKit(ItemStack shulker) {
+            return keptWholeKit(shulker);
+        }
+
+        @Override
+        public KitSettings kitSettings() {
+            Stash st = stash;
+            return st == null ? null : KitStore.shared().get(st.server, st.name);
+        }
+
+        @Override
+        public boolean kitOrdersOn() {
+            return kitOrdersCapable();
         }
 
         @Override
@@ -3062,6 +3271,9 @@ public class StashSorter extends Module {
         // Everything is put away: whatever others left on the ground comes before kits and compacting
         if (startGround()) return true;
 
+        // Kit restock (idle, after everything is sorted, before compaction)
+        if (kitRestockStep()) return true;
+
         // Nothing left to sort: build kits
         if (kitsOn() && !orderKit() && activeCarried().isEmpty() && !compactor.active() && kitBuilder.begin() && runKit(kitBuilder.next())) return true;
 
@@ -3233,7 +3445,8 @@ public class StashSorter extends Module {
     // Building kits
 
     private boolean kitsOn() {
-        return buildKits.get() && mode.get() == Mode.Signs && shulkersOk();
+        // Retired: the saved local kits are not built any more (kit orders and restock build the dashboard's kits)
+        return false;
     }
 
     /**
@@ -10370,6 +10583,7 @@ public class StashSorter extends Module {
             Stash.remember();
             if (mc.level != null) cachedDimension = mc.level.dimension().toString();
             applyPendingArea();
+            restockWatch();
             pumpAlerts();
             ground.update();
             // Not walking for us: Baritone's settings are the user's own

@@ -19,6 +19,76 @@ next feature batch, and 1.0.0 will mark the first stable release. The version is
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-10
+
+A pre-release build from the `dev` branch. Nothing in it has been tested in game yet. It covers everything since 0.6.0.
+Works with Stash Manager server 1.1.0 (kit2) or newer (1.2.0 is current), and works alongside Stash Sorter plugin 1.17.0.
+The details of kit orders and restock are in the [README](README.md#kit-orders-and-restock).
+
+### Added
+- **Kit sorting v2, release 2: kit orders in the addon's stash bot.** The bot now carries out the kit lines of Stash Manager
+  orders. Its rules:
+  - It claims orders with the kit flag (`kitOrders`), and its heartbeat reports what it can do with kits.
+  - Ready copies go first: complete copies already in the stash, including several identical copies. Each one is a kit.
+  - The rest are built on the fullest incomplete copy that fits, or in an empty shulker of the template's colour. With no
+    empty shulker of that colour, any colour is used and the result notes `colour_substituted`.
+  - Items are gathered by match key within the order's `take` budget.
+  - A built box is named after its template.
+  - A final completeness check runs before delivery, so a short kit is never delivered. A short kit is stored as an
+    incomplete copy if it is named, and returned if it is not.
+  - The order's kit result is reported as `result.kit`.
+- **Kit restock** (`kit-restock`), while the bot is idle:
+  - Only for templates with a keep count above 0, set in the Kit Builder. The first 16 such templates, by id, are looked at.
+  - Incomplete copies are topped up first, then new copies are built. Only unreserved stock is used, and nothing is crafted.
+  - The 1728 experience bottles of the repair reserve are kept.
+  - It starts no job before the first heartbeat reply on the connection, and it yields to orders: a waiting order stops a
+    running job.
+  - It is capped at `kit-restock-per-hour` jobs an hour. The job start times are saved in
+    `meteor-client/qwerte/kit-restock.json`, so a restart does not reset the cap.
+  - It leaves `kit-restock-min-empty` empty shulkers in the stash after each job.
+- **Settings:** `kit-orders` (on), `kit-restock` (on, shown while `kit-orders` is on), `kit-restock-per-hour` (12, from 0 to
+  120) and `kit-restock-min-empty` (2, from 0 to 54). Kit orders need `kit-sorting`.
+- **Heartbeat:** the kit capabilities are real now. `enabled` (kit orders on, with `accept-orders`) and `restock` (kit restock on too) follow the settings, `importer` is true, and
+  `craft` is always false.
+
+### Removed
+- The local `build-kits` setting, and the routing of saved kits by sign (a chest signed with a kit's name). Saved kits are
+  no longer built, routed or reserved in chests. Import local kits (Kit Builder tab) still works.
+
+### Changed
+- Container Tweaks is renamed to `qwerte-container-tweaks`, because Musheor's addon has a module named `container-tweaks`
+  and Meteor keeps only one module per name. Saved settings and keybind carry over from an old `container-tweaks` entry
+  (or `container-tweaks-porter`), but only when that entry has Qwerte's own settings.
+- If another addon replaces a Qwerte module, the log names it and chat warns once.
+- New `debug-freeze` setting (off, in the Shulker Preview group): a temporary log for testing the freeze. It writes a line
+  when the freeze key, the hovered box or the freeze decision changes, at most 200 lines each time the module is turned on.
+
+### Fixed
+- **Shulker preview freeze key:** the module could be displaced by a same-name module from another addon, which left
+  Meteor's BetterTooltips preview unfrozen. The rename above fixes this.
+- **Messenger has no minimum size any more:**
+  - the window goes down to about 24 × 12 GUI units, and the text scales down to 0.1×;
+  - the conversation list collapses behind an `=` button when the window is narrow;
+  - the header buttons hide when it is narrower still;
+  - a very short window shows only the input line or only the messages;
+  - the title bar and the resize grip stay grabbable at 8 real pixels or more;
+  - the first keystroke brings the input line back;
+  - the `auto-font-scale` description is updated.
+- **Shared kit files** keep their exact bytes in a fresh checkout: `.gitattributes` marks the `kit-items.json` and
+  `kit-types.json` tables and the kit fixtures of the addon and the server as `-text`.
+
+### Known limits
+- Kit orders aren't resumable: after a restart, the order fails with "the bot restarted while building kits; retry the order".
+- Kit shortfalls aren't crafted (`craft` is false).
+- Restock can't see reservations held by other bots' orders on a shared stash.
+- Restock doesn't stop for a nearby player.
+- Unnamed short kits are left to normal sorting rather than emptied.
+- Kit orders ignore the bottle reserve, per the contract.
+- Very small Messenger windows start a drag when clicked near the top.
+
+### Not tested in game
+- Everything in this release.
+
 ## [0.6.0] - 2026-11-10
 
 A pre-release build from the `dev` branch. Nothing in it has been tested in game yet. It covers everything since 0.5.0.

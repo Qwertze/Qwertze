@@ -30,21 +30,23 @@ public class QwerteAddon extends MeteorAddon {
         LOG.info("Initializing Qwerte Addon");
 
         // Modules
-        Modules.get().add(new AutoTill());
-        Modules.get().add(new AutoDirt());
-        Modules.get().add(new StashSorter());
-        Modules.get().add(new StashOverlay());
-        Modules.get().add(new StashManager());
-        Modules.get().add(new ResetPearl());
-        Modules.get().add(new StashWindow());
-        Modules.get().add(new Messenger());
-        Modules.get().add(new ContainerTweaks());
-        Modules.get().add(new Printer());
+        StartupChecks.add(new AutoTill());
+        StartupChecks.add(new AutoDirt());
+        StartupChecks.add(new StashSorter());
+        StartupChecks.add(new StashOverlay());
+        StartupChecks.add(new StashManager());
+        StartupChecks.add(new ResetPearl());
+        StartupChecks.add(new StashWindow());
+        StartupChecks.add(new Messenger());
+        StartupChecks.add(new ContainerTweaks());
+        StartupChecks.add(new Printer());
 
         // On by default; a saved state (loaded after the addons start) overrides it, so turning it off sticks
         OrderNotifications notifications = new OrderNotifications();
-        Modules.get().add(notifications);
+        StartupChecks.add(notifications);
         notifications.toggle();
+
+        StartupChecks.init();
 
         // The stash area draft in the world (follows the draft of the Stash window; not a module)
         MeteorClient.EVENT_BUS.subscribe(new com.porter.qwerte.manager.gui.AreaOutline());
