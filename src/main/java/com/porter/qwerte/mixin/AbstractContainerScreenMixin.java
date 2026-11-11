@@ -1,6 +1,5 @@
 package com.porter.qwerte.mixin;
 
-import com.porter.qwerte.events.ContainerScreenRenderEvent;
 import com.porter.qwerte.events.ContainerSlotClickEvent;
 import com.porter.qwerte.events.ContainerTooltipEvent;
 import meteordevelopment.meteorclient.MeteorClient;
@@ -17,8 +16,8 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Container screen hooks for Container Tweaks: a render event (which also records the mouse position for
- * click events), a cancellable tooltip event and a cancellable slot click event. The signatures used are
+ * Container screen hooks for Container Tweaks: a cancellable tooltip event and a cancellable slot click event. The render
+ * event is in AbstractContainerScreenRenderMixin, which differs per Minecraft version. The signatures used are
  * identical in 1.21.4 and 1.21.11. Each hook only posts a reusable singleton event; with no subscribers the
  * vanilla behaviour is unchanged. Other mods that touch the same methods (Meteor itself, inventory mods)
  * inject alongside this one; the two HEAD hooks only cancel when a Qwerte subscriber asks for it.
@@ -31,13 +30,6 @@ public abstract class AbstractContainerScreenMixin {
     @Shadow
     @Final
     protected AbstractContainerMenu menu;
-
-    @Inject(method = "render(Lnet/minecraft/client/gui/GuiGraphics;IIF)V", at = @At("TAIL"), require = 1)
-    private void qwerte$afterRender(GuiGraphics graphics, int mouseX, int mouseY, float delta, CallbackInfo ci) {
-        ContainerSlotClickEvent.lastMouseX = mouseX;
-        ContainerSlotClickEvent.lastMouseY = mouseY;
-        MeteorClient.EVENT_BUS.post(ContainerScreenRenderEvent.get((AbstractContainerScreen<?>) (Object) this, graphics, mouseX, mouseY, hoveredSlot));
-    }
 
     @Inject(method = "renderTooltip(Lnet/minecraft/client/gui/GuiGraphics;II)V", at = @At("HEAD"), cancellable = true, require = 1)
     private void qwerte$onTooltip(GuiGraphics graphics, int mouseX, int mouseY, CallbackInfo ci) {

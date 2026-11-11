@@ -5,8 +5,11 @@ import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.world.inventory.Slot;
 
 /**
- * Posted at the end of AbstractContainerScreen.render (TAIL), after the tooltip, for every container screen.
- * hoveredSlot may be null. One reusable instance: read the fields during the event and do not keep the event.
+ * Posted once a container screen has drawn its slots (see AbstractContainerScreenRenderMixin), for every container screen,
+ * the player and creative inventories included. It comes before the rest of the screen is drawn (on 1.21.11 the recipe
+ * book, the carried item and the tooltip), so it is for deciding things; drawing that must sit on top waits for
+ * {@link ContainerScreenDrawEvent}. hoveredSlot may be null. One reusable instance: read the fields during the event and
+ * do not keep the event.
  */
 public class ContainerScreenRenderEvent {
     private static final ContainerScreenRenderEvent INSTANCE = new ContainerScreenRenderEvent();

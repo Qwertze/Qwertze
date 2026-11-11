@@ -663,6 +663,13 @@ If another addon replaces any Qwerte module, the game log names it and chat warn
   tooltip. Clicks inside the frozen grid do nothing. It stays hold-to-freeze. The key is read straight from the keyboard
   (New in 0.4.0-dev.18.1), so it still works when another mod takes the key; before, holding Alt could do nothing with
   some mods installed. A key bound with modifiers is still checked by Meteor.
+- The freeze works in chests, shulker boxes and the other containers. New in 0.7.1, it also works in the crafting table and
+  the furnace screens, and in your player inventory and the creative inventory when `freeze-in-inventory` is on.
+- `freeze-in-inventory` (on by default; in the Shulker Preview group, shown while `preview` is on). Off, the freeze works
+  only in chests, shulker boxes and the other containers, not in your own inventory or the creative inventory. New in 0.7.1.
+- The left and right Shift, Control, Alt and Super keys count as the same key for `freeze-key`, so with Left Alt set, Right
+  Alt freezes too. New in 0.7.1. A key bound with modifiers is still checked by Meteor, as before.
+- The frozen grid is drawn on top of the recipe book and of any item you carry or drag. New in 0.7.1.
 - While `preview` is on, Meteor's own shulker preview is hidden, and Meteor's BetterTooltips settings are left as they are.
   `hide-text-list` (on by default) also leaves the text list of contents (such as "Dirt x64, and 5 more") out of the tooltip.
   On 1.21.11 that applies to every item with contents, since the game doesn't say which item the list belongs to.
@@ -672,7 +679,8 @@ If another addon replaces any Qwerte module, the game log names it and chat warn
 
 - `debug-freeze` (off; in the Shulker Preview group, shown while `preview` is on) is temporary. While it is on, each change of
   the freeze key, the hovered box or the freeze decision is written to the game log, at most 200 lines each time the module
-  is turned on. Leave it off unless you are testing the freeze.
+  is turned on. Leave it off unless you are testing the freeze. From 0.7.1 the line also lists the modifier keys (Shift,
+  Control, Alt, Super) that are held, by key code, with the freeze key. Other held keys are only counted, never named.
 
 #### Smart Shulker and Smart Echest
 Both are off by default. Turn on `smart-shulker` for shulker boxes and `smart-echest` for ender chests.
@@ -1092,8 +1100,8 @@ Out of materials:
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) for Minecraft **1.21.11** or **1.21.4**.
 2. Put [Meteor Client](https://meteorclient.com) for the same Minecraft version in your `mods` folder.
 3. Download the `qwerte-addon` jar for your Minecraft version from the
-   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.7.0`, see
-   [Versioning](#versioning) and [Dev builds](#dev-builds)): `qwerte-addon-0.7.0+1.21.11.jar` or `qwerte-addon-0.7.0+1.21.4.jar`.
+   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.7.1`, see
+   [Versioning](#versioning) and [Dev builds](#dev-builds)): `qwerte-addon-0.7.1+1.21.11.jar` or `qwerte-addon-0.7.1+1.21.4.jar`.
    Put it in your `mods` folder. It needs Stash Manager server 1.1.0 or newer for kit v2, and works alongside Stash Sorter plugin 1.17.0.
 4. *(Optional, for auto-walk and refilling)* Download `baritone-api-fabric-1.3.0-<minecraft>.jar` for your version from
    [dekrom's Baritone releases](https://github.com/dekrom/baritone/releases) (for example
@@ -1120,7 +1128,7 @@ Qwerte uses `MAJOR.MINOR.PATCH` versions:
 The `0.4.0-dev.N` counting has ended. 0.5.0 is the first release under this scheme. 0.5.x releases are fixes, 0.6.0 is the
 next feature batch, and 1.0.0 will mark the first stable release.
 
-**Compatibility:** Qwerte **0.7.0** needs [Stash Manager server](stash-manager-server/README.md) **1.1.0** or newer for kit v2
+**Compatibility:** Qwerte **0.7.1** needs [Stash Manager server](stash-manager-server/README.md) **1.1.0** or newer for kit v2
 (**1.2.0** is current), and works alongside the Stash Sorter plugin **1.17.0** (see
 [Stash Sorter for AquariusProxy](https://github.com/Qwertze/Stash-Sorter)).
 

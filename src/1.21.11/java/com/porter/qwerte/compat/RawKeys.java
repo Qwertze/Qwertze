@@ -1,5 +1,6 @@
 package com.porter.qwerte.compat;
 
+import com.porter.qwerte.tweaks.DownKeys;
 import meteordevelopment.meteorclient.utils.misc.Keybind;
 import org.lwjgl.glfw.GLFW;
 
@@ -16,7 +17,25 @@ public final class RawKeys {
         if (bind == null || !bind.isSet() || mc.getWindow() == null) return false;
         long window = mc.getWindow().handle();
         int value = bind.getValue();
-        if (bind.isKey()) return GLFW.glfwGetKey(window, value) == GLFW.GLFW_PRESS;
-        return GLFW.glfwGetMouseButton(window, value) == GLFW.GLFW_PRESS;
+        if (!bind.isKey()) return GLFW.glfwGetMouseButton(window, value) == GLFW.GLFW_PRESS;
+        if (GLFW.glfwGetKey(window, value) == GLFW.GLFW_PRESS) return true;
+        // The left and right Shift, Control, Alt and Super keys count as the same key: some layouts (AltGr) and keyboards
+        // report the other one
+        int other = otherSide(value);
+        return other != value && GLFW.glfwGetKey(window, other) == GLFW.GLFW_PRESS;
+    }
+
+    /** The key on the other side of a modifier key, or the key itself. */
+    public static int otherSide(int key) {
+        if (key >= GLFW.GLFW_KEY_LEFT_SHIFT && key <= GLFW.GLFW_KEY_LEFT_SUPER) return key + 4;
+        if (key >= GLFW.GLFW_KEY_RIGHT_SHIFT && key <= GLFW.GLFW_KEY_RIGHT_SUPER) return key - 4;
+        return key;
+    }
+
+    /** The modifier keys and the freeze key GLFW reports down, and how many other keys, for the freeze debug log. */
+    public static String pressed(int freezeKey) {
+        if (mc.getWindow() == null) return "[] others=0";
+        long window = mc.getWindow().handle();
+        return DownKeys.describe(key -> GLFW.glfwGetKey(window, key) == GLFW.GLFW_PRESS, freezeKey);
     }
 }

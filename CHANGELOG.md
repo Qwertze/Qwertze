@@ -19,6 +19,40 @@ next feature batch, and 1.0.0 will mark the first stable release. The version is
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-11
+
+A pre-release build from the `dev` branch. Nothing in it has been tested in game yet. It is a patch on 0.7.0 and changes
+only Container Tweaks and its rename migration.
+Works with the same Stash Manager server and Stash Sorter plugin as 0.7.0: Stash Manager server 1.1.0 (kit2) or newer
+(1.2.0 is current), and Stash Sorter plugin 1.17.0.
+
+### Added
+- **Shulker preview freeze in the inventories.** The freeze key now also works in your player inventory, the creative
+  inventory, the crafting table and the furnace screens. On 1.21.11 those screens never reached the old render hook, so
+  the freeze did nothing in them.
+- **`freeze-in-inventory`** (on, in the Shulker Preview group, shown while `preview` is on). On: the freeze works in your
+  player and creative inventory as well as in containers. Off: it only freezes in chests, shulker boxes and the other
+  containers (the crafting table and furnace included).
+- **Frozen preview drawn on top.** The frozen grid is now drawn above the recipe book and above any item you carry or drag.
+
+### Changed
+- **Freeze key twins.** The left or right Shift, Control, Alt or Super key counts as the same key, so holding either one
+  of a pair freezes. Some layouts (AltGr) and keyboards report the other side.
+- **`debug-freeze`** shows more key-state detail. It logs the modifier key codes (Shift, Control, Alt, Super) and the
+  freeze key, with what Meteor and the keyboard report for it. Other held keys are only counted; their names and codes are
+  never written.
+
+### Fixed
+- **Container Tweaks rename migration.** Saved settings and the keybind from an old `container-tweaks` entry (or
+  `container-tweaks-porter`) did not move to `qwerte-container-tweaks` in 0.7.0. Meteor saves `modules.nbt` uncompressed,
+  and the addon read it as compressed, so the module started from defaults. Both formats are read now.
+  - An install that already has a `qwerte-container-tweaks` entry is not changed. Old settings are not copied after the
+    fact.
+
+### Not tested in game
+- Everything in this release: the freeze in the inventories, `freeze-in-inventory`, the drawing order, the freeze key
+  twins, the rename migration and the `debug-freeze` log.
+
 ## [0.7.0] - 2026-11-10
 
 A pre-release build from the `dev` branch. Nothing in it has been tested in game yet. It covers everything since 0.6.0.

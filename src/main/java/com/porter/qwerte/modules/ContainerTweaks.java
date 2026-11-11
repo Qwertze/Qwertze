@@ -4,6 +4,7 @@ import com.porter.qwerte.QwerteAddon;
 import com.porter.qwerte.compat.ItemIcons;
 import com.porter.qwerte.compat.RawKeys;
 import com.porter.qwerte.compat.ScreenOverlay;
+import com.porter.qwerte.events.ContainerScreenDrawEvent;
 import com.porter.qwerte.events.ContainerScreenRenderEvent;
 import com.porter.qwerte.events.ContainerSlotClickEvent;
 import com.porter.qwerte.events.ContainerSlotRenderEvent;
@@ -11,6 +12,7 @@ import com.porter.qwerte.events.ContainerTooltipEvent;
 import com.porter.qwerte.events.HotbarSlotRenderEvent;
 import com.porter.qwerte.events.ShulkerTooltipLinesEvent;
 import com.porter.qwerte.tweaks.FreezeDecision;
+import com.porter.qwerte.tweaks.FreezeScreens;
 import com.porter.qwerte.tweaks.FrozenGrid;
 import com.porter.qwerte.tweaks.MigrationSource;
 import com.porter.qwerte.tweaks.Orphans;
@@ -38,6 +40,8 @@ import meteordevelopment.orbit.EventHandler;
 import meteordevelopment.orbit.EventPriority;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.inventory.CreativeModeInventoryScreen;
+import net.minecraft.client.gui.screens.inventory.InventoryScreen;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -100,6 +104,14 @@ public class ContainerTweaks extends Module {
         .build()
     );
 
+    private final Setting<Boolean> freezeInInventory = sgPreview.add(new BoolSetting.Builder()
+        .name("freeze-in-inventory")
+        .description("Lets the freeze key also work in your own inventory and the creative inventory. Off: it only freezes in chests, shulker boxes and other containers.")
+        .defaultValue(true)
+        .visible(preview::get)
+        .build()
+    );
+
     private final Setting<Boolean> hideTextList = sgPreview.add(new BoolSetting.Builder()
         .name("hide-text-list")
         .description("Leaves out the text list of contents (\"Dirt x64, and 5 more\") from a shulker box's tooltip while the preview is on. On 1.21.11 this applies to every item with contents, since the game does not say which item the list belongs to.")
@@ -144,7 +156,7 @@ public class ContainerTweaks extends Module {
 
     private final Setting<Boolean> debugFreeze = sgPreview.add(new BoolSetting.Builder()
         .name("debug-freeze")
-        .description("Temporary: writes a line to the game log each time the freeze key, the hovered shulker box or the freeze decision changes. Leave off unless asked to test the freeze.")
+        .description("Temporary: writes a line to the game log each time the freeze key, the hovered shulker box or the freeze decision changes. Logs modifier key codes (Shift, Control, Alt, Super) and the freeze key; other held keys are only counted. Leave off unless asked to test the freeze.")
         .defaultValue(false)
         .visible(preview::get)
         .build()
@@ -248,6 +260,7 @@ public class ContainerTweaks extends Module {
     private ShulkerSummaries.Summary frozenSummary;
     private int panelX, panelY;
     private GuiGraphics panelGraphics;
+    private Screen queuedScreen;
     private final Runnable panelDraw = this::drawPanel;
 
     private final SmartPlaceSession session = new SmartPlaceSession(new SessionHost());
@@ -339,9 +352,16 @@ public class ContainerTweaks extends Module {
 
     @EventHandler
     private void onScreenRender(ContainerScreenRenderEvent event) {
+        queuedScreen = null;
         hoverScreen = event.screen;
         hoverShulker = event.hoveredSlot != null && ShulkerSummaries.of(event.hoveredSlot.getItem()) != null;
         if (!preview.get()) {
+            unfreeze();
+            return;
+        }
+        FreezeScreens.Kind kind = event.screen instanceof InventoryScreen || event.screen instanceof CreativeModeInventoryScreen
+            ? FreezeScreens.Kind.INVENTORY : FreezeScreens.Kind.CONTAINER;
+        if (!FreezeScreens.allowed(kind, freezeInInventory.get())) {
             unfreeze();
             return;
         }
@@ -363,6 +383,17 @@ public class ContainerTweaks extends Module {
             case NONE -> {}
         }
         if (!frozen) return;
+
+        // Drawn by onScreenDraw, once the screen has drawn everything of its own
+        queuedScreen = event.screen;
+    }
+
+    /** Draws the frozen preview, once per frame, above the whole screen. */
+    @EventHandler
+    private void onScreenDraw(ContainerScreenDrawEvent event) {
+        if (queuedScreen == null || event.screen != queuedScreen) return;
+        queuedScreen = null;
+        if (!frozen || frozenSummary == null) return;
 
         panelGraphics = event.graphics;
         ScreenOverlay.top(event.graphics, panelDraw);
@@ -396,15 +427,20 @@ public class ContainerTweaks extends Module {
 
     /** One line per change of the key, the hovered shulker box, the decision or the frozen state. */
     private void debugFreeze(boolean held, boolean hovered, FreezeDecision.Action action) {
-        String now = "held=" + held + " hovered=" + hovered + " action=" + action + " frozen=" + frozen;
-        if (now.equals(lastDebug) || debugLines >= MAX_DEBUG_LINES) return;
-        lastDebug = now;
+        if (debugLines >= MAX_DEBUG_LINES) return;
+        Keybind bind = freezeKey.get();
+        // The cheap fields first; the key scan only runs when one of them changed
+        String cheap = "held=" + held + " hovered=" + hovered + " action=" + action + " frozen=" + frozen + " meteor=" + bind.isPressed();
+        if (cheap.equals(lastDebug)) return;
+        lastDebug = cheap;
         debugLines++;
-        QwerteAddon.LOG.info("container-tweaks freeze: {} key={} screen={}", now, freezeKey.get(), mc.screen == null ? "none" : mc.screen.getClass().getSimpleName());
+        String down = RawKeys.pressed(bind.getValue());
+        QwerteAddon.LOG.info("container-tweaks freeze: {} down={} key={} code={} isKey={} screen={}", cheap, down, bind, bind.getValue(), bind.isKey(), mc.screen == null ? "none" : mc.screen.getClass().getSimpleName());
     }
 
     private void unfreeze() {
         frozen = false;
+        queuedScreen = null;
         frozenScreen = null;
         frozenSummary = null;
         frozenStack = ItemStack.EMPTY;

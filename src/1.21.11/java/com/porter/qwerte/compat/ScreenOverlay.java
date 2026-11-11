@@ -12,7 +12,8 @@ public final class ScreenOverlay {
     }
 
     /**
-     * Runs {@code draw} on a new layer above everything drawn so far, tooltips included.
+     * Runs {@code draw} on a new layer above everything drawn into the screen so far. Tooltips set with
+     * {@code setTooltipForNextFrame} are drawn after the screen's layers, so they stay above this one.
      */
     public static void top(GuiGraphics graphics, Runnable draw) {
         graphics.nextStratum();

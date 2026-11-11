@@ -15,7 +15,10 @@ import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.Tag;
 import net.minecraft.nbt.ListTag;
 
+import java.io.BufferedInputStream;
+import java.io.DataInputStream;
 import java.io.File;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -63,6 +66,18 @@ public final class StartupChecks {
         }
     }
 
+    /** Meteor saves modules.nbt without compression; a compressed file is read too. */
+    private static CompoundTag read(File file, NbtAccounter accounter) throws Exception {
+        boolean gzip;
+        try (InputStream probe = Files.newInputStream(file.toPath())) {
+            gzip = probe.read() == 0x1f && probe.read() == 0x8b;
+        }
+        if (gzip) return NbtIo.readCompressed(file.toPath(), accounter);
+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(file.toPath())))) {
+            return NbtIo.read(in, accounter);
+        }
+    }
+
     private static void migrate() throws Exception {
         Module module = Modules.get().get(MigrationSource.NEW_NAME);
         if (module == null || !OURS.contains(module)) return;
@@ -74,7 +89,7 @@ public final class StartupChecks {
             QwerteAddon.LOG.warn("Container Tweaks: modules.nbt is {} bytes, too large to read for the migration, starting from defaults", size);
             return;
         }
-        CompoundTag root = NbtIo.readCompressed(file.toPath(), NbtAccounter.create(MAX_HEAP));
+        CompoundTag root = read(file, NbtAccounter.create(MAX_HEAP));
 
         List<Entry> entries = new ArrayList<>();
         List<CompoundTag> tags = new ArrayList<>();

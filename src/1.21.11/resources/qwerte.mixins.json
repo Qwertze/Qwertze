@@ -5,7 +5,9 @@
   "compatibilityLevel": "JAVA_21",
   "mixins": [
     "AbstractContainerScreenMixin",
+    "AbstractContainerScreenRenderMixin",
     "AbstractContainerScreenSlotMixin",
+    "AbstractRecipeBookScreenDrawMixin",
     "ChatComponentMixin",
     "ChatScreenAccessor",
     "ClientPacketListenerMixin",
