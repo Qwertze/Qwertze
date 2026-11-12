@@ -275,6 +275,9 @@ public final class StashManagerServer {
                 return 0;
             }
         };
+        PearlStore pearlStore = new PearlStore(config.dataDir());
+        pearlStore.load();
+        PearlEngine pearlEngine = new PearlEngine(pearlStore);
         RepairStore repairStore = new RepairStore(config.dataDir());
         repairStore.load();
         RepairBots repairBots = new RepairBots(); // in memory only
@@ -285,6 +288,7 @@ public final class StashManagerServer {
                 System.err.println("Could not drop the repair settings of a forgotten stash: " + e.getMessage());
             }
             repairBots.forget(srv, stashName);
+            pearlEngine.forget(srv, stashName);
             try {
                 craftStore.forget(srv, stashName);
             } catch (IOException e) {
@@ -303,10 +307,12 @@ public final class StashManagerServer {
         AreaRoutes areaRoutes = new AreaRoutes(areaStore, areaBots, store, audit, areaGuard, kitReports, sessions);
         AddonRoutes addonRoutes = new AddonRoutes(store, link, icons, orders, owners, delivery, kits, kitReports, craft, areaStore, areaBots, audit, areaGuard);
         addonRoutes.repair(repairStore, repairBots);
+        addonRoutes.pearl(pearlEngine);
         addonRoutes.register(router);
         BrowserRoutes browserRoutes = new BrowserRoutes(store, config, link, urls, orders, owners, sessions, audit, delivery, kits, kitReports, craft);
         browserRoutes.areas(areaRoutes);
         browserRoutes.repair(repairRoutes);
+        browserRoutes.pearl(pearlEngine);
         browserRoutes.register(router);
         areaRoutes.register(router);
         new CraftRoutes(craft, orders, audit, store).register(router);
@@ -314,6 +320,7 @@ public final class StashManagerServer {
         kitRoutes.repair(repairStore);
         kitRoutes.register(router);
         repairRoutes.register(router);
+        new PearlRoutes(pearlEngine, store, hub, audit).register(router);
         new DeliveryRoutes(delivery, owners).register(router);
         new OrderRoutes(orders, owners, audit).register(router);
         new BotRoutes(hub).register(router);

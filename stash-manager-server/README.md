@@ -10,9 +10,9 @@ The wire format and the access rules are in [PROTOCOL.md](PROTOCOL.md).
 
 The server uses the same rule as the Qwerte addon: **x.0.0** for major breaking changes, **x.y.0** for new features, bug
 fixes and more, and **x.y.z** for minor bug fixes, single one-off patches and hotfixes. The version is set in
-`build.gradle.kts` (`version`). This is version **1.2.0** (the repair release, see [CHANGELOG.md](CHANGELOG.md)).
+`build.gradle.kts` (`version`). This is version **1.3.0** (the pearl travel release, see [CHANGELOG.md](CHANGELOG.md)).
 
-Compatibility: Qwerte addon **0.5.0** works with Stash Manager server **1.2.0**, and the Stash Sorter plugin **1.17.0** works with it too. Repair passes need the plugin 1.17.0; the addon has none yet.
+Compatibility: Qwerte addon **0.5.0** and the Stash Sorter plugin **1.17.0** work with Stash Manager server **1.3.0** as before (they send no pearl fields). Pearl travel needs the Stash Sorter plugin **1.18.0** and this server; with an older server the plugin makes no pearl trips. Repair passes need the plugin 1.17.0; the addon has none yet.
 
 ## Build
 
@@ -316,6 +316,34 @@ Each stash's repair settings are in `stash-manager-data/repair.json`, or in the 
 
 - **One stash's entry can't be read:** repair is off for that stash only (its routes answer `503`). The entry is kept as it is and written back unchanged on later saves. Fix it by hand, keeping its `server` and `stash`, then restart.
 - **Neither file can be read:** repair is off for every stash, the routes answer `503`, and the server never writes over either file.
+
+## Pearl travel
+
+A Stash Sorter bot with pearl travel on can walk from its stash to a pearl station and back (plugin 1.18.0, see its README). This server keeps the stations and the trips, and decides from both bots' reports what has happened. No coordinates are stored or sent. Nothing here has been tested in game.
+
+The panel is on the **Kits** tab, below Repair. Reading it needs the **activity** permission. Stations, pins, approvals, allowed travellers, chamber resets and the away clear need the owner; Go, Back and Stop need the **settings** permission (Go asks for a confirmation). A user the owner has forced into streamer mode gets `403` on every pearl route.
+
+### Stations and travellers
+
+- A **station** is a loader bot with its stasis chambers, run by PearlPlus or the Qwerte addon. The owner adds it on the website: a name, the server, the dimension, the loader's player name and, optionally, the home station of one stash (at most one per stash). At most 16 stations, with 32 chambers each.
+- The chambers come from the loader's reports, not from typing. The owner assigns a traveller to one of them, and only a chamber whose owner is that traveller can be assigned.
+- A loader's reports count only after the owner clicks **This is my loader** for the source that reports for it. Its travellers are the names listed on the station (at most 16) and the traveller of a home stash. The owner confirms each traveller's uuid (**Confirm uuid**). A bot whose reported uuid changes is refused until the owner confirms the new one.
+
+### Trips
+
+- A trip starts on the website, or from the bot with `stash pearl go` and `stash pearl back`. The server checks the loader (it reports within 60 s), the chamber (armed, and reported after the traveller joined), the loader's players, the locks, the station's loads (20 an hour), the cooldown (5 minutes between trips, except the way back) and a return pearl at home unless the trip is one way. Counted pauses are retried 3 times, 30 s apart.
+- A pull is confirmed only when both bots agree: the traveller saw the teleport, and the loader saw the pearl gone and the traveller within 16 blocks of the chamber, within 10 s of it.
+- A trip that goes wrong after the whisper, and leaves the bot somewhere other than where it started, keeps the bot away until the owner clears it ("It's home" on the panel). A pull timeout with the bot still in place does not. The panel shows the alerts `away_order`, `unexpected_location`, `rearm_failed`, `chamber_broken`, `arrival_unconfirmed` and `uuid_mismatch`. The bot's own `stash pearl home` works only when the server sees the bot away with no open trip and no alert for the stash.
+
+### Limits
+
+- Writes: 60 a minute per user. Trip starts and stops: 6 a minute per user. Over the limit the server answers `429` with a `Retry-After` header.
+- A trip can't be stopped once the bot has whispered: the stop answers `409`.
+- A bot that sends no pearl fields is never offered a trip.
+
+### Stored settings: pearl.json
+
+Stations, trips and pins are stored in `stash-manager-data/pearl.json`, or in the folder you give with `--data`. The file is written atomically and only the owner can read it. The previous file is kept as `pearl.json.bak` when it reads clean, and the backup is used when the file is missing or unreadable. Chambers, loader state and load counts are kept in memory only, so after a restart they come back with the loader's next report. When neither file can be read, pearl travel is off (its routes answer `503`) and the server never writes over either file.
 
 ## What the server prints at start
 

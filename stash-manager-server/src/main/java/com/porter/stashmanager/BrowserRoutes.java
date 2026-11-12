@@ -21,6 +21,7 @@ final class BrowserRoutes {
     private final DeliveryContents delivery;
     private final KitStore kits;
     private volatile RepairRoutes repairRoutes;
+    private volatile PearlEngine pearlEngine;
     private final KitReports kitReports;
     private final CraftService craft; // null: no crafting support (craft: null in the stash list)
     private volatile AreaRoutes areaRoutes; // null: no stash area (area: null in the stash list)
@@ -118,6 +119,8 @@ final class BrowserRoutes {
             DeliveryContents.Snapshot dc = delivery.get(server, stash);
             o.add("deliveryContents", dc == null ? com.google.gson.JsonNull.INSTANCE : dc.summary());
             o.add("kits", kitSummary(server, stash));
+            PearlEngine pe = pearlEngine;
+            o.add("pearl", pe == null ? com.google.gson.JsonNull.INSTANCE : pe.summary(server, stash)); // a boolean and a state: no names, no ids
             RepairRoutes rr = repairRoutes;
             o.add("repairPass", rr == null ? com.google.gson.JsonNull.INSTANCE : rr.summaryJson(server, stash)); // no positions
             AreaRoutes ar = areaRoutes;
@@ -132,6 +135,11 @@ final class BrowserRoutes {
             o.addProperty("serverLabel", labels.get(o.get("server").getAsString()));
         }
         return list;
+    }
+
+    /** Gives the stash list the pearl travel summary (set once at start). */
+    void pearl(PearlEngine engine) {
+        this.pearlEngine = engine;
     }
 
     /** Gives the stash list the repair passes' summary (set once at start). */

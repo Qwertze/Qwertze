@@ -3483,6 +3483,7 @@
       craftSetRender();
       areaSetRender();
       repairRender();
+      pearlRender();
     } else if (kbTab) {
       kbRender();
     } else if (!orders) {
@@ -6627,6 +6628,336 @@
     repairWrite("/api/v1/repair/stop", {});
   });
 
+  // ---------- Pearl travel (PEARL-CONTRACT v1.0) ----------
+  // GET/POST /api/v1/pearl*: stations, the bots that can travel, trips and alerts. Names, players and stashes are shown as text only
+  // (textContent) and marked data-sensitive; a user the owner forced into streamer mode gets 403 {permission: "streamer"} for all of it.
+
+  var PEARL_POLL_MS = 5000;
+  var PEARL_STATE_WORDS = {
+    pending: "waiting for the bot", running: "under way", paused: "waiting", completed: "done", failed: "failed", cancelled: "stopped"
+  };
+  var PEARL_CODE_WORDS = {
+    bot_offline: "the bot stopped sending heartbeats", not_ingame: "the bot is not in the game", in_queue: "the bot is in the queue",
+    just_joined: "the bot has only just joined", low_pearls: "fewer than 2 pearls", no_pearl_assigned: "no pearl of this bot at that station",
+    chamber_empty: "the chamber has no pearl", owner_offline: "the pearl's owner is offline", chamber_unknown: "the loader can't see the chamber",
+    chamber_broken: "the chamber is marked broken", chamber_locked: "another trip holds the chamber", loader_locked: "another trip holds the loader",
+    loader_stale: "the loader hasn't reported lately", loader_misconfigured: "the loader has PearlPlus temporary mode on",
+    no_return_pearl: "no armed pearl for the way back", station_limit: "20 loads in the last hour", cooldown: "a trip ended less than 5 minutes ago",
+    player_near: "a player is near", loader_player_near: "a player is near the loader", loader_busy: "the loader is busy",
+    loader_no_answer: "the loader did not answer", load_aborted: "the loader gave up", pull_timeout: "no pull arrived in time",
+    unexpected_location: "arrived somewhere unexpected: held", arrival_unconfirmed: "the arrival could not be confirmed", stopped: "stopped",
+    order_arrived: "an order arrived", server_restarted: "the server restarted", busy_order: "an order is waiting for the stash",
+    go_timeout: "the bot did not start the pull in time", uuid_mismatch: "the bot's uuid changed",
+    uuid_unpinned: "the owner has not confirmed the bot's uuid"
+  };
+  var PEARL_ALERT_WORDS = {
+    away_order: "An order is waiting for a bot that is away and has no armed pearl to come back.",
+    unexpected_location: "A bot arrived somewhere unexpected and is held. Check where it is, then press \u201cIt's home\u201d.",
+    rearm_failed: "A bot could not re-arm its pearl after arriving.",
+    chamber_broken: "A chamber is marked broken: loads there did nothing twice.",
+    arrival_unconfirmed: "A trip could not be confirmed (the server restarted, or nobody reported for 30 minutes); check where the bot is.",
+    uuid_mismatch: "A bot reports a different uuid than the one its name was first seen with. It is ignored until the owner trusts the new one."
+  };
+  var pearlSet = { timer: 0, loading: false, writing: false, token: 0, data: null, error: "", sig: "", pick: {} };
+
+  function pearlEl(id) {
+    return $("pearl-" + id);
+  }
+
+  function pearlSync() {
+    window.clearTimeout(pearlSet.timer);
+    pearlSet.timer = 0;
+    if (kitsVisible() && can("activity") && !forcedStreamer()) pearlPoll();
+  }
+
+  function pearlReset() {
+    pearlSet.token++;
+    pearlSet.data = null;
+    pearlSet.error = "";
+    pearlSet.sig = "";
+    pearlSet.pick = {};
+    pearlRender();
+    pearlSync();
+  }
+
+  function pearlPoll() {
+    if (pearlSet.loading || pearlSet.writing) return;
+    pearlSet.loading = true;
+    var token = pearlSet.token;
+    api("/api/v1/pearl").then(function (d) {
+      if (token !== pearlSet.token) return;
+      pearlSet.data = d && typeof d === "object" ? d : null;
+      pearlSet.error = "";
+    }, function (e) {
+      if (token !== pearlSet.token) return;
+      pearlSet.data = null;
+      pearlSet.error = pearlError(e, "read");
+    }).then(function () {
+      pearlSet.loading = false;
+      if (token !== pearlSet.token) {
+        pearlSync();
+        return;
+      }
+      pearlRender();
+      window.clearTimeout(pearlSet.timer);
+      pearlSet.timer = kitsVisible() && can("activity") && !forcedStreamer() ? window.setTimeout(pearlPoll, PEARL_POLL_MS) : 0;
+    });
+  }
+
+  function pearlError(e, what) {
+    var b = e && e.body && typeof e.body === "object" ? e.body : {};
+    if (e && e.status === 403 && b.permission === "streamer") return "Pearl travel is hidden while streamer mode is forced on for your account.";
+    if (e && e.status === 403) return what === "read" ? "You don't have permission to see pearl travel." : "That needs the \u201csettings\u201d permission (stations: the owner).";
+    if (e && e.status === 404) return "That isn't available.";
+    if (e && e.status === 429) return "Too many changes. Wait " + num(b.retryAfter, 1) + " s.";
+    if (e && e.status === 503) return "Pearl travel is off: the server can't read pearl.json. Fix or remove the file and restart the server.";
+    if (e && e.network) return "Can't reach the server. Trying again.";
+    if (typeof b.error === "string" && b.error) return safeServerText(sentence(b.error), "The server refused that (details are hidden in streamer mode).");
+    return what === "read" ? "Couldn't load pearl travel." : "Couldn't save that.";
+  }
+
+  function pearlWrite(path, body, done) {
+    if (pearlSet.writing) return;
+    pearlSet.writing = true;
+    var token = ++pearlSet.token;
+    api(path, { method: "POST", body: body }).then(function (d) {
+      if (token !== pearlSet.token) return;
+      pearlSet.data = d && typeof d === "object" ? d : pearlSet.data;
+      pearlSet.error = "";
+      if (done) done();
+    }, function (e) {
+      toast(pearlError(e, "write"));
+    }).then(function () {
+      pearlSet.writing = false;
+      pearlSet.token++;
+      pearlSet.sig = "";
+      pearlRender();
+      pearlSync();
+    });
+  }
+
+  function pearlText(parent, cls, text, sensitive) {
+    var e = kitEl("span", cls, text);
+    if (sensitive) e.setAttribute("data-sensitive", "");
+    parent.appendChild(e);
+    return e;
+  }
+
+  function pearlBtn(parent, label, handler, disabled) {
+    var b = kitEl("button", "mc-button small", label);
+    b.type = "button";
+    b.disabled = !!disabled;
+    b.addEventListener("click", handler);
+    parent.appendChild(b);
+    return b;
+  }
+
+  function pearlStationName(d, id) {
+    var list = d && Array.isArray(d.stations) ? d.stations : [];
+    for (var i = 0; i < list.length; i++) if (list[i].id === id) return str(list[i].name);
+    return "a station";
+  }
+
+  function pearlRender() {
+    var d = pearlSet.data;
+    var banner = pearlEl("banner");
+    banner.hidden = !pearlSet.error;
+    banner.textContent = pearlSet.error;
+    var owner = !!me.owner;
+    var canWrite = can("settings") && !forcedStreamer() && !pearlSet.writing;
+    pearlEl("form").hidden = !d || !owner;
+    var sig = d ? JSON.stringify([d, owner, canWrite, streamerOn(), pearlSet.pick]) : "";
+    if (sig === pearlSet.sig) return;
+    pearlSet.sig = sig;
+    var alerts = pearlEl("alerts"), trav = pearlEl("travellers"), sts = pearlEl("stations"), trips = pearlEl("trips");
+    [alerts, trav, sts, trips].forEach(function (n) { n.textContent = ""; });
+    if (!d) return;
+    (Array.isArray(d.alerts) ? d.alerts : []).forEach(function (a) {
+      var row = kitEl("div", "kits-banner warn");
+      pearlText(row, "", PEARL_ALERT_WORDS[a.kind] || "Something needs a look.", false);
+      if (a.stash) pearlText(row, "hint", " (" + str(a.stash) + ")", true);
+      if (owner && a.kind === "uuid_mismatch") {
+        (Array.isArray(d.travellers) ? d.travellers : []).forEach(function (t) {
+          if (t.stash !== a.stash || !t.uuidMismatch) return;
+          pearlBtn(row, "Trust the new uuid", function () {
+            if (!window.confirm(streamerOn() ? "Trust the new uuid of this bot?" : "Trust the new uuid of " + str(t.player) + "? Only do this when the player really changed accounts.")) return;
+            if (!t.reportedUuid) return;
+            pearlWrite("/api/v1/pearl/pins/reset", { player: t.player, uuid: t.reportedUuid });
+          }, pearlSet.writing);
+        });
+      }
+      alerts.appendChild(row);
+    });
+    var stations = Array.isArray(d.stations) ? d.stations : [];
+    (Array.isArray(d.travellers) ? d.travellers : []).forEach(function (t) {
+      if (!t.supports) return;
+      var row = kitEl("div", "pearl-row");
+      pearlText(row, "pearl-name", str(t.stash) + " \u00b7 " + str(t.player), true);
+      pearlText(row, "hint", " " + num(t.pearls && t.pearls.carried, 0) + " pearls" + (t.game && t.game !== "in" ? ", " + (t.game === "queue" ? "in the queue" : "offline") : "") +
+        (t.online ? "" : ", not sending heartbeats") + (t.away ? ", away" : ""), false);
+      if (owner) {
+        // The owner confirms the uuid the bot reported: the server never learns it from a heartbeat by itself.
+        if (t.uuidConflict) pearlText(row, "kits-banner warn", " Two stashes report different uuids for this name: check which one is real before pinning.", false);
+        if (t.pinnedUuid) {
+          pearlText(row, "hint", " \u00b7 uuid " + str(t.pinnedUuid), true);
+        } else if (t.reportedUuid) {
+          pearlText(row, "hint", " \u00b7 reports uuid " + str(t.reportedUuid) + " (not confirmed)", true);
+          pearlBtn(row, "Confirm uuid", function () {
+            var check = "Check this uuid out of band first (in game, or on a profile site such as namemc.com) before pinning it: a wrong pin lets someone else's bot use this player's pearl.";
+            if (!window.confirm(streamerOn() ? "Confirm the uuid this bot reported? " + check : "Confirm that " + str(t.player) + " has the uuid " + str(t.reportedUuid) + "? " + check)) return;
+            pearlWrite("/api/v1/pearl/pins/reset", { player: t.player, uuid: t.reportedUuid });
+          }, pearlSet.writing);
+        }
+      }
+      var key = str(t.server) + "|" + str(t.stash);
+      var sel = document.createElement("select");
+      sel.className = "mc-select";
+      sel.setAttribute("data-sensitive", "");
+      stations.forEach(function (s, si) {
+        var o = document.createElement("option");
+        o.value = s.id;
+        // An open dropdown can't be blurred: in streamer mode the stations are numbered.
+        o.textContent = (streamerOn() ? "Station " + (si + 1) : str(s.name)) + (s.server !== t.server ? " (another server)" : "");
+        sel.appendChild(o);
+      });
+      if (pearlSet.pick[key]) sel.value = pearlSet.pick[key];
+      sel.addEventListener("change", function () {
+        pearlSet.pick[key] = sel.value;
+        pearlSet.sig = "";
+      });
+      sel.disabled = !canWrite || !!t.trip || !!t.away || !stations.length;
+      row.appendChild(sel);
+      pearlBtn(row, "Go", function () {
+        var label = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : "the station";
+        if (!window.confirm(streamerOn() ? "Send this bot by ender pearl?" : "Send " + str(t.player) + " from " + str(t.stash) + " to " + label + " by ender pearl?")) return;
+        pearlWrite("/api/v1/pearl/trips", { server: t.server, stash: t.stash, station: sel.value, action: "go" });
+      }, !canWrite || !!t.trip || !!t.away || !stations.length);
+      pearlBtn(row, "Back", function () {
+        pearlWrite("/api/v1/pearl/trips", { server: t.server, stash: t.stash, action: "back" });
+      }, !canWrite || !!t.trip || !t.away);
+      if (owner && t.away) {
+        pearlBtn(row, "It's home", function () {
+          pearlWrite("/api/v1/pearl/away/clear", { server: t.server, stash: t.stash });
+        }, pearlSet.writing);
+      }
+      trav.appendChild(row);
+    });
+    if (!trav.firstChild) trav.appendChild(kitEl("div", "hint", "No bot has said it can travel by pearl yet (it needs the pearl travel setting on in StashSorter 1.18.0 or the addon 0.8.0)."));
+    stations.forEach(function (s) {
+      var card = kitEl("div", "pearl-station");
+      var head = kitEl("div", "pearl-row");
+      pearlText(head, "pearl-name", str(s.name), true);
+      var ls = s.loaderState || {};
+      pearlText(head, "hint", " \u00b7 " + str(s.dim).replace("minecraft:", "").replace("_", " ") + " \u00b7 loader " + str(s.loader && s.loader.player) +
+        (ls.online ? ", online" : ", not reporting") + (s.stash ? " \u00b7 home of " + str(s.stash) : ""), true);
+      if (ls.warning === "temporaryMode") pearlText(head, "kits-banner warn", " The loader has PearlPlus temporary mode on: trips are refused until it is switched off.", false);
+      if (owner) {
+        pearlBtn(head, "Remove", function () {
+          pearlWrite("/api/v1/pearl/stations/delete", { id: s.id });
+        }, pearlSet.writing);
+      }
+      card.appendChild(head);
+      var waiting = owner && Array.isArray(ls.pending) ? ls.pending : [];
+      if (waiting.length) {
+        pearlText(card, "kits-banner warn", ls.approved ? "New sources report as this loader:" : "This loader is not approved yet. These sources report as it:", false);
+      }
+      waiting.forEach(function (p) {
+        var wait = kitEl("div", "pearl-row");
+        var seen = p.lastSeen ? new Date(p.lastSeen).toLocaleTimeString() : "?";
+        pearlText(wait, "", str(p.source) + (p.stash ? " (stash " + str(p.stash) + ")" : "") + " \u00b7 last seen " + seen + " ", true);
+        pearlBtn(wait, "This is my loader", function () {
+          if (!window.confirm(streamerOn() ? "Approve this source as the loader?" : "Approve " + str(p.source) + " as the loader " + str(s.loader && s.loader.player) + "? Trips will use its reports.")) return;
+          pearlWrite("/api/v1/pearl/stations/approve", { id: s.id, source: p.source });
+        }, pearlSet.writing);
+        pearlBtn(wait, "Dismiss", function () {
+          pearlWrite("/api/v1/pearl/stations/dismiss", { id: s.id, source: p.source });
+        }, pearlSet.writing);
+        card.appendChild(wait);
+      });
+      if (!waiting.length && owner && !ls.approved && ls.source) {
+        pearlText(card, "hint", "Waiting for the loader to report.", false);
+      }
+      if (owner) {
+        var al = kitEl("div", "pearl-row");
+        pearlText(al, "hint", "Allowed travellers: ", false);
+        (Array.isArray(s.allowed) ? s.allowed : []).forEach(function (a) {
+          pearlText(al, "", str(a.name) + (a.uuid ? "" : " (no uuid)") + " ", true);
+          pearlBtn(al, "Remove", function () {
+            pearlWrite("/api/v1/pearl/allowed", { station: s.id, player: a.name, allowed: false });
+          }, pearlSet.writing);
+        });
+        (Array.isArray(d.travellers) ? d.travellers : []).forEach(function (t) {
+          var n = str(t.player).toLowerCase();
+          var listed = (Array.isArray(s.allowed) ? s.allowed : []).some(function (a) { return a.name === n; });
+          if (!t.supports || listed || t.player === undefined) return;
+          var b = pearlBtn(al, "Allow " + str(t.player), function () {
+            pearlWrite("/api/v1/pearl/allowed", { station: s.id, player: t.player, allowed: true });
+          }, pearlSet.writing);
+          b.setAttribute("data-sensitive", "");
+        });
+        card.appendChild(al);
+      }
+      (Array.isArray(s.chambers) ? s.chambers : []).forEach(function (c) {
+        var line = kitEl("div", "pearl-chamber");
+        pearlText(line, "", str(c.id) + " \u00b7 " + (c.ownerKnown ? str(c.owner) : "owner unknown"), true);
+        pearlText(line, "hint", " \u00b7 " + str(c.state).replace("_", " "), false);
+        if (owner && c.state === "broken") {
+          pearlBtn(line, "Reset", function () {
+            pearlWrite("/api/v1/pearl/chambers/reset", { station: s.id, chamber: c.id });
+          }, pearlSet.writing);
+        }
+        if (canWrite && owner && c.ownerKnown) {
+          var mine = s.assign && s.assign[str(c.owner).toLowerCase()] === c.id;
+          var useBtn = pearlBtn(line, mine ? "Unassign" : "Use for " + str(c.owner), function () {
+            pearlWrite("/api/v1/pearl/assign", { station: s.id, player: c.owner, chamber: mine ? null : c.id });
+          }, pearlSet.writing);
+          useBtn.setAttribute("data-sensitive", "");
+        }
+        card.appendChild(line);
+      });
+      sts.appendChild(card);
+    });
+    if (!stations.length) sts.appendChild(kitEl("div", "hint", owner ? "No station yet. Add one below: the loader bot's name and the dimension of its chambers." : "No station yet (the owner adds them)."));
+    (Array.isArray(d.trips) ? d.trips : []).slice(0, 10).forEach(function (t) {
+      var row = kitEl("div", "pearl-row");
+      var to = t.params && t.params.route && t.params.route.legs && t.params.route.legs[0] ? pearlStationName(d, t.params.route.legs[0].station) : "a station";
+      pearlText(row, "", (t.action === "back" ? "Back to " : "To ") + to + " \u00b7 " + str(t.scope && t.scope.stash), true);
+      var why = t.error ? " (" + (PEARL_CODE_WORDS[t.error.code] || str(t.error.code)) + ")" : t.pauseReason ? " (" + (PEARL_CODE_WORDS[t.pauseReason] || str(t.pauseReason)) + ")" : "";
+      pearlText(row, "hint", " \u00b7 " + (PEARL_STATE_WORDS[t.state] || str(t.state)) + why + (t.warning ? " \u00b7 check: " + str(t.warning).replace("_", " ") : ""), false);
+      if (canWrite && (t.state === "pending" || t.state === "running" || t.state === "paused") && t.checkpoint && ["precheck", "arm_home", "ready"].indexOf(t.checkpoint.step) >= 0) {
+        pearlBtn(row, "Stop", function () {
+          pearlWrite("/api/v1/pearl/trips/stop", { id: t.id });
+        }, pearlSet.writing);
+      }
+      trips.appendChild(row);
+    });
+    if (!trips.firstChild) trips.appendChild(kitEl("div", "hint", "No trips yet."));
+  }
+
+  pearlEl("add").addEventListener("click", function () {
+    var name = pearlEl("name").value.trim();
+    var loader = pearlEl("loader").value.trim();
+    var home = pearlEl("home").value.trim();
+    if (!name || !/^[A-Za-z0-9_]{3,16}$/.test(loader)) {
+      toast("Give the station a name and the loader bot's player name (3 to 16 letters, digits or _).");
+      return;
+    }
+    var servers = {};
+    (pearlSet.data && Array.isArray(pearlSet.data.travellers) ? pearlSet.data.travellers : []).forEach(function (t) { servers[t.server] = true; });
+    var list = Object.keys(servers);
+    var s = currentStash();
+    var server = s ? s.server : list[0];
+    if (!server) {
+      toast("Open a stash first: the station is registered on its server.");
+      return;
+    }
+    pearlWrite("/api/v1/pearl/stations", { name: name, server: server, dim: pearlEl("dim").value, loader: { player: loader }, stash: home || null }, function () {
+      pearlEl("name").value = "";
+      pearlEl("loader").value = "";
+      pearlEl("home").value = "";
+    });
+  });
+
   // ---------- stash area ----------
   // GET/POST /api/v1/area (AREA-CONTRACT.md): the box the bots keep the stash in. The draft lives only in the page (the six
   // fields) until Save. The numbers are positions: blurred in streamer mode; a user forced into streamer mode gets 403.
@@ -7158,6 +7489,7 @@
     craftSetSync();
     areaSetSync();
     repairSync();
+    pearlSync();
   }
 
   function kitsReset() {
@@ -7171,6 +7503,7 @@
     craftSetReset();
     areaSetReset();
     repairReset();
+    pearlReset();
   }
 
   function kitsPoll() {

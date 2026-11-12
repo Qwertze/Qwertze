@@ -324,6 +324,25 @@
           <div class="repair-tiles" id="repair-tiles"></div>
           <div class="repair-last" id="repair-last"></div>
         </section>
+        <section class="inset pearl-set" id="pearl-set" aria-labelledby="pearl-set-title">
+          <div class="section-title" id="pearl-set-title">Pearl travel</div>
+          <div class="hint">A bot can travel to another station by pearl: it whispers the loader bot there, which pulls it through its stasis chamber, and the bot throws a fresh pearl when it arrives. Chamber positions never leave the loader bot. A trip can be stopped until the whisper is sent; a pull can't be undone.</div>
+          <div class="kits-banner" id="pearl-banner" role="status" hidden></div>
+          <div class="pearl-alerts" id="pearl-alerts"></div>
+          <div class="pearl-sub">Bots</div>
+          <div id="pearl-travellers"></div>
+          <div class="pearl-sub">Stations</div>
+          <div id="pearl-stations"></div>
+          <div class="kits-sc-row" id="pearl-form" hidden>
+            <label class="kits-sc-field">Station name <input id="pearl-name" class="mc-input" type="text" maxlength="32" autocomplete="off" spellcheck="false" data-sensitive></label>
+            <label class="kits-sc-field">Dimension <select id="pearl-dim" class="mc-select"><option value="minecraft:overworld">Overworld</option><option value="minecraft:the_nether">The Nether</option><option value="minecraft:the_end">The End</option></select></label>
+            <label class="kits-sc-field">Loader bot (player name) <input id="pearl-loader" class="mc-input" type="text" maxlength="16" autocomplete="off" spellcheck="false" data-sensitive></label>
+            <label class="kits-sc-field">Home of stash (optional) <input id="pearl-home" class="mc-input" type="text" maxlength="64" autocomplete="off" spellcheck="false" data-sensitive></label>
+            <button type="button" class="mc-button small" id="pearl-add">Add station</button>
+          </div>
+          <div class="pearl-sub">Trips</div>
+          <div id="pearl-trips"></div>
+        </section>
       </div>
 
       <div class="view view-kb" id="view-kb" hidden>

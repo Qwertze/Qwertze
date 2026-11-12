@@ -2781,3 +2781,8 @@ html[data-theme="mac"] .conn-online::before {
 .repair-tile-l { font-size: 13px; overflow-wrap: anywhere; }
 .repair-last { margin-top: 8px; }
 .repair-item { font-size: 13px; overflow-wrap: anywhere; }
+.pearl-sub { margin-top: 10px; font-weight: bold; }
+.pearl-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 4px 0; }
+.pearl-name { font-weight: bold; overflow-wrap: anywhere; }
+.pearl-station { margin: 6px 0; padding: 6px 8px; border: 1px solid var(--border, #555); border-radius: var(--radius); }
+.pearl-chamber { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-left: 10px; overflow-wrap: anywhere; }

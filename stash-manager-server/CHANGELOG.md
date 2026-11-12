@@ -16,6 +16,28 @@ before it are headed by their date and jar name. Qwerte addon 0.5.0 works with t
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-11
+
+Release jar `stash-manager-server-1.3.0-pre.jar` (in `qwerte-release`), SHA-256 `a41f8bb0f81f0be7f5fea12171f7fa925a2f360cfebaa8aba78c56bd9097a055`. Automated tests: 551, 0 failures, 1 skipped.
+
+### Added
+- **Pearl travel** (PEARL-CONTRACT v1.0 rev 7; Stash Sorter plugin 1.18.0 uses it; not tried in the game yet). Stations (a `ps-` id, the loader's player name, server, dimension, an optional home station per stash, the loader's approval and its allowed travellers), trips (Task records `t-` with kind `travel`, the six states, the chamber and loader locks) and the heartbeat and reply fields. See [Pearl travel](README.md#pearl-travel) and PROTOCOL.md.
+- **Loader reports.** `POST /api/v1/bot/pearls` (signed, after a `bot/hello`) for the plugin loader, and the heartbeat field `pearlLoader` for the addon loader. The reply lists the owner-approved travellers (`allow`), each with its pinned uuid.
+- **Traveller heartbeat and reply.** The heartbeat's `pearlTravel` object (needs `player`; `null` clears) and the reply's `pearlTrip` and `pearlAwayClear`. `pearlAwayClear` is repeated until the bot reports `away: null`, for at most 10 minutes (rev 7). A bot's local `go`, `back` or `home` is audited.
+- **Browser routes.** `GET /api/v1/pearl` (activity permission). Owner writes: stations and their deletion, assign, pins, approve and dismiss, allowed travellers, chamber reset and the away clear. `settings` writes: trip start and stop. Rate limits: 60 writes and 6 trip starts or stops per user per minute. Audit actions `pearl.station`, `pearl.station.delete`, `pearl.assign`, `pearl.pin.reset`, `pearl.loader.approve`, `pearl.loader.dismiss`, `pearl.allowed`, `pearl.chamber.reset`, `pearl.trip`, `pearl.stop` and `pearl.away.clear`.
+- **Website.** A "Pearl travel" panel on the **Kits** tab, below Repair: the travellers (pearls carried, away, Go with a confirmation, Back, Stop before the whisper, "It's home"), the stations and their chambers, the trips and the alerts.
+- **Stash list.** `GET /api/v1/stashes` entries gain `pearl: { away, trip }` (a boolean and the trip's state; no names or ids).
+- **Storage.** `pearl.json` in the data folder: `{ version: 1, stations, trips, pins }`, written atomically, owner only, with a `pearl.json.bak` from a clean previous file. When neither can be read, pearl travel is off (`503`) and nothing is overwritten.
+- **Streamer mode.** A user forced into streamer mode gets `403 { permission: "streamer" }` on every pearl route, like the repair routes.
+
+### Compatibility
+- Stash Sorter plugin 1.18.0 needs this server for pearl travel. With an older server it makes no trips (its reply has no `pearlTrip`), and its loader gets no `allow` and reports no chambers. Its other features are unchanged.
+- Bots that send no pearl fields (the plugin before 1.18.0, and the Qwerte addon until its pearl release) work as before and are never offered a trip.
+
+### Notes
+- No coordinates are stored or sent in pearl travel: stations, trips, reports and whispers carry ids only. Pearl ids are names the owner chose and are shown to every user who sees the page, so don't name chambers after coordinates.
+- Pearl travel has not been tested in game.
+
 ## [1.2.0] - 2026-11-10
 
 Release jar `stash-manager-server-repair-pre.jar`, SHA-256 `be83fb27596720e8544f0613c9c843bee3b3e98fc990d607aaa2498832d66528`,

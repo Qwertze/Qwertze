@@ -26,6 +26,7 @@ final class AddonRoutes {
     private final DeliveryContents delivery;
     private final KitStore kits;       // null: this server has no kit support (the reply leaves the kit fields out)
     private final KitReports kitReports;
+    private volatile PearlEngine pearl; // null: this server has no pearl travel
     private volatile RepairStore repairStore; // null: this server has no repair passes (the reply leaves the repair fields out)
     private volatile RepairBots repairBots;
     private final CraftService craft;  // null: this server has no crafting support (the reply leaves the craft fields out)
@@ -218,6 +219,42 @@ final class AddonRoutes {
             Http.error(ex, 400, "player is required when repairHash or repairPass is sent");
             return;
         }
+        // PEARL-CONTRACT v1.0: pearlTravel (a traveller's state) and pearlLoader (a loader's report): an object, null or absent. Both need
+        // the player; a loader report must be the heartbeat's own player's.
+        boolean hasPearlTravel = o.has("pearlTravel");
+        JsonObject pearlTravel = null;
+        boolean hasPearlLoader = o.has("pearlLoader");
+        JsonObject pearlLoader = null;
+        if (hasPearlTravel || hasPearlLoader) {
+            String who = string(o, "player");
+            if (who == null || who.isEmpty()) {
+                Http.error(ex, 400, "player is required when pearlTravel or pearlLoader is sent");
+                return;
+            }
+            if (!PearlBodies.PLAYER.matcher(who).matches()) {
+                Http.error(ex, 400, "player must be a player name when pearlTravel or pearlLoader is sent");
+                return;
+            }
+            try {
+                if (hasPearlTravel && !o.get("pearlTravel").isJsonNull()) {
+                    if (!o.get("pearlTravel").isJsonObject()) throw new IllegalArgumentException("pearlTravel must be an object or null");
+                    pearlTravel = o.getAsJsonObject("pearlTravel");
+                    PearlBodies.travel(pearlTravel);
+                }
+                if (hasPearlLoader && !o.get("pearlLoader").isJsonNull()) {
+                    if (!o.get("pearlLoader").isJsonObject()) throw new IllegalArgumentException("pearlLoader must be an object or null");
+                    pearlLoader = o.getAsJsonObject("pearlLoader");
+                    JsonObject clean = PearlBodies.loader(pearlLoader);
+                    if (!clean.get("player").getAsString().equalsIgnoreCase(who)) {
+                        Http.error(ex, 409, "the report's player isn't this bot's player");
+                        return;
+                    }
+                }
+            } catch (IllegalArgumentException e) {
+                Http.error(ex, 400, e.getMessage());
+                return;
+            }
+        }
         // CRAFT-CONTRACT.md: craftOrders is an object (the bot can carry out craft orders), null (it can't any more) or absent
         // (an older bot); craftHash is the hash of the craft settings it has cached, null (none) or absent.
         // AREA-CONTRACT.md: area is the bot's report of its stash area (object), absent for an older bot. player is required.
@@ -314,9 +351,32 @@ final class AddonRoutes {
             RepairBots.Beat rbeat = repairBots.beat(server, stash);
             repairFields(out, server, stash, hasRepairHash, repairHash, rbeat == null ? null : rbeat.pass());
         }
+        if (pearl != null && !pearl.disabled() && (hasPearlTravel || hasPearlLoader || pearl.knows(server, stash))) {
+            try {
+                if (pearlLoader != null) {
+                    JsonObject lr = pearl.onLoader(string(o, "player"), "hb:" + server + "/" + stash, pearlLoader);
+                    JsonObject reply = new JsonObject();
+                    reply.add("allow", lr.get("allow"));
+                    reply.add("intervalMs", lr.get("intervalMs"));
+                    out.add("pearlLoader", reply);
+                }
+                int pending = out.get("orders") instanceof JsonObject oj && oj.get("pending") != null ? oj.get("pending").getAsInt() : 0;
+                JsonObject r = pearl.onTraveller(server, stash, string(o, "player"), hasPearlTravel, pearlTravel, pending);
+                r.entrySet().forEach(e -> out.add(e.getKey(), e.getValue()));
+            } catch (PearlEngine.Refused e) {
+                Http.error(ex, e.status, e.getMessage());
+                return;
+            }
+            if (audit != null) for (String[] a : pearl.drainAudits()) audit.add(null, "bot " + string(o, "player"), a[0], a[1], AuthRoutes.address(ex));
+        }
         if (craft != null) craftFields(out, server, stash, hasCraftHash, craftHash);
         if (areas != null && areaBots != null) areaFields(ex, out, server, stash, string(o, "player"), hasArea, areaReport);
         Http.json(ex, 200, out);
+    }
+
+    /** Gives the heartbeat pearl travel (set once at start). */
+    void pearl(PearlEngine engine) {
+        this.pearl = engine;
     }
 
     /** Gives the heartbeat the repair passes (set once at start). */
