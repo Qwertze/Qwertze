@@ -458,7 +458,8 @@ New in 0.4.0-dev and still being tested.
   `experimental-climb-throw` are off by default.
 
 ### Messenger
-New in 0.4.0-dev.16, extended in 0.4.0-dev.17, in 0.5.0 (display, theme and chat replacement) and in 0.8.0 (the Console).
+New in 0.4.0-dev.16, extended in 0.4.0-dev.17, in 0.5.0 (display, theme and chat replacement), in 0.8.0 (the Console) and in 0.9.0 (list side,
+corners, sounds, focus target, snapping, badges).
 Not tested in game yet.
 
 Messenger reads your whispers into a small chat window with a history per player and a Global view of the public chat,
@@ -540,6 +541,36 @@ and sends from the window. Turn it on with the **Messenger** module (category Qw
   `system-message-opacity` (55 per cent, from 10 to 100) dims the console lines in Global and in the Console (server
   messages, joins and leaves, and notices from Meteor and its addons). Player chat is always at full opacity. `show-player-heads` (on) draws the
   player's head in front of a public chat line written `<Name> text`.
+- **Window layout (New in 0.9.0).**
+  - `list-side` (Auto, Left, Right; Auto by default) puts the conversation list, the narrow-layout toggle and the list view
+    on that side. Auto goes right when the window's centre is past 55% of the screen width and back left only below 45%;
+    it is worked out when you let go of the window, when it opens and when the screen size or GUI scale changes, never
+    mid-drag. The side is saved with the window.
+  - `corner-radius` (0 to 8 GUI pixels, 0 by default) rounds the window, header, input box, buttons, badges and selected
+    and hover rows. 0 is square, as before.
+  - `snap-to-edges` (on) and `snap-distance` (0 to 32, 8 by default): dragging or resizing sticks an edge to the screen edge
+    within the distance, and the window then slides along that edge. Pull away past the distance to let go. Two snapped
+    edges make a corner; the grip snaps the right and bottom edges. Snapped edges stay on the screen edge when the screen
+    size or GUI scale changes. The window's place is saved as `v2:x,y,w,h,anchors,side` (`v1` still reads).
+  - `badge-global`, `badge-console` and `badge-dms` (all on) hide only the badge drawing, and a hidden badge also leaves
+    the total in the title. Counting is unchanged. Global has no unread count, so `badge-global` does nothing today; it applies only if Global gets one later.
+  - The title shows the unread total as a small badge at the right end of the title area. When there is little room
+    "Messenger - " goes first, then the name is cut with "...".
+- **Focus target (New in 0.9.0).** `focus-opens` (Last open by default) sets what the focus key opens: Last open (per
+  server, kept across restarts), Global, Console (Global if `separate-console` is off), Newest unread (the conversation
+  with the most recent unread message, else Last open) or Specific DM (`focus-dm`; an empty conversation is made if there
+  is none, and an empty `focus-dm` means Last open). `focus-dm` and Last open accept standard Java player names only (3 to 16
+  letters, digits and underscores). The chat key always opens Global and does not change what Last open remembers; only a
+  selection you make in the window does.
+- **Sounds (New in 0.9.0).** `notification-sound` (on) is the master switch. In the Sound group, `dm-sound` (Built-in by
+  default, None, or a file), `console-sound` (None by default; new Console lines with `separate-console` on, not while you
+  read the Console, at most once per 2 seconds) and `sound-volume` (0 to 100, 25 by default) set the sounds. Files go in
+  `meteor-client/qwerte/sounds` (made, with a `README.txt`, when the module turns on): `.ogg` (Vorbis) or `.wav` (PCM, 8 or
+  16 bit, mono or stereo), at most 2 MiB and 10 seconds, directly in the folder (no sub folders, and a link that leads out
+  of the folder is refused). They play through Java's audio output at `sound-volume` times the game's master volume. If a
+  file can't be used the built-in blip plays and one chat warning names the file; it is repeated only when the setting or
+  the file changes. `.ogg` files are decoded by the game's bundled native decoder (LWJGL stb_vorbis 3.3.3), so only use sound
+  files you trust. Whisper sounds are at least 250 ms apart.
 - **Theme (New in 0.5.0).** The window's colours are set in the Theme settings. `follow-meteor-theme` (off) uses the colours
   of Meteor's current GUI theme all the time, checked twice a second. The **Sync theme with Meteor** button copies them once
   instead. The console colours (New in 0.8.0): `console-text` for console lines, `console-note` for the Messenger's notes
@@ -556,7 +587,9 @@ and sends from the window. Turn it on with the **Messenger** module (category Qw
   `extra-patterns` empty. Sending: `command-template` `/msg {name} {text}`, `send-interval-ms` 1500. History: `save-history`
   off, `max-history` 200, `global-scrollback` 500. Window: `show-overlay` on, `window-opacity` 75, `focus-key` Right Ctrl,
   `take-chat-key` off, `overlay-global` off, `notification-sound` on, `replace-chat` off, `auto-font-scale` on,
-  `system-message-opacity` 55, `show-player-heads` on. Console (from 0.8.0): `separate-console` off, `global-keeps-joins-leaves`
+  `system-message-opacity` 55, `show-player-heads` on. Window layout (from 0.9.0): `list-side` Auto, `corner-radius` 0,
+  `snap-to-edges` on, `snap-distance` 8, `badge-global`, `badge-console` and `badge-dms` on, `focus-opens` Last open, `focus-dm`
+  empty. Sound (from 0.9.0): `dm-sound` Built-in, `console-sound` None, `sound-volume` 25. Console (from 0.8.0): `separate-console` off, `global-keeps-joins-leaves`
   off, `global-keeps-deaths` off, `overlay-shows-console` on, `console-italic` off. Theme: `follow-meteor-theme` off, and the
   console colours unset. Debug: `debug-lines` off.
 
@@ -1122,8 +1155,8 @@ Out of materials:
 1. Install [Fabric Loader](https://fabricmc.net/use/installer/) for Minecraft **1.21.11** or **1.21.4**.
 2. Put [Meteor Client](https://meteorclient.com) for the same Minecraft version in your `mods` folder.
 3. Download the `qwerte-addon` jar for your Minecraft version from the
-   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.8.0`, see
-   [Versioning](#versioning) and [Dev builds](#dev-builds)): `qwerte-addon-0.8.0+1.21.11.jar` or `qwerte-addon-0.8.0+1.21.4.jar`.
+   [releases page](https://github.com/Qwertze/Qwertze/releases) (this build is the pre-release `v0.9.0`, see
+   [Versioning](#versioning) and [Dev builds](#dev-builds)): `qwerte-addon-0.9.0+1.21.11.jar` or `qwerte-addon-0.9.0+1.21.4.jar`.
    Put it in your `mods` folder. It needs Stash Manager server 1.1.0 or newer for kit v2, and works alongside Stash Sorter plugin 1.17.0.
 4. *(Optional, for auto-walk and refilling)* Download `baritone-api-fabric-1.3.0-<minecraft>.jar` for your version from
    [dekrom's Baritone releases](https://github.com/dekrom/baritone/releases) (for example
@@ -1147,10 +1180,10 @@ Qwerte uses `MAJOR.MINOR.PATCH` versions:
 - **x.y.0**: new features, bug fixes and more.
 - **x.y.z**: minor bug fixes, single one-off patches and hotfixes.
 
-The `0.4.0-dev.N` counting has ended. 0.5.0 is the first release under this scheme. 0.5.x releases are fixes, 0.6.0 is the
-next feature batch, and 1.0.0 will mark the first stable release.
+The `0.4.0-dev.N` counting has ended. 0.5.0 is the first release under this scheme. 0.5.x releases are fixes, the 0.x.0 releases after 0.5.0
+are feature batches, and 1.0.0 will mark the first stable release.
 
-**Compatibility:** Qwerte **0.8.0** needs [Stash Manager server](stash-manager-server/README.md) **1.1.0** or newer for kit v2
+**Compatibility:** Qwerte **0.9.0** needs [Stash Manager server](stash-manager-server/README.md) **1.1.0** or newer for kit v2
 (**1.2.0** is current), and works alongside the Stash Sorter plugin **1.17.0** (see
 [Stash Sorter for AquariusProxy](https://github.com/Qwertze/Stash-Sorter)).
 

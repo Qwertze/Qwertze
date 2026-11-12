@@ -12,17 +12,28 @@ import com.porter.qwerte.messenger.ConsoleRoute;
 import com.porter.qwerte.messenger.ConversationStore;
 import com.porter.qwerte.messenger.DmFormat;
 import com.porter.qwerte.messenger.DmParser;
+import com.porter.qwerte.messenger.ClipPlayer;
 import com.porter.qwerte.messenger.DmPattern;
+import com.porter.qwerte.messenger.FocusOpens;
 import com.porter.qwerte.messenger.Geometry;
 import com.porter.qwerte.messenger.HistoryJson;
+import com.porter.qwerte.messenger.LastOpen;
 import com.porter.qwerte.messenger.LineKind;
+import com.porter.qwerte.messenger.ListSideMode;
 import com.porter.qwerte.messenger.MessengerCore;
 import com.porter.qwerte.messenger.MessengerScale;
+import com.porter.qwerte.messenger.MessengerSounds;
+import com.porter.qwerte.messenger.Pcm;
+import com.porter.qwerte.messenger.SoundFiles;
+import com.porter.qwerte.messenger.SoundGate;
+import com.porter.qwerte.messenger.SoundLibrary;
+import com.porter.qwerte.messenger.StbOggDecoder;
 import com.porter.qwerte.messenger.MessengerTheme;
 import com.porter.qwerte.messenger.ThemeColor;
 import com.porter.qwerte.messenger.MessengerScreen;
 import com.porter.qwerte.messenger.MessengerUi;
 import com.porter.qwerte.messenger.OnlineNames;
+import com.porter.qwerte.messenger.OverlayProjection;
 import com.porter.qwerte.messenger.Outbox;
 import com.porter.qwerte.messenger.ServerStores;
 import com.porter.qwerte.messenger.SendText;
@@ -44,8 +55,10 @@ import meteordevelopment.meteorclient.gui.widgets.pressable.WButton;
 import meteordevelopment.meteorclient.settings.BoolSetting;
 import meteordevelopment.meteorclient.settings.ColorSetting;
 import meteordevelopment.meteorclient.settings.DoubleSetting;
+import meteordevelopment.meteorclient.settings.EnumSetting;
 import meteordevelopment.meteorclient.settings.IntSetting;
 import meteordevelopment.meteorclient.settings.KeybindSetting;
+import meteordevelopment.meteorclient.settings.ProvidedStringSetting;
 import meteordevelopment.meteorclient.settings.Setting;
 import meteordevelopment.meteorclient.settings.SettingGroup;
 import meteordevelopment.meteorclient.settings.StringListSetting;
@@ -66,6 +79,7 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
 import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -74,8 +88,10 @@ import java.util.EnumSet;
 import java.util.Map;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -96,6 +112,11 @@ import static meteordevelopment.meteorclient.MeteorClient.mc;
 public class Messenger extends Module {
     private static final org.slf4j.Logger LOG = com.mojang.logging.LogUtils.getLogger();
     private static final String GEOMETRY_KEY = "qwerteMessengerWindow";
+    private static final String LAST_OPEN_KEY = "qwerteMessengerLastOpen";
+    /** The Console sound plays at most this often, however many console lines arrive. */
+    private static final long CONSOLE_SOUND_GAP_MS = 2000;
+    /** Whisper sounds are at least this far apart, so a flood of whispers is not a flood of sounds. */
+    private static final long DM_SOUND_GAP_MS = 250;
     /** Changed whispers are written after this long; the public chat alone only after the longer one (or on leaving). */
     private static final long SAVE_EVERY_MS = 20_000;
     private static final long SAVE_GLOBAL_EVERY_MS = 5 * 60_000;
@@ -104,6 +125,7 @@ public class Messenger extends Module {
     private final SettingGroup sgSending = settings.createGroup("Sending");
     private final SettingGroup sgHistory = settings.createGroup("History");
     private final SettingGroup sgWindow = settings.createGroup("Window");
+    private final SettingGroup sgSound = settings.createGroup("Sound");
     private final SettingGroup sgTheme = settings.createGroup("Theme");
     private final SettingGroup sgConsole = settings.createGroup("Console");
     private final SettingGroup sgDebug = settings.createGroup("Debug");
@@ -267,6 +289,75 @@ public class Messenger extends Module {
         .build()
     );
 
+    private final Setting<FocusOpens> focusOpens = sgWindow.add(new EnumSetting.Builder<FocusOpens>()
+        .name("focus-opens")
+        .description("What the focus key opens: the one you had open last on this server, Global, the Console (Global if separate-console is off), the conversation with the newest unread message, or the player in focus-dm. The chat key always opens Global.")
+        .defaultValue(FocusOpens.LAST_OPEN)
+        .build()
+    );
+
+    private final Setting<String> focusDm = sgWindow.add(new StringSetting.Builder()
+        .name("focus-dm")
+        .description("The player the focus key opens. A new empty conversation is made if there is none. Empty: the last one you had open.")
+        .defaultValue("")
+        .visible(() -> focusOpens.get() == FocusOpens.SPECIFIC_DM)
+        .build()
+    );
+
+    private final Setting<ListSideMode> listSide = sgWindow.add(new EnumSetting.Builder<ListSideMode>()
+        .name("list-side")
+        .description("Which side the conversation list is on. Auto puts it on the right when the window is mostly on the right half of the screen, and back on the left when it is mostly on the left. It is worked out when you let go of the window, when it opens and when the screen size changes.")
+        .defaultValue(ListSideMode.AUTO)
+        .build()
+    );
+
+    private final Setting<Integer> cornerRadius = sgWindow.add(new IntSetting.Builder()
+        .name("corner-radius")
+        .description("How round the corners are, in GUI pixels. 0 is square, as before.")
+        .defaultValue(0)
+        .range(0, 8)
+        .sliderRange(0, 8)
+        .build()
+    );
+
+    private final Setting<Boolean> snapToEdges = sgWindow.add(new BoolSetting.Builder()
+        .name("snap-to-edges")
+        .description("While you drag or resize the window, its edges stick to the screen edges. Pull away past snap-distance to let go. A snapped edge stays on the screen edge when the screen size or GUI scale changes.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Integer> snapDistance = sgWindow.add(new IntSetting.Builder()
+        .name("snap-distance")
+        .description("How close to a screen edge the window sticks to it, in GUI pixels.")
+        .defaultValue(8)
+        .range(0, 32)
+        .sliderRange(0, 32)
+        .visible(() -> snapToEdges.get())
+        .build()
+    );
+
+    private final Setting<Boolean> badgeGlobal = sgWindow.add(new BoolSetting.Builder()
+        .name("badge-global")
+        .description("Shows the unread badge for Global. Global has no unread count, so this does nothing today; it applies only if Global gets one later.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Boolean> badgeConsole = sgWindow.add(new BoolSetting.Builder()
+        .name("badge-console")
+        .description("Shows the unread badge on the Console entry. A hidden badge is also left out of the total in the title. Counting goes on, so turning it back on shows the right number.")
+        .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<Boolean> badgeDms = sgWindow.add(new BoolSetting.Builder()
+        .name("badge-dms")
+        .description("Shows the unread badges on the conversations. A hidden badge is also left out of the total in the title. Counting goes on, so turning it back on shows the right number.")
+        .defaultValue(true)
+        .build()
+    );
+
     private final Setting<Boolean> takeChatKey = sgWindow.add(new BoolSetting.Builder()
         .name("take-chat-key")
         .description("Take priority over the chat key: it opens the Messenger on Global instead of the normal chat. The command key (/) still opens the normal chat with a slash. Only a chat opened with empty text is taken, so on 1.21.11 a saved vanilla chat draft still opens vanilla chat, and another mod that opens an empty chat screen is taken too. Off: the normal chat is untouched.")
@@ -340,8 +431,35 @@ public class Messenger extends Module {
 
     private final Setting<Boolean> sound = sgWindow.add(new BoolSetting.Builder()
         .name("notification-sound")
-        .description("A quiet sound when a whisper arrives (not when you are reading that conversation).")
+        .description("Turns the notification sounds on or off: the whisper sound (not when you are reading that conversation) and the Console sound. Which sounds they are is set in the Sound group.")
         .defaultValue(true)
+        .build()
+    );
+
+    private final Setting<String> dmSound = sgSound.add(new ProvidedStringSetting.Builder()
+        .name("dm-sound")
+        .description("The sound for a new whisper: Built-in (a short blip), None, or a file from meteor-client/qwerte/sounds (.ogg or .wav, at most 2 MiB and 10 seconds). Needs notification-sound on.")
+        .defaultValue(MessengerSounds.BUILTIN)
+        .supplier(() -> SoundFiles.choices(soundsDir()))
+        .onChanged(v -> this.sounds.resetWarning())
+        .build()
+    );
+
+    private final Setting<String> consoleSound = sgSound.add(new ProvidedStringSetting.Builder()
+        .name("console-sound")
+        .description("The sound for a new Console line, at most once every 2 seconds. Only with separate-console on, and not while you are reading the Console. Needs notification-sound on.")
+        .defaultValue(MessengerSounds.NONE)
+        .supplier(() -> SoundFiles.choices(soundsDir()))
+        .onChanged(v -> this.sounds.resetWarning())
+        .build()
+    );
+
+    private final Setting<Integer> soundVolume = sgSound.add(new IntSetting.Builder()
+        .name("sound-volume")
+        .description("How loud the notification sounds are, in percent. The game's master volume applies too.")
+        .defaultValue(25)
+        .range(0, 100)
+        .sliderRange(0, 100)
         .build()
     );
 
@@ -457,6 +575,46 @@ public class Messenger extends Module {
         }
 
         @Override
+        public ListSideMode listSide() {
+            return listSide.get();
+        }
+
+        @Override
+        public int cornerRadius() {
+            return cornerRadius.get();
+        }
+
+        @Override
+        public boolean snapToEdges() {
+            return snapToEdges.get();
+        }
+
+        @Override
+        public int snapDistance() {
+            return snapDistance.get();
+        }
+
+        @Override
+        public boolean badgeGlobal() {
+            return badgeGlobal.get();
+        }
+
+        @Override
+        public boolean badgeConsole() {
+            return badgeConsole.get();
+        }
+
+        @Override
+        public boolean badgeDms() {
+            return badgeDms.get();
+        }
+
+        @Override
+        public void selectionChanged(String what) {
+            lastOpen.put(core.stores().currentKey(), what);
+        }
+
+        @Override
         public boolean autoFontScale() {
             return autoFontScale.get();
         }
@@ -479,6 +637,31 @@ public class Messenger extends Module {
             return (takeChatKey.get() || replaceChat.get()) ? "Press the chat key (" + chatKeyName + ") to type" : "Open chat (" + chatKeyName + ") and click here, or enable take-chat-key";
         }
     });
+    /** What was open last, per server; saved with the module so the focus key can bring it back. */
+    private LastOpen lastOpen = new LastOpen();
+    private final SoundGate consoleSoundGate = new SoundGate(CONSOLE_SOUND_GAP_MS);
+    private final SoundGate dmSoundGate = new SoundGate(DM_SOUND_GAP_MS);
+    private final ClipPlayer clipPlayer = new ClipPlayer();
+    private volatile ExecutorService soundWorker;
+    private final MessengerSounds sounds = new MessengerSounds(new SoundLibrary(soundsDir(), new StbOggDecoder()), new MessengerSounds.Out() {
+        @Override
+        public void builtin(float volume) {
+            // quiet: a short high blip (pitch 1.6); the game's mixer applies the master volume
+            mc.execute(() -> {
+                if (mc.player != null) mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.EXPERIENCE_ORB_PICKUP, 1.6f, volume));
+            });
+        }
+
+        @Override
+        public void warn(String message) {
+            mc.execute(() -> warning("%s", message));
+        }
+
+        @Override
+        public void play(Pcm pcm, float gain) throws Exception {
+            clipPlayer.play(pcm, gain);
+        }
+    }, r -> soundWorker().execute(r));
     private String chatKeyName = "T";
     private long chatKeyAt;
 
@@ -529,6 +712,40 @@ public class Messenger extends Module {
         }, "qwerte-messenger-flush"));
     }
 
+    /** The folder of the custom sounds: meteor-client/qwerte/sounds. */
+    private static Path soundsDir() {
+        return MeteorClient.FOLDER.toPath().resolve("qwerte").resolve("sounds");
+    }
+
+    /** One background thread for loading, decoding and playing sound files, made on first use. */
+    private ExecutorService soundWorker() {
+        ExecutorService w = soundWorker;
+        if (w == null) {
+            synchronized (this) {
+                w = soundWorker;
+                if (w == null) {
+                    // One thread and a short queue: a flood of whispers drops the extra sounds instead of piling up work
+                    w = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS, new ArrayBlockingQueue<>(8), r -> {
+                        Thread t = new Thread(r, "qwerte-messenger-sound");
+                        t.setDaemon(true);
+                        return t;
+                    }, new ThreadPoolExecutor.DiscardPolicy());
+                    soundWorker = w;
+                }
+            }
+        }
+        return w;
+    }
+
+    /** The master volume of the game, 0 to 1. */
+    private float masterVolume() {
+        try {
+            return Math.max(0f, Math.min(1f, mc.options.getSoundSourceVolume(SoundSource.MASTER)));
+        } catch (RuntimeException e) {
+            return 1f;
+        }
+    }
+
     /** The key of the server the player is on: its address, or "local" for singleplayer and LAN. */
     private String serverKey() {
         var server = mc.getCurrentServer();
@@ -552,6 +769,7 @@ public class Messenger extends Module {
         core.switchServer(serverKey());
         ui.reset();
         saveBlocked = false;
+        SoundFiles.ensureFolder(soundsDir());
         ChatReplace.hidden(replaceChat.get());
         rebuildParser();
         checkTemplate(template.get());
@@ -603,9 +821,8 @@ public class Messenger extends Module {
         boolean reading = ui.isReading(p.name());
         MessengerCore.Received r = core.receive(p, self, now, reading);
         if (r == null) return;
-        if (r.fromOther() && !reading && sound.get() && mc.player != null) {
-            // quiet: a short high blip at a quarter of the volume
-            mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.EXPERIENCE_ORB_PICKUP, 1.6f, 0.25f));
+        if (r.fromOther() && !reading && sound.get() && mc.player != null && !MessengerSounds.NONE.equals(dmSound.get()) && dmSoundGate.pass(now)) {
+            sounds.play(dmSound.get(), soundVolume.get(), masterVolume());
         }
     }
 
@@ -628,6 +845,10 @@ public class Messenger extends Module {
         boolean added = target == ConsoleRoute.Target.CONSOLE
             ? core.receiveConsole(shown, now, ui.isReadingConsole())
             : core.receiveGlobal(shown, now, console);
+        if (added && target == ConsoleRoute.Target.CONSOLE && sound.get() && mc.player != null && !ui.isReadingConsole()
+            && !MessengerSounds.NONE.equals(consoleSound.get()) && consoleSoundGate.pass(now)) {
+            sounds.play(consoleSound.get(), soundVolume.get(), masterVolume());
+        }
         if (debugLines.get()) debugLine(event, shown, console, added, type, target);
     }
 
@@ -679,7 +900,16 @@ public class Messenger extends Module {
     private void onRender2D(Render2DEvent event) {
         if (!overlay.get() || mc.player == null || mc.options.hideGui) return;
         if (mc.screen != null && !(mc.screen instanceof ChatScreen)) return; // also over the chat, where the mouse is free
-        ui.render(event.drawContext, event.screenWidth, event.screenHeight, -1, -1, false);
+        // Not event.screenWidth / screenHeight: Meteor posts the GUI width for both of them, so a window snapped to the
+        // bottom edge was put below the screen. The focused window (MessengerScreen) is laid out in the GUI size of the game window.
+        int guiW = mc.getWindow().getGuiScaledWidth();
+        int guiH = mc.getWindow().getGuiScaledHeight();
+        OverlayProjection.begin(event.drawContext);
+        try {
+            ui.render(event.drawContext, guiW, guiH, -1, -1, false);
+        } finally {
+            OverlayProjection.end(event.drawContext);
+        }
     }
 
     private void keybindAction() {
@@ -687,8 +917,14 @@ public class Messenger extends Module {
             // A key that types a character can not also let go, or the letter would close the window while you type
             if (!typesCharacters(focusKey.get())) ui.close();
         } else if (mc.screen == null && mc.player != null) {
+            ui.show(focusTarget());
             open();
         }
+    }
+
+    /** What the focus key opens now (focus-opens); the chat key does not use this and stays on Global. */
+    private FocusOpens.Target focusTarget() {
+        return focusOpens.get().resolve(lastOpen.get(core.stores().currentKey()), separateConsole.get(), core.store().newestUnread(), focusDm.get());
     }
 
     private static boolean typesCharacters(Keybind key) {
@@ -726,7 +962,7 @@ public class Messenger extends Module {
         String initial = ((ChatScreenAccessor) event.screen).qwerte$getInitial();
         if (ChatKeyRoute.route(true, initial, available) != ChatKeyRoute.Route.MESSENGER) return;
         event.cancel();
-        ui.selectGlobal();
+        ui.selectGlobalQuiet(); // the chat key does not change what Last open remembers
         open();
     }
 
@@ -889,6 +1125,7 @@ public class Messenger extends Module {
     public CompoundTag toTag() {
         CompoundTag tag = super.toTag();
         if (tag != null && geometry != null) tag.putString(GEOMETRY_KEY, geometry.encode());
+        if (tag != null && !lastOpen.isEmpty()) tag.putString(LAST_OPEN_KEY, lastOpen.encode());
         return tag;
     }
 
@@ -896,6 +1133,7 @@ public class Messenger extends Module {
     public Module fromTag(CompoundTag tag) {
         // A malformed value is ignored: the window then opens in its default place
         geometry = Geometry.decode(string(tag.get(GEOMETRY_KEY)));
+        lastOpen = LastOpen.decode(string(tag.get(LAST_OPEN_KEY)));
         ui.resetGeometry(); // the window may already have read the old place
         return super.fromTag(tag);
     }

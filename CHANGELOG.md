@@ -13,11 +13,75 @@ Qwerte uses `MAJOR.MINOR.PATCH` versions:
 - **x.y.0**: new features, bug fixes and more.
 - **x.y.z**: minor bug fixes, single one-off patches and hotfixes.
 
-The `0.4.0-dev.N` counting has ended. 0.5.0 is the first release under this scheme. 0.5.x releases are fixes, 0.6.0 is the
-next feature batch, and 1.0.0 will mark the first stable release. The version is set by `mod-version` in
+The `0.4.0-dev.N` counting has ended. 0.5.0 is the first release under this scheme. 0.5.x releases are fixes, the 0.x.0 releases after 0.5.0
+are feature batches, and 1.0.0 will mark the first stable release. The version is set by `mod-version` in
 `gradle/libs.versions.toml`.
 
 ## [Unreleased]
+
+## [0.9.0] - 2026-11-11
+
+A pre-release build from the `dev` branch, checked in game on 1.21.11 (see below). It is a feature release on 0.8.0
+and changes only the Messenger.
+Works with the same Stash Manager server and Stash Sorter plugin as 0.8.0: Stash Manager server 1.1.0 (kit2) or newer
+(1.2.0 is current), and Stash Sorter plugin 1.17.0.
+
+### Added
+- **`list-side` (Auto, Left, Right; default Auto).** The conversation list, the narrow-layout toggle button and the list
+  view go on that side. Auto puts them on the right when the window's centre is further right than 55% of the screen
+  width, and back on the left only when it is further left than 45%; in between the side stays. Auto is worked out
+  when you let go of the window, when it opens and when the screen size or GUI scale changes, never while you drag. The
+  side is saved with the window.
+- **`corner-radius` (0 to 8 GUI pixels; default 0).** Rounds the window, the header, the input box, the buttons, the
+  badges and the selected and hover rows (the inner parts use a smaller radius). 0 draws plain rectangles, exactly as
+  before. The panels inside the window are cut to its rounded shape, so they never paint over its corners. The focused
+  input box is drawn without the game's border while the radius is above 1.
+- **Custom notification sounds.** Put `.ogg` (Vorbis) or `.wav` (PCM, 8 or 16 bit, mono or stereo) files in
+  `meteor-client/qwerte/sounds` (the folder and a `README.txt` are made when the module turns on). New Sound group:
+  `dm-sound` (Built-in, None, or a file from the folder; default Built-in, today's blip), `console-sound` (default None;
+  plays for new Console lines with `separate-console` on, while the Console is not being read, at most once every
+  2 seconds) and `sound-volume` (0 to 100, default 25, the same as the old blip). The game's master volume applies to
+  files too. `notification-sound` stays the master on/off for both sounds.
+  - Files play through Java's own audio output (the game cannot play a file from outside its resources), decoded in the
+    background. A file must be a plain name directly in the folder, at most 2 MiB and 10 seconds. Its real path must stay
+    inside the folder, so a link can't lead out of it.
+  - If a file is missing, unreadable, too big, too long, not valid audio or can't be played, the built-in blip plays
+    instead and the Messenger says so once in chat, naming the file. It says it again only when the setting or the file
+    changes. `.ogg` files are decoded by the game's bundled native decoder (LWJGL stb_vorbis 3.3.3), so only use sound files you
+    trust. Whisper sounds are at least 250 ms apart, and a flood of sounds is dropped rather than queued.
+- **`focus-opens` (Last open, Global, Console, Newest unread, Specific DM; default Last open)** and **`focus-dm`.** What
+  the focus key opens. Last open is remembered per server and kept across restarts. Console falls back to Global when
+  `separate-console` is off. Newest unread is the conversation with the most recent unread message, else Last open.
+  Specific DM opens `focus-dm`, making an empty conversation if there is none, or Last open when `focus-dm` is empty.
+  `focus-dm` and Last open accept standard Java player names only. The chat key (`take-chat-key`, `replace-chat`) always opens
+  Global and does not change what Last open remembers.
+- **`snap-to-edges` (on) and `snap-distance` (0 to 32, default 8).** While you drag or resize the window, an edge within
+  the distance of a screen edge locks flush to it, and the window slides freely along that edge. It lets go when you pull
+  more than the distance away (measured from where the mouse would put the window); there is no modifier key. Two snapped
+  edges make a corner. The grip snaps the right and bottom edges. Snapped edges are saved and stay on their screen edge
+  when the screen size or GUI scale changes (the size is clamped first). With snapping off the old clamp applies.
+- **`badge-global`, `badge-console` and `badge-dms` (all on).** Hide only the badge drawing. A hidden badge also leaves the
+  total in the title. Unread counting is unchanged. Global has no unread count, so `badge-global` does nothing today; it applies only if Global gets one later.
+
+### Changed
+- The window's saved place is now `v2:x,y,w,h,anchors,side`. A saved `v1:x,y,w,h` still reads, with no anchors and the list on the left.
+- `notification-sound` now switches both the whisper sound and the Console sound.
+
+### Fixed
+- The title was cut off as "Messenger - Global (2". The unread total is now a small badge at the right end of the title
+  area, left of the header buttons, and the title text is cut with "...". When there is little room, "Messenger - " is
+  dropped first.
+- **Bottom-anchored window in the overlay.** Meteor passes the GUI width as the height in `Render2DEvent`, so a
+  window snapped to the bottom edge was drawn below the screen. The overlay now uses the game window's GUI height.
+- **1.21.4 overlay projection.** The overlay is drawn under the game's scaled GUI projection. Meteor's 2D event uses
+  an unscaled one, and the window's sizes are in GUI pixels.
+
+### Tested in game
+- On 1.21.11 (both test instances), including the bottom-anchor overlay fix.
+
+### Not tested in game
+- The 1.21.4 build, including the 1.21.4 overlay projection change (a suspected size problem at GUI scale 2 or more
+  that was never seen in game).
 
 ## [0.8.0] - 2026-11-11
 

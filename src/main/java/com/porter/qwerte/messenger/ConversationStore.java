@@ -329,6 +329,44 @@ public final class ConversationStore {
         return n + (consoleVisible ? consoleUnread : 0);
     }
 
+    /**
+     * The unread total the title shows: only what the badge settings leave on. Global has no unread count, so its flag
+     * changes nothing today. The counts themselves are not touched, so a badge turned back on shows the right number.
+     */
+    public int visibleUnread(boolean global, boolean console, boolean dms) {
+        int n = 0;
+        if (dms) {
+            for (Conversation c : byKey.values()) n += c.unread();
+        }
+        if (console && consoleVisible) n += consoleUnread;
+        return n;
+    }
+
+    /**
+     * The player whose conversation has the unread message that arrived most recently, or null when nothing is unread.
+     * Ties go to the name that sorts first.
+     */
+    public String newestUnread() {
+        Conversation best = null;
+        long bestTime = Long.MIN_VALUE;
+        for (Conversation c : byKey.values()) {
+            if (c.unread() <= 0) continue;
+            long t = c.lastActivity();
+            for (int i = c.messages().size() - 1; i >= 0; i--) {
+                Message m = c.messages().get(i);
+                if (m.direction() == Direction.IN) {
+                    t = m.time();
+                    break;
+                }
+            }
+            if (best == null || t > bestTime || (t == bestTime && c.key().compareTo(best.key()) < 0)) {
+                best = c;
+                bestTime = t;
+            }
+        }
+        return best == null ? null : best.name();
+    }
+
     /** Forgets one conversation. */
     public void remove(String name) {
         if (name != null && byKey.remove(Conversation.key(name)) != null) {

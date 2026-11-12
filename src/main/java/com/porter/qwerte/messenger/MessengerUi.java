@@ -80,6 +80,28 @@ public final class MessengerUi {
 
         /** Draw the sender's head in front of a public chat line. */
         boolean showHeads();
+
+        /** list-side: where the conversation list goes. */
+        ListSideMode listSide();
+
+        /** corner-radius, 0 to 8 GUI pixels (0: plain rectangles). */
+        int cornerRadius();
+
+        /** snap-to-edges. */
+        boolean snapToEdges();
+
+        /** snap-distance, in GUI pixels. */
+        int snapDistance();
+
+        /** The unread badges of the Global row, the Console row and the conversation rows are drawn. They only hide the drawing. */
+        boolean badgeGlobal();
+
+        boolean badgeConsole();
+
+        boolean badgeDms();
+
+        /** The user opened Global ({@link LastOpen#GLOBAL}), the Console ({@link LastOpen#CONSOLE}) or a conversation (its key). */
+        void selectionChanged(String what);
     }
 
     private record Rect(int x1, int y1, int x2, int y2) {
@@ -160,6 +182,21 @@ public final class MessengerUi {
     private String confirmName;
 
     private Geometry geo;
+    /** The screen size (GUI pixels) at the last frame; a change (also from the GUI scale) puts the list side up for a new look. */
+    private int lastSw = -1;
+    private int lastSh = -1;
+    private ListSideMode lastSideMode;
+    /** The rounded corners: logical pixels of the window, set by {@link #layout}. */
+    private int rWin;
+    private int rIn1;
+    private int rIn2;
+    private GuiGraphics roundG;
+    private int roundColor;
+    private final RoundRect.Sink roundSink = (x1, y1, x2, y2) -> roundG.fill(x1, y1, x2, y2, roundColor);
+    /** Cuts every span to the window's rounded shape before it is drawn, so nothing paints over the window's corners. */
+    private final RoundRect.Sink clipSink = (x1, y1, x2, y2) -> RoundRect.spansIn(this.winRect.x1, this.winRect.y1, this.winRect.x2, this.winRect.y2, this.rWin, x1, y1, x2, y2, roundSink);
+    /** The right edge of the header's left part: the leftmost of the buttons and the list toggle, or the window's edge. */
+    private int headRight;
     /**
      * The scale the window is drawn with (see {@link MessengerScale}). Everything inside is laid out in logical pixels:
      * the window's real size divided by this, drawn through a pose scale about the window's corner. The geometry
@@ -180,6 +217,8 @@ public final class MessengerUi {
     private Rect histRect = winRect;
     private Rect pickRect = winRect;
     private Rect inputRect = winRect;
+    /** The rounded fill behind the input box (corner-radius above 1), else empty. */
+    private Rect inputBox = winRect;
     private Rect sendRect = winRect;
     private Rect gripRect = winRect;
     private Rect btnList = winRect;
@@ -262,6 +301,7 @@ public final class MessengerUi {
     /** Called when the screen opens. */
     public void focus() {
         focused = true;
+        reevaluateSide(); // the window appears in front of the user
         ensureInput();
         input.setFocused(true);
         Conversation c = selectedConversation();
@@ -302,9 +342,44 @@ public final class MessengerUi {
         setSelected(null);
     }
 
+    /** Shows Global without remembering it as Last open: the chat key does this, it is not a choice made in the window. */
+    public void selectGlobalQuiet() {
+        setSelected(null, false);
+    }
+
+    /**
+     * Shows what the focus key was asked to open (focus-opens). A conversation that is not there is made empty, like New
+     * does, only for a target that says so; otherwise it falls back to Global.
+     */
+    public void show(FocusOpens.Target target) {
+        switch (target.kind()) {
+            case GLOBAL -> selectGlobal();
+            case CONSOLE -> {
+                if (host.separateConsole()) selectConsole();
+                else selectGlobal();
+            }
+            case DM -> {
+                ConversationStore store = host.core().store();
+                Conversation c = store.get(target.name());
+                if (c == null && target.create()) c = store.open(target.name(), System.currentTimeMillis());
+                if (c != null) select(c.name());
+                else selectGlobal();
+            }
+            default -> {
+                // KEEP: whatever is open stays
+            }
+        }
+    }
+
     private void setSelected(String key) {
+        setSelected(key, true);
+    }
+
+    /** {@code record}: the user chose this, so the focus key's Last open remembers it. */
+    private void setSelected(String key, boolean record) {
         if (input != null) drafts.put(draftKey(selected), input.getValue());
         selected = key;
+        if (record) host.selectionChanged(key == null ? LastOpen.GLOBAL : CONSOLE_KEY.equals(key) ? LastOpen.CONSOLE : key);
         histScroll = 0;
         blocksSrc = null;
         scrollSrc = null;
@@ -397,13 +472,46 @@ public final class MessengerUi {
     }
 
     private Geometry current(int sw, int sh) {
+        boolean fresh = false;
         if (geo == null) {
             Geometry saved = host.geometry();
             geo = saved != null ? saved : Geometry.initial(sw, sh);
+            fresh = true;
         }
-        geo = geo.clamp(sw, sh);
+        // Snapped edges stay on their screen edge when the size changes; with snapping off it is the plain clamp
+        geo = host.snapToEdges() ? geo.fit(sw, sh) : geo.clamp(sw, sh);
+        boolean screenChanged = sw != lastSw || sh != lastSh;
+        ListSideMode mode = host.listSide();
+        boolean modeChanged = mode != lastSideMode;
+        lastSw = sw;
+        lastSh = sh;
+        lastSideMode = mode;
+        // Auto looks again when the window appears, when the screen size or GUI scale changes and when the setting does; never mid-drag
+        if ((fresh || screenChanged || modeChanged) && drag == Drag.NONE) applySide(sw);
         scale = MessengerScale.effective(host.autoFontScale(), host.fontScale(), geo.w(), geo.h());
         return geo;
+    }
+
+    /** Auto: picks the side from where the window is (with the hysteresis of {@link ListSideMode}); the result is saved with the geometry. */
+    private void applySide(int sw) {
+        if (geo == null) return;
+        ListSide next = host.listSide().resolve(geo.side(), geo.x(), geo.w(), sw);
+        if (next != geo.side()) {
+            geo = geo.withSide(next);
+            host.geometryChanged(geo);
+        }
+    }
+
+    private void reevaluateSide() {
+        if (geo != null && lastSw > 0 && drag == Drag.NONE) applySide(lastSw);
+    }
+
+    /** The side the list is on now: the setting, or for Auto the one that was worked out and saved. */
+    private ListSide listSide() {
+        ListSideMode mode = host.listSide();
+        if (mode == ListSideMode.LEFT) return ListSide.LEFT;
+        if (mode == ListSideMode.RIGHT) return ListSide.RIGHT;
+        return geo == null ? ListSide.LEFT : geo.side();
     }
 
     /** A real GUI x as a logical one (the window's corner stays where it is). */
@@ -424,6 +532,47 @@ public final class MessengerUi {
     private int bg(ThemeColor c) {
         float o = Math.max(0.2f, Math.min(1f, host.opacity()));
         return MessengerTheme.scaleAlpha(host.color(c), o);
+    }
+
+    // ---------- rounded corners ----------
+
+    /** A radius in GUI pixels as logical pixels of the scaled window (0 stays 0, anything else at least 1). */
+    private int logicalRadius(int guiPx) {
+        return guiPx <= 0 ? 0 : Math.max(1, Math.round(guiPx / scale));
+    }
+
+    /**
+     * A filled rectangle with the given radius at each corner (top left, top right, bottom right, bottom left). With all
+     * radii 0 it is one plain {@code fill}, exactly as before rounding existed; otherwise the spans of {@link RoundRect}.
+     */
+    private void fillRound(GuiGraphics g, int x1, int y1, int x2, int y2, int tl, int tr, int br, int bl, int color) {
+        if (rWin == 0) { // no rounding anywhere: one plain fill
+            g.fill(x1, y1, x2, y2, color);
+            return;
+        }
+        roundG = g;
+        roundColor = color;
+        RoundRect.spans(x1, y1, x2, y2, tl, tr, br, bl, clipSink); // also a square-cornered shape is cut to the window's
+        roundG = null;
+    }
+
+    private void rounded(GuiGraphics g, int x1, int y1, int x2, int y2, int radius, int color) {
+        fillRound(g, x1, y1, x2, y2, radius, radius, radius, radius, color);
+    }
+
+    /**
+     * A panel of the window (the window itself, the header, the list, ...): only the part inside the window's rounded
+     * shape is filled, so a panel never paints over the window's corners. With radius 0 it is one plain {@code fill}.
+     */
+    private void pane(GuiGraphics g, int x1, int y1, int x2, int y2, int color) {
+        if (rWin == 0) {
+            g.fill(x1, y1, x2, y2, color);
+            return;
+        }
+        roundG = g;
+        roundColor = color;
+        RoundRect.spansIn(winRect.x1, winRect.y1, winRect.x2, winRect.y2, rWin, x1, y1, x2, y2, roundSink);
+        roundG = null;
     }
 
     // ---------- drawing ----------
@@ -471,10 +620,10 @@ public final class MessengerUi {
         shownList = list;
         consoleRow = host.separateConsole();
         drawFocus = focus;
-        if (CONSOLE_KEY.equals(selected) && !consoleRow) setSelected(null); // separate-console was turned off
+        if (CONSOLE_KEY.equals(selected) && !consoleRow) setSelected(null, false); // separate-console was turned off
         if (selected != null && !CONSOLE_KEY.equals(selected) && store.get(selected) == null) { // it was deleted (or this is another server)
             String dead = selected;
-            setSelected(null);
+            setSelected(null, false);
             drafts.remove(dead);
         }
         Conversation sel = selectedConversation();
@@ -493,15 +642,32 @@ public final class MessengerUi {
         layout(w, focus, font);
 
         // Frame, title, panes
-        g.fill(winRect.x1, winRect.y1, winRect.x2, winRect.y2, bg(ThemeColor.WINDOW));
-        g.fill(titleRect.x1, titleRect.y1, titleRect.x2, titleRect.y2, bg(ThemeColor.HEADER));
-        int total = store.totalUnread();
-        String title = "Messenger" + (shown != null ? " - " + shown.name() : consoleShown ? " - Console" : globalShown ? " - Global" : "")
-            + (globalShown && !consoleShown && core.globalQueued() ? " (sending...)" : "") + (total > 0 ? " (" + total + ")" : "");
-        if (!plan.history() && status != null && System.currentTimeMillis() <= statusUntil) title = status; // the messages (where it is shown) are hidden
-        int titleX = btnList.w() > 0 ? btnList.x2 + 3 : titleRect.x1 + 4;
-        int titleMax = (btnNew.w() > 0 ? btnNew.x1 : titleRect.x2) - titleX - 4;
-        if (titleMax > 6 && titleRect.h() >= 9) g.drawString(font, font.plainSubstrByWidth(title, titleMax), titleX, titleRect.y1 + 3, col(ThemeColor.TEXT), true);
+        pane(g, winRect.x1, winRect.y1, winRect.x2, winRect.y2, bg(ThemeColor.WINDOW));
+        pane(g, titleRect.x1, titleRect.y1, titleRect.x2, titleRect.y2, bg(ThemeColor.HEADER));
+        // The title: the text, cut with "..." (without "Messenger - " first) to leave room for the unread badge at its right end
+        int total = store.visibleUnread(host.badgeGlobal(), host.badgeConsole(), host.badgeDms());
+        String subject = shown != null ? shown.name() : consoleShown ? "Console" : globalShown ? "Global" : "";
+        if (globalShown && !consoleShown && core.globalQueued()) subject += " (sending...)";
+        String prefix = TitleFit.PREFIX;
+        if (!plan.history() && status != null && System.currentTimeMillis() <= statusUntil) { // the messages (where it is shown) are hidden
+            subject = status;
+            prefix = "";
+        }
+        int titleX = btnList.w() > 0 && btnList.x1 < titleRect.x1 + titleRect.w() / 2 ? btnList.x2 + 3 : titleRect.x1 + 4;
+        int areaRight = headRight - 4;
+        String count = total > 99 ? "99+" : String.valueOf(total);
+        int badgeW = total > 0 ? font.width(count) + 6 : 0;
+        if (areaRight - titleX > 6 && titleRect.h() >= 9) {
+            TitleFit.Result fit = TitleFit.fit(font::width, prefix, subject, badgeW, areaRight - titleX);
+            if (!fit.text().isEmpty()) g.drawString(font, fit.text(), titleX, titleRect.y1 + 3, col(ThemeColor.TEXT), true);
+            if (fit.badge()) {
+                int bx2 = areaRight;
+                int by1 = titleRect.y1 + 2;
+                int by2 = titleRect.y2 - 2;
+                rounded(g, bx2 - badgeW, by1, bx2, by2, rIn2, col(ThemeColor.BADGE));
+                g.drawString(font, count, bx2 - badgeW + 3, titleRect.y1 + 3, MessengerTheme.textOn(col(ThemeColor.BADGE)), false);
+            }
+        }
         if (btnList.w() > 0) button(g, font, btnList, listView ? "<" : "=", mx, my, listView);
         if (focus && btnNew.w() > 0) {
             button(g, font, btnNew, contactOpen ? "Cancel" : "New", mx, my, contactOpen);
@@ -510,7 +676,7 @@ public final class MessengerUi {
         }
 
         if (listRect.w() > 0) {
-            g.fill(listRect.x1, listRect.y1, listRect.x2, listRect.y2, bg(ThemeColor.LEFT_PANE));
+            pane(g, listRect.x1, listRect.y1, listRect.x2, listRect.y2, bg(ThemeColor.LEFT_PANE));
             drawList(g, font, list, focus, mx, my, shown == null ? null : shown.key(), globalShown && !consoleShown);
         }
         if (plan.history()) {
@@ -526,13 +692,15 @@ public final class MessengerUi {
             // grip
             // the grip is at least 8 real pixels; its dots grow with it
             int k = Math.max(1, Math.round(gripRect.w() / (float) GRIP));
+            int gx = gripRect.x2 - rWin / 2; // the dots keep inside a rounded corner
+            int gy = gripRect.y2 - rWin / 2;
             for (int i = 0; i < 3; i++) {
                 int o = (2 + i * 3) * k;
-                g.fill(gripRect.x2 - o - k, gripRect.y2 - 2 * k, gripRect.x2 - o, gripRect.y2 - k, col(ThemeColor.DIM));
-                g.fill(gripRect.x2 - 2 * k, gripRect.y2 - o - k, gripRect.x2 - k, gripRect.y2 - o, col(ThemeColor.DIM));
+                g.fill(gx - o - k, gy - 2 * k, gx - o, gy - k, col(ThemeColor.DIM));
+                g.fill(gx - 2 * k, gy - o - k, gx - k, gy - o, col(ThemeColor.DIM));
             }
         } else if (plan.input()) {
-            g.fill(inputRect.x1, inputRect.y1, inputRect.x2, inputRect.y2, bg(ThemeColor.INPUT));
+            rounded(g, inputRect.x1, inputRect.y1, inputRect.x2, inputRect.y2, rIn1, bg(ThemeColor.INPUT));
             g.drawString(font, font.plainSubstrByWidth(host.hint(), Math.max(10, inputRect.w() - 8)), inputRect.x1 + 4, inputRect.y1 + 4, col(ThemeColor.DIM), false);
         }
         if (dotTip != null) drawDotTip(g, font, (int) Math.floor(lx(0)), (int) Math.floor(ly(0)), (int) Math.ceil(lx(sw)), (int) Math.ceil(ly(sh))); // last, so nothing covers it
@@ -557,12 +725,23 @@ public final class MessengerUi {
             confirm = Confirm.NONE;
             setStatus("Cancelled: window too small");
         }
-        // Header, left to right: the list toggle; right to left: the buttons
+        // Rounded corners (logical pixels). The panels are cut to the window's shape, so the radius is the window's own.
+        int guiR = Math.max(0, Math.min(8, host.cornerRadius()));
+        rWin = logicalRadius(guiR);
+        rIn1 = logicalRadius(guiR - 1);
+        rIn2 = logicalRadius(guiR - 2);
+        boolean listRight = listSide() == ListSide.RIGHT;
+        // Header: the list toggle is on the list's side (the left end, or the right end with the buttons to its left); the buttons are on the right
         int by1 = titleRect.y1 + 2;
         int by2 = titleRect.y2 - 2;
-        btnList = focus && plan.toggle() && !contactOpen ? new Rect(titleRect.x1 + 2, by1, titleRect.x1 + 2 + (by2 - by1) + 4, by2) : none;
+        int toggleW = (by2 - by1) + 4;
+        if (focus && plan.toggle() && !contactOpen) {
+            btnList = listRight ? new Rect(titleRect.x2 - 2 - toggleW, by1, titleRect.x2 - 2, by2) : new Rect(titleRect.x1 + 2, by1, titleRect.x1 + 2 + toggleW, by2);
+        } else {
+            btnList = none;
+        }
         if (focus && plan.buttons()) {
-            int bx = winRect.x2 - 3;
+            int bx = listRight && btnList.w() > 0 ? btnList.x1 - 2 : winRect.x2 - 3;
             int dw = font.width("Delete") + 8;
             btnDelete = new Rect(bx - dw, by1, bx, by2);
             bx -= dw + 2;
@@ -577,33 +756,49 @@ public final class MessengerUi {
             btnNew = none;
         }
 
-        // The list: beside the messages, or (collapsed and asked for) instead of them
+        // The list: beside the messages (on the left or the right), or (collapsed and asked for) instead of them
         int listW = Math.max(60, Math.min(110, winRect.w() * 3 / 10));
-        if (plan.sidebar()) listRect = new Rect(winRect.x1, titleRect.y2, winRect.x1 + listW, winRect.y2);
+        if (plan.sidebar()) listRect = listRight ? new Rect(winRect.x2 - listW, titleRect.y2, winRect.x2, winRect.y2) : new Rect(winRect.x1, titleRect.y2, winRect.x1 + listW, winRect.y2);
         else if (plan.listView()) listRect = new Rect(winRect.x1, titleRect.y2, winRect.x2, winRect.y2);
         else listRect = none;
-        int left = plan.sidebar() ? listRect.x2 + 1 : winRect.x1; // where the messages and the input start
+        int left = plan.sidebar() && !listRight ? listRect.x2 + 1 : winRect.x1; // where the messages and the input start
+        int right = plan.sidebar() && listRight ? listRect.x1 - 1 : winRect.x2; // and where they end
         int inputH = plan.input() ? INPUT_H : 0;
-        if (plan.input()) inputRect = new Rect(left + PAD, winRect.y2 - INPUT_H, winRect.x2 - PAD, winRect.y2 - 1);
+        if (plan.input()) inputRect = new Rect(left + PAD, winRect.y2 - INPUT_H, right - PAD, winRect.y2 - 1);
         else inputRect = none;
         int sendW = font.width("Send") + 10;
         sendRect = !plan.input() ? none : focus ? new Rect(inputRect.x2 - sendW, inputRect.y1, inputRect.x2, inputRect.y2) : inputRect;
-        pickCols = Math.max(1, (winRect.x2 - left - 2 * PAD - 6) / CELL);
+        pickCols = Math.max(1, (right - left - 2 * PAD - 6) / CELL);
         int pickH = focus && pickerOpen && plan.input() && plan.history() ? PICK_ROWS * CELL + 4 : 0;
-        pickRect = pickH > 0 ? new Rect(left, winRect.y2 - INPUT_H - pickH, winRect.x2, winRect.y2 - INPUT_H) : none;
-        histRect = plan.history() ? new Rect(left, titleRect.y2, winRect.x2, winRect.y2 - inputH - pickH) : none;
+        pickRect = pickH > 0 ? new Rect(left, winRect.y2 - INPUT_H - pickH, right, winRect.y2 - INPUT_H) : none;
+        histRect = plan.history() ? new Rect(left, titleRect.y2, right, winRect.y2 - inputH - pickH) : none;
         int gripSize = MessengerLayout.hitSize(GRIP, scale, Math.min(winRect.w(), winRect.h()));
         gripRect = new Rect(winRect.x2 - gripSize, winRect.y2 - gripSize, winRect.x2, winRect.y2);
         // Above scale 0.4 only the part of the header left of the buttons starts a drag; at tiny scales all of it, and taller
-        int titleRight = scale > MessengerLayout.GRAB_SCALE && btnNew.w() > 0 ? btnNew.x1 : winRect.x2;
+        headRight = btnNew.w() > 0 ? btnNew.x1 : listRight && btnList.w() > 0 ? btnList.x1 : titleRect.x2;
+        int titleRight = scale > MessengerLayout.GRAB_SCALE ? headRight : winRect.x2;
         titleHit = new Rect(winRect.x1, winRect.y1, titleRight, winRect.y1 + MessengerLayout.titleHitHeight(TITLE_H, scale, winRect.h()));
         searchRect = new Rect(histRect.x1 + PAD, histRect.y1 + PAD, histRect.x2 - PAD, histRect.y1 + PAD + 14);
         contactRect = new Rect(histRect.x1, searchRect.y2 + PAD, histRect.x2, histRect.y2);
         if (focus) {
             ensureInput();
-            input.setX(inputRect.x1);
-            input.setY(inputRect.y1);
-            input.setWidth(Math.max(20, inputRect.w() - sendW - 3));
+            int boxW = Math.max(20, inputRect.w() - sendW - 3);
+            if (rIn1 > 0) {
+                // Rounded: the box draws no border of its own (the text then starts at its x), and a rounded fill is drawn behind it
+                input.setBordered(false);
+                input.setX(inputRect.x1 + 4);
+                input.setY(inputRect.y1 + (inputRect.h() - 8) / 2);
+                input.setHeight(8);
+                input.setWidth(Math.max(12, boxW - 8));
+                inputBox = new Rect(inputRect.x1, inputRect.y1, inputRect.x1 + boxW, inputRect.y2);
+            } else {
+                input.setBordered(true);
+                input.setX(inputRect.x1);
+                input.setY(inputRect.y1);
+                input.setHeight(14);
+                input.setWidth(boxW);
+                inputBox = none;
+            }
             if (contactOpen) {
                 ensureSearch();
                 search.setX(searchRect.x1);
@@ -615,7 +810,7 @@ public final class MessengerUi {
 
     private void button(GuiGraphics g, Font font, Rect r, String label, int mx, int my, boolean active) {
         boolean hover = r.contains(mx, my);
-        g.fill(r.x1, r.y1, r.x2, r.y2, col(hover ? ThemeColor.BUTTON_HOVER : active ? ThemeColor.BUTTON_ACTIVE : ThemeColor.BUTTON));
+        rounded(g, r.x1, r.y1, r.x2, r.y2, rIn2, col(hover ? ThemeColor.BUTTON_HOVER : active ? ThemeColor.BUTTON_ACTIVE : ThemeColor.BUTTON));
         g.drawString(font, label, r.x1 + (r.w() - font.width(label)) / 2, r.y1 + (r.h() - 8) / 2, col(ThemeColor.TEXT), false);
     }
 
@@ -632,15 +827,15 @@ public final class MessengerUi {
             Conversation c = i < specials ? null : list.get(i - specials);
             Rect row = new Rect(listRect.x1, y, listRect.x2, y + ROW_H);
             boolean isSel = consoleEntry ? consoleShown : c == null ? globalShown : c.key().equals(shownKey);
-            if (isSel) g.fill(row.x1, row.y1, row.x2, row.y2, bg(ThemeColor.SELECTED));
-            else if (focus && row.contains(mx, my)) g.fill(row.x1, row.y1, row.x2, row.y2, bg(ThemeColor.HOVER));
+            if (isSel) rounded(g, row.x1, row.y1, row.x2, row.y2, rIn2, bg(ThemeColor.SELECTED));
+            else if (focus && row.contains(mx, my)) rounded(g, row.x1, row.y1, row.x2, row.y2, rIn2, bg(ThemeColor.HOVER));
             if (consoleEntry) {
-                int unread = host.core().store().consoleUnread();
+                int unread = host.badgeConsole() ? host.core().store().consoleUnread() : 0; // the badge setting only hides the drawing
                 int badgeW = 0;
                 if (unread > 0) {
                     String n = unread > 99 ? "99+" : String.valueOf(unread);
                     int bw = font.width(n) + 6;
-                    g.fill(row.x2 - bw - 2, row.y1 + 2, row.x2 - 2, row.y2 - 2, col(ThemeColor.BADGE));
+                    rounded(g, row.x2 - bw - 2, row.y1 + 2, row.x2 - 2, row.y2 - 2, rIn2, col(ThemeColor.BADGE));
                     g.drawString(font, n, row.x2 - bw + 1, row.y1 + 2, MessengerTheme.textOn(col(ThemeColor.BADGE)), false);
                     badgeW = bw + 3;
                 }
@@ -655,10 +850,10 @@ public final class MessengerUi {
             int dotX = row.x1 + 4;
             drawDot(g, dotX, row.y1 + (ROW_H - DOT) / 2, online(c.name()), focus ? listRect : null, mx, my);
             int badgeW = DOT + DOT_GAP;
-            if (c.unread() > 0) {
+            if (c.unread() > 0 && host.badgeDms()) {
                 String n = c.unread() > 99 ? "99+" : String.valueOf(c.unread());
                 int bw = font.width(n) + 6;
-                g.fill(row.x2 - bw - 2, row.y1 + 2, row.x2 - 2, row.y2 - 2, col(ThemeColor.BADGE));
+                rounded(g, row.x2 - bw - 2, row.y1 + 2, row.x2 - 2, row.y2 - 2, rIn2, col(ThemeColor.BADGE));
                 g.drawString(font, n, row.x2 - bw + 1, row.y1 + 2, MessengerTheme.textOn(col(ThemeColor.BADGE)), false);
                 badgeW += bw + 3;
             }
@@ -776,7 +971,7 @@ public final class MessengerUi {
         }
         g.enableScissor(histRect.x1, histRect.y1, histRect.x2, histRect.y2);
         String s = font.plainSubstrByWidth(status, histRect.w() - 8);
-        g.fill(histRect.x1, histRect.y2 - 11, histRect.x2, histRect.y2, 0xC0200C0C);
+        pane(g, histRect.x1, histRect.y2 - 11, histRect.x2, histRect.y2, 0xC0200C0C);
         g.drawString(font, s, histRect.x1 + 4, histRect.y2 - 10, col(ThemeColor.ERROR), false);
         g.disableScissor();
     }
@@ -923,7 +1118,7 @@ public final class MessengerUi {
 
     private void drawContacts(GuiGraphics g, Font font, int mx, int my) {
         ensureSearch();
-        g.fill(histRect.x1, histRect.y1, histRect.x2, histRect.y2, bg(ThemeColor.WINDOW));
+        pane(g, histRect.x1, histRect.y1, histRect.x2, histRect.y2, bg(ThemeColor.WINDOW));
         search.render(g, mx, my, 0f);
         List<ContactPicker.Entry> list = contacts();
         drawn = list;
@@ -940,8 +1135,8 @@ public final class MessengerUi {
             if (y >= contactRect.y2) break;
             ContactPicker.Entry e = list.get(i);
             Rect row = new Rect(contactRect.x1 + 1, y, contactRect.x2 - 1, y + ROW_H);
-            if (i == contactSel) g.fill(row.x1, row.y1, row.x2, row.y2, bg(ThemeColor.SELECTED));
-            else if (row.contains(mx, my)) g.fill(row.x1, row.y1, row.x2, row.y2, bg(ThemeColor.HOVER));
+            if (i == contactSel) rounded(g, row.x1, row.y1, row.x2, row.y2, rIn2, bg(ThemeColor.SELECTED));
+            else if (row.contains(mx, my)) rounded(g, row.x1, row.y1, row.x2, row.y2, rIn2, bg(ThemeColor.HOVER));
             String tag = switch (e.source()) {
                 case FRIEND -> "friend";
                 case ONLINE -> "online";
@@ -1033,7 +1228,7 @@ public final class MessengerUi {
     }
 
     private void drawPicker(GuiGraphics g, int mx, int my) {
-        g.fill(pickRect.x1, pickRect.y1, pickRect.x2, pickRect.y2, bg(ThemeColor.LEFT_PANE));
+        pane(g, pickRect.x1, pickRect.y1, pickRect.x2, pickRect.y2, bg(ThemeColor.LEFT_PANE));
         List<String> files = emoji.files();
         int rowsTotal = (files.size() + pickCols - 1) / pickCols;
         pickScroll = Math.max(0, Math.min(pickScroll, Math.max(0, rowsTotal - PICK_ROWS)));
@@ -1053,6 +1248,7 @@ public final class MessengerUi {
 
     private void drawInput(GuiGraphics g, Font font, int mx, int my) {
         ensureInput();
+        if (inputBox.w() > 0) rounded(g, inputBox.x1, inputBox.y1, inputBox.x2, inputBox.y2, rIn1, bg(ThemeColor.INPUT));
         input.render(g, mx, my, 0f);
         button(g, font, sendRect, "Send", mx, my, false);
     }
@@ -1166,27 +1362,33 @@ public final class MessengerUi {
             if (contactOpen) closeContacts();
             ensureInput();
             input.setFocused(true);
-            EditInput.click(input, x, y, button);
+            // A rounded box is only 8 pixels tall: a click anywhere in its area still puts the cursor in it
+            double cx = inputBox.w() > 0 ? Math.max(input.getX(), Math.min(x, input.getX() + input.getWidth() - 1)) : x;
+            double cy = inputBox.w() > 0 ? Math.max(input.getY(), Math.min(y, input.getY() + input.getHeight() - 1)) : y;
+            EditInput.click(input, cx, cy, button);
             return true;
         }
         return true;
     }
 
     public boolean mouseReleased() {
-        if (drag != Drag.NONE && geo != null) host.geometryChanged(geo);
+        boolean wasDragging = drag != Drag.NONE;
         drag = Drag.NONE;
+        if (wasDragging && geo != null) {
+            reevaluateSide(); // Auto looks at where the window was left, never while it moves
+            host.geometryChanged(geo);
+        }
         return true;
     }
 
     public boolean mouseDragged(double x, double y, int sw, int sh) {
         if (drag == Drag.NONE) return false;
         Geometry w = current(sw, sh);
+        // The edges snap by where the mouse would put the window, not by where it is (see EdgeSnap)
         if (drag == Drag.MOVE) {
-            geo = new Geometry((int) x - dragDx, (int) y - dragDy, w.w(), w.h()).clamp(sw, sh);
+            geo = EdgeSnap.move(w, (int) x - dragDx, (int) y - dragDy, sw, sh, host.snapToEdges(), host.snapDistance());
         } else {
-            int nw = (int) x + dragDx - w.x();
-            int nh = (int) y + dragDy - w.y();
-            geo = new Geometry(w.x(), w.y(), Math.max(Geometry.MIN_W, nw), Math.max(Geometry.MIN_H, nh)).clamp(sw, sh);
+            geo = EdgeSnap.resize(w, (int) x + dragDx, (int) y + dragDy, sw, sh, host.snapToEdges(), host.snapDistance());
         }
         return true;
     }
