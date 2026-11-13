@@ -154,6 +154,8 @@ final class Redact {
             }
         }
         craftResult(o);
+        enchantResult(o);
+        enchantOrderKeys(o);
         kitResult(o);
         kitNames(o);
         // Keys are item keys; anything else (free text) is hidden.
@@ -222,6 +224,71 @@ final class Redact {
             t.addProperty("name", n > 0 ? "Kit " + n : "Kit");
             String cat = text(t, "category");
             if (cat != null && cat.startsWith("c:")) t.addProperty("category", "custom");
+        }
+    }
+
+    private static void safeKeys(JsonElement arr, String field) {
+        if (arr == null || !arr.isJsonArray()) return;
+        for (JsonElement e : arr.getAsJsonArray()) {
+            if (!e.isJsonObject()) continue;
+            JsonObject o = e.getAsJsonObject();
+            String v = text(o, field);
+            if (o.has(field) && (v == null || !SAFE_KEY.matcher(v).matches())) o.addProperty(field, HIDDEN);
+        }
+    }
+
+    /**
+     * The enchant plan route's reply for a forced streamer: the index keys in it (plan materials, availability books) come from the
+     * bot, so any that is not an item key reads "(hidden)". The rest is item and enchantment ids and numbers.
+     */
+    static void enchantPlan(JsonObject reply) {
+        JsonObject plan = obj(reply, "plan");
+        if (plan != null) safeKeys(plan.get("materials"), "key");
+        JsonObject availability = obj(reply, "availability");
+        if (availability != null) safeKeys(availability.get("books"), "key");
+    }
+
+    /** An order's enchant plans and take: index keys that are not item keys read "(hidden)". */
+    static void enchantOrderKeys(JsonObject order) {
+        JsonObject en = obj(order, "enchant");
+        if (en == null) return;
+        safeKeys(en.get("take"), "key");
+        JsonElement lines = en.get("lines");
+        if (lines == null || !lines.isJsonArray()) return;
+        for (JsonElement l : lines.getAsJsonArray()) {
+            if (!l.isJsonObject()) continue;
+            JsonElement plans = l.getAsJsonObject().get("plans");
+            if (plans == null || !plans.isJsonArray()) continue;
+            for (JsonElement p : plans.getAsJsonArray()) if (p.isJsonObject()) safeKeys(p.getAsJsonObject().get("materials"), "key");
+        }
+    }
+
+    /**
+     * result.enchant is numbers, item keys, enchantment ids and reasons (ENCHANT-CONTRACT v1.0, SR-M6): anything that fails SAFE_KEY, and
+     * a reason outside the closed set, reads "(hidden)" for a forced streamer (the ingest already checked them; this is the second layer).
+     */
+    static void enchantResult(JsonObject order) {
+        JsonObject en = obj(obj(order, "result"), "enchant");
+        if (en == null) return;
+        JsonElement shorts = en.get("short");
+        if (shorts != null && shorts.isJsonArray()) {
+            for (JsonElement s : shorts.getAsJsonArray()) {
+                if (!s.isJsonObject()) continue;
+                String reason = text(s.getAsJsonObject(), "reason");
+                if (reason == null || !EnchantResults.REASONS.contains(reason)) s.getAsJsonObject().addProperty("reason", HIDDEN);
+            }
+        }
+        for (String list : new String[]{"made", "short", "returned", "levels"}) {
+            JsonElement arr = en.get(list);
+            if (arr == null || !arr.isJsonArray()) continue;
+            for (JsonElement s : arr.getAsJsonArray()) {
+                if (!s.isJsonObject()) continue;
+                JsonObject so = s.getAsJsonObject();
+                for (String field : new String[]{"key", "id"}) {
+                    String v = text(so, field);
+                    if (so.has(field) && (v == null || !SAFE_KEY.matcher(v).matches())) so.addProperty(field, HIDDEN);
+                }
+            }
         }
     }
 

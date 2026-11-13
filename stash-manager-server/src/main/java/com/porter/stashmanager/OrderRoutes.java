@@ -23,17 +23,45 @@ final class OrderRoutes {
     private static final Pattern STATUS = Pattern.compile("^/api/v1/orders/(o-[0-9a-f]{12})/status$");
     private static final Pattern RETRY = Pattern.compile("^/api/v1/orders/(o-[0-9a-f]{12})/retry$");
     private static final Pattern FORCE_CANCEL = Pattern.compile("^/api/v1/orders/(o-[0-9a-f]{12})/force-cancel$");
+    private static final Pattern ACCEPT_CURSE = Pattern.compile("^/api/v1/orders/(o-[0-9a-f]{12})/accept-curse$");
     private static final int MAX_KEY = 256;
     private static final int MAX_RESULT_LINES = 400;
+    private static final int MAX_CURSES = 16;
 
     private final OrderStore orders;
     private final Owners owners;
     private final AuditLog audit;
+    private volatile EnchantOrders enchant; // null: this server has no enchant orders
+    private volatile EnchantLimits enchantLimits;
 
     OrderRoutes(OrderStore orders, Owners owners, AuditLog audit) {
         this.orders = orders;
         this.owners = owners;
         this.audit = audit;
+    }
+
+    /** Gives the routes the enchant planner's capability check and the per-user limits (set once at start). */
+    void enchant(EnchantOrders enchant, EnchantLimits limits) {
+        this.enchant = enchant;
+        this.enchantLimits = limits;
+    }
+
+    /**
+     * One create, retry or accept-curse counts once against the user's 12 a minute (TL4-B2). False after answering 429.
+     */
+    private boolean countEnchant(HttpExchange ex, Users.Principal who) throws IOException {
+        EnchantLimits l = enchantLimits;
+        if (l == null) return true;
+        long wait = l.startOrder(who.id()); // one at a time per user; the caller ends it in a finally
+        if (wait <= 0) return true;
+        long seconds = Math.max(1, (wait + 999) / 1000);
+        ex.getResponseHeaders().set("Retry-After", Long.toString(seconds));
+        JsonObject o = new JsonObject();
+        o.addProperty("ok", false);
+        o.addProperty("error", "too many enchant orders; wait a moment");
+        o.addProperty("retryAfter", seconds);
+        Http.json(ex, 429, o);
+        return false;
     }
 
     /**
@@ -87,6 +115,7 @@ final class OrderRoutes {
             .pattern(Router.POST, CANCEL, Router.Guard.BROWSER_WRITE, Router.Perm.ORDER_OWN_OR_ALL, this::cancel)
             .pattern(Router.POST, FORCE_CANCEL, Router.Guard.BROWSER_WRITE, Router.Perm.ORDER_OWN_OR_ALL, this::forceCancel)
             .pattern(Router.POST, RETRY, Router.Guard.BROWSER_WRITE, Router.Perm.ORDER_OWN_OR_ALL, this::retry)
+            .pattern(Router.POST, ACCEPT_CURSE, Router.Guard.BROWSER_WRITE, Router.Perm.ORDER, this::acceptCurse)
             .pattern(Router.POST, STATUS, Router.Guard.ADDON_KEY, this::status);
     }
 
@@ -131,8 +160,10 @@ final class OrderRoutes {
         }
         boolean repairAll = ra != null && ra.isJsonPrimitive() && ra.getAsBoolean();
         List<OrderStore.Line> lines = new ArrayList<>();
+        boolean anyEnchant = false;
         for (int i = 0; i < raw.size(); i++) {
             String problem = null;
+            boolean enchantProblem = false;
             OrderStore.Line line = null;
             JsonElement e = raw.get(i);
             if (!e.isJsonObject()) {
@@ -142,7 +173,18 @@ final class OrderRoutes {
                 String type = AddonRoutes.string(l, "type");
                 String key = AddonRoutes.string(l, "key");
                 long count = positiveInt(l.get("count"));
-                if (!"item".equals(type) && !"shulker".equals(type) && !"craft".equals(type) && !"kit".equals(type)) problem = "type must be item, shulker, craft or kit";
+                if ("enchant".equals(type)) {
+                    // ENCHANT-CONTRACT v1.0: {type: "enchant", key: "minecraft:diamond_sword", count: 1..4, enchants: [{id, lvl}]}
+                    enchantProblem = true;
+                    List<OrderStore.EnchantWant> wants = EnchantOrders.parseWants(l.get("enchants"));
+                    if (!EnchantOrders.validItem(key)) problem = "key of an enchant line must be an item id like minecraft:diamond_sword";
+                    else if (count < 1 || count > EnchantOrders.MAX_PER_LINE) problem = "count of an enchant line must be a whole number from 1 to " + EnchantOrders.MAX_PER_LINE;
+                    else if (wants == null) problem = "enchants must be a list of {id, lvl} entries with a level from 1 to " + EnchantIndex.MAX_LEVEL;
+                    else {
+                        line = new OrderStore.Line("enchant", key, count, false, wants);
+                        anyEnchant = true;
+                    }
+                } else if (!"item".equals(type) && !"shulker".equals(type) && !"craft".equals(type) && !"kit".equals(type)) problem = "type must be item, shulker, craft, kit or enchant";
                 else if ("kit".equals(type) && (key == null || !KitTemplate.ID.matcher(key).matches())) {
                     problem = "key of a kit line must be a kit id like t-3f2a9c1d";
                 } else if ("kit".equals(type) && (count < 1 || count > KitOrders.MAX_PER_LINE)) {
@@ -161,20 +203,41 @@ final class OrderRoutes {
                 }
             }
             if (problem != null) {
-                lineError(ex, 400, problem, i);
+                if (enchantProblem) lineError(ex, OrderStore.OrderException.enchant(400, problem, i, "bad_request"));
+                else lineError(ex, 400, problem, i);
                 return;
             }
             lines.add(line);
         }
+        Users.Principal counted = null;
         try {
             Users.Principal who = Router.user(ex);
+            if (anyEnchant) {
+                if (!countEnchant(ex, who)) return;
+                counted = who;
+            }
             OrderStore.Order order = orders.place(server, stash, lines, names, repairAll, who.id(), who.name());
+            if (anyEnchant) audit.add(who, "order.place", order.id + " (enchant: " + enchantItems(order) + " item(s))", AuthRoutes.address(ex));
             JsonObject out = Http.ok();
             out.add("order", shown(ex, order.toJson()));
             Http.json(ex, 200, out);
         } catch (OrderStore.OrderException e) {
             lineError(ex, e);
+        } finally {
+            if (counted != null) endEnchant(counted);
         }
+    }
+
+    /** Ends the per-user guard {@link #countEnchant} started. */
+    private void endEnchant(Users.Principal who) {
+        EnchantLimits l = enchantLimits;
+        if (l != null) l.endOrder(who.id());
+    }
+
+    private static long enchantItems(OrderStore.Order order) {
+        long n = 0;
+        for (OrderStore.Line l : order.lines) if (l.type().equals("enchant")) n += l.count();
+        return n;
     }
 
     /** POST /api/v1/orders/clear {server, stash}: drops the stash's finished orders; open ones stay. */
@@ -243,12 +306,18 @@ final class OrderRoutes {
             return;
         }
         if (!mayChange(ex, m.group(1))) return;
+        Users.Principal counted = null;
         try {
             Users.Principal who = Router.user(ex);
-            boolean own = who.id().equals(orders.placedBy(m.group(1)));
+            boolean own =who.id().equals(orders.placedBy(m.group(1)));
             if (!who.perms().order() && !(who.perms().plannerOrder() && own)) {
                 Router.forbid(ex, "place orders", "order");
                 return;
+            }
+            // A retry re-plans every enchant line against the stash as it is now; it counts once against the user's 12 a minute.
+            if (orders.hasEnchantLine(m.group(1))) {
+                if (!countEnchant(ex, who)) return;
+                counted = who;
             }
             OrderStore.Order order = orders.retry(m.group(1), who.id(), who.name());
             audit.add(who, "order.retry", m.group(1) + " as " + order.id, AuthRoutes.address(ex));
@@ -256,8 +325,85 @@ final class OrderRoutes {
             out.add("order", shown(ex, order.toJson()));
             Http.json(ex, 200, out);
         } catch (OrderStore.OrderException e) {
-            if (e.status == 400 || e.craft != null || e.kit != null) lineError(ex, e);
+            if (e.status == 400 || e.craft != null || e.kit != null || e.enchant != null) lineError(ex, e);
             else Http.error(ex, e.status, e.getMessage());
+        } finally {
+            if (counted != null) endEnchant(counted);
+        }
+    }
+
+    /**
+     * POST /api/v1/orders/{id}/accept-curse {curse: [ids]} (ENCHANT-CONTRACT v1.0, D1): the orderer says yes to the curses the order names.
+     * Only the person who placed the order may accept (an {@code ordersAll} admin can cancel it, not accept it). Check order: the stash is
+     * in the user's scope (404), the caller placed the order (403), the order is awaiting curse approval (409), the list equals the
+     * stored one (409 with the current list). Then the order is planned again and reserved (or failed) by the store. Audited.
+     */
+    private void acceptCurse(HttpExchange ex) throws IOException {
+        Matcher m = ACCEPT_CURSE.matcher(ex.getRequestURI().getRawPath());
+        if (!m.matches()) {
+            Http.error(ex, 404, "not found");
+            return;
+        }
+        String id = m.group(1);
+        Users.Principal who = Router.user(ex);
+        IndexStore.StashKey where = orders.stashOf(id);
+        if (where == null || !who.perms().seesStash(where.server(), where.stash())) {
+            Http.error(ex, 404, "no such order");
+            return;
+        }
+        if (!who.id().equals(orders.placedBy(id))) {
+            Http.error(ex, 403, "only the person who placed this order can accept its curse");
+            return;
+        }
+        try {
+            orders.checkAcceptable(id, null); // the state (409) comes before the body is read
+        } catch (OrderStore.OrderException e) {
+            Http.error(ex, e.status, e.getMessage());
+            return;
+        }
+        JsonElement json = AddonRoutes.readJson(ex);
+        JsonObject body = json != null && json.isJsonObject() ? json.getAsJsonObject() : null;
+        List<String> asked = new ArrayList<>();
+        JsonElement list = body == null ? null : body.get("curse");
+        if (list == null || !list.isJsonArray() || list.getAsJsonArray().size() > MAX_CURSES) {
+            Http.error(ex, 400, "curse must be the list of curse ids the order names");
+            return;
+        }
+        for (JsonElement c : list.getAsJsonArray()) {
+            if (!(c instanceof JsonPrimitive p) || !p.isString() || !EnchantIndex.ID.matcher(p.getAsString()).matches()) {
+                Http.error(ex, 400, "curse must be the list of curse ids the order names");
+                return;
+            }
+            asked.add(EnchantIndex.namespaced(com.porter.qwerte.core.enchant.McData.norm(p.getAsString())));
+        }
+        Users.Principal counted = null;
+        try {
+            orders.checkAcceptable(id, asked); // then the list (409), before anything is planned or counted
+            if (!countEnchant(ex, who)) return;
+            counted = who;
+            OrderStore.Order order = orders.acceptCurse(id, asked);
+            audit.add(who, "order.accept-curse", id + " -> " + order.status, AuthRoutes.address(ex));
+            JsonObject out = Http.ok();
+            out.add("order", shown(ex, order.toJson()));
+            Http.json(ex, 200, out);
+        } catch (OrderStore.OrderException e) {
+            if (e.status == 409 && e.curseList != null) {
+                // The list differs (or the plan now needs another curse): the current list is served as it is (enchantment ids).
+                JsonObject o = new JsonObject();
+                o.addProperty("ok", false);
+                o.addProperty("error", e.getMessage());
+                com.google.gson.JsonArray current = new com.google.gson.JsonArray();
+                e.curseList.forEach(current::add);
+                o.add("curse", current);
+                audit.add(who, "order.accept-curse", id + " -> refused (409)", AuthRoutes.address(ex));
+                Http.json(ex, 409, o);
+            } else if (e.status == 400 || e.enchant != null) {
+                lineError(ex, e);
+            } else {
+                Http.error(ex, e.status, e.getMessage());
+            }
+        } finally {
+            if (counted != null) endEnchant(counted);
         }
     }
 
@@ -268,10 +414,22 @@ final class OrderRoutes {
             Http.error(ex, 404, "not found");
             return;
         }
-        if (!mayChange(ex, m.group(1))) return;
+        if (!mayChange(ex, m.group(1))) return; // seesStash (404), then the orderer or an ordersAll admin (403)
+        // An enchant order needs an explicit {"confirm": true} (SR2-N1); other orders ignore the body as before.
+        boolean enchant = orders.hasEnchantLine(m.group(1));
+        boolean confirmed = false;
+        if (enchant) {
+            JsonElement json = AddonRoutes.readJson(ex);
+            JsonElement c = json != null && json.isJsonObject() ? json.getAsJsonObject().get("confirm") : null;
+            if (c != null && !c.isJsonNull() && !(c instanceof JsonPrimitive cp && cp.isBoolean())) {
+                Http.error(ex, 400, "confirm must be true or false");
+                return;
+            }
+            confirmed = c != null && !c.isJsonNull() && c.getAsBoolean();
+        }
         try {
-            OrderStore.Order order = orders.forceCancel(m.group(1));
-            audit.add(Router.user(ex), "order.force-cancel", order.id, AuthRoutes.address(ex));
+            OrderStore.Order order = orders.forceCancel(m.group(1), confirmed); // the state check, then the confirm check
+            audit.add(Router.user(ex), "order.force-cancel", order.id + (enchant ? " (enchant: true)" : ""), AuthRoutes.address(ex));
             JsonObject out = Http.ok();
             out.add("order", shown(ex, order.toJson()));
             Http.json(ex, 200, out);
@@ -300,7 +458,13 @@ final class OrderRoutes {
         boolean craftOrders = o.get("craftOrders") instanceof JsonPrimitive cp && cp.isNumber() && positiveInt(cp) >= 1;
         // kitOrders >= 1: the bot builds kits (KIT-CONTRACT-v2). Without it a held kit order fails and pending ones are skipped.
         boolean kitOrders = o.get("kitOrders") instanceof JsonPrimitive kp && kp.isNumber() && positiveInt(kp) >= 1;
-        OrderStore.Order order = orders.claim(server, stash, craftOrders, kitOrders);
+        // enchantOrders >= 1 (ENCHANT-CONTRACT v1.0): the flag is not enough. An enchant order is handed out only when a fresh enabled enchant
+        // heartbeat block exists whose mc is the index's version, and the claim's player is both the stash owner and that heartbeat's player.
+        String claimPlayer = AddonRoutes.string(o, "player");
+        EnchantOrders eo = enchant;
+        boolean enchantFlag = o.get("enchantOrders") instanceof JsonPrimitive ep && ep.isNumber() && positiveInt(ep) >= 1;
+        boolean enchantOk = enchantFlag && eo != null && claimPlayer != null && eo.claimReady(server, stash, claimPlayer);
+        OrderStore.Order order = orders.claim(server, stash, new OrderStore.Claim(craftOrders, kitOrders, enchantOk, enchantOk ? claimPlayer : null));
         if (order == null) {
             Http.send(ex, 204, null, null, "no-store");
             return;
@@ -349,7 +513,8 @@ final class OrderRoutes {
             return;
         }
         try {
-            OrderStore.Order order = orders.status(m.group(1), status, phase, progress, message, result);
+            // An order claimed by a player (an enchant order) takes status reports only from that player (409 otherwise).
+            OrderStore.Order order = orders.status(m.group(1), status, phase, progress, message, result, AddonRoutes.string(o, "player"));
             JsonObject out = Http.ok();
             out.add("order", shown(ex, order.toJson()));
             Http.json(ex, 200, out);
@@ -385,6 +550,7 @@ final class OrderRoutes {
         o.addProperty("line", e.line >= 0 ? e.line : null);
         if (e.craft != null) o.addProperty("craft", e.craft);
         if (e.kit != null) o.addProperty("kit", e.kit);
+        if (e.enchant != null) o.addProperty("enchant", e.enchant);
         if (e.shortItems != null) o.add("short", e.shortItems);
         Http.json(ex, e.status, o);
     }
@@ -466,6 +632,8 @@ final class OrderRoutes {
         if (craft != null) out.add("craft", craft);
         JsonObject kit = kitResult(r.get("kit"));
         if (kit != null) out.add("kit", kit);
+        JsonObject enchantResult = EnchantResults.parse(r.get("enchant"));
+        if (enchantResult != null) out.add("enchant", enchantResult);
         return out;
     }
 

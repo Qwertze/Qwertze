@@ -183,6 +183,39 @@
             </div>
           </div>
         </section>
+        <section class="inset enchant-box" id="ench-box" hidden>
+          <div class="cart-head">
+            <div class="section-title">Enchanted items</div>
+            <div class="cart-count" id="ench-count"></div>
+          </div>
+          <div class="note" id="ench-status" role="status" hidden></div>
+          <div class="ench-cols">
+            <div class="ench-pick">
+              <label class="ench-label" for="ench-filter">Base item</label>
+              <input id="ench-filter" class="mc-input" type="search" placeholder="Search items" autocomplete="off" spellcheck="false">
+              <select id="ench-item" class="mc-select ench-item" size="8" aria-label="Base item"></select>
+              <div class="ench-label" id="ench-list-label">Enchantments</div>
+              <div class="ench-list" id="ench-list" role="group" aria-labelledby="ench-list-label"></div>
+              <div class="ench-add">
+                <label class="ench-label" for="ench-qty">Count</label>
+                <input id="ench-qty" class="mc-input qty-input" type="number" min="1" max="4" value="1">
+                <button type="button" class="mc-button" id="ench-add" disabled>Add to order</button>
+              </div>
+              <div class="note" id="ench-add-note">One order holds at most 16 enchanted items in at most 8 lines. The preview is for a single item; the order plans each item in turn.</div>
+            </div>
+            <div class="ench-side">
+              <div class="gui-title">Preview</div>
+              <div class="ench-preview" id="ench-preview" role="status"></div>
+              <div class="gui-title">This order</div>
+              <div class="ench-lines" id="ench-lines"></div>
+              <div class="cart-actions">
+                <button type="button" class="mc-button" id="ench-place" disabled>Place enchant order</button>
+                <button type="button" class="mc-button danger" id="ench-clear" disabled>Clear</button>
+              </div>
+              <div class="note" id="ench-msg" role="status"></div>
+            </div>
+          </div>
+        </section>
         <section class="inset order-list">
           <div class="cart-head">
             <div class="section-title">Orders</div>

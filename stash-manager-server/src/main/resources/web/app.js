@@ -730,6 +730,8 @@
       if (!res.ok) {
         var err = new Error("HTTP " + res.status);
         err.status = res.status;
+        var ra = parseInt(res.headers.get("Retry-After"), 10); // whole seconds (429 and 503 carry it)
+        err.retryAfter = ra > 0 ? ra : 0;
         return res.json().then(function (body) {
           err.body = body;
           if (res.status === 403 && body && typeof body === "object" && path.indexOf("/api/v1/auth/") !== 0) {
@@ -4195,6 +4197,7 @@
   // ---------- orders: bot status ----------
 
   function renderBotStatus() {
+    enchSync();
     var s = currentStash();
     if (!s) {
       el.deliveryStatus.textContent = "";
@@ -5478,10 +5481,10 @@
   // ---------- orders: list ----------
 
   var STATUS_LABEL = {
-    pending: "Pending", accepted: "Accepted", in_progress: "In progress",
+    pending: "Pending", accepted: "Accepted", in_progress: "In progress", held_curse: "Needs your approval",
     delivered: "Delivered", failed: "Failed", cancelled: "Cancelled"
   };
-  var OPEN_STATUS = { pending: true, accepted: true, in_progress: true };
+  var OPEN_STATUS = { pending: true, accepted: true, in_progress: true, held_curse: true };
 
   function scheduleOrdersPoll(delay) {
     window.clearTimeout(orders.timer);
@@ -5569,6 +5572,7 @@
   function linesSummary(o) {
     return o.lines.map(function (l) {
       if (l.type === "kit") return "Kit: " + grouped(l.count) + " × " + kbOrderKitName(o, str(l.key));
+      if (l.type === "enchant") return grouped(l.count) + " × " + plPretty(str(l.key)) + " (" + enchListText(l.enchants) + ")";
       var item = lineItem(l.type, l.key);
       // A craft line: made by the bot from stash materials ("Craft: 8 Spruce Stairs").
       if (l.type === "craft") return "Craft: " + grouped(l.count) + " " + (item ? item.name : plPretty(str(l.key)));
@@ -5798,8 +5802,11 @@
         cancel.className = "mc-button small danger";
         cancel.textContent = "Cancel";
         cancel.addEventListener("click", function () {
-          var running = o.status !== "pending";
-          if (!window.confirm(running ? "Ask the bot to stop this order at a safe point?" : "Cancel this order?")) return;
+          var running = o.status !== "pending" && o.status !== "held_curse";
+          var enchantRun = running && orderHasEnchant(o);
+          if (!window.confirm(enchantRun
+            ? "Cancel this enchant order? The cancel applies after enchanting finishes: the bot completes the item it is working on, skips the rest and returns everything to the stash."
+            : running ? "Ask the bot to stop this order at a safe point?" : "Cancel this order?")) return;
           cancel.disabled = true;
           api("/api/v1/orders/" + encodeURIComponent(o.id) + "/cancel", { method: "POST", body: {} }).then(function () {
             toast(running ? "Cancel requested" : "Order cancelled");
@@ -5838,11 +5845,17 @@
         force.className = "mc-button small danger";
         force.textContent = "Force cancel";
         force.addEventListener("click", function () {
-          if (!window.confirm("The bot hasn't confirmed. Mark this order cancelled anyway? If the bot is still working on it, " +
-            "it will stop when it next reports.")) return;
+          var enchantForce = orderHasEnchant(o);
+          if (!window.confirm(enchantForce
+            ? "FORCE CANCEL an enchant order?\n\nThe bot has not confirmed the cancel and may be in the middle of enchanting. " +
+              "The order is marked cancelled, but its items, books, anvils and bottles stay reserved until the bot reports back " +
+              "(or a few minutes after it goes offline). The bot stops at its next step and returns everything to the stash; " +
+              "an item that is half enchanted is not delivered.\n\nForce cancel anyway?"
+            : "The bot hasn't confirmed. Mark this order cancelled anyway? If the bot is still working on it, " +
+              "it will stop when it next reports.")) return;
           force.disabled = true;
-          api("/api/v1/orders/" + encodeURIComponent(o.id) + "/force-cancel", { method: "POST", body: {} }).then(function () {
-            toast("Order cancelled");
+          api("/api/v1/orders/" + encodeURIComponent(o.id) + "/force-cancel", { method: "POST", body: enchantForce ? { confirm: true } : {} }).then(function () {
+            toast(enchantForce ? "Order cancelled; its items stay reserved until the bot confirms" : "Order cancelled");
             scheduleOrdersPoll(0);
           }, function (e) {
             toast("Could not force cancel" + (e && e.body && e.body.error ? ": " + e.body.error : ""));
@@ -5900,6 +5913,8 @@
           card.appendChild(nd);
         }
       }
+      appendCurseInfo(card, o);
+      appendEnchantInfo(card, o);
       appendRepairInfo(card, o);
       appendCraftInfo(card, o);
       appendKitInfo(card, o);
@@ -5935,6 +5950,847 @@
   document.addEventListener("visibilitychange", function () {
     if (!document.hidden && state.tab === "orders") scheduleOrdersPoll(0);
   });
+
+  // ---------- enchant orders: picker, live plan, order list (ENCHANT-CONTRACT v1.0) ----------
+  // The panel shows when the stash's bot reports enchant support (GET /api/v1/stashes: enchant.supports). The valid items,
+  // levels and conflicts come from /enchant-<mc>.json, a static copy of qwerte-core's table for that Minecraft version
+  // (the server has no route that serves them; keep the copies in step with qwerte-core when its tables change). The
+  // preview is POST /api/v1/enchant/plan: advisory only, the order create plans again. Everything the server says is
+  // shown as text (textContent), never as HTML.
+
+  var ENCH_MC = ["1.21.4", "1.21.11"];
+  var ENCH_MAX_COUNT = 4;
+  var ENCH_MAX_ITEMS = 16;
+  var ENCH_MAX_LINES = 8;
+  var ENCH_MAX_PICKS = 12;
+  var ENCH_DEBOUNCE_MS = 600;
+  var ENCH_ROMAN = ["", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"];
+
+  var ENCH_CODE_TEXT = {
+    no_bot: "No enchant-capable bot is online for this stash right now.",
+    mc_unsupported: "This stash's Minecraft version has no enchantment table yet.",
+    nothing_wanted: "Pick at least one enchantment.",
+    unknown_enchant: "One of those enchantments isn't known for this Minecraft version.",
+    invalid_level: "One of the levels is outside what the game allows.",
+    duplicate: "An enchantment was picked twice.",
+    wrong_item: "One of the enchantments can't go on that item.",
+    conflict: "Two of the enchantments conflict with each other.",
+    bad_request: "That order isn't valid (check the counts).",
+    no_base: "The stash has no usable base item for this.",
+    base_unusable: "Every base item in the stash carries enchantments that aren't part of this order.",
+    books_short: "The stash doesn't hold the enchanted books this needs.",
+    too_expensive: "No order of anvil steps stays under 40 levels per step.",
+    too_complex: "That is too complex to plan; pick fewer enchantments.",
+    xp_short: "The stash doesn't hold enough Bottles o' Enchanting (the repair reserve is kept back).",
+    inventory_full: "The bot couldn't carry everything this needs at once; pick fewer enchantments.",
+    busy: "The server is busy planning. Try again in a moment.",
+    rate_limited: "Too many requests for now."
+  };
+
+  var ENCH_SHORT_WHY = {
+    too_expensive: "a step would have cost 40 levels or more",
+    books_short: "the books ran short",
+    xp_short: "there weren't enough bottles",
+    no_anvil: "no anvil was available",
+    inventory_full: "the bot's inventory was full",
+    cost_mismatch: "the real costs were higher than planned",
+    mc_unsupported: "the Minecraft version isn't supported",
+    mc_mismatch: "the bot's Minecraft version differs from the plan",
+    busy: "the bot was busy",
+    too_complex: "the plan was too complex",
+    no_base: "the base item was missing",
+    anvil_broke: "the anvil broke",
+    wrong_result: "the anvil gave an unexpected result",
+    module_conflict: "another bot module was in the way",
+    cap: "the bot reached its limit",
+    cancelled: "the order was cancelled",
+    timeout: "it took too long"
+  };
+
+  var ee = {
+    box: $("ench-box"), count: $("ench-count"), status: $("ench-status"), filter: $("ench-filter"), item: $("ench-item"),
+    listLabel: $("ench-list-label"), list: $("ench-list"), qty: $("ench-qty"), add: $("ench-add"), addNote: $("ench-add-note"),
+    preview: $("ench-preview"), lines: $("ench-lines"), place: $("ench-place"), clear: $("ench-clear"), msg: $("ench-msg")
+  };
+  var ENCH_ADD_NOTE = ee.addNote.textContent;
+  var ench = {
+    tables: {},          // mc -> { state: "loading" | "ready" | "error", t, at }
+    stash: "", mc: "", shown: false,
+    item: "",            // the base item, without "minecraft:"
+    picks: new Map(),    // enchantment id -> level
+    rows: [],            // { id, max, row, cb, sel, why }
+    itemsFor: "",        // what the item list was built for (mc + filter)
+    lines: [],           // the order being made: { key, count, enchants: [{id, lvl}] }
+    badLine: -1,
+    timer: 0, token: 0, inflight: false, dirty: false, holdUntil: 0, last: null, detailsOpen: false,
+    placing: false
+  };
+  var enchCurse = { notes: new Map() }; // order id -> a note under the Accept button
+
+  function enchRoman(n) {
+    return n >= 1 && n < ENCH_ROMAN.length ? ENCH_ROMAN[n] : String(n);
+  }
+
+  function enchName(id) {
+    var s = str(id);
+    return plPretty(s.indexOf(":") < 0 ? "minecraft:" + s : s);
+  }
+
+  /** "Diamond Sword" for "minecraft:diamond_sword" or an index key like "minecraft:enchanted_book#a1b2c3d4". */
+  function enchItemName(key) {
+    return plPretty(str(key).split("#")[0]);
+  }
+
+  /** "Sharpness V, Unbreaking III" for [{ id, lvl }]; "" for an empty or missing list. */
+  function enchLevelsText(list) {
+    var a = Array.isArray(list) ? list.filter(function (e) { return e && typeof e === "object" && typeof e.id === "string"; }) : [];
+    return a.map(function (e) {
+      var lvl = num(e.lvl, 0);
+      return enchName(e.id) + (lvl > 0 ? " " + enchRoman(lvl) : "");
+    }).join(", ");
+  }
+
+  /** The enchantments of an order line for its summary. */
+  function enchListText(list) {
+    return enchLevelsText(list) || "enchanted";
+  }
+
+  function orderHasEnchant(o) {
+    return !!o && Array.isArray(o.lines) && o.lines.some(function (l) { return l && l.type === "enchant"; });
+  }
+
+  // ----- the tables -----
+
+  function enchParse(doc) {
+    if (!doc || typeof doc !== "object" || !Array.isArray(doc.enchantments) || !doc.itemTags || !doc.exclusiveSets) return null;
+    var t = { byId: new Map(), order: [], tags: new Map(), sets: new Map(), items: [] };
+    doc.enchantments.forEach(function (e) {
+      if (!e || typeof e.id !== "string" || !(num(e.max, 0) >= 1)) return;
+      t.byId.set(e.id, { id: e.id, max: Math.floor(num(e.max, 1)), tag: str(e.supports), set: str(e.exclusive) });
+      t.order.push(e.id);
+    });
+    [["itemTags", t.tags], ["exclusiveSets", t.sets]].forEach(function (pair) {
+      Object.keys(doc[pair[0]]).forEach(function (k) {
+        var v = doc[pair[0]][k];
+        if (Array.isArray(v)) pair[1].set(k, new Set(v.filter(function (x) { return typeof x === "string"; })));
+      });
+    });
+    var all = new Set();
+    t.order.forEach(function (id) {
+      var s = t.tags.get(t.byId.get(id).tag);
+      if (s) s.forEach(function (it) { all.add(it); });
+    });
+    t.items = Array.from(all).sort(function (a, b) {
+      var x = plPretty("minecraft:" + a);
+      var y = plPretty("minecraft:" + b);
+      return x < y ? -1 : x > y ? 1 : 0;
+    });
+    return t.order.length && t.items.length ? t : null;
+  }
+
+  /** The table of a Minecraft version, or null while it loads (or when it can't be loaded). */
+  function enchTable(mc) {
+    if (ENCH_MC.indexOf(mc) < 0) return null;
+    var e = ench.tables[mc];
+    if (e && e.state === "ready") return e.t;
+    if (e && (e.state === "loading" || Date.now() - e.at < 15000)) return null;
+    ench.tables[mc] = { state: "loading", at: Date.now() };
+    api("/enchant-" + mc + ".json", { timeout: 15000 }).then(function (doc) {
+      var t = enchParse(doc);
+      ench.tables[mc] = t ? { state: "ready", t: t, at: Date.now() } : { state: "error", at: Date.now() };
+    }, function () {
+      ench.tables[mc] = { state: "error", at: Date.now() };
+    }).then(enchSync);
+    return null;
+  }
+
+  /** The enchantments the item takes, in table order. */
+  function enchFor(t, item) {
+    return t.order.filter(function (id) {
+      var s = t.tags.get(t.byId.get(id).tag);
+      return !!s && s.has(item);
+    });
+  }
+
+  function enchConflicts(t, a, b) {
+    if (a === b) return false;
+    var inSet = function (owner, other) {
+      var e = t.byId.get(owner);
+      var s = e && e.set ? t.sets.get(e.set) : null;
+      return !!s && s.has(other);
+    };
+    return inSet(a, b) || inSet(b, a);
+  }
+
+  // ----- the panel -----
+
+  function enchResetDraft() {
+    ench.item = "";
+    ench.picks.clear();
+    ench.lines = [];
+    ench.badLine = -1;
+    ench.last = null;
+    ench.token++;
+    window.clearTimeout(ench.timer);
+    ench.rows = [];
+    ench.itemsFor = "";
+    ee.filter.value = "";
+    ee.msg.textContent = "";
+    ee.msg.classList.remove("warn");
+  }
+
+  /** Shows or hides the panel for the selected stash and brings it up to date (after every stash poll). */
+  function enchSync() {
+    if (!ench || !ee || !ee.box) return;
+    var s = currentStash();
+    var info = s && s.enchant && typeof s.enchant === "object" ? s.enchant : null;
+    var key = s ? stashKey(s) : "";
+    if (key !== ench.stash) {
+      enchResetDraft();
+      ench.stash = key;
+    }
+    var show = !!s && can("order") && !!info && info.supports === true && ENCH_MC.indexOf(str(info.mc)) >= 0;
+    ee.box.hidden = !show;
+    if (!show) {
+      window.clearTimeout(ench.timer);
+      ench.shown = false;
+      return;
+    }
+    var mc = str(info.mc);
+    var changed = false;
+    if (mc !== ench.mc) {
+      ench.mc = mc;
+      ench.item = "";
+      ench.picks.clear();
+      ench.itemsFor = "";
+      changed = true;
+    }
+    var t = enchTable(mc);
+    var st = ench.tables[mc];
+    var note = "";
+    var warn = false;
+    if (!t) {
+      note = st && st.state === "error" ? "Couldn't load the enchantment tables for Minecraft " + mc + ". Trying again." : "Loading the enchantment tables…";
+      warn = !!st && st.state === "error";
+    } else if (info.canOrder !== true) {
+      note = "This stash's bot can't take enchant orders right now (it is offline, enchanting is switched off, or its Minecraft version differs). " +
+        "You can still preview a plan; it will be marked as an estimate.";
+      warn = true;
+    }
+    ee.status.textContent = note;
+    ee.status.classList.toggle("warn", warn);
+    ee.status.hidden = !note;
+    if (t) {
+      var built = mc + "|" + ee.filter.value.trim().toLowerCase();
+      if (ench.itemsFor !== built) {
+        ench.itemsFor = built;
+        enchRenderItems(t);
+        enchBuildRows(t);
+        changed = true;
+      }
+    } else {
+      ee.item.replaceChildren();
+      ee.list.replaceChildren();
+    }
+    enchRenderLines();
+    enchUpdateAdd();
+    if (changed || !ench.shown) enchSchedulePlan();
+    ench.shown = true;
+  }
+
+  function enchRenderItems(t) {
+    var f = ee.filter.value.trim().toLowerCase();
+    var frag = document.createDocumentFragment();
+    t.items.forEach(function (id) {
+      var name = plPretty("minecraft:" + id);
+      if (f && name.toLowerCase().indexOf(f) < 0 && id.indexOf(f.replace(/ /g, "_")) < 0) return;
+      var o = document.createElement("option");
+      o.value = id;
+      o.textContent = name;
+      frag.appendChild(o);
+    });
+    ee.item.replaceChildren(frag);
+    if (ench.item) ee.item.value = ench.item;
+  }
+
+  /** One row per enchantment the chosen item takes: a checkbox, a level, and why it is greyed out. */
+  function enchBuildRows(t) {
+    ench.rows = [];
+    ee.list.replaceChildren();
+    if (!ench.item) {
+      ee.listLabel.textContent = "Enchantments";
+      ee.list.appendChild(line("note", "Pick a base item first."));
+      return;
+    }
+    ee.listLabel.textContent = "Enchantments for " + plPretty("minecraft:" + ench.item);
+    var frag = document.createDocumentFragment();
+    enchFor(t, ench.item).forEach(function (id) {
+      var e = t.byId.get(id);
+      var row = document.createElement("div");
+      row.className = "ench-row";
+      var lab = document.createElement("label");
+      lab.className = "ench-check";
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      var nm = document.createElement("span");
+      nm.textContent = enchName(id);
+      lab.appendChild(cb);
+      lab.appendChild(nm);
+      var sel = document.createElement("select");
+      sel.className = "mc-select ench-level";
+      sel.setAttribute("aria-label", enchName(id) + " level");
+      for (var l = 1; l <= e.max; l++) {
+        var o = document.createElement("option");
+        o.value = String(l);
+        o.textContent = enchRoman(l);
+        sel.appendChild(o);
+      }
+      sel.value = String(e.max);
+      var why = document.createElement("span");
+      why.className = "ench-why";
+      row.appendChild(lab);
+      row.appendChild(sel);
+      row.appendChild(why);
+      cb.addEventListener("change", function () {
+        if (cb.checked) ench.picks.set(id, Number(sel.value));
+        else ench.picks.delete(id);
+        enchPicksChanged(t);
+      });
+      sel.addEventListener("change", function () {
+        if (ench.picks.has(id)) {
+          ench.picks.set(id, Number(sel.value));
+          enchPicksChanged(t);
+        }
+      });
+      ench.rows.push({ id: id, max: e.max, row: row, cb: cb, sel: sel, why: why });
+      frag.appendChild(row);
+    });
+    ee.list.appendChild(frag);
+    enchUpdateRows(t);
+  }
+
+  /** Checked state, level, and the reason a row is greyed out (a conflict with a picked enchantment, or the cap). */
+  function enchUpdateRows(t) {
+    ench.rows.forEach(function (r) {
+      var picked = ench.picks.has(r.id);
+      var why = "";
+      if (!picked) {
+        ench.picks.forEach(function (lvl, pid) {
+          if (!why && enchConflicts(t, r.id, pid)) why = "Conflicts with " + enchName(pid);
+        });
+        if (!why && ench.picks.size >= ENCH_MAX_PICKS) why = "At most " + ENCH_MAX_PICKS + " enchantments per item";
+      }
+      r.cb.checked = picked;
+      r.cb.disabled = !!why;
+      r.sel.disabled = !picked || r.max < 2;
+      if (picked) r.sel.value = String(ench.picks.get(r.id));
+      r.row.classList.toggle("off", !!why);
+      r.why.textContent = why;
+    });
+  }
+
+  function enchPicksChanged(t) {
+    enchUpdateRows(t);
+    enchUpdateAdd();
+    enchSchedulePlan();
+  }
+
+  function enchTotalItems() {
+    return ench.lines.reduce(function (n, l) { return n + l.count; }, 0);
+  }
+
+  function enchQty() {
+    return clampInt(ee.qty.value, 1, ENCH_MAX_COUNT);
+  }
+
+  function enchUpdateAdd() {
+    var qty = enchQty();
+    var total = enchTotalItems();
+    var why = "";
+    if (ench.lines.length >= ENCH_MAX_LINES) why = "This order has the most lines it can hold (" + ENCH_MAX_LINES + ").";
+    else if (total + qty > ENCH_MAX_ITEMS) why = "One order holds at most " + ENCH_MAX_ITEMS + " enchanted items; " + total + " are in it.";
+    ee.add.disabled = !ench.item || !ench.picks.size || !!why;
+    ee.addNote.textContent = why || ENCH_ADD_NOTE;
+  }
+
+  /** The picked enchantments in table order, as the API wants them. */
+  function enchPicked() {
+    var out = [];
+    ench.rows.forEach(function (r) {
+      if (ench.picks.has(r.id)) out.push({ id: "minecraft:" + r.id, lvl: ench.picks.get(r.id) });
+    });
+    return out;
+  }
+
+  function enchRenderLines() {
+    var frag = document.createDocumentFragment();
+    if (!ench.lines.length) frag.appendChild(line("note", "Nothing added yet. Pick an item and its enchantments, then Add to order."));
+    ench.lines.forEach(function (l, i) {
+      var row = document.createElement("div");
+      row.className = "cart-line" + (i === ench.badLine ? " bad" : "");
+      var name = document.createElement("span");
+      name.className = "cart-name";
+      name.textContent = grouped(l.count) + " × " + enchItemName(l.key) + ": " + enchLevelsText(l.enchants);
+      row.appendChild(name);
+      var rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "mc-button small danger";
+      rm.textContent = "×";
+      rm.setAttribute("aria-label", "Remove");
+      rm.addEventListener("click", function () {
+        ench.lines.splice(i, 1);
+        ench.badLine = -1;
+        enchRenderLines();
+        enchUpdateAdd();
+      });
+      row.appendChild(rm);
+      frag.appendChild(row);
+    });
+    ee.lines.replaceChildren(frag);
+    var s = currentStash();
+    var info = s && s.enchant && typeof s.enchant === "object" ? s.enchant : null;
+    ee.count.textContent = enchTotalItems() + " / " + ENCH_MAX_ITEMS + " items";
+    ee.place.disabled = !ench.lines.length || ench.placing || !info || info.canOrder !== true;
+    ee.place.title = info && info.canOrder !== true ? "This stash's bot can't take enchant orders right now" : "";
+    ee.clear.disabled = !ench.lines.length || ench.placing;
+  }
+
+  ee.filter.addEventListener("input", function () {
+    var t = enchTable(ench.mc);
+    if (!t) return;
+    ench.itemsFor = ench.mc + "|" + ee.filter.value.trim().toLowerCase();
+    enchRenderItems(t);
+  });
+
+  ee.item.addEventListener("change", function () {
+    var t = enchTable(ench.mc);
+    if (!t || !ee.item.value) return;
+    ench.item = ee.item.value;
+    ench.picks.clear();
+    enchBuildRows(t);
+    enchUpdateAdd();
+    enchSchedulePlan();
+  });
+
+  ee.qty.addEventListener("change", function () {
+    ee.qty.value = String(enchQty());
+    enchUpdateAdd();
+  });
+
+  ee.add.addEventListener("click", function () {
+    if (ee.add.disabled || !ench.item || !ench.picks.size) return;
+    ench.lines.push({ key: "minecraft:" + ench.item, count: enchQty(), enchants: enchPicked() });
+    ench.badLine = -1;
+    ee.msg.textContent = "";
+    ee.msg.classList.remove("warn");
+    enchRenderLines();
+    enchUpdateAdd();
+  });
+
+  ee.clear.addEventListener("click", function () {
+    ench.lines = [];
+    ench.badLine = -1;
+    ee.msg.textContent = "";
+    ee.msg.classList.remove("warn");
+    enchRenderLines();
+    enchUpdateAdd();
+  });
+
+  // ----- the live preview -----
+
+  function enchRequest() {
+    var s = currentStash();
+    if (!s || !ench.item || !ench.picks.size) return null;
+    return { server: s.server, stash: s.stash, key: "minecraft:" + ench.item, enchants: enchPicked() };
+  }
+
+  function enchSchedulePlan() {
+    window.clearTimeout(ench.timer);
+    ench.token++;
+    if (ee.box.hidden) return;
+    if (!enchRequest()) {
+      ee.preview.classList.remove("stale");
+      ee.preview.replaceChildren(line("note", ench.item ? "Pick at least one enchantment to see the plan." : "Pick an item and its enchantments to see the plan."));
+      return;
+    }
+    ee.preview.classList.add("stale");
+    if (!ee.preview.firstChild) ee.preview.appendChild(line("note", "Planning…"));
+    ench.timer = window.setTimeout(enchRunPlan, ENCH_DEBOUNCE_MS);
+  }
+
+  function enchRunPlan() {
+    var req = enchRequest();
+    if (!req || ee.box.hidden) return;
+    if (ench.inflight) {
+      ench.dirty = true; // one plan at a time per user: ask again when this one is back
+      return;
+    }
+    var now = Date.now();
+    if (now < ench.holdUntil) {
+      window.clearTimeout(ench.timer);
+      ench.timer = window.setTimeout(enchRunPlan, ench.holdUntil - now + 50);
+      return;
+    }
+    var sig = JSON.stringify(req);
+    if (ench.last && ench.last.sig === sig && now - ench.last.at < 15000) {
+      ee.preview.classList.remove("stale");
+      enchRenderPlan(ench.last.body);
+      return;
+    }
+    var token = ench.token;
+    ench.inflight = true;
+    api("/api/v1/enchant/plan", { method: "POST", body: req, timeout: 10000 }).then(function (d) {
+      if (token !== ench.token) return;
+      ench.last = { sig: sig, at: Date.now(), body: d };
+      ee.preview.classList.remove("stale");
+      enchRenderPlan(d);
+    }, function (e) {
+      if (token !== ench.token) return;
+      enchPlanError(e);
+    }).then(function () {
+      ench.inflight = false;
+      if (ench.dirty) {
+        ench.dirty = false;
+        if (enchRequest()) {
+          window.clearTimeout(ench.timer);
+          ench.timer = window.setTimeout(enchRunPlan, 50);
+        }
+      }
+    });
+  }
+
+  /** A failed preview: 429 and 503 wait for Retry-After and ask again; the rest says why. */
+  function enchPlanError(e) {
+    var b = e && e.body && typeof e.body === "object" ? e.body : {};
+    var status = e && e.status;
+    if (status === 429 || status === 503) {
+      var wait = clampInt(num(b.retryAfter, 0) || (e && e.retryAfter) || (status === 503 ? 3 : 5), 1, 120);
+      ench.holdUntil = Date.now() + wait * 1000;
+      ee.preview.classList.add("stale");
+      ee.preview.replaceChildren(line("note warn", (status === 429 ? "Too many previews. " : "The server is busy planning. ") +
+        "Trying again in " + wait + " s."));
+      window.clearTimeout(ench.timer);
+      ench.timer = window.setTimeout(enchRunPlan, wait * 1000 + 50);
+      return;
+    }
+    ee.preview.classList.remove("stale");
+    if (status === 400 && b.ok === false && typeof b.message === "string") {
+      enchRenderPlan(b);
+      return;
+    }
+    var text = status === 404 ? "This stash isn't available."
+      : status === 403 ? "You don't have permission to preview enchant orders."
+      : status === 413 ? "That request is too big."
+      : e && e.network ? "Can't reach the server."
+      : "Couldn't get a preview" + (status ? " (HTTP " + status + ")" : "") + ".";
+    ee.preview.replaceChildren(line("note warn", text));
+  }
+
+  /** A material as a phrase: "Diamond Sword", "Book: Sharpness V". */
+  function enchMatLabel(m) {
+    if (!m || typeof m !== "object") return "an item";
+    var has = enchLevelsText(m.ench);
+    var rc = num(m.rc, 0);
+    var tail = rc > 0 ? " (repair cost " + grouped(rc) + ")" : "";
+    if (m.kind === "base") return enchItemName(m.key) + (m.crafted === true ? " (will be crafted)" : has ? " (has " + has + ")" : "") + tail;
+    return "Book: " + (has || "enchanted book") + tail;
+  }
+
+  function enchChips(items) {
+    var d = document.createElement("div");
+    d.className = "ench-stats";
+    items.forEach(function (t) {
+      var c = document.createElement("span");
+      c.className = "ench-chip";
+      c.textContent = t;
+      d.appendChild(c);
+    });
+    return d;
+  }
+
+  function enchRenderPlan(d) {
+    var frag = document.createDocumentFragment();
+    if (!d || d.ok !== true || !d.plan || typeof d.plan !== "object") {
+      var code = str(d && d.code);
+      frag.appendChild(line("note warn", d && typeof d.message === "string" && d.message ? sentence(d.message) : "The plan was refused."));
+      if (ENCH_CODE_TEXT[code] && code !== "bad_request") frag.appendChild(line("note", ENCH_CODE_TEXT[code]));
+      ee.preview.replaceChildren(frag);
+      return;
+    }
+    var p = d.plan;
+    var mats = Array.isArray(p.materials) ? p.materials : [];
+    var steps = Array.isArray(p.steps) ? p.steps : [];
+    frag.appendChild(enchChips([
+      plural(grouped(steps.length), "step"),
+      grouped(num(p.totalLevels, 0)) + " levels in total",
+      grouped(num(p.points, 0)) + " XP points",
+      plural(grouped(num(p.bottles, 0)), "bottle")
+    ]));
+    if (d.estimate === true) {
+      frag.appendChild(line("note warn", "Estimate only. No enchant-capable bot is online, or the stash's index doesn't list the repair cost of some items, so this can't be ordered yet."));
+    } else if (d.canOrder !== true) {
+      frag.appendChild(line("note warn", "The server says this can't be ordered right now."));
+    } else {
+      frag.appendChild(line("ench-ok", "This can be ordered."));
+    }
+    if (d.truncated === true) frag.appendChild(line("note", "The search was cut short, so a cheaper order of steps may exist."));
+    var curse = Array.isArray(p.curse) ? p.curse.filter(function (c) { return typeof c === "string"; }) : [];
+    if (curse.length) {
+      frag.appendChild(line("note warn", "This needs a book that also carries " + curse.map(enchName).join(" and ") +
+        ". After you place the order it waits for your approval before the bot starts."));
+    }
+    var finished = enchLevelsText(p.levels);
+    if (finished) frag.appendChild(line("ench-line", "Finished item: " + finished));
+    var extras = enchLevelsText(p.extras);
+    if (extras) frag.appendChild(line("ench-line", "Also on the item (came with a book, not ordered): " + extras));
+
+    var det = document.createElement("details");
+    det.className = "ench-steps";
+    det.open = ench.detailsOpen;
+    det.addEventListener("toggle", function () { ench.detailsOpen = det.open; });
+    var sum = document.createElement("summary");
+    sum.textContent = "Materials and anvil steps";
+    det.appendChild(sum);
+    var label = function (i) {
+      return i >= 0 && i < mats.length ? enchMatLabel(mats[i]) : "result of step " + (i - mats.length + 1);
+    };
+    mats.forEach(function (m) { det.appendChild(line("order-line", "Uses: " + enchMatLabel(m))); });
+    steps.forEach(function (st, i) {
+      if (!st || typeof st !== "object") return;
+      det.appendChild(line("order-line", "Step " + (i + 1) + ": " + label(num(st.left, -1)) + " + " + label(num(st.right, -1)) +
+        " (" + plural(grouped(num(st.cost, 0)), "level") + ")"));
+    });
+    frag.appendChild(det);
+
+    var av = d.availability && typeof d.availability === "object" ? d.availability : null;
+    if (av) {
+      var names = {};
+      mats.forEach(function (m) {
+        if (m && typeof m.key === "string" && !Object.prototype.hasOwnProperty.call(names, m.key)) names[m.key] = enchMatLabel(m);
+      });
+      var rows = [];
+      var add = function (text, short) { rows.push(line("ench-line" + (short ? " ench-short" : ""), text)); };
+      if (av.base && typeof av.base === "object") {
+        var have = num(av.base.have, 0);
+        if (av.base.craft === true) add("Base item in the stash: " + grouped(have) + ". None can be used, so the base will be crafted from the stash's materials.", false);
+        else add("Base item in the stash: " + grouped(have), have < 1);
+      }
+      (Array.isArray(av.books) ? av.books : []).forEach(function (b) {
+        if (!b || typeof b !== "object") return;
+        var need = num(b.need, 0);
+        var got = num(b.have, 0);
+        var nm = Object.prototype.hasOwnProperty.call(names, str(b.key)) ? names[str(b.key)] : "Book";
+        add(nm + ": need " + grouped(need) + ", stash has " + grouped(got), got < need);
+      });
+      if (av.anvil && typeof av.anvil === "object") {
+        add("Anvils: need " + grouped(num(av.anvil.need, 0)) + ", stash has " + grouped(num(av.anvil.have, 0)), num(av.anvil.have, 0) < num(av.anvil.need, 0));
+      }
+      if (av.bottles && typeof av.bottles === "object") {
+        add("Bottles o' Enchanting: need " + grouped(num(av.bottles.need, 0)) + ", usable " + grouped(num(av.bottles.usable, 0)) +
+          " (the repair reserve is kept back)", num(av.bottles.usable, 0) < num(av.bottles.need, 0));
+      }
+      if (rows.length) {
+        var box = document.createElement("div");
+        box.className = "ench-avail";
+        box.appendChild(line("ench-sub", "In the stash"));
+        rows.forEach(function (r) { box.appendChild(r); });
+        frag.appendChild(box);
+      }
+    }
+    ee.preview.replaceChildren(frag);
+  }
+
+  // ----- placing the order -----
+
+  function enchOrderError(e) {
+    var b = e && e.body && typeof e.body === "object" ? e.body : {};
+    if (e && e.network) return "Can't reach the server. Try again.";
+    if (e && (e.status === 429 || e.status === 503)) {
+      var wait = clampInt(num(b.retryAfter, 0) || (e && e.retryAfter) || 5, 1, 120);
+      return (e.status === 429 ? "Too many orders or plans for now. " : "The server is busy planning. ") + "Try again in " + wait + " s.";
+    }
+    var code = str(b.enchant);
+    var prefix = typeof b.line === "number" && b.line >= 0 ? "Line " + (b.line + 1) + ": " : "";
+    var fallback = ENCH_CODE_TEXT[code] || "Could not place the order" + (e && e.status ? " (HTTP " + e.status + ")" : "") + ".";
+    var text = str(b.error) ? safeServerText(sentence(b.error), ENCH_CODE_TEXT[code] || "The order was refused (details are hidden in streamer mode).") : fallback;
+    return prefix + text;
+  }
+
+  ee.place.addEventListener("click", function () {
+    var s = currentStash();
+    if (!s || !ench.lines.length || ench.placing) return;
+    ench.placing = true;
+    ench.badLine = -1;
+    enchRenderLines();
+    ee.msg.textContent = "Placing the order…";
+    ee.msg.classList.remove("warn");
+    var sent = ench.lines.map(function (l) { return { type: "enchant", key: l.key, count: l.count, enchants: l.enchants }; });
+    api("/api/v1/orders", { method: "POST", body: { server: s.server, stash: s.stash, lines: sent }, timeout: 20000 }).then(function (d) {
+      ench.placing = false;
+      ench.lines = [];
+      var st = d && d.order ? str(d.order.status) : "";
+      ee.msg.textContent = st === "held_curse"
+        ? "Order placed. It needs a curse from one of the books: approve it in the Orders list below to start it."
+        : st === "failed" ? "The order was placed but could not be planned. See the Orders list below."
+        : s.online ? "Order placed." : "Order placed. It will start when the bot reconnects.";
+      toast(st === "held_curse" ? "Order placed: needs your approval" : "Order placed");
+      enchRenderLines();
+      enchUpdateAdd();
+      scheduleOrdersPoll(0);
+    }, function (e) {
+      ench.placing = false;
+      var b = e && e.body;
+      ench.badLine = b && typeof b.line === "number" ? b.line : -1;
+      ee.msg.textContent = enchOrderError(e);
+      if (streamerOn()) ee.msg.setAttribute("data-sensitive", "");
+      else ee.msg.removeAttribute("data-sensitive");
+      ee.msg.classList.add("warn");
+      enchRenderLines();
+      scheduleOrdersPoll(0);
+    });
+  });
+
+  // ----- order cards -----
+
+  /** A held_curse order: the curses are named, only the orderer can accept, anyone who may manage it can cancel. */
+  function appendCurseInfo(card, o) {
+    if (o.status !== "held_curse") return;
+    var hold = o.hold && typeof o.hold === "object" ? o.hold : null;
+    var curses = hold && Array.isArray(hold.curse) ? hold.curse.filter(function (c) { return typeof c === "string"; }) : [];
+    var names = curses.map(enchName).join(" and ");
+    var box = document.createElement("div");
+    box.className = "order-curse";
+    box.appendChild(line("order-curse-text", "This order needs a book that also carries " + (names || "a curse") +
+      ". Nothing is reserved yet and the bot has not started. Accept it to continue, or cancel the order."));
+    var note = enchCurse.notes.get(o.id);
+    if (note) box.appendChild(line("note warn", note));
+    if (ownOrder(o) && curses.length && (can("order") || can("plannerOrder"))) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "mc-button small primary";
+      btn.textContent = "Accept " + names;
+      btn.addEventListener("click", function () { enchAcceptCurse(o, curses, btn); });
+      box.appendChild(btn);
+    } else if (!ownOrder(o)) {
+      var by = o.placedBy && typeof o.placedBy === "object" ? str(o.placedBy.name) : "";
+      box.appendChild(line("note", "Only " + (by || "the person who placed it") + " can accept this. You can cancel it."));
+    }
+    card.appendChild(box);
+  }
+
+  function enchAcceptCurse(o, curses, btn) {
+    btn.disabled = true;
+    enchCurse.notes.delete(o.id);
+    api("/api/v1/orders/" + encodeURIComponent(o.id) + "/accept-curse", { method: "POST", body: { curse: curses } }).then(function (d) {
+      var st = d && d.order ? str(d.order.status) : "";
+      toast(st === "failed" ? "The order could not be planned. See its message." : "Curse accepted: the order is queued");
+      scheduleOrdersPoll(0);
+    }, function (e) {
+      var b = e && e.body && typeof e.body === "object" ? e.body : {};
+      if (e && e.status === 409 && Array.isArray(b.curse)) {
+        // The order now needs other curses than the ones on screen: show the new list and ask again.
+        var list = b.curse.filter(function (c) { return typeof c === "string"; });
+        o.hold = { reason: "curse", curse: list };
+        enchCurse.notes.set(o.id, list.length
+          ? "The curses this order needs changed. It now needs: " + list.map(enchName).join(" and ") + ". Check it and accept again."
+          : "The order changed. Check it and try again.");
+      } else if (e && e.status === 409) {
+        enchCurse.notes.set(o.id, "This order is no longer waiting for approval.");
+      } else if (e && e.status === 429) {
+        enchCurse.notes.set(o.id, "Too many orders for now. Try again in " + clampInt(num(b.retryAfter, 0) || (e && e.retryAfter) || 5, 1, 120) + " s.");
+      } else if (e && e.status === 503) {
+        enchCurse.notes.set(o.id, "The server is busy planning. Try again in " + clampInt((e && e.retryAfter) || 3, 1, 120) + " s.");
+      } else if (e && e.status === 403) {
+        enchCurse.notes.set(o.id, "Only the person who placed the order can accept it.");
+      } else {
+        enchCurse.notes.set(o.id, (str(b.error) ? safeServerText(sentence(str(b.error)), "The server refused that (details are hidden in streamer mode).") : "") ||
+          "Couldn't accept the curse (HTTP " + (e && e.status ? e.status : "error") + ").");
+      }
+      renderOrderList();
+      scheduleOrdersPoll(0);
+    });
+  }
+
+  function enchKeysText(list) {
+    var arr = Array.isArray(list) ? list.filter(function (e) { return e && typeof e === "object" && num(e.count, 0) > 0; }) : [];
+    var shown = arr.slice(0, 8).map(function (e) { return grouped(num(e.count, 0)) + " " + enchItemName(e.key); });
+    if (arr.length > shown.length) shown.push("and " + (arr.length - shown.length) + " more");
+    return shown.join(", ");
+  }
+
+  /** What an enchant order reserves while it is open, the cancel rules, and what the bot did once it is done. */
+  function appendEnchantInfo(card, o) {
+    if (!orderHasEnchant(o)) return;
+    var en = o.enchant && typeof o.enchant === "object" ? o.enchant : null;
+    var open = OPEN_STATUS[o.status] && o.status !== "held_curse";
+    if (en && open && Array.isArray(en.lines)) {
+      var points = 0;
+      var bottles = 0;
+      en.lines.forEach(function (l) {
+        (l && Array.isArray(l.plans) ? l.plans : []).forEach(function (p) {
+          if (p && typeof p === "object") {
+            points += num(p.points, 0);
+            bottles += num(p.bottles, 0);
+          }
+        });
+      });
+      if (points > 0 || bottles > 0) {
+        card.appendChild(line("order-enchant", "Enchanting: about " + grouped(points) + " XP points, " + plural(grouped(bottles), "bottle") + " reserved."));
+      }
+    }
+    // A base the stash lacks is crafted by the bot (the order's craft block; it is used by the enchanting, not delivered).
+    var madeBases = o.craft && typeof o.craft === "object" && Array.isArray(o.craft.forEnchant) ? o.craft.forEnchant : [];
+    var madeText = madeBases.filter(function (b) { return b && typeof b === "object" && typeof b.key === "string"; })
+      .map(function (b) { return grouped(num(b.count, 0)) + " × " + enchItemName(b.key); }).join(", ");
+    if (madeText && (OPEN_STATUS[o.status] || o.status === "held_curse")) {
+      card.appendChild(line("order-enchant", "Base will be crafted: " + madeText + " (used for the enchanting, not delivered)."));
+    }
+    if (open && o.cancelRequested) {
+      card.appendChild(line("order-enchant order-enchant-warn", "Cancel will apply after enchanting finishes: the bot completes the item it is working on, skips the rest and returns everything to the stash."));
+    } else if (o.status === "in_progress") {
+      card.appendChild(line("note", "A cancel applies after enchanting finishes (the bot completes the item it is working on)."));
+    }
+    var res = FINISHED_STATUS[o.status] && o.result && typeof o.result === "object" && o.result.enchant && typeof o.result.enchant === "object"
+      ? o.result.enchant : null;
+    if (!res) return;
+    var made = Array.isArray(res.made) ? res.made.filter(function (m) { return m && typeof m === "object"; }) : [];
+    var short = Array.isArray(res.short) ? res.short.filter(function (m) { return m && typeof m === "object"; }) : [];
+    if (made.length) {
+      card.appendChild(line("order-enchant", "Enchanted: " + made.map(function (m) {
+        var name = enchItemName(m.key);
+        return num(m.made, 0) >= num(m.wanted, 0) ? grouped(num(m.made, 0)) + " " + name
+          : grouped(num(m.made, 0)) + " of " + grouped(num(m.wanted, 0)) + " " + name;
+      }).join(", ") + "."));
+    }
+    if (short.length) {
+      card.appendChild(line("order-enchant order-enchant-warn", "Not enchanted: " + short.map(function (m) {
+        var why = str(m.reason);
+        return enchItemName(m.key) + " (" + (Object.prototype.hasOwnProperty.call(ENCH_SHORT_WHY, why) ? ENCH_SHORT_WHY[why] : "reason hidden") + ")";
+      }).join(", ") + "."));
+    }
+    var back = enchKeysText(res.returned);
+    if (back) card.appendChild(line("order-enchant", "Returned to the stash: " + back + "."));
+    var last = enchLevelsText(res.levels);
+    var used = num(res.bottlesUsed, 0);
+    var broke = num(res.anvilsBroken, 0);
+    if (last || used > 0 || broke > 0) {
+      var d = document.createElement("details");
+      d.className = "order-enchant-details";
+      var openKey = "enchant:" + o.id;
+      d.open = orders.expanded.has(openKey);
+      d.addEventListener("toggle", function () {
+        if (d.open) orders.expanded.add(openKey);
+        else orders.expanded.delete(openKey);
+      });
+      var sm = document.createElement("summary");
+      sm.textContent = "Enchanting details";
+      d.appendChild(sm);
+      if (last) d.appendChild(line("order-line", "Last item: " + last));
+      if (used > 0) d.appendChild(line("order-line", plural(grouped(used), "bottle") + " used"));
+      if (broke > 0) d.appendChild(line("order-line", plural(grouped(broke), "anvil") + " broke"));
+      card.appendChild(d);
+    }
+  }
 
   // ---------- crafting table settings (in the Kits tab: the stash's settings) ----------
   // GET/POST /api/v1/craft*: where the stash's crafting table is, and what must never be used as an ingredient

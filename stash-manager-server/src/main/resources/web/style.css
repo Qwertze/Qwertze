@@ -2786,3 +2786,41 @@ html[data-theme="mac"] .conn-online::before {
 .pearl-name { font-weight: bold; overflow-wrap: anywhere; }
 .pearl-station { margin: 6px 0; padding: 6px 8px; border: 1px solid var(--border, #555); border-radius: var(--radius); }
 .pearl-chamber { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-left: 10px; overflow-wrap: anywhere; }
+
+/* ---------- enchant orders ---------- */
+
+.badge.st-held_curse { background: var(--warn-bg); color: var(--warn-fg); }
+.enchant-box { display: flex; flex-direction: column; gap: 8px; }
+.ench-cols { display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+.ench-pick { display: flex; flex-direction: column; gap: 6px; flex: 1 1 280px; min-width: 240px; max-width: 460px; }
+.ench-side { display: flex; flex-direction: column; gap: 8px; flex: 1 1 280px; min-width: 240px; max-width: 460px; }
+.ench-label { color: var(--text); font-size: 13px; }
+.ench-item { width: 100%; }
+.ench-list { display: flex; flex-direction: column; gap: 3px; max-height: 320px; overflow-y: auto; }
+.ench-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 2px 4px; border-radius: var(--radius); }
+.ench-row.off { opacity: 0.6; }
+.ench-check { display: flex; align-items: center; gap: 6px; min-width: 150px; color: var(--text); font-size: 14px; }
+.ench-level { padding: 2px 4px; font-size: 13px; }
+.ench-why { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.ench-add { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ench-preview { display: flex; flex-direction: column; gap: 4px; color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
+.ench-preview.stale { opacity: 0.6; }
+.ench-stats { display: flex; gap: 6px; flex-wrap: wrap; }
+.ench-chip { background: var(--chip-bg); color: var(--text); border: var(--border-w) solid var(--border); border-radius: var(--pill); padding: 1px 8px; font-size: 12px; }
+.ench-ok { background: var(--ok-bg); color: var(--ok-fg); border-radius: var(--radius); padding: 1px 6px; align-self: flex-start; }
+.ench-line { color: var(--text); }
+.ench-short { background: var(--warn-bg); color: var(--warn-fg); border-radius: var(--radius); padding: 1px 6px; }
+.ench-sub { color: var(--muted); font-size: 12px; }
+.ench-steps summary { cursor: pointer; }
+.ench-lines { display: flex; flex-direction: column; gap: 4px; }
+.ench-lines .cart-line.bad { outline: 2px solid var(--danger-fg); }
+.order-curse { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; background: var(--warn-bg); color: var(--warn-fg); border-radius: var(--radius); padding: 4px 8px; }
+.order-curse-text, .order-enchant, .order-enchant-details { font-size: 13px; overflow-wrap: anywhere; }
+.order-curse .note.warn { background: none; padding: 0; color: inherit; font-weight: 700; }
+.order-enchant { color: var(--text); }
+.order-enchant-warn { background: var(--warn-bg); color: var(--warn-fg); border-radius: var(--radius); padding: 1px 6px; }
+.order-enchant-details summary { cursor: pointer; }
+@media (max-width: 640px) {
+  .ench-cols { flex-direction: column; align-items: stretch; }
+  .ench-pick, .ench-side { min-width: 0; max-width: none; flex: 1 1 auto; }
+}

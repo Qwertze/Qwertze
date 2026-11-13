@@ -5,3 +5,6 @@ plugins {
 }
 
 rootProject.name = "stash-manager-server"
+
+// Shared pure-Java library (com.porter:qwerte-core), substituted from source so a fresh clone builds with one command.
+includeBuild("../qwerte-core")

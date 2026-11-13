@@ -126,6 +126,9 @@ final class BrowserRoutes {
             AreaRoutes ar = areaRoutes;
             o.add("area", ar == null ? com.google.gson.JsonNull.INSTANCE : ar.summaryJson(server, stash)); // no positions
             o.add("craft", craft == null ? com.google.gson.JsonNull.INSTANCE : craft.summaryJson(server, stash)); // no positions
+            EnchantOrders eo = enchantOrders;
+            // ENCHANT-CONTRACT v1.0: {supports, mc, canOrder}; the Minecraft version and two booleans, no names and no positions.
+            o.add("enchant", eo == null ? com.google.gson.JsonNull.INSTANCE : eo.bots().summary(server, stash, owners.owner(server, stash), eo.supportedMc(server, stash)));
             if (forced) Redact.stash(o);
         }
         // "Server 1": what a page in streamer mode shows instead of the address (numbered over the visible stashes).
@@ -140,6 +143,13 @@ final class BrowserRoutes {
     /** Gives the stash list the pearl travel summary (set once at start). */
     void pearl(PearlEngine engine) {
         this.pearlEngine = engine;
+    }
+
+    private volatile EnchantOrders enchantOrders;
+
+    /** Gives the stash list the enchant summary {supports, mc, canOrder} (set once at start). */
+    void enchant(EnchantOrders enchant) {
+        this.enchantOrders = enchant;
     }
 
     /** Gives the stash list the repair passes' summary (set once at start). */

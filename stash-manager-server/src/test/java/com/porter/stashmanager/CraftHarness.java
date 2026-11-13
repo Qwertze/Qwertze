@@ -39,6 +39,8 @@ abstract class CraftHarness {
     static final class FakeRecipes implements RecipeSource {
         volatile RecipeTable table;
         volatile String state = "ready";
+        /** The Minecraft version the table is served for (the enchant tests use 1.21.11). */
+        volatile String mc = MC;
         final java.util.concurrent.atomic.AtomicInteger requests = new java.util.concurrent.atomic.AtomicInteger();
 
         FakeRecipes(RecipeTable table) {
@@ -47,12 +49,12 @@ abstract class CraftHarness {
 
         @Override
         public RecipeTable table(String mcVersion) {
-            return MC.equals(mcVersion) && state.equals("ready") ? table : null;
+            return mc.equals(mcVersion) && state.equals("ready") ? table : null;
         }
 
         @Override
         public String state(String mcVersion) {
-            return MC.equals(mcVersion) ? state : "none";
+            return mc.equals(mcVersion) ? state : "none";
         }
 
         @Override
@@ -70,6 +72,8 @@ abstract class CraftHarness {
     IndexStore store;
     OrderStore orders;
     CraftService craft;
+    /** The routes built by start(): the enchant tests reach their capability store, limits and plan route through it. */
+    StashManagerServer.Routes routes;
     FakeRecipes recipes;
     Users users;
     final AtomicLong now = new AtomicLong(1_000_000_000_000L);
@@ -137,6 +141,7 @@ abstract class CraftHarness {
             new LinkState(config.keyState().generation()), List.of(), sessions, users, audit, hub, new LoginLimiter(),
             new PlanStore(now::get), new ViewerHub(hub, audit), recipes, new CraftBots(botClock::get), new AreaBots(areaClock::get));
         craft = r.craft();
+        routes = r;
         server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 16);
         server.setExecutor(Executors.newFixedThreadPool(4));
         server.createContext("/", r.router());

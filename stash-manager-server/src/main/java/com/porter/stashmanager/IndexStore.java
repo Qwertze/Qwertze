@@ -73,16 +73,23 @@ public final class IndexStore {
      */
     public record OrderCounts(Map<String, Long> items, Map<String, String> itemIds, Map<String, Integer> maxStacks,
                               Map<String, Long> shulkers, Map<String, Long> filledByItemKey, Map<String, Long> filledById,
-                              Map<String, Repair.Info> repairs, Map<String, String> matches) {
+                              Map<String, Repair.Info> repairs, Map<String, String> matches,
+                              Map<String, EnchantIndex.Entry> enchant) {
         public OrderCounts(Map<String, Long> items, Map<String, String> itemIds, Map<String, Integer> maxStacks,
                            Map<String, Long> shulkers, Map<String, Long> filledByItemKey, Map<String, Long> filledById) {
-            this(items, itemIds, maxStacks, shulkers, filledByItemKey, filledById, Map.of(), Map.of());
+            this(items, itemIds, maxStacks, shulkers, filledByItemKey, filledById, Map.of(), Map.of(), Map.of());
         }
 
         public OrderCounts(Map<String, Long> items, Map<String, String> itemIds, Map<String, Integer> maxStacks,
                            Map<String, Long> shulkers, Map<String, Long> filledByItemKey, Map<String, Long> filledById,
                            Map<String, Repair.Info> repairs) {
-            this(items, itemIds, maxStacks, shulkers, filledByItemKey, filledById, repairs, Map.of());
+            this(items, itemIds, maxStacks, shulkers, filledByItemKey, filledById, repairs, Map.of(), Map.of());
+        }
+
+        public OrderCounts(Map<String, Long> items, Map<String, String> itemIds, Map<String, Integer> maxStacks,
+                           Map<String, Long> shulkers, Map<String, Long> filledByItemKey, Map<String, Long> filledById,
+                           Map<String, Repair.Info> repairs, Map<String, String> matches) {
+            this(items, itemIds, maxStacks, shulkers, filledByItemKey, filledById, repairs, matches, Map.of());
         }
 
         /**
@@ -370,6 +377,24 @@ public final class IndexStore {
         return p == null ? null : p.dimension;
     }
 
+    /** What the bot's last heartbeat said about naming (an anvil is set), or null when it never did. */
+    Naming naming(String server, String stash) {
+        Stash s = stashes.get(new StashKey(server, stash));
+        if (s == null) return null;
+        synchronized (s) {
+            return s.naming;
+        }
+    }
+
+    /** When the stash's bot last sent a heartbeat or an index (0 when never). */
+    long lastSeen(String server, String stash) {
+        Stash s = stashes.get(new StashKey(server, stash));
+        if (s == null) return 0;
+        synchronized (s) {
+            return s.lastSeen;
+        }
+    }
+
     /** The bot's delivery container position, or null. */
     Delivery delivery(String server, String stash) {
         Stash s = stashes.get(new StashKey(server, stash));
@@ -519,10 +544,14 @@ public final class IndexStore {
         JsonArray items = index.getAsJsonArray("items");
         Map<String, JsonObject> byKey = new LinkedHashMap<>();
         Map<String, Long> counts = new HashMap<>();
+        Map<String, EnchantIndex.Entry> enchant = new HashMap<>();
         for (JsonElement e : items) {
             JsonObject item = e.getAsJsonObject();
             String key = item.get("key").getAsString();
             long count = Math.max(0, item.get("count").getAsLong());
+            // ENCHANT-CONTRACT v1.0: a bad ench / rc / named field is dropped here (the entry stays); the first entry of a key wins.
+            EnchantIndex.Entry ee = EnchantIndex.clean(item);
+            if (!byKey.containsKey(key) && (ee.known() || ee.rc() >= 0 || ee.named())) enchant.put(key, ee);
             byKey.putIfAbsent(key, item);
             counts.merge(key, count, Long::sum);
         }
@@ -580,7 +609,7 @@ public final class IndexStore {
             if (m != null && !m.isEmpty()) matches.put(e.getKey(), m);
         }
         OrderCounts orderCounts = new OrderCounts(Map.copyOf(itemCounts), Map.copyOf(itemIds), Map.copyOf(maxStacks), Map.copyOf(shulkerCounts),
-            Map.copyOf(filledByItemKey), Map.copyOf(filledById), Map.copyOf(repairs), Map.copyOf(matches));
+            Map.copyOf(filledByItemKey), Map.copyOf(filledById), Map.copyOf(repairs), Map.copyOf(matches), Map.copyOf(enchant));
 
         index.addProperty("receivedAt", receivedAt);
         byte[] disk = Json.GSON.toJson(index).getBytes(StandardCharsets.UTF_8);

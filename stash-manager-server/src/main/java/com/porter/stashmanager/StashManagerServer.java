@@ -152,6 +152,7 @@ public final class StashManagerServer {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("Stopping Stash Manager...");
             built.viewer().close();
+            built.enchantRoutes().close();
             server.stop(1);
             icons.close();
             packs.close();
@@ -193,7 +194,8 @@ public final class StashManagerServer {
         }
     }
 
-    record Routes(Router router, AuthRoutes auth, PlanStore plans, ViewerHub viewer, DeliveryContents delivery, CraftService craft) {
+    record Routes(Router router, AuthRoutes auth, PlanStore plans, ViewerHub viewer, DeliveryContents delivery, CraftService craft,
+                  EnchantOrders enchant, EnchantRoutes enchantRoutes, EnchantLimits enchantLimits) {
     }
 
     /** Every route, in order (the static files last). Shared with the tests, so they check the real registrations. */
@@ -268,6 +270,11 @@ public final class StashManagerServer {
         orders.craft(craft);
         craft.kits(kits);
         orders.kits(new KitOrders(kits, kitReports));
+        EnchantBots enchantBots = new EnchantBots(); // in memory only
+        EnchantOrders enchantOrders = new EnchantOrders(store, enchantBots, owners);
+        orders.enchant(enchantOrders);
+        enchantOrders.craft(craft); // a missing base is crafted when the stash can craft (ENCHANT-CONTRACT draft 3.4)
+        EnchantLimits enchantLimits = new EnchantLimits();
         Redact.kitNumbers = (srv, st, id) -> {
             try {
                 return new java.util.ArrayList<>(kits.get(srv, st).types().templates().keySet()).indexOf(id) + 1;
@@ -281,6 +288,7 @@ public final class StashManagerServer {
         RepairStore repairStore = new RepairStore(config.dataDir());
         repairStore.load();
         RepairBots repairBots = new RepairBots(); // in memory only
+        enchantOrders.repair(repairStore); // the bottle reserve of the xp check
         store.onForget((srv, stashName) -> {
             try {
                 repairStore.forget(srv, stashName);
@@ -295,6 +303,7 @@ public final class StashManagerServer {
                 System.err.println("Could not drop the craft settings of a forgotten stash: " + e.getMessage());
             }
             craft.bots().forget(srv, stashName);
+            enchantBots.forget(srv, stashName);
             try {
                 areaStore.forget(srv, stashName);
             } catch (IOException e) {
@@ -308,11 +317,13 @@ public final class StashManagerServer {
         AddonRoutes addonRoutes = new AddonRoutes(store, link, icons, orders, owners, delivery, kits, kitReports, craft, areaStore, areaBots, audit, areaGuard);
         addonRoutes.repair(repairStore, repairBots);
         addonRoutes.pearl(pearlEngine);
+        addonRoutes.enchant(enchantOrders);
         addonRoutes.register(router);
         BrowserRoutes browserRoutes = new BrowserRoutes(store, config, link, urls, orders, owners, sessions, audit, delivery, kits, kitReports, craft);
         browserRoutes.areas(areaRoutes);
         browserRoutes.repair(repairRoutes);
         browserRoutes.pearl(pearlEngine);
+        browserRoutes.enchant(enchantOrders);
         browserRoutes.register(router);
         areaRoutes.register(router);
         new CraftRoutes(craft, orders, audit, store).register(router);
@@ -322,7 +333,11 @@ public final class StashManagerServer {
         repairRoutes.register(router);
         new PearlRoutes(pearlEngine, store, hub, audit).register(router);
         new DeliveryRoutes(delivery, owners).register(router);
-        new OrderRoutes(orders, owners, audit).register(router);
+        OrderRoutes orderRoutes = new OrderRoutes(orders, owners, audit);
+        orderRoutes.enchant(enchantOrders, enchantLimits);
+        orderRoutes.register(router);
+        EnchantRoutes enchantRoutes = new EnchantRoutes(enchantOrders, orders, store, enchantLimits);
+        enchantRoutes.register(router);
         new BotRoutes(hub).register(router);
         new DashboardRoutes(hub, store, owners, sessions, audit).register(router);
         new UserRoutes(users, sessions, audit, plans).register(router);
@@ -330,7 +345,7 @@ public final class StashManagerServer {
         new ViewerRoutes(viewer).register(router);
         new IconRoutes(icons).register(router);
         new StaticRoutes().register(router); // last: the catch-all
-        return new Routes(router, authRoutes, plans, viewer, delivery, craft);
+        return new Routes(router, authRoutes, plans, viewer, delivery, craft, enchantOrders, enchantRoutes, enchantLimits);
     }
 
     private static void setDefault(String key, String value) {

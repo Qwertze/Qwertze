@@ -37,22 +37,41 @@ final class OrderStore {
     /** The most shulkers one order may need: one double chest (the addon's Order.MAX_BINS). */
     static final int MAX_SHULKERS = 54;
     static final int SHULKER_SLOTS = 27;
+    /** The states that reserve (an order the bot may be working on, or waits to claim). */
     static final Set<String> OPEN = Set.of("pending", "accepted", "in_progress");
+    /** An order waiting for the orderer's curse approval (ENCHANT-CONTRACT v1.0, D1/D2): reserves nothing, counts toward MAX_OPEN. */
+    static final String HELD_CURSE = "held_curse";
+    /** What counts toward MAX_OPEN: the reserving states and the awaiting-approval one. */
+    static final Set<String> COUNTED = Set.of("pending", "accepted", "in_progress", HELD_CURSE);
+    static final int MAX_HELD_CURSE_PER_USER = 3;
+    /** After the bot's heartbeat goes stale, a force-cancelled enchant order keeps its reservations this much longer. */
+    static final long HOLD_AFTER_STALE_MS = 120_000;
+    /** The longest a force-cancelled enchant order's reservations are held, whatever the bot's heartbeats say (coordinator decision, 10 minutes). */
+    static final long HOLD_MAX_MS = 600_000;
     static final Set<String> FINISHED = Set.of("delivered", "failed", "cancelled");
     private static final SecureRandom RANDOM = new SecureRandom();
 
     /**
-     * type is item, shulker, craft (CRAFT-CONTRACT.md: a craft line makes the item from stash materials) or kit
-     * (KIT-CONTRACT-v2: a finished kit of a template; key is the template id). repair: the
+     * type is item, shulker, craft (CRAFT-CONTRACT.md: a craft line makes the item from stash materials), kit
+     * (KIT-CONTRACT-v2: a finished kit of a template; key is the template id) or enchant (ENCHANT-CONTRACT v1.0: key is the item,
+     * enchants the ordered enchantments; null for the other types). repair: the
      * line's "Repair" toggle (PROTOCOL.md, "Additions: repair with XP bottles"). */
-    record Line(String type, String key, long count, boolean repair) {
+    record Line(String type, String key, long count, boolean repair, List<EnchantWant> enchants) {
+        Line(String type, String key, long count, boolean repair) {
+            this(type, key, count, repair, null);
+        }
+
         Line(String type, String key, long count) {
-            this(type, key, count, false);
+            this(type, key, count, false, null);
         }
 
         String ref() {
             return type + ":" + key;
         }
+    }
+
+    /** One ordered enchantment: id as the request wrote it (namespaced or plain), lvl 1..255. */
+    record EnchantWant(String id, int lvl) {
     }
 
     /**
@@ -71,6 +90,10 @@ final class OrderStore {
         String kitName;
         /** That kit's number in the stash's template list (what a forced streamer sees instead of its name), 0 if unknown. */
         int kitNumber;
+        /** The code of a refused enchant line (ENCHANT-CONTRACT v1.0): no_bot / mc_unsupported (409) or an order-check or planning code (400), else null. */
+        final String enchant;
+        /** Accept-curse: the curses the order needs now (a 409 for a list that differs), or null. */
+        List<String> curseList;
 
         OrderException(int status, String message, int line) {
             this(status, message, line, null, null);
@@ -81,11 +104,21 @@ final class OrderStore {
         }
 
         OrderException(int status, String message, int line, String craft, String kit) {
+            this(status, message, line, craft, kit, null);
+        }
+
+        private OrderException(int status, String message, int line, String craft, String kit, String enchant) {
             super(message);
             this.status = status;
             this.line = line;
             this.craft = craft;
             this.kit = kit;
+            this.enchant = enchant;
+        }
+
+        /** A refused enchant line: status 409 with no_bot / mc_unsupported, or 400 with a code of the contract. */
+        static OrderException enchant(int status, String message, int line, String code) {
+            return new OrderException(status, message, line, null, null, code);
         }
     }
 
@@ -118,6 +151,14 @@ final class OrderStore {
         String placedById; // Users.OWNER_ID or a sub-user's id; null for orders from before accounts (the owner's)
         String placedByName; // the name at the time
         String retriedAs; // the order this one was placed again as (Retry, or the planner's "order part again"), or null
+        JsonObject enchant; // ENCHANT-CONTRACT v1.0: {v, mc, lines, take, curse}, made at placement; null when there are no enchant lines
+        JsonObject hold; // {reason: "curse", curse: [ids]} while the order is awaiting curse approval, else null
+        /** The player of the claim that took an enchant order; status calls must come from it (409 otherwise). Never sent to a browser. */
+        String claimedBy;
+        /** When an enchant order was force-cancelled and its reservations are held until the bot acknowledges (0 = no hold). Never sent to a browser. */
+        long forceHoldAt;
+        /** Asks whether the force-cancel hold is still active (set when the order is held or loaded with a hold); null for orders without one. */
+        java.util.function.BooleanSupplier holdProbe;
 
         JsonObject toJson() {
             JsonObject o = new JsonObject();
@@ -131,6 +172,7 @@ final class OrderStore {
                 lo.addProperty("key", l.key);
                 lo.addProperty("count", l.count);
                 if (l.repair) lo.addProperty("repair", true);
+                if (l.enchants != null) lo.add("enchants", EnchantOrders.wantsJson(l.enchants));
                 ls.add(lo);
             }
             o.add("lines", ls);
@@ -139,6 +181,9 @@ final class OrderStore {
             o.add("repairEstimate", repairEstimate == null ? com.google.gson.JsonNull.INSTANCE : repairEstimate.deepCopy());
             o.add("craft", craft == null ? com.google.gson.JsonNull.INSTANCE : craft.deepCopy());
             if (kit != null) o.add("kit", kit.deepCopy());
+            if (enchant != null) o.add("enchant", enchant.deepCopy());
+            if (hold != null) o.add("hold", hold.deepCopy());
+            if (forceHoldAt > 0 && holdProbe != null && holdProbe.getAsBoolean()) o.addProperty("reservationsHeld", true); // a page note; never stored
             o.addProperty("createdAt", createdAt);
             o.addProperty("updatedAt", updatedAt);
             o.addProperty("status", status);
@@ -160,6 +205,15 @@ final class OrderStore {
             return o;
         }
 
+        /** What is written to disk: the order as a browser sees it, plus the bot-binding and hold state that no page may see. */
+        JsonObject toDiskJson() {
+            JsonObject o = toJson();
+            if (claimedBy != null) o.addProperty("claimedBy", claimedBy);
+            o.remove("reservationsHeld");
+            if (forceHoldAt > 0) o.addProperty("forceHoldAt", forceHoldAt);
+            return o;
+        }
+
         static Order fromJson(JsonObject o) {
             Order r = new Order();
             r.id = o.get("id").getAsString();
@@ -168,9 +222,21 @@ final class OrderStore {
             r.lines = new ArrayList<>();
             for (JsonElement e : o.getAsJsonArray("lines")) {
                 JsonObject l = e.getAsJsonObject();
+                List<EnchantWant> wants = null;
+                if (l.has("enchants") && l.get("enchants").isJsonArray()) {
+                    wants = new ArrayList<>();
+                    for (JsonElement w : l.getAsJsonArray("enchants")) {
+                        JsonObject wo = w.getAsJsonObject();
+                        wants.add(new EnchantWant(wo.get("id").getAsString(), wo.get("lvl").getAsInt()));
+                    }
+                }
                 r.lines.add(new Line(l.get("type").getAsString(), l.get("key").getAsString(), l.get("count").getAsLong(),
-                    l.has("repair") && l.get("repair").isJsonPrimitive() && l.get("repair").getAsBoolean()));
+                    l.has("repair") && l.get("repair").isJsonPrimitive() && l.get("repair").getAsBoolean(), wants));
             }
+            r.enchant = o.has("enchant") && o.get("enchant").isJsonObject() ? o.getAsJsonObject("enchant") : null;
+            r.hold = o.has("hold") && o.get("hold").isJsonObject() ? o.getAsJsonObject("hold") : null;
+            r.claimedBy = str(o, "claimedBy");
+            r.forceHoldAt = o.has("forceHoldAt") && o.get("forceHoldAt").isJsonPrimitive() ? o.get("forceHoldAt").getAsLong() : 0;
             r.repairAll = o.has("repairAll") && o.get("repairAll").isJsonPrimitive() && o.get("repairAll").getAsBoolean();
             r.repairEstimate = o.has("repairEstimate") && o.get("repairEstimate").isJsonObject() ? o.getAsJsonObject("repairEstimate") : null;
             r.craft = o.has("craft") && o.get("craft").isJsonObject() ? o.getAsJsonObject("craft") : null;
@@ -224,6 +290,7 @@ final class OrderStore {
     private final IndexStore index;
     private volatile CraftService craftService; // null: this server plans no craft lines
     private volatile KitOrders kitOrders; // null: this server takes no kit lines
+    private volatile EnchantOrders enchantOrders; // null: this server takes no enchant lines
     private final Map<IndexStore.StashKey, Book> books = new ConcurrentHashMap<>();
     private final Map<String, Book> byOrderId = new ConcurrentHashMap<>();
 
@@ -259,6 +326,15 @@ final class OrderStore {
         this.kitOrders = kits;
     }
 
+    /** Gives the store the enchant planner (set once at start). Without it an enchant line is refused. */
+    void enchant(EnchantOrders enchant) {
+        this.enchantOrders = enchant;
+    }
+
+    EnchantOrders enchantOrders() {
+        return enchantOrders;
+    }
+
     void load() throws IOException {
         Files.createDirectories(dir);
         try (DirectoryStream<Path> files = Files.newDirectoryStream(dir, "*.json")) {
@@ -269,6 +345,7 @@ final class OrderStore {
                     synchronized (b) {
                         for (JsonElement e : root.getAsJsonArray("orders")) {
                             Order o = Order.fromJson(e.getAsJsonObject());
+                            if (o.forceHoldAt > 0) o.holdProbe = () -> holdActive(o);
                             b.orders.add(o);
                             byOrderId.put(o.id, b);
                         }
@@ -291,7 +368,7 @@ final class OrderStore {
         root.addProperty("server", b.server);
         root.addProperty("stash", b.stash);
         JsonArray list = new JsonArray();
-        for (Order o : b.orders) list.add(o.toJson());
+        for (Order o : b.orders) list.add(o.toDiskJson());
         root.add("orders", list);
         AtomicFiles.write(dir.resolve(IndexStore.fileName(b.server, b.stash)), Json.GSON.toJson(root).getBytes(StandardCharsets.UTF_8));
     }
@@ -301,7 +378,7 @@ final class OrderStore {
         int excess = b.orders.size() - KEEP;
         for (int i = 0; i < b.orders.size() && excess > 0; ) {
             Order o = b.orders.get(i);
-            if (FINISHED.contains(o.status)) {
+            if (FINISHED.contains(o.status) && !holdActive(o)) { // a force-cancelled enchant order still reserves until the hold ends
                 b.orders.remove(i);
                 byOrderId.remove(o.id, b);
                 excess--;
@@ -311,16 +388,71 @@ final class OrderStore {
         }
     }
 
-    private static Map<String, Long> reserved(Book b) {
+    private Map<String, Long> reserved(Book b) {
         Map<String, Long> out = new HashMap<>();
         for (Order o : b.orders) {
-            if (!OPEN.contains(o.status)) continue;
-            for (Line l : o.lines) out.merge(l.ref(), l.count, Long::sum);
-            // The ingredients of a craft order are taken from the stash like item lines (CRAFT-CONTRACT.md, "The pool").
-            CraftService.take(o.craft).forEach((id, n) -> out.merge("item:" + id, n, Long::sum));
-            KitOrders.reservations(o, out);
+            if (!OPEN.contains(o.status) && !holdActive(o)) continue; // held_curse reserves nothing (D2)
+            addReservations(o, out);
         }
         return out;
+    }
+
+    /** What one order reserves: its lines (the enchant lines through their take instead), craft and kit takes, the enchant take. */
+    static void addReservations(Order o, Map<String, Long> out) {
+        // An enchant line has no ref of its own: what it takes is the order's enchant take, by exact index key (TL2-B4).
+        for (Line l : o.lines) if (!l.type.equals("enchant")) out.merge(l.ref(), l.count, Long::sum);
+        // The ingredients of a craft order are taken from the stash like item lines (CRAFT-CONTRACT.md, "The pool").
+        CraftService.take(o.craft).forEach((id, n) -> out.merge("item:" + id, n, Long::sum));
+        KitOrders.reservations(o, out);
+        enchantTake(o).forEach((key, n) -> out.merge("item:" + key, n, Long::sum));
+    }
+
+    /** The enchant take of an order by index key (empty for an order with none, and for one awaiting curse approval). */
+    static Map<String, Long> enchantTake(Order o) {
+        return takeOf(o.enchant);
+    }
+
+    /** The {@code take} of an order's enchant object by index key. */
+    static Map<String, Long> takeOf(JsonObject enchant) {
+        Map<String, Long> out = new HashMap<>();
+        if (enchant == null || !enchant.has("take") || !enchant.get("take").isJsonArray()) return out;
+        for (JsonElement e : enchant.getAsJsonArray("take")) {
+            if (!e.isJsonObject()) continue;
+            JsonObject t = e.getAsJsonObject();
+            if (t.has("key") && t.has("count")) out.merge(t.get("key").getAsString(), t.get("count").getAsLong(), Long::sum);
+        }
+        return out;
+    }
+
+    /**
+     * Whether a force-cancelled enchant order still reserves (SR2-N1): until the bot acknowledges at its next step boundary (its next
+     * status call, which clears forceHoldAt), or 2 minutes after its heartbeat goes stale ({@link EnchantBots#FRESH_MS} old), counted from
+     * the force-cancel when the bot was never heard.
+     */
+    private boolean holdActive(Order o) {
+        EnchantOrders eo = enchantOrders;
+        if (o.forceHoldAt <= 0 || !"cancelled".equals(o.status) || eo == null) return false;
+        long now = eo.bots().now();
+        EnchantBots.Beat beat = eo.bots().get(o.server, o.stash);
+        long ref = Math.max(o.forceHoldAt, beat == null ? 0 : beat.at());
+        boolean active = now - o.forceHoldAt < HOLD_MAX_MS && now - ref < EnchantBots.FRESH_MS + HOLD_AFTER_STALE_MS;
+        // Sticky: once the hold has ended it never switches back on (a later heartbeat doesn't revive it). Written with the next save.
+        if (!active) o.forceHoldAt = 0;
+        return active;
+    }
+
+    /** The bottles every open enchant order of the stash reserves (the heartbeat reply's enchant.bottlesReserved), held ones included. */
+    long enchantBottlesReserved(String server, String stash) {
+        Book b = books.get(new IndexStore.StashKey(server, stash));
+        if (b == null) return 0;
+        synchronized (b) {
+            long n = 0;
+            for (Order o : b.orders) {
+                if (!OPEN.contains(o.status) && !holdActive(o)) continue;
+                n += enchantTake(o).getOrDefault(Repair.BOTTLE_KEY, 0L);
+            }
+            return n;
+        }
     }
 
     /**
@@ -357,10 +489,21 @@ final class OrderStore {
         if (counts == null) throw new OrderException(400, "no index for that stash", -1);
 
         // Merge lines with the same type and key, remembering where each first appeared (for error reporting).
+        // Enchant lines never merge (ENCHANT-CONTRACT v1.0): each keeps its own enchantments and plans.
         Map<String, Line> merged = new LinkedHashMap<>();
         Map<String, Integer> firstIndex = new HashMap<>();
+        List<Line> enchantLines = new ArrayList<>();
+        List<EnchantOrders.Req> enchantReqs = new ArrayList<>();
         for (int i = 0; i < requested.size(); i++) {
             Line l = requested.get(i);
+            if (l.type.equals("enchant")) {
+                if (l.count < 1 || l.count > EnchantOrders.MAX_PER_LINE) {
+                    throw OrderException.enchant(400, "count of an enchant line must be a whole number from 1 to " + EnchantOrders.MAX_PER_LINE, i, "bad_request");
+                }
+                enchantLines.add(l);
+                enchantReqs.add(new EnchantOrders.Req(i, l.key, (int) l.count, l.enchants == null ? List.of() : l.enchants));
+                continue;
+            }
             Line prev = merged.get(l.ref());
             if (prev == null) {
                 merged.put(l.ref(), l);
@@ -375,12 +518,15 @@ final class OrderStore {
         Line firstKit = merged.values().stream().filter(l -> l.type.equals("kit")).findFirst().orElse(null);
         JsonObject craftPlan = null;
         KitOrders.Plan kitPlan = null;
+        EnchantOrders.Result enchantPlan = null;
+        EnchantOrders.Budget enchantBudget = new EnchantOrders.Budget(); // one clock and one unit total over the re-plans of this placement
         long planVersion = -1;
         // A craft plan can take seconds: it is made outside the lock, against the orders as they were (the book's version),
         // and made again if they changed before the order is stored. The lock is never held for a full plan.
         for (int attempt = 0; ; attempt++) {
-            boolean planned = firstCraft != null || firstKit != null;
+            boolean planned = firstCraft != null || firstKit != null || !enchantReqs.isEmpty();
             if (planned) {
+                craftPlan = null; // made again on every attempt (an earlier attempt's base craft must not linger)
                 CraftService cs = craftService;
                 if (firstCraft != null && cs == null) throw new OrderException(400, "this server can't craft orders", firstIndex.get(firstCraft.ref()));
                 KitOrders ko = kitOrders;
@@ -417,27 +563,126 @@ final class OrderStore {
                         throw e;
                     }
                 }
+                if (!enchantReqs.isEmpty()) {
+                    EnchantOrders eo = enchantOrders;
+                    if (eo == null) throw new OrderException(400, "this server can't plan enchant orders", enchantReqs.get(0).line());
+                    // The rest of this order (its item lines, craft and kit takes) is reserved before the enchant take is drawn.
+                    Map<String, Long> forEnchant = new HashMap<>(snapshot);
+                    Order own = new Order();
+                    own.lines = new ArrayList<>(merged.values());
+                    own.craft = craftPlan;
+                    own.kit = kitPlan == null ? null : kitPlan.kit();
+                    addReservations(own, forEnchant);
+                    // ENCHANT-CONTRACT draft 3.4: an item with no usable base in the stash gets a crafted one when the stash can craft.
+                    // This first pass finds how many bases are missing; the craft is then planned (its take reserved), and the enchant
+                    // plan is made again around it, so the two never use the same stock.
+                    EnchantOrders.BaseCraft bc = eo.baseCraft(server, stash);
+                    enchantPlan = eo.planOrder(server, stash, counts, forEnchant, enchantReqs, true, enchantBudget, bc);
+                    Map<String, Integer> bases = bc == null ? Map.of() : bc.used();
+                    if (!bases.isEmpty()) {
+                        if (cs == null) throw new OrderException(400, "this server can't craft orders", enchantReqs.get(0).line());
+                        JsonObject withoutBases = craftPlan; // the craft lines' and kit shortfalls' plan alone
+                        Map<String, Long> forCraft2 = new HashMap<>(snapshot);
+                        takeOf(enchantPlan.enchant()).forEach((k, n) -> forCraft2.merge("item:" + k, n, Long::sum)); // the craft can't eat the enchant stock
+                        for (int round = 0; ; round++) {
+                            craftPlan = planWithBases(cs, server, stash, counts, forCraft2, forCraft, craftIndex, bases, enchantReqs);
+                            EnchantOrders.BaseCraft fixed = EnchantOrders.BaseCraft.fixed(bases);
+                            own.craft = craftPlan;
+                            Map<String, Long> forEnchant2 = new HashMap<>(snapshot);
+                            addReservations(own, forEnchant2);
+                            enchantPlan = eo.planOrder(server, stash, counts, forEnchant2, enchantReqs, true, enchantBudget, fixed);
+                            Map<String, Integer> got = fixed.used();
+                            if (got.equals(bases)) break;
+                            if (got.isEmpty()) { // a real base turned up: nothing to craft
+                                craftPlan = withoutBases;
+                                break;
+                            }
+                            if (round >= 1) throw new OrderException(409, "the stash changed while this order was being planned; try again", -1);
+                            bases = got;
+                        }
+                    }
+                }
                 Runnable hook = afterPlan;
                 if (hook != null) hook.run();
             }
             synchronized (b) {
-                if ((firstCraft != null || firstKit != null) && b.version != planVersion) {
+                if (planned && b.version != planVersion) {
                     if (attempt >= 2) throw new OrderException(409, "other orders changed while this one was being planned; try again", -1);
                     continue;
                 }
                 return storeLocked(b, server, stash, merged, firstIndex, names, repairAll, byId, byName, counts, craftPlan,
-                    kitPlan == null ? null : kitPlan.kit());
+                    kitPlan == null ? null : kitPlan.kit(), enchantLines, enchantPlan);
             }
         }
     }
 
+    /**
+     * The craft plan of an order that also crafts enchant bases (ENCHANT-CONTRACT draft 3.4): the order's craft lines, the kits' shortfalls and
+     * one craft line per missing base (an item with no usable base), planned together so they share ingredients and the caps. The result's
+     * {@code forEnchant} lists how many of each item are bases for the enchant plans (they are made, not delivered). A shortage or a refusal
+     * is the craft planner's own error, at the enchant line that needs the base.
+     */
+    private static JsonObject planWithBases(CraftService cs, String server, String stash, IndexStore.OrderCounts counts, Map<String, Long> reserved,
+                                            Collection<Line> forCraft, Map<String, Integer> craftIndex, Map<String, Integer> bases,
+                                            List<EnchantOrders.Req> reqs) throws OrderException {
+        Map<String, Line> all = new LinkedHashMap<>();
+        for (Line l : forCraft) all.put(l.ref(), l);
+        Map<String, Integer> at = new HashMap<>(craftIndex);
+        JsonArray forEnchant = new JsonArray();
+        for (Map.Entry<String, Integer> e : bases.entrySet()) {
+            Line c = new Line("craft", e.getKey(), e.getValue());
+            Line prev = all.get(c.ref());
+            all.put(c.ref(), prev == null ? c : new Line("craft", e.getKey(), prev.count + e.getValue(), prev.repair));
+            int line = reqs.get(0).line();
+            for (EnchantOrders.Req r : reqs) {
+                if (EnchantIndex.namespaced(com.porter.qwerte.core.enchant.McData.norm(r.key())).equals(e.getKey())) {
+                    line = r.line();
+                    break;
+                }
+            }
+            at.putIfAbsent(c.ref(), line);
+            JsonObject fo = new JsonObject();
+            fo.addProperty("key", e.getKey());
+            fo.addProperty("count", e.getValue());
+            forEnchant.add(fo);
+        }
+        JsonObject craft = cs.planOrder(server, stash, counts, reserved, all.values(), at);
+        craft.add("forEnchant", forEnchant);
+        return craft;
+    }
+
+    /** The enchant bases an order's craft block makes ({@code craft.forEnchant}), by namespaced item id; empty for an order with none. */
+    static Map<String, Integer> forEnchant(JsonObject craft) {
+        Map<String, Integer> out = new java.util.TreeMap<>();
+        if (craft == null || !craft.has("forEnchant") || !craft.get("forEnchant").isJsonArray()) return out;
+        for (JsonElement e : craft.getAsJsonArray("forEnchant")) {
+            if (!e.isJsonObject()) continue;
+            JsonObject o = e.getAsJsonObject();
+            if (o.has("key") && o.has("count")) out.merge(o.get("key").getAsString(), o.get("count").getAsInt(), Integer::sum);
+        }
+        return out;
+    }
+
     private Order storeLocked(Book b, String server, String stash, Map<String, Line> merged, Map<String, Integer> firstIndex,
                               JsonObject names, boolean repairAll, String byId, String byName, IndexStore.OrderCounts counts,
-                              JsonObject craftPlan, JsonObject kitPlan) throws OrderException, IOException {
+                              JsonObject craftPlan, JsonObject kitPlan, List<Line> enchantLines, EnchantOrders.Result enchantPlan)
+        throws OrderException, IOException {
         {
-            long open = b.orders.stream().filter(o -> OPEN.contains(o.status)).count();
+            long open = b.orders.stream().filter(o -> COUNTED.contains(o.status)).count();
             if (open >= MAX_OPEN) throw new OrderException(400, "too many open orders for this stash (limit " + MAX_OPEN + ")", -1);
+            boolean awaitingCurse = enchantPlan != null && !enchantPlan.curse().isEmpty();
+            if (awaitingCurse) {
+                String who = byId == null ? Users.OWNER_ID : byId;
+                long waiting = b.orders.stream().filter(o -> HELD_CURSE.equals(o.status)
+                    && who.equals(o.placedById == null ? Users.OWNER_ID : o.placedById)).count();
+                if (waiting >= MAX_HELD_CURSE_PER_USER) {
+                    throw new OrderException(400, "you already have " + MAX_HELD_CURSE_PER_USER
+                        + " orders waiting for curse approval; answer or cancel one first", -1);
+                }
+            }
             Map<String, Long> reserved = reserved(b);
+            // The enchant take of this order (reserved only when it is not awaiting curse approval) comes out of the item lines' stock too.
+            Map<String, Long> ownTake = enchantPlan == null || awaitingCurse ? Map.of() : takeOf(enchantPlan.enchant());
             for (Line l : merged.values()) {
                 int at = firstIndex.get(l.ref());
                 if (l.type.equals("craft")) {
@@ -447,13 +692,15 @@ final class OrderStore {
                 if (l.type.equals("kit")) continue; // planned with the kit's template, before the lock
                 long total = counts.total(l.type, l.key);
                 if (total < 0) throw new OrderException(400, "not in the stash: " + l.key, at);
-                long available = Math.max(0, total - reserved.getOrDefault(l.ref(), 0L));
+                long available = Math.max(0, total - reserved.getOrDefault(l.ref(), 0L) - (l.type.equals("item") ? ownTake.getOrDefault(l.key, 0L) : 0L));
                 if (l.count > Integer.MAX_VALUE) throw new OrderException(400, "count too large", at);
                 if (l.count > available) {
                     throw new OrderException(400, "only " + available + " available for " + l.key + " (asked for " + l.count + ")", at);
                 }
             }
-            long shulkers = shulkersNeeded(merged.values(), counts);
+            List<Line> all = new ArrayList<>(merged.values());
+            all.addAll(enchantLines);
+            long shulkers = shulkersNeeded(all, counts);
             if (shulkers > MAX_SHULKERS) {
                 throw new OrderException(400, "too big: this order needs " + shulkers + " shulkers, and one order can fill at most "
                     + MAX_SHULKERS + " (one double chest)", -1);
@@ -463,7 +710,7 @@ final class OrderStore {
             o.id = newId();
             o.server = server;
             o.stash = stash;
-            o.lines = new ArrayList<>(merged.values());
+            o.lines = all;
             o.names = names == null ? null : names.deepCopy();
             o.repairAll = repairAll;
             o.repairEstimate = repairEstimate(o.lines, repairAll, counts, bottlesAvailable(counts, reserved));
@@ -472,6 +719,15 @@ final class OrderStore {
             o.createdAt = now;
             o.updatedAt = now;
             o.status = "pending";
+            if (enchantPlan != null) {
+                o.enchant = enchantPlan.enchant();
+                if (awaitingCurse) {
+                    // D1/D2: it reserves nothing until the orderer says yes; accept re-plans and reserves then.
+                    o.enchant.add("take", new JsonArray());
+                    o.status = HELD_CURSE;
+                    o.hold = holdJson(enchantPlan.curse());
+                }
+            }
             o.placedById = byId;
             o.placedByName = byId == null ? null : byName;
             b.orders.add(o);
@@ -566,6 +822,161 @@ final class OrderStore {
         }
         markRetried(id, again.id);
         return again;
+    }
+
+    /**
+     * The accept-curse checks that need no planning: 404 for an unknown order, 409 unless the order is awaiting curse approval, and 409
+     * (the exception carries the stored list) when asked is not that list.
+     */
+    void checkAcceptable(String id, List<String> asked) throws OrderException {
+        Book b = byOrderId.get(id);
+        if (b == null) throw new OrderException(404, "no such order", -1);
+        List<String> sorted = asked == null ? null : new ArrayList<>(asked);
+        if (sorted != null) java.util.Collections.sort(sorted);
+        synchronized (b) {
+            Order o = find(b, id);
+            if (o == null) throw new OrderException(404, "no such order", -1);
+            if (!HELD_CURSE.equals(o.status)) throw new OrderException(409, "this order isn't waiting for curse approval", -1);
+            List<String> stored = holdCurse(o);
+            if (sorted != null && !stored.equals(sorted)) {
+                OrderException e = new OrderException(409, "the curses this order needs have changed; ask again", -1);
+                e.curseList = stored;
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * POST /api/v1/orders/{id}/accept-curse (ENCHANT-CONTRACT v1.0, D1): the orderer says yes to the curses the order names. The caller
+     * (the route) has checked scope and that the caller placed the order. Here: the state must be held_curse (409) and the consented
+     * list must equal the stored one (409, the exception carries the current list); then the order is planned again OUTSIDE the lock, and the
+     * book's version is checked under it. A curse-free plan, or one that needs only the consented curses, makes it pending with its
+     * reservations; a plan that needs another curse keeps it awaiting with the new list (409); an infeasible plan fails the order with the
+     * plan's reason (like retry).
+     */
+    Order acceptCurse(String id, List<String> consented) throws OrderException, IOException {
+        Book b = byOrderId.get(id);
+        if (b == null) throw new OrderException(404, "no such order", -1);
+        List<String> asked = new ArrayList<>(consented);
+        java.util.Collections.sort(asked);
+        EnchantOrders eo = enchantOrders;
+        if (eo == null) throw new OrderException(400, "this server can't plan enchant orders", -1);
+        EnchantOrders.Budget budget = new EnchantOrders.Budget(); // one clock and one unit total over every attempt
+        for (int attempt = 0; ; attempt++) {
+            List<Line> lines;
+            Map<String, Long> snapshot;
+            long version;
+            String server;
+            String stash;
+            JsonObject craftPlan;
+            JsonObject kitPlan;
+            synchronized (b) {
+                Order o = find(b, id);
+                if (o == null) throw new OrderException(404, "no such order", -1);
+                if (!HELD_CURSE.equals(o.status)) throw new OrderException(409, "this order isn't waiting for curse approval", -1);
+                List<String> stored = holdCurse(o);
+                if (!stored.equals(asked)) {
+                    OrderException e = new OrderException(409, "the curses this order needs have changed; ask again", -1);
+                    e.curseList = stored;
+                    throw e;
+                }
+                lines = new ArrayList<>(o.lines);
+                craftPlan = o.craft;
+                kitPlan = o.kit;
+                snapshot = reserved(b);
+                version = b.version;
+                server = o.server;
+                stash = o.stash;
+            }
+            IndexStore.OrderCounts counts = index.orderCounts(server, stash);
+            EnchantOrders.Result res = null;
+            OrderException failure = null;
+            if (counts == null) {
+                failure = new OrderException(400, "no index for that stash", -1);
+            } else {
+                List<EnchantOrders.Req> reqs = new ArrayList<>();
+                Order own = new Order();
+                own.lines = new ArrayList<>();
+                own.craft = craftPlan; // the order's craft and kit takes are reserved once it runs, so the enchant take is drawn around them
+                own.kit = kitPlan;
+                for (int i = 0; i < lines.size(); i++) {
+                    Line l = lines.get(i);
+                    if (l.type.equals("enchant")) reqs.add(new EnchantOrders.Req(i, l.key, (int) l.count, l.enchants == null ? List.of() : l.enchants));
+                    else own.lines.add(l);
+                }
+                Map<String, Long> forEnchant = new HashMap<>(snapshot);
+                addReservations(own, forEnchant); // the order's other lines are reserved once it runs
+                try {
+                    // The order keeps its craft (draft 3.4): the bases it crafts are offered again, no more than craft.forEnchant says.
+                    Map<String, Integer> bases = forEnchant(craftPlan);
+                    res = eo.planOrder(server, stash, counts, forEnchant, reqs, false, budget, bases.isEmpty() ? null : EnchantOrders.BaseCraft.fixed(bases));
+                } catch (OrderException e) {
+                    failure = e;
+                }
+            }
+            Runnable hook = afterPlan;
+            if (hook != null) hook.run();
+            synchronized (b) {
+                Order o = find(b, id);
+                if (o == null) throw new OrderException(404, "no such order", -1);
+                if (!HELD_CURSE.equals(o.status)) throw new OrderException(409, "this order isn't waiting for curse approval", -1);
+                if (b.version != version) {
+                    if (attempt >= 2) throw new OrderException(409, "other orders changed while this one was being planned; try again", -1);
+                    continue;
+                }
+                if (failure == null) {
+                    // What the order reserves once it runs (its other lines, craft and kit takes, the new enchant take) must still be there.
+                    Order probe = new Order();
+                    probe.lines = o.lines;
+                    probe.craft = o.craft;
+                    probe.kit = o.kit;
+                    probe.enchant = res.enchant();
+                    failure = shortage(probe, counts, snapshot);
+                }
+                if (failure != null) {
+                    o.status = "failed";
+                    o.hold = null;
+                    o.message = Http.truncate(failure.getMessage(), MAX_MESSAGE);
+                    o.updatedAt = System.currentTimeMillis();
+                    prune(b);
+                    save(b);
+                    return o;
+                }
+                if (!asked.containsAll(res.curse())) {
+                    o.enchant = res.enchant();
+                    o.enchant.add("take", new JsonArray());
+                    o.hold = holdJson(res.curse());
+                    o.updatedAt = System.currentTimeMillis();
+                    save(b);
+                    OrderException e = new OrderException(409, "this order now needs a curse you haven't accepted", -1);
+                    e.curseList = new ArrayList<>(res.curse());
+                    throw e;
+                }
+                o.enchant = res.enchant();
+                o.hold = null;
+                o.status = "pending";
+                o.updatedAt = System.currentTimeMillis();
+                save(b);
+                return o;
+            }
+        }
+    }
+
+    /** The first line the stash can no longer cover for what the order would reserve (item and shulker refs), else null. */
+    private static OrderException shortage(Order o, IndexStore.OrderCounts counts, Map<String, Long> reservedByOthers) {
+        Map<String, Long> need = new HashMap<>();
+        addReservations(o, need);
+        for (Map.Entry<String, Long> e : need.entrySet()) {
+            String ref = e.getKey();
+            int colon = ref.indexOf(':');
+            String type = ref.substring(0, colon);
+            if (!type.equals("item") && !type.equals("shulker")) continue; // ready:<template> and the like
+            String key = ref.substring(colon + 1);
+            long total = counts.total(type, key);
+            long free = total < 0 ? 0 : Math.max(0, total - reservedByOthers.getOrDefault(ref, 0L));
+            if (e.getValue() > free) return new OrderException(400, "the stash no longer holds enough of " + key + " for this order", -1);
+        }
+        return null;
     }
 
     private static final String PENDING = "\u0000pending";
@@ -666,7 +1077,9 @@ final class OrderStore {
         long slots = 0;
         long units = 0;
         for (Line l : lines) {
-            if (l.type.equals("craft")) {
+            if (l.type.equals("enchant")) {
+                slots += l.count; // each finished item takes a slot of its own (ENCHANT-CONTRACT v1.0)
+            } else if (l.type.equals("craft")) {
                 long max = CraftService.maxStack(counts, l.key);
                 slots += (l.count + max - 1) / max;
             } else if (l.type.equals("kit")) {
@@ -679,6 +1092,24 @@ final class OrderStore {
             }
         }
         return units + (slots + SHULKER_SLOTS - 1) / SHULKER_SLOTS;
+    }
+
+    private static JsonObject holdJson(List<String> curse) {
+        JsonObject hold = new JsonObject();
+        hold.addProperty("reason", "curse");
+        JsonArray list = new JsonArray();
+        curse.forEach(list::add);
+        hold.add("curse", list);
+        return hold;
+    }
+
+    private static List<String> holdCurse(Order o) {
+        List<String> out = new ArrayList<>();
+        if (o.hold != null && o.hold.has("curse") && o.hold.get("curse").isJsonArray()) {
+            for (JsonElement e : o.hold.getAsJsonArray("curse")) out.add(e.getAsString());
+        }
+        java.util.Collections.sort(out);
+        return out;
     }
 
     private String newId() {
@@ -734,6 +1165,7 @@ final class OrderStore {
             for (java.util.Iterator<Order> it = b.orders.iterator(); it.hasNext(); ) {
                 Order o = it.next();
                 if (!FINISHED.contains(o.status)) continue;
+                if (holdActive(o)) continue; // a force-cancelled enchant order still reserves until the bot acknowledges
                 it.remove();
                 byOrderId.remove(o.id, b);
                 removed++;
@@ -743,7 +1175,7 @@ final class OrderStore {
         }
     }
 
-    /** pending -> cancelled now; accepted/in_progress -> cancelRequested; finished -> 409. */
+    /** pending or awaiting curse approval -> cancelled now; accepted/in_progress -> cancelRequested; finished -> 409. */
     Order cancel(String id) throws OrderException, IOException {
         Book b = byOrderId.get(id);
         if (b == null) throw new OrderException(404, "no such order", -1);
@@ -751,8 +1183,9 @@ final class OrderStore {
             Order o = find(b, id);
             if (o == null) throw new OrderException(404, "no such order", -1);
             if (FINISHED.contains(o.status)) throw new OrderException(409, "order is already " + o.status, -1);
-            if (o.status.equals("pending")) {
+            if (o.status.equals("pending") || o.status.equals(HELD_CURSE)) {
                 o.status = "cancelled";
+                o.hold = null;
                 o.message = "Cancelled before the bot started.";
             } else if (!o.cancelRequested) {
                 o.cancelRequested = true;
@@ -770,17 +1203,35 @@ final class OrderStore {
      * 409 when no cancel was requested or the order isn't held by the bot.
      */
     Order forceCancel(String id) throws OrderException, IOException {
+        return forceCancel(id, false);
+    }
+
+    /**
+     * The same. An enchant order (SR2-N1) needs confirm (the route's strict {@code confirm: true}): the bot may be mid-enchant with the
+     * books, so the order's reservations stay until the bot acknowledges at its next step boundary (its next status call, answered 409)
+     * or until 2 minutes after its heartbeat goes stale. The state check comes first; the guards before it are the route's.
+     */
+    Order forceCancel(String id, boolean confirmed) throws OrderException, IOException {
         Book b = byOrderId.get(id);
         if (b == null) throw new OrderException(404, "no such order", -1);
         synchronized (b) {
             Order o = find(b, id);
             if (o == null) throw new OrderException(404, "no such order", -1);
             if (FINISHED.contains(o.status)) throw new OrderException(409, "order is already " + o.status, -1);
-            if (!o.cancelRequested || o.status.equals("pending")) {
+            if (!o.cancelRequested || o.status.equals("pending") || o.status.equals(HELD_CURSE)) {
                 throw new OrderException(409, "request a cancel first; force cancel is for orders the bot hasn't confirmed", -1);
+            }
+            boolean enchant = hasEnchant(o);
+            if (enchant && !confirmed) {
+                throw new OrderException(400, "confirm: true is required to force-cancel an enchant order (the bot may be mid-enchant)", -1);
             }
             o.status = "cancelled";
             o.message = "cancelled from the website (bot didn't confirm)";
+            EnchantOrders eo = enchantOrders;
+            if (enchant && eo != null) {
+                o.forceHoldAt = eo.bots().now();
+                o.holdProbe = () -> holdActive(o);
+            }
             o.updatedAt = System.currentTimeMillis();
             prune(b);
             save(b);
@@ -833,9 +1284,9 @@ final class OrderStore {
         if (b != null) {
             synchronized (b) {
                 for (Order o : b.orders) {
-                    if (!OPEN.contains(o.status)) continue;
+                    if (!COUNTED.contains(o.status)) continue;
                     open++;
-                    if (active == null && !o.status.equals("pending")) {
+                    if (active == null && !o.status.equals("pending") && !o.status.equals(HELD_CURSE)) {
                         active = new JsonObject();
                         active.addProperty("id", o.id);
                         active.addProperty("status", o.status);
@@ -869,6 +1320,22 @@ final class OrderStore {
         return false;
     }
 
+    /** Whether the bot must carry out enchant orders for this one. */
+    static boolean hasEnchant(Order o) {
+        for (Line l : o.lines) if (l.type.equals("enchant")) return true;
+        return false;
+    }
+
+    /** Whether an order has an enchant line (false for an unknown order). */
+    boolean hasEnchantLine(String id) {
+        Book b = byOrderId.get(id);
+        if (b == null) return false;
+        synchronized (b) {
+            Order o = find(b, id);
+            return o != null && hasEnchant(o);
+        }
+    }
+
     /** { pending: n, cancel: [ids of held orders with a cancel requested] } for the heartbeat reply. */
     JsonObject heartbeatJson(String server, String stash) {
         return heartbeatJson(server, stash, true);
@@ -884,6 +1351,14 @@ final class OrderStore {
 
     /** The same; with kitCapable false the pending orders with kit lines are not counted either. */
     JsonObject heartbeatJson(String server, String stash, boolean craftCapable, boolean kitCapable) {
+        return heartbeatJson(server, stash, craftCapable, kitCapable, false);
+    }
+
+    /**
+     * The same; with enchantCapable false the pending orders with enchant lines are not counted either. An order awaiting curse approval
+     * is never counted (it is not pending).
+     */
+    JsonObject heartbeatJson(String server, String stash, boolean craftCapable, boolean kitCapable, boolean enchantCapable) {
         JsonObject out = new JsonObject();
         JsonArray cancel = new JsonArray();
         int pending = 0;
@@ -892,7 +1367,7 @@ final class OrderStore {
             synchronized (b) {
                 for (Order o : b.orders) {
                     if (o.status.equals("pending")) {
-                        if ((craftCapable || !hasCraft(o)) && (kitCapable || !hasKit(o))) pending++;
+                        if ((craftCapable || !hasCraft(o)) && (kitCapable || !hasKit(o)) && (enchantCapable || !hasEnchant(o))) pending++;
                     } else if (o.cancelRequested && (o.status.equals("accepted") || o.status.equals("in_progress"))) cancel.add(o.id);
                 }
             }
@@ -924,6 +1399,25 @@ final class OrderStore {
      * reservations) and pending orders with kit lines are skipped and stay pending.
      */
     Order claim(String server, String stash, boolean craftOrders, boolean kitFlag) throws IOException {
+        return claim(server, stash, new Claim(craftOrders, kitFlag, false, null));
+    }
+
+    static final String ENCHANT_DOWNGRADED = "the bot can no longer enchant; retry the order";
+
+    /**
+     * What a claim says its bot can do. craft and kit are the claim's flags (craftOrders / kitOrders >= 1). enchant is true only when
+     * the route verified everything the contract demands for an enchant order (ENCHANT-CONTRACT v1.0, "Heartbeat, claim and
+     * capability": the enchantOrders flag, a fresh enabled heartbeat block, mc equal to the index's version, and the claim's player equal
+     * to both the stash owner and the heartbeat's player); player is that claim player, recorded as {@code claimedBy}.
+     */
+    record Claim(boolean craft, boolean kit, boolean enchant, String player) {
+    }
+
+    /** The held order if there is one, else the oldest pending one this claim may take, now accepted. Null = none. */
+    Order claim(String server, String stash, Claim caps) throws IOException {
+        boolean craftOrders = caps.craft();
+        boolean kitFlag = caps.kit();
+        boolean enchantFlag = caps.enchant();
         Book b = books.get(new IndexStore.StashKey(server, stash));
         if (b == null) return null;
         synchronized (b) {
@@ -932,9 +1426,12 @@ final class OrderStore {
             try {
                 for (Order o : b.orders) {
                     if (!(o.status.equals("accepted") || o.status.equals("in_progress"))) continue;
+                    // An enchant order is only ever handed back to the player that claimed it.
+                    if (hasEnchant(o) && enchantFlag && o.claimedBy != null && !o.claimedBy.equalsIgnoreCase(caps.player())) continue;
                     boolean needCraft = hasCraft(o) && !craftOrders;
                     boolean needKit = hasKit(o) && !kitFlag;
-                    if (!needCraft && !needKit) {
+                    boolean needEnchant = hasEnchant(o) && !enchantFlag;
+                    if (!needCraft && !needKit && !needEnchant) {
                         o.flaglessSince = 0;
                         o.flaglessClaims = 0;
                         o.lastFlagless = 0;
@@ -957,16 +1454,18 @@ final class OrderStore {
                     o.flaglessClaims++;
                     CraftService cs = craftService;
                     KitOrders ko = kitOrders;
+                    EnchantOrders eo = enchantOrders;
                     long window = now - o.flaglessSince;
                     boolean alive = (!needCraft || (cs != null && cs.capableWithin(server, stash, window)))
-                        && (!needKit || (ko != null && ko.capableWithin(server, stash, window)));
+                        && (!needKit || (ko != null && ko.capableWithin(server, stash, window)))
+                        && (!needEnchant || (eo != null && eo.bots().enabledWithin(server, stash, window)));
                     boolean expired = o.flaglessClaims >= 3 && window > DOWNGRADE_GRACE_MS && now - startedAt > DOWNGRADE_GRACE_MS
                         && (!alive || window > DOWNGRADE_ABSOLUTE_MS);
                     // A claim every 11 minutes would restart the episode each time: the third such claim fails it.
                     if (o.flaglessEpisodes >= 2 && now - startedAt > DOWNGRADE_GRACE_MS) expired = true;
                     if (!expired) return null;
                     o.status = "failed";
-                    o.message = needKit && !needCraft ? KIT_DOWNGRADED : DOWNGRADED;
+                    o.message = needEnchant && !needCraft && !needKit ? ENCHANT_DOWNGRADED : needKit && !needCraft ? KIT_DOWNGRADED : DOWNGRADED;
                     o.updatedAt = System.currentTimeMillis();
                     changed = true;
                 }
@@ -974,8 +1473,9 @@ final class OrderStore {
                 if (changed) save(b);
             }
             for (Order o : b.orders) {
-                if (o.status.equals("pending") && (craftOrders || !hasCraft(o)) && (kitFlag || !hasKit(o))) {
+                if (o.status.equals("pending") && (craftOrders || !hasCraft(o)) && (kitFlag || !hasKit(o)) && (enchantFlag || !hasEnchant(o))) {
                     o.status = "accepted";
+                    if (hasEnchant(o)) o.claimedBy = caps.player(); // status calls must come from this player
                     o.updatedAt = System.currentTimeMillis();
                     save(b);
                     return o;
@@ -985,17 +1485,36 @@ final class OrderStore {
         }
     }
 
-    /** A status report from the bot. Fields are validated by the route; the move is checked here. */
+    /** A status report from the bot, without the claim's player (an order claimed by a player can't be reported on this way). */
     Order status(String id, String status, String phase, JsonObject progress, String message, JsonObject result)
+        throws OrderException, IOException {
+        return status(id, status, phase, progress, message, result, null);
+    }
+
+    /**
+     * A status report from the bot. Fields are validated by the route; the move is checked here. An order with a claimedBy (an enchant
+     * order) accepts a report only from that player (409 otherwise, nothing changes). A report on a force-cancelled enchant order is the
+     * bot's acknowledgement: its held reservations are released, and it is answered 409 like any report on a finished order.
+     */
+    Order status(String id, String status, String phase, JsonObject progress, String message, JsonObject result, String player)
         throws OrderException, IOException {
         Book b = byOrderId.get(id);
         if (b == null) throw new OrderException(404, "no such order", -1);
         synchronized (b) {
             Order o = find(b, id);
             if (o == null) throw new OrderException(404, "no such order", -1);
+            if (o.claimedBy != null && (player == null || !o.claimedBy.equalsIgnoreCase(player))) {
+                throw new OrderException(409, "this order was claimed by another bot", -1);
+            }
+            if (o.forceHoldAt > 0 && o.status.equals("cancelled")) {
+                o.forceHoldAt = 0;
+                o.updatedAt = System.currentTimeMillis();
+                save(b);
+            }
             if (!allowed(o.status, status)) {
                 throw new OrderException(409, "can't go from " + o.status + " to " + status, -1);
             }
+            if (result != null) EnchantResults.crossCheck(o, result, enchantOrders == null ? RepairStore.DEFAULT_RESERVE : enchantOrders.reserve(o.server, o.stash));
             o.status = status;
             if (phase != null) o.phase = phase;
             if (progress != null) o.progress = progress;

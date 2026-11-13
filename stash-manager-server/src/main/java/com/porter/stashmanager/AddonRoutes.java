@@ -120,6 +120,19 @@ final class AddonRoutes {
             conflict(ex, owner);
             return;
         }
+        // ENCHANT-CONTRACT v1.0: an index that carries ench, rc or named must come from the stash owner (an index value is a claim the
+        // planner builds orders on). The fields themselves are checked when the index is prepared (a bad one is dropped, the entry stays).
+        if (EnchantIndex.carries(index)) {
+            if (player == null || player.isEmpty()) {
+                Http.error(ex, 400, "player is required when an index carries ench, rc or named");
+                return;
+            }
+            String own = owners.owner(server, stash);
+            if (own == null || !own.equalsIgnoreCase(player)) {
+                conflict(ex, own == null ? "" : own);
+                return;
+            }
+        }
         try {
             store.putIndex(index);
         } catch (IndexStore.FullException e) {
@@ -278,6 +291,33 @@ final class AddonRoutes {
                 }
             }
         }
+        // ENCHANT-CONTRACT v1.0: enchant is {v: 1, enabled, mc, carry?}, null (cleared) or absent (kept). It needs the player, who is the
+        // one the claim and the owner checks compare with; memory only.
+        boolean hasEnchant = o.has("enchant");
+        EnchantBots.Cap enchantCap = null;
+        if (hasEnchant) {
+            String who = string(o, "player");
+            if (who == null || who.isEmpty()) {
+                Http.error(ex, 400, "player is required when enchant is sent");
+                return;
+            }
+            if (!PearlBodies.PLAYER.matcher(who).matches()) {
+                Http.error(ex, 400, "player must be a player name when enchant is sent");
+                return;
+            }
+            if (!o.get("enchant").isJsonNull()) {
+                if (!o.get("enchant").isJsonObject()) {
+                    Http.error(ex, 400, "enchant must be an object or null");
+                    return;
+                }
+                try {
+                    enchantCap = EnchantBots.parse(o.getAsJsonObject("enchant"));
+                } catch (IllegalArgumentException e) {
+                    Http.error(ex, 400, e.getMessage());
+                    return;
+                }
+            }
+        }
         boolean hasCraftOrders = o.has("craftOrders");
         if ((hasCraftOrders || o.has("craftHash")) && (string(o, "player") == null || string(o, "player").isEmpty())) {
             Http.error(ex, 400, "player is required when craftOrders or craftHash is sent");
@@ -333,6 +373,8 @@ final class AddonRoutes {
         if (hasDeliveryHash && deliveryHash == null) delivery.clear(server, stash); // the container was unset
         out.addProperty("needDelivery", delivery.needed(server, stash, deliveryHash));
         if (craft != null) craft.bots().beat(server, stash, hasCraftOrders, craftCap, hasCraftHash, craftHash);
+        EnchantOrders eo = enchant;
+        if (eo != null) eo.bots().beat(server, stash, hasEnchant, enchantCap, string(o, "player")); // before the reply: the pending count depends on it
         if (kits != null && kitReports != null) {
             // craft is true only when the bot also carries out craft orders (this heartbeat's craftOrders, else the stored one).
             if (kitCap != null && kitCap.craft()) {
@@ -343,13 +385,25 @@ final class AddonRoutes {
             kitReports.beat(server, stash, hasKitsHash, kitsHash, hasKitsHash2, kitsHash2, hasKitOrders, kitCap, o.has("kitsReportHash"), kitsReportHash);
         }
         if (repairBots != null) repairBots.beat(server, stash, hasRepairHash, repairHash, hasRepairPass, repairPass); // before the reply: it reads the bot's acknowledgements
+        String enchantMc = eo == null ? null : eo.supportedMc(server, stash);
+        boolean enchantCapable = eo != null && enchantMc != null && eo.botReady(server, stash, enchantMc);
         out.add("orders", orders.heartbeatJson(server, stash, craft == null || craft.bots().capable(server, stash),
-            kitReports == null || kitReports.kitCapable(server, stash)));
+            kitReports == null || kitReports.kitCapable(server, stash), enchantCapable));
         if (result.rescan() != null) out.addProperty("rescan", result.rescan());
         if (kits != null && kitReports != null) kitFields(out, server, stash, hasKitsHash, kitsHash, kitsReportHash, hasKitsHash2, kitsHash2);
         if (repairBots != null) {
             RepairBots.Beat rbeat = repairBots.beat(server, stash);
             repairFields(out, server, stash, hasRepairHash, repairHash, rbeat == null ? null : rbeat.pass());
+        }
+        // TL4-B1: to an enchant-capable or repair-capable bot, the bottles every open enchant order of the stash reserves; the bot passes
+        // them as heldOrderBottles to RepairRules.usable, so repair can't spend them.
+        if (eo != null) {
+            boolean repairCapable = repairBots != null && repairBots.beat(server, stash) != null && repairBots.beat(server, stash).supports();
+            if (eo.bots().known(server, stash) || repairCapable) {
+                JsonObject en = new JsonObject();
+                en.addProperty("bottlesReserved", orders.enchantBottlesReserved(server, stash));
+                out.add("enchant", en);
+            }
         }
         if (pearl != null && !pearl.disabled() && (hasPearlTravel || hasPearlLoader || pearl.knows(server, stash))) {
             try {
@@ -377,6 +431,13 @@ final class AddonRoutes {
     /** Gives the heartbeat pearl travel (set once at start). */
     void pearl(PearlEngine engine) {
         this.pearl = engine;
+    }
+
+    private volatile EnchantOrders enchant; // null: this server has no enchant orders (no enchant fields in the reply)
+
+    /** Gives the heartbeat the enchant capability store (set once at start). */
+    void enchant(EnchantOrders enchant) {
+        this.enchant = enchant;
     }
 
     /** Gives the heartbeat the repair passes (set once at start). */

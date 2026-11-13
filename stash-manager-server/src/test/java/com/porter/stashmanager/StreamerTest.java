@@ -478,6 +478,8 @@ class StreamerTest {
             "[POST] ^/api/v1/orders/(o-[0-9a-f]{12})/cancel$ BROWSER_WRITE ORDER_OWN_OR_ALL",
             "[POST] ^/api/v1/orders/(o-[0-9a-f]{12})/force-cancel$ BROWSER_WRITE ORDER_OWN_OR_ALL",
             "[POST] ^/api/v1/orders/(o-[0-9a-f]{12})/retry$ BROWSER_WRITE ORDER_OWN_OR_ALL",
+            // Accept a curse (ENCHANT-CONTRACT v1.0): answers with the order, redacted like every order; see EnchantOrdersTest.
+            "[POST] ^/api/v1/orders/(o-[0-9a-f]{12})/accept-curse$ BROWSER_WRITE ORDER",
             "[GET] ^/api/v1/bots/([A-Za-z0-9_-]{1,64})/viewer/stream$ SESSION VIEWER",
             "[GET, HEAD] ^/api/v1/bots/([A-Za-z0-9_-]{1,64})/viewer$ SESSION VIEWER",
             "[POST] /api/v1/planner/upload BROWSER_UPLOAD PLANNER",
@@ -497,6 +499,9 @@ class StreamerTest {
             "[POST] ^/api/v1/planner/(p-[0-9a-f]{12})/delete$ BROWSER_WRITE PLANNER",
             // The Printer's craft quote: item ids and counts only, no positions (CRAFT-CONTRACT.md).
             "[POST] /api/v1/craft/plan BROWSER_WRITE CRAFT_QUOTE",
+            // The enchant planner (ENCHANT-CONTRACT v1.0): item and enchantment ids, counts and index keys, no positions; the same answer for
+            // a forced streamer (the server address is resolved through the opaque id). See EnchantRoutesTest.
+            "[POST] /api/v1/enchant/plan BROWSER_WRITE ORDER",
             "[GET, HEAD] /icon/ SESSION ICONS");
         java.util.Set<String> forbidden = java.util.Set.of(
             "[POST] ^/api/v1/bots/([A-Za-z0-9_-]{1,64})/(settings|jobs|console|activity)$ BROWSER_WRITE ACTIVITY",
