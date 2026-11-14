@@ -1718,7 +1718,7 @@ html.streamer .sv-hidden { display: inline; color: var(--muted); font-style: ita
 
   /* ----- 2. compact sticky header ----- */
   .header { display: contents; }
-  .header .info-row, .header .conflict-warn { flex: none; order: 0; }
+  .header .info-row, .header .conflict-warn, .header .ops-bar { flex: none; order: 0; }
   .title-row {
     position: sticky;
     top: 0;
@@ -2823,4 +2823,33 @@ html[data-theme="mac"] .conn-online::before {
 @media (max-width: 640px) {
   .ench-cols { flex-direction: column; align-items: stretch; }
   .ench-pick, .ench-side { min-width: 0; max-width: none; flex: 1 1 auto; }
+}
+
+/* Farms page, STOP bar and bot role controls (farms.js). Colours come from the theme variables. */
+.ops-bar { order: 21; flex: 1 1 100%; display: flex; flex-direction: column; gap: 4px; }
+.ops-bar[hidden] { display: none; }
+.ops-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.ops-reason { flex: 0 1 260px; }
+.ops-stop { font-weight: 700; padding: 3px 14px; background: var(--danger-bg); color: var(--danger-fg); border-color: var(--danger-fg); }
+.ops-stop:disabled { opacity: 0.6; }
+.farm-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.farm-head .section-title { margin-right: auto; }
+.farm-intro { display: flex; flex-direction: column; gap: 6px; }
+.farm-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; }
+.farm-ok { background: var(--ok-bg); color: var(--ok-fg); border-radius: var(--radius); padding: 1px 6px; }
+.farm-list { margin-top: 12px; }
+.farm-card .dash-bot-actions { flex-wrap: wrap; }
+.farm-start, .farm-actions { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 6px; }
+.farm-form { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; align-items: end; }
+.farm-form .kits-sc-field .mc-input, .farm-form .kits-sc-field .mc-select { width: 100%; }
+.farm-name-hint { grid-column: 1 / -1; }
+.farm-check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
+.farm-botctl { display: flex; flex-direction: column; gap: 4px; padding-top: 4px; border-top: 1px solid var(--border); }
+.farm-editorbox:empty { display: none; }
+.farm-editor { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.farm-session { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 3px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.farm-session-name { font-weight: 700; color: var(--text); }
+@media (max-width: 767px) {
+  .ops-bar { margin-left: calc(8px + env(safe-area-inset-left)); margin-right: calc(8px + env(safe-area-inset-right)); }
+  .ops-reason { flex: 1 1 100%; }
 }

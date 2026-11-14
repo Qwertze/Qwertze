@@ -41,6 +41,29 @@ final class DashboardRoutes {
         this.owners = owners;
     }
 
+    private TaskService tasks;
+
+    /** The task slice (roles and the farmer flag): a farmer bot's settings, jobs, console and activity are owner only. */
+    DashboardRoutes tasks(TaskService tasks) {
+        this.tasks = tasks;
+        return this;
+    }
+
+    /**
+     * FARM-CONTRACT P5b / TASK R4: the four per-bot routes (GET and POST) answer 403 "manage farms (owner only)" to everyone but
+     * the owner when the bot is a farmer (the owner gave it the role, or it has ever reported farmer.enabled). The id is
+     * resolved with Router.botParam first; this runs before the body is read and before the console, proxy and sudo checks, so
+     * none of their answers can differ for a farmer bot. A bot outside the user's scope, or unknown, gets the unchanged 404.
+     * True after answering.
+     */
+    private boolean farmerGate(HttpExchange ex, Matcher m) throws IOException {
+        if (tasks == null) return false;
+        String id = Router.botParam(ex, m.group(1));
+        if (id == null || !perms(ex).seesBot(id) || !tasks.isFarmer(id) || Router.user(ex).owner()) return false;
+        Router.forbid(ex, Router.Perm.FARMS.what, Router.Perm.FARMS.key);
+        return true;
+    }
+
     void register(Router router) {
         // Every bot route needs the Bots view; settings, proxy and console levels are checked below.
         router.exact(Router.GET, "/api/v1/bots", Router.Guard.SESSION, Router.Perm.ACTIVITY, this::list)
@@ -75,6 +98,12 @@ final class DashboardRoutes {
                 all.addAll(b.scopes.keySet());
                 all.forEach(scopes::add);
                 o.add("scopes", scopes);
+            }
+            if (tasks != null && Router.user(ex).owner()) {
+                // Roles are the owner's (TASK): no other user sees the field.
+                JsonArray roles = new JsonArray();
+                tasks.rolesOf(o.get("botId").getAsString()).forEach(roles::add);
+                o.add("roles", roles);
             }
             // Its stashes: the ones this player owns or last used.
             JsonArray mine = new JsonArray();
@@ -125,6 +154,7 @@ final class DashboardRoutes {
             Http.error(ex, 404, "not found");
             return;
         }
+        if (farmerGate(ex, m)) return;
         if (m.group(2).equals("console") && !perms(ex).consoleRead()) {
             Router.forbid(ex, "use the console", "console");
             return;
@@ -236,6 +266,7 @@ final class DashboardRoutes {
 
     private void post(HttpExchange ex) throws IOException {
         Matcher m = BOT.matcher(ex.getRequestURI().getRawPath());
+        if (m.matches() && farmerGate(ex, m)) return;
         if (!m.matches() || m.group(2).equals("jobs") || m.group(2).equals("activity")) {
             Http.error(ex, 404, "not found");
             return;

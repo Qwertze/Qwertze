@@ -61,7 +61,7 @@ final class RepairRoutes {
     }
 
     void register(Router router) {
-        router.exact(Router.POST, "/api/v1/repair/report", Router.Guard.ADDON_KEY, this::report)
+        router.exact(Router.POST, "/api/v1/repair/report", Router.Guard.ADDON_KEY_LEGACY, this::report)
             .exact(Router.GET, "/api/v1/repair", Router.Guard.SESSION, Router.Perm.VIEW, this::get)
             .exact(Router.POST, "/api/v1/repair/settings", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::settings)
             .exact(Router.POST, "/api/v1/repair/chest", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::chest)

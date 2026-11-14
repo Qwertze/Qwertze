@@ -13,6 +13,7 @@
   <link rel="stylesheet" href="/style.css">
   <script src="/streamer-init.js"></script>
   <script src="/app.js" defer></script>
+  <script src="/farms.js" defer></script>
 </head>
 <body>
   <div class="layout">
@@ -77,12 +78,14 @@
         </div>
       </div>
       <div class="conflict-warn" id="conflict-warn" hidden></div>
+      <div class="ops-bar" id="ops-bar" role="status" hidden></div>
       <nav class="dash-nav" id="dash-nav" aria-label="Pages">
         <button type="button" class="mc-button nav-btn" data-page="stash">Stash</button>
         <button type="button" class="mc-button nav-btn" data-page="orders">Orders</button>
         <button type="button" class="mc-button nav-btn" data-page="planner" id="nav-planner" hidden>Build Planner</button>
         <button type="button" class="mc-button nav-btn" data-page="bots" id="bots-open">Bots</button>
         <button type="button" class="mc-button nav-btn" data-page="activity" id="nav-activity" hidden>Activity</button>
+        <button type="button" class="mc-button nav-btn" data-page="farms" id="nav-farms" hidden>Farms</button>
         <button type="button" class="mc-button nav-btn" data-page="viewer" id="nav-viewer" hidden>Live</button>
         <button type="button" class="mc-button nav-btn" data-page="settings">Settings</button>
         <button type="button" class="mc-button nav-btn" data-page="proxy" id="nav-proxy" hidden>Proxy</button>
@@ -402,6 +405,11 @@
       </section>
     </main>
 
+    <main class="panel dash-page farms-page" id="page-farms" hidden>
+      <div class="panel-label">Farms</div>
+      <div id="farms-root"></div>
+    </main>
+
     <main class="panel dash-page" id="page-activity" hidden>
       <div class="dash-head">
         <div class="panel-label" id="activity-title">Activity</div>
@@ -709,6 +717,7 @@
         <button type="button" class="mc-button icon-btn" id="more-close" aria-label="Close">&#x2715;</button>
       </div>
       <div class="sheet-list">
+        <button type="button" class="sheet-item" data-page="farms">Farms</button>
         <button type="button" class="sheet-item" data-page="planner">Build Planner</button>
         <button type="button" class="sheet-item" data-page="viewer">Live viewer</button>
         <button type="button" class="sheet-item" data-page="settings">Settings</button>

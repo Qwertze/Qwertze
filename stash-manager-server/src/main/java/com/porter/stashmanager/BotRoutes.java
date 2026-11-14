@@ -36,9 +36,19 @@ final class BotRoutes {
     private static final int MAX_CAPS = 16;
 
     private final BotHub hub;
+    private java.util.function.Predicate<String> farmers = id -> false;
+
+    /** Tests only: runs between the farmer check and the store of an activity post, to drive the flip race deterministically. */
+    static volatile Runnable afterFarmerCheck;
 
     BotRoutes(BotHub hub) {
         this.hub = hub;
+    }
+
+    /** Which bot ids count as farmers (the owner's role or the sticky farmerSeen flag): their activity is scrubbed. */
+    BotRoutes farmers(java.util.function.Predicate<String> farmers) {
+        this.farmers = farmers;
+        return this;
     }
 
     void register(Router router) {
@@ -331,12 +341,19 @@ final class BotRoutes {
         BotHub.Bot b = known(ex, AddonRoutes.string(o, "botId"));
         if (b == null) return;
         long now = System.currentTimeMillis();
-        JsonObject snapshot = Activity.clean(o.get("activity"), now);
+        // A farmer-role bot's snapshot is rebuilt from an allowlist before it is stored (FARM-CONTRACT P5d); its events are dropped.
+        boolean farmer = farmers.test(b.botId);
+        Runnable seam = afterFarmerCheck;
+        if (seam != null) seam.run();
+        JsonObject snapshot = farmer ? Activity.cleanFarmer(o.get("activity"), now) : Activity.clean(o.get("activity"), now);
         if (snapshot == null) {
             Http.error(ex, 400, "activity must be an object");
             return;
         }
-        hub.activity(b, snapshot, Activity.events(o.get("activity"), now));
+        hub.activity(b, snapshot, farmer ? new JsonArray() : Activity.events(o.get("activity"), now));
+        // The bot may have become a farmer between the check above and the store: what was just stored is then unscrubbed and is
+        // cleared again (the flip clears first and publishes the flag before it does, so one of the two always sees the other).
+        if (!farmer && farmers.test(b.botId)) hub.clearBotData(b.botId);
         Http.json(ex, 200, Http.ok());
     }
 

@@ -25,7 +25,7 @@ final class DeliveryRoutes {
     }
 
     void register(Router router) {
-        router.exact(Router.POST, "/api/v1/delivery", Router.Guard.ADDON_KEY, this::post)
+        router.exact(Router.POST, "/api/v1/delivery", Router.Guard.ADDON_KEY_LEGACY, this::post)
             .exact(Router.GET, "/api/v1/delivery", Router.Guard.SESSION, Router.Perm.VIEW, this::get);
     }
 

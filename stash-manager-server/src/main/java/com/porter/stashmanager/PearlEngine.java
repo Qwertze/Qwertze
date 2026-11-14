@@ -187,10 +187,29 @@ final class PearlEngine {
         }
     }
 
-    private static String newId(String prefix, int hex) {
-        byte[] b = new byte[hex / 2];
-        RANDOM.nextBytes(b);
-        return prefix + HexFormat.of().formatHex(b);
+    private volatile java.util.function.Predicate<String> taskIdUsed = id -> false;
+
+    /** Whether an id is already a task id of the task service (the t- space is shared, FI-13); must not take the engine's lock. */
+    void taskIds(java.util.function.Predicate<String> used) {
+        this.taskIdUsed = used;
+    }
+
+    /** Whether an id is a trip id or one of a trip's child ids. */
+    synchronized boolean tripIdUsed(String id) {
+        for (PearlStore.Trip t : store.trips) {
+            if (id.equals(t.id) || id.equals(t.childLoad) || id.equals(t.childRearm)) return true;
+        }
+        return false;
+    }
+
+    String newId(String prefix, int hex) {
+        while (true) {
+            byte[] b = new byte[hex / 2];
+            RANDOM.nextBytes(b);
+            String id = prefix + HexFormat.of().formatHex(b);
+            if (prefix.equals("t-") && (taskIdUsed.test(id) || tripIdUsed(id))) continue;
+            return id;
+        }
     }
 
     private void alert(String kind, PearlStore.Trip t, long now) {

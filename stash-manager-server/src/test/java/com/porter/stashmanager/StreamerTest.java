@@ -469,6 +469,9 @@ class StreamerTest {
             "[GET, HEAD] /api/v1/index SESSION VIEW",
             "[GET, HEAD] /api/v1/link SESSION LINK",
             "[GET, HEAD] /api/v1/bots SESSION ACTIVITY",
+            // The STOP state (FARM-CONTRACT E4, draft 2.3): opaque bot ids for a forced streamer, no reason, roles, names or tasks for any
+            // non-owner; see FarmPrivacyTest.
+            "[GET, HEAD] /api/v1/ops SESSION ACTIVITY",
             "[GET, HEAD] ^/api/v1/bots/([A-Za-z0-9_-]{1,64})/(settings|jobs|console|activity)$ SESSION ACTIVITY",
             "[GET, HEAD] /api/v1/delivery SESSION VIEW",
             "[GET, HEAD] /api/v1/orders SESSION VIEW",
@@ -544,6 +547,17 @@ class StreamerTest {
             "[GET, HEAD] /api/v1/area SESSION VIEW",
             "[POST] /api/v1/area BROWSER_WRITE SETTINGS");
         java.util.Set<String> ownerOnly = java.util.Set.of(
+            // Farms, tasks, STOP and roles (FARM-CONTRACT E4, TASK-CONTRACT draft 2.3): the new Perm.FARMS, owner only; see FarmPrivacyTest.
+            "[GET, HEAD] /api/v1/farms SESSION FARMS",
+            "[POST] /api/v1/farms BROWSER_WRITE FARMS",
+            "[POST] /api/v1/farms/delete BROWSER_WRITE FARMS",
+            "[POST] /api/v1/farms/start BROWSER_WRITE FARMS",
+            "[POST] /api/v1/farms/stop BROWSER_WRITE FARMS",
+            "[POST] /api/v1/farms/attach BROWSER_WRITE FARMS",
+            "[GET, HEAD] /api/v1/tasks SESSION FARMS",
+            "[POST] /api/v1/ops/stop BROWSER_WRITE FARMS",
+            "[POST] /api/v1/ops/resume BROWSER_WRITE FARMS",
+            "[POST] /api/v1/bots/roles BROWSER_WRITE FARMS",
             "[POST] /api/v1/link/regenerate BROWSER_WRITE OWNER",
             "[POST] /api/v1/area/home BROWSER_WRITE OWNER",
             "[GET, HEAD] /api/v1/users SESSION OWNER",

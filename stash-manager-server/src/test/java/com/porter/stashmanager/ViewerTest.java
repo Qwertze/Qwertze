@@ -60,6 +60,7 @@ class ViewerTest {
     BotHub hub;
     ViewerHub viewer;
     AuditLog audit;
+    TaskService tasks;
     byte[] k;
     final HttpClient http = HttpClient.newHttpClient();
     final List<InputStream> open = new ArrayList<>();
@@ -97,6 +98,7 @@ class ViewerTest {
         StashManagerServer.Routes r = StashManagerServer.routes(config, store, orders, owners, icons,
             new LinkState(config.keyState().generation()), List.of(), sessions, users, audit, hub, new LoginLimiter(),
             new PlanStore(), viewer);
+        tasks = r.tasks();
         server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 64);
         server.setExecutor(Executors.newFixedThreadPool(24));
         server.createContext("/", r.router());
@@ -905,5 +907,19 @@ class ViewerTest {
         assertEquals(200, botPost("/api/v1/bot/viewer", delta("b1", session, 2, "\"hud\":" + hud)).status);
         JsonObject got = s.next("hud", 2000).data().getAsJsonObject("hud");
         assertEquals(3, got.getAsJsonArray("inv").get(0).getAsJsonObject().get("c").getAsInt());
+    }
+
+    // ---------- a bot that becomes a farmer (FARM-CONTRACT P5c) ----------
+
+    @Test
+    void anOpenStreamEndsWhenItsBotBecomesAFarmer() throws Exception {
+        String owner = login(null, OWNER_PW);
+        assertEquals(200, botPost("/api/v1/bot/viewer", full("b1", vs(1), 1)).status);
+        Stream s = stream(owner, "b1", vs(7));
+        assertNotNull(s.next("hello", 2000));
+        tasks.setRoles("b1", List.of("farmer"));
+        Event bye = s.next("bye", 3000);
+        assertNotNull(bye, "the stream re-checks the farmer status");
+        assertEquals("revoked", bye.data().get("reason").getAsString());
     }
 }

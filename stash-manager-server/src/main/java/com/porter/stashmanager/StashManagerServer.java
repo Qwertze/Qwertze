@@ -26,6 +26,8 @@ public final class StashManagerServer {
 
     public static void main(String[] args) throws IOException {
         System.setProperty("java.awt.headless", "true");
+        // The signed-request floor (TASK R2): a request stamped before this moment is refused, so nothing captured before a restart replays.
+        final long startedAt = System.currentTimeMillis();
         // Drop connections that take too long to send a request or to read a response (slow clients).
         // Read once by the JDK's HttpServer, so they must be set before it is created. -D on the command line wins.
         setDefault("sun.net.httpserver.maxReqTime", "30");
@@ -101,6 +103,7 @@ public final class StashManagerServer {
         Routes built = routes(config, store, orders, owners, icons, link, urls, sessions, users, audit, hub, new LoginLimiter(), new PlanStore(),
             null, recipePacks);
         Router router = built.router();
+        router.signer().notBefore(signerFloor(startedAt));
         AuthRoutes authRoutes = built.auth();
         if (!users.list().isEmpty()) System.out.println("  Website users: the owner and " + users.list().size() + " sub-user(s).");
 
@@ -149,8 +152,18 @@ public final class StashManagerServer {
         }
         icons.prefetch(store.allIconIds());
 
+        // Dirty state files (a STOP that was applied but not saved) are retried in the background, not only by the next call.
+        java.util.concurrent.ScheduledExecutorService flusher = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "stash-manager-flush");
+            t.setDaemon(true);
+            return t;
+        });
+        flusher.scheduleWithFixedDelay(built.tasks()::retryFlush, TaskService.FLUSH_RETRY_MS, TaskService.FLUSH_RETRY_MS, TimeUnit.MILLISECONDS);
+
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("Stopping Stash Manager...");
+            flusher.shutdownNow();
+            built.tasks().retryFlush(); // an "applied, not saved" STOP gets one last try
             built.viewer().close();
             built.enchantRoutes().close();
             server.stop(1);
@@ -181,6 +194,15 @@ public final class StashManagerServer {
     }
 
     /**
+     * The oldest request timestamp a restarted server accepts (TASK R2): the start time minus the allowed clock skew, so a bot whose
+     * clock runs behind by up to the skew is not locked out right after a restart. Trade-off: a request captured up to one skew
+     * before the restart can still be replayed once, until its own timestamp is a skew old (PROTOCOL.md).
+     */
+    static long signerFloor(long startedAt) {
+        return startedAt - Signer.MAX_SKEW_MS;
+    }
+
+    /**
      * What the start-up output says about the bots' API key. The key itself is printed only on the run that generated it (the
      * output of a service ends up in a journal that more people can read than the data folder); every other start only says
      * that a key is set. The key stays in config.properties and in the website's Link addon panel.
@@ -195,7 +217,7 @@ public final class StashManagerServer {
     }
 
     record Routes(Router router, AuthRoutes auth, PlanStore plans, ViewerHub viewer, DeliveryContents delivery, CraftService craft,
-                  EnchantOrders enchant, EnchantRoutes enchantRoutes, EnchantLimits enchantLimits) {
+                  EnchantOrders enchant, EnchantRoutes enchantRoutes, EnchantLimits enchantLimits, TaskService tasks) {
     }
 
     /** Every route, in order (the static files last). Shared with the tests, so they check the real registrations. */
@@ -249,9 +271,24 @@ public final class StashManagerServer {
                          PlanStore plans, ViewerHub viewer, RecipeSource recipes, CraftBots bots, AreaBots areaBotsIn, KitReports kitReportsIn) {
         // A user's plans end with their last session, whatever ended it (logout, expiry, a reset).
         plans.sessionCheck(id -> sessions.countByUser().getOrDefault(id, 0) > 0);
+        // The task slice: bot profiles and STOP, tasks, farms (data/bots.json, ops.json, tasks.json, automation/farms.json).
+        OpsStore opsStore = new OpsStore(config.dataDir(), System::currentTimeMillis);
+        opsStore.load();
+        TaskStore taskStore = new TaskStore(config.dataDir(), System::currentTimeMillis);
+        taskStore.load();
+        FarmStore farmStore = new FarmStore(config.dataDir());
+        farmStore.load();
+        TaskService taskService = new TaskService(opsStore, taskStore, farmStore, hub, audit);
+        taskService.onFarmerFlip(hub::clearBotData);
+        taskService.onFarmerFlip(viewer::forget);
+        taskService.recoverAfterLoad();
+        FarmService farmService = new FarmService(taskService);
         Router router = new Router(new AccessControl(config), sessions, config, users);
-        router.ids(new ServerIds(ServerIds.secret(config.dataDir()), store::servers,
-            () -> hub.all().stream().map(b -> b.botId).toList()));
+        router.ids(new ServerIds(ServerIds.secret(config.dataDir()), store::servers, () -> {
+            java.util.LinkedHashSet<String> all = new java.util.LinkedHashSet<>(hub.all().stream().map(b -> b.botId).toList());
+            all.addAll(taskService.botIds());
+            return all;
+        }));
         AuthRoutes authRoutes = new AuthRoutes(config, sessions, limiter, users, audit);
         authRoutes.ids(router.ids());
         authRoutes.onSessionsEnded(plans::pruneNow);
@@ -284,7 +321,11 @@ public final class StashManagerServer {
         };
         PearlStore pearlStore = new PearlStore(config.dataDir());
         pearlStore.load();
+
         PearlEngine pearlEngine = new PearlEngine(pearlStore);
+        // Pearl trips share the t- id space with tasks (FI-13): each side checks the other's ids (the task side lock-free).
+        taskService.otherIds(pearlEngine::tripIdUsed);
+        pearlEngine.taskIds(taskService::taskIdUsed);
         RepairStore repairStore = new RepairStore(config.dataDir());
         repairStore.load();
         RepairBots repairBots = new RepairBots(); // in memory only
@@ -318,6 +359,7 @@ public final class StashManagerServer {
         addonRoutes.repair(repairStore, repairBots);
         addonRoutes.pearl(pearlEngine);
         addonRoutes.enchant(enchantOrders);
+        addonRoutes.ops(taskService::heartbeatOps);
         addonRoutes.register(router);
         BrowserRoutes browserRoutes = new BrowserRoutes(store, config, link, urls, orders, owners, sessions, audit, delivery, kits, kitReports, craft);
         browserRoutes.areas(areaRoutes);
@@ -338,14 +380,16 @@ public final class StashManagerServer {
         orderRoutes.register(router);
         EnchantRoutes enchantRoutes = new EnchantRoutes(enchantOrders, orders, store, enchantLimits);
         enchantRoutes.register(router);
-        new BotRoutes(hub).register(router);
-        new DashboardRoutes(hub, store, owners, sessions, audit).register(router);
+        new BotRoutes(hub).farmers(taskService::isFarmer).register(router);
+        new DashboardRoutes(hub, store, owners, sessions, audit).tasks(taskService).register(router);
+        new TaskRoutes(taskService).register(router);
+        new FarmRoutes(taskService, farmService, audit).register(router);
         new UserRoutes(users, sessions, audit, plans).register(router);
         new PlannerRoutes(store, orders, plans, audit, craft).register(router);
-        new ViewerRoutes(viewer).register(router);
+        new ViewerRoutes(viewer).farmers(taskService::isFarmer).register(router);
         new IconRoutes(icons).register(router);
         new StaticRoutes().register(router); // last: the catch-all
-        return new Routes(router, authRoutes, plans, viewer, delivery, craft, enchantOrders, enchantRoutes, enchantLimits);
+        return new Routes(router, authRoutes, plans, viewer, delivery, craft, enchantOrders, enchantRoutes, enchantLimits, taskService);
     }
 
     private static void setDefault(String key, String value) {

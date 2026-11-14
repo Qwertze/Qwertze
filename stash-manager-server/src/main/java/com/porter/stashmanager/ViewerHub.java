@@ -495,6 +495,11 @@ final class ViewerHub implements AutoCloseable {
         return lives.get(botId);
     }
 
+    /** Drops what the viewer holds for a bot (a bot that has just become a farmer, FARM-CONTRACT P5e). */
+    synchronized void forget(String botId) {
+        lives.remove(botId);
+    }
+
     private void startSweeper() {
         if (sweeper != null) return;
         sweeper = Executors.newSingleThreadScheduledExecutor(r -> {

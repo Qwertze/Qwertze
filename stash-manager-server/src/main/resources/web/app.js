@@ -123,6 +123,8 @@
     ordersClear: $("orders-clear"),
     pageActivity: $("page-activity"),
     navActivity: $("nav-activity"),
+    navFarms: $("nav-farms"),
+    pageFarms: $("page-farms"),
     activityTitle: $("activity-title"),
     actEmpty: $("act-empty"),
     actBody: $("act-body"),
@@ -358,6 +360,7 @@
     if (page === "bots" || page === "activity") return can("activity");
     if (page === "proxy") return permMode("proxy") !== "none" && !forcedStreamer();
     if (page === "console") return permMode("console") !== "none" && !forcedStreamer();
+    if (page === "farms") return me.owner === true && !forcedStreamer(); // the owner only (farm names and sessions are never sent to anyone else)
     if (page === "planner") return can("planner");
     if (page === "viewer") return can("viewer");
     return true;
@@ -10241,6 +10244,7 @@
     el.pageConsole.hidden = page !== "console";
     el.pageProxy.hidden = page !== "proxy";
     el.pageActivity.hidden = page !== "activity";
+    el.pageFarms.hidden = page !== "farms";
     el.pagePlanner.hidden = page !== "planner";
     if (vel) vel.page.hidden = page !== "viewer"; // (the viewer's code below may not have run yet)
     var navs = el.dashNav.querySelectorAll(".nav-btn");
@@ -10262,6 +10266,10 @@
     }
     if (page === "console") loadConsole();
     window.clearTimeout(act.timer);
+    if (window.StashFarms) {
+      if (page === "farms") window.StashFarms.open();
+      else window.StashFarms.close();
+    }
     if (page === "activity") loadActivity();
     if (page === "planner") plannerOpen();
     else plannerClose();
@@ -10301,6 +10309,7 @@
       updateDashTitles();
       updateProxyNav();
       updateActivityNav(first);
+      if (window.StashFarms) window.StashFarms.sync();
       if (dash.page === "proxy") {
         var before = proxyScope;
         renderProxyScopes();
@@ -10422,6 +10431,10 @@
         st.appendChild(document.createTextNode(" "));
       });
       card.appendChild(st);
+      if (window.StashFarms && me.owner) {
+        var ctl = window.StashFarms.botControls(b);
+        if (ctl) card.appendChild(ctl);
+      }
       var actions = document.createElement("div");
       actions.className = "dash-bot-actions";
       var caps = Array.isArray(b.caps) ? b.caps : [];
@@ -12505,7 +12518,7 @@
     account: $("account-btn"),
     accountMenu: $("account-menu")
   };
-  var MORE_PAGES = ["planner", "viewer", "settings", "proxy", "console"];
+  var MORE_PAGES = ["farms", "planner", "viewer", "settings", "proxy", "console"];
 
   /** Opens a page exactly as its desktop nav button does (that button stays the single source of truth). */
   function openNavPage(page) {
@@ -12658,6 +12671,8 @@
     el.botsOpen.hidden = !activity;
     el.navConsole.hidden = !pageAllowed("console");
     el.navPlanner.hidden = !pageAllowed("planner");
+    el.navFarms.hidden = !pageAllowed("farms");
+    if (window.StashFarms) window.StashFarms.sync();
     renderStreamer(false); // forced streamer mode: on and locked
     updateViewerNav();
     plannerPerms();
@@ -13468,6 +13483,7 @@
 
   var act = { timer: 0, data: null, bot: null, levelFilter: "", sourceFilter: "", moduleQuery: "", enabledOnly: false };
   var LEVEL_COLORS = { info: "lvl-info", warn: "lvl-warn", error: "lvl-error" };
+  var FARMER_KINDS = { plugin: "Plugin task", module: "Module", process: "Process" };
 
   function durationText(ms) {
     var s = Math.max(0, Math.round(ms / 1000));
@@ -13485,6 +13501,14 @@
     var visible = dash.page === "activity" && !document.hidden;
     if (dash.page === "activity" && b && hasCap(b, "activity") && !auth.blocked) {
       var botId = b.botId;
+      if (act.denied === me.id + ":" + botId) {
+        // The server said 403 (a farmer bot's activity is the owner's): don't ask again, that would only repeat the
+        // permission refresh. The next login or a different bot tries again.
+        el.actBody.hidden = true;
+        el.actEmpty.hidden = false;
+        el.actEmpty.textContent = "This bot's activity is for the owner only.";
+        return;
+      }
       api("/api/v1/bots/" + encodeURIComponent(botId) + "/activity").then(function (d) {
         if (botId !== dash.botId || dash.page !== "activity") return;
         if (act.bot !== botId) {
@@ -13493,7 +13517,16 @@
         }
         act.data = d;
         renderActivity();
-      }, function () {});
+      }, function (err) {
+        // A farmer bot's activity is the owner's (403 permission: owner): say so instead of an empty page.
+        if (err && err.status === 403 && botId === dash.botId && dash.page === "activity") {
+          act.denied = me.id + ":" + botId;
+          window.clearTimeout(act.timer);
+          el.actBody.hidden = true;
+          el.actEmpty.hidden = false;
+          el.actEmpty.textContent = "This bot's activity is for the owner only.";
+        }
+      });
     } else if (dash.page === "activity") {
       el.actBody.hidden = true;
       el.actEmpty.hidden = false;
@@ -13617,6 +13650,11 @@
     // --- now doing ---
     var cur = Array.isArray(a.current) ? a.current : [];
     var nf = document.createDocumentFragment();
+    var farmerSnap = typeof a.eventCount === "number"; // a farmer bot: the server keeps only a short allowlist of fields
+    if (farmerSnap) {
+      nf.appendChild(line("note", "Farmer bot: the server keeps only its status. Positions, names, module lists and event text are not collected" +
+        (a.eventCount > 0 ? " (" + a.eventCount + " event" + (a.eventCount === 1 ? "" : "s") + " not shown)." : ".")));
+    }
     if (!cur.length) nf.appendChild(line("note", "Nothing running right now."));
     cur.forEach(function (it) {
       if (!it || typeof it !== "object") return;
@@ -13627,7 +13665,8 @@
       top.appendChild(line("now-source", str(it.source) || "?"));
       if (typeof it.since === "number") top.appendChild(line("note", "since " + durationText(serverNow() - it.since)));
       card.appendChild(top);
-      if (str(it.title)) card.appendChild(line("now-title", str(it.title)));
+      var itTitle = str(it.title) || (farmerSnap && str(it.kind) ? FARMER_KINDS[it.kind] || "" : "");
+      if (itTitle) card.appendChild(line("now-title", itTitle));
       if (str(it.detail)) card.appendChild(hide(line("now-detail", str(it.detail))));
       if (it.progress && typeof it.progress === "object" && num(it.progress.total, 0) > 0) {
         var bar = document.createElement("div");
@@ -14094,4 +14133,20 @@
   window.setInterval(function () { if (!auth.blocked) refreshSudo(); }, 30000);
   el.sort.value = state.sortAll;
   checkAuth(); // renders the tabs once logged in (their icons need the session)
+
+  // ---------- host for farms.js (the Farms page, the STOP bar and the bot role controls) ----------
+  // A small read-only surface; farms.js builds its DOM with textContent only, like this file.
+  window.StashHost = {
+    api: api, str: str, num: num, line: line, hide: hide, hiddenSpan: hiddenSpan, ago: ago, durationText: durationText,
+    toast: toast, serverNow: serverNow,
+    isOwner: function () { return me.owner === true && !forcedStreamer(); },
+    canActivity: function () { return can("activity"); },
+    blocked: function () { return !!auth.blocked; },
+    streamerOn: streamerOn,
+    bots: function () { return dash.bots.slice(); },
+    botName: botName,
+    rerenderBots: function () { if (dash.page === "bots") renderDashBots(); },
+    reloadBots: pollBots
+  };
+  Object.freeze(window.StashHost);
 })();

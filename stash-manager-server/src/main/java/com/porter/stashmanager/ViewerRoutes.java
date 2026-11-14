@@ -32,6 +32,25 @@ final class ViewerRoutes {
     private final BotHub hub;
     private Router router;
 
+    private java.util.function.Predicate<String> farmers = id -> false;
+
+    /** Which bot ids count as farmers: their viewer frames are refused (FARM-CONTRACT P5c). */
+    ViewerRoutes farmers(java.util.function.Predicate<String> farmers) {
+        this.farmers = farmers;
+        return this;
+    }
+
+    /** 403 { code: "farmer" } for a farmer-role bot's frame; true after answering. */
+    private boolean refuseFarmer(HttpExchange ex, String botId) throws IOException {
+        if (!farmers.test(botId)) return false;
+        JsonObject o = new JsonObject();
+        o.addProperty("ok", false);
+        o.addProperty("error", Fail.text("farmer"));
+        o.addProperty("code", "farmer");
+        Http.json(ex, 403, o);
+        return true;
+    }
+
     ViewerRoutes(ViewerHub viewer) {
         this.viewer = viewer;
         this.hub = viewer.bots();
@@ -71,6 +90,7 @@ final class ViewerRoutes {
                 Http.error(ex, 409, "say hello first");
                 return;
             }
+            if (refuseFarmer(ex, preId)) return;
             if (limited(ex, preId)) return;
         }
         JsonElement json;
@@ -98,6 +118,7 @@ final class ViewerRoutes {
             Http.error(ex, 409, "say hello first");
             return;
         }
+        if (refuseFarmer(ex, botId)) return;
         if (preId == null && limited(ex, botId)) return;
         ViewerHub.Frame f;
         try {
@@ -107,6 +128,7 @@ final class ViewerRoutes {
             return;
         }
         ViewerHub.FrameResult r = viewer.frame(b, f);
+        if (farmers.test(botId)) viewer.forget(botId); // became a farmer while this frame was stored
         JsonObject out = Http.ok();
         out.addProperty("watching", r.watching());
         out.addProperty("resync", r.resync());
@@ -137,6 +159,7 @@ final class ViewerRoutes {
         }
         BotHub.Bot b = bot(ex, m.group(1));
         if (b == null) return;
+        if (refuseFarmer(ex, b.botId)) return; // a farmer sends no frames: nothing to show, for anyone
         long now = viewer.now();
         JsonObject o = new JsonObject();
         o.addProperty("now", now);
@@ -176,6 +199,7 @@ final class ViewerRoutes {
         }
         BotHub.Bot b = bot(ex, m.group(1));
         if (b == null) return;
+        if (refuseFarmer(ex, b.botId)) return; // before any stream header is sent
         String vs = Http.query(ex).get("vs");
         if (vs == null || !VS.matcher(vs).matches()) {
             Http.error(ex, 400, "vs must be 16 hex digits");
@@ -345,7 +369,7 @@ final class ViewerRoutes {
             // Re-checked before the data goes out: a revoked session gets only the bye.
             if (now >= nextAuth || (now >= nextHb)) {
                 nextAuth = now + authMs;
-                if (!router.stillAllowed(token, Router.Perm.VIEWER, b.botId)
+                if (!router.stillAllowed(token, Router.Perm.VIEWER, b.botId) || farmers.test(b.botId)
                     || (mask == null && Redact.forced(router.current(token)))) {
                     // Revoked, or forced into streamer mode since this stream began: the page reconnects and then
                     // gets the redacted form.
@@ -375,7 +399,7 @@ final class ViewerRoutes {
             if (sb.isEmpty() && now - out.lastWrite >= ViewerHub.PING_MS) sb.append(":\n\n");
             // Before every write: forced into streamer mode since this stream began? (In memory, cheap.) Then only the
             // bye goes out; the page reconnects and gets the redacted form.
-            if (mask == null && Redact.forced(router.current(token))) {
+            if ((mask == null && Redact.forced(router.current(token))) || farmers.test(b.botId)) {
                 sendBye(out, "revoked");
                 return;
             }

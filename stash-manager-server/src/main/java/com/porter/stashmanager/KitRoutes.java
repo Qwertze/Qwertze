@@ -53,7 +53,7 @@ final class KitRoutes {
     }
 
     void register(Router router) {
-        router.exact(Router.POST, "/api/v1/kits/report", Router.Guard.ADDON_KEY, this::report)
+        router.exact(Router.POST, "/api/v1/kits/report", Router.Guard.ADDON_KEY_LEGACY, this::report)
             .exact(Router.GET, "/api/v1/kits", Router.Guard.SESSION, Router.Perm.VIEW, this::get)
             .exact(Router.POST, "/api/v1/kits/chest", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::chest)
             .exact(Router.POST, "/api/v1/kits/rule", Router.Guard.BROWSER_WRITE, Router.Perm.SETTINGS, this::rule)

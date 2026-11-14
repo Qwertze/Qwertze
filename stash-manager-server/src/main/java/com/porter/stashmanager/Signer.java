@@ -43,6 +43,16 @@ final class Signer {
         return clock.getAsLong();
     }
 
+    /**
+     * The start-time floor (TASK-CONTRACT R2): a request whose ts is older than this is refused, so a request captured
+     * before a restart cannot be replayed into the fresh nonce cache. 0 = no floor.
+     */
+    private volatile long notBefore;
+
+    void notBefore(long ms) {
+        this.notBefore = ms;
+    }
+
     /** K = HMAC-SHA256(key = UTF-8(apiKey), msg = "stash-manager v1"). */
     static byte[] deriveKey(String apiKey) {
         return hmac(apiKey.getBytes(StandardCharsets.UTF_8), "stash-manager v1".getBytes(StandardCharsets.UTF_8));
@@ -91,7 +101,7 @@ final class Signer {
 
     /** Cheap checks before the body is read: a well-formed header with a fresh timestamp. */
     boolean precheck(Auth a) {
-        return a != null && Math.abs(now() - a.ts()) <= MAX_SKEW_MS;
+        return a != null && Math.abs(now() - a.ts()) <= MAX_SKEW_MS && a.ts() >= notBefore;
     }
 
     /**
@@ -100,7 +110,7 @@ final class Signer {
      */
     int verify(Auth a, String method, String pathWithQuery, byte[] body, byte[]... keys) {
         long now = now();
-        if (a == null || Math.abs(now - a.ts()) > MAX_SKEW_MS) return -1;
+        if (a == null || Math.abs(now - a.ts()) > MAX_SKEW_MS || a.ts() < notBefore) return -1;
         byte[] given = a.sig().getBytes(StandardCharsets.US_ASCII);
         int match = -1;
         for (int i = 0; i < keys.length; i++) {

@@ -76,8 +76,8 @@ final class AddonRoutes {
     }
 
     void register(Router router) {
-        router.exact(Router.POST, "/api/v1/index", Router.Guard.ADDON_KEY, this::postIndex)
-            .exact(Router.POST, "/api/v1/heartbeat", Router.Guard.ADDON_KEY, this::heartbeat);
+        router.exact(Router.POST, "/api/v1/index", Router.Guard.ADDON_KEY_LEGACY, this::postIndex)
+            .exact(Router.POST, "/api/v1/heartbeat", Router.Guard.ADDON_KEY_LEGACY, this::heartbeat);
     }
 
     /** Strict UTF-8 JSON body, or null when it doesn't parse. */
@@ -425,7 +425,17 @@ final class AddonRoutes {
         }
         if (craft != null) craftFields(out, server, stash, hasCraftHash, craftHash);
         if (areas != null && areaBots != null) areaFields(ex, out, server, stash, string(o, "player"), hasArea, areaReport);
+        // TASK-CONTRACT "Heartbeat reply": { stop, rev }. Everything-stop only: a heartbeat names no bot id, so a per-bot STOP reaches
+        // a bot through tasks/sync. Older bots ignore the field.
+        if (opsField != null) out.add("ops", opsField.get());
         Http.json(ex, 200, out);
+    }
+
+    private java.util.function.Supplier<JsonObject> opsField;
+
+    /** Gives the heartbeat the "ops" field (the global STOP and its counter). */
+    void ops(java.util.function.Supplier<JsonObject> ops) {
+        this.opsField = ops;
     }
 
     /** Gives the heartbeat pearl travel (set once at start). */

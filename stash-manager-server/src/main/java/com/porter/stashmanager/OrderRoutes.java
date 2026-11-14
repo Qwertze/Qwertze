@@ -108,7 +108,7 @@ final class OrderRoutes {
 
     void register(Router router) {
         // claim is registered before the id patterns; the patterns only match o-<12 hex>.
-        router.exact(Router.POST, "/api/v1/orders/claim", Router.Guard.ADDON_KEY, this::claim)
+        router.exact(Router.POST, "/api/v1/orders/claim", Router.Guard.ADDON_KEY_LEGACY, this::claim)
             .exact(Router.POST, "/api/v1/orders", Router.Guard.BROWSER_WRITE, Router.Perm.ORDER, this::place)
             .exact(Router.POST, "/api/v1/orders/clear", Router.Guard.BROWSER_WRITE, Router.Perm.ORDERS_ALL, this::clear)
             .exact(Router.GET, "/api/v1/orders", Router.Guard.SESSION, Router.Perm.VIEW, this::list)
@@ -116,7 +116,7 @@ final class OrderRoutes {
             .pattern(Router.POST, FORCE_CANCEL, Router.Guard.BROWSER_WRITE, Router.Perm.ORDER_OWN_OR_ALL, this::forceCancel)
             .pattern(Router.POST, RETRY, Router.Guard.BROWSER_WRITE, Router.Perm.ORDER_OWN_OR_ALL, this::retry)
             .pattern(Router.POST, ACCEPT_CURSE, Router.Guard.BROWSER_WRITE, Router.Perm.ORDER, this::acceptCurse)
-            .pattern(Router.POST, STATUS, Router.Guard.ADDON_KEY, this::status);
+            .pattern(Router.POST, STATUS, Router.Guard.ADDON_KEY_LEGACY, this::status);
     }
 
     // ---------- browser ----------

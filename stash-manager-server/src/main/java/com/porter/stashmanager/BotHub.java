@@ -498,6 +498,29 @@ final class BotHub {
         return out;
     }
 
+    /**
+     * Forgets everything stored for a bot that has just become a farmer (FARM-CONTRACT P5e): the activity snapshot, the events,
+     * the settings values (bot/state), the command results (bot/results) with their jobs and console, and what the browser
+     * asked for. Anything pushed before it was known as a farmer may hold positions.
+     */
+    void clearBotData(String botId) {
+        Bot b = bot(botId);
+        if (b == null) return;
+        synchronized (b) {
+            b.activity = null;
+            b.activityAt = 0;
+            b.events.clear();
+            b.eventKeys.clear();
+            b.scopes.clear();
+            b.need.clear();
+            b.queue.clear();
+            b.jobs.clear();
+            b.console.clear();
+            b.consoleRev++;
+            b.notifyAll();
+        }
+    }
+
     boolean online(Bot b) {
         synchronized (b) {
             return online(b, now());

@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "com.porter"
-version = "1.0.0"
+version = "1.1.0"
 
 repositories {
     mavenCentral()
@@ -14,6 +14,7 @@ dependencies {
     testImplementation(platform("org.junit:junit-bom:5.11.4"))
     testImplementation("org.junit.jupiter:junit-jupiter")
     testImplementation("com.google.code.gson:gson:2.13.2") // only to write enchant-vectors.json from a test
+    testImplementation("com.google.jimfs:jimfs:1.3.0") // test only: an in-memory POSIX file system for the farm key tests
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 

@@ -28,8 +28,19 @@ final class Router implements HttpHandler {
     enum Guard {
         /** Only the access check (LAN address + Host allowlist): static files, auth state. */
         OPEN,
-        /** A bot: Authorization: Bearer <apiKey>, otherwise 401. Never needs a website login. */
+        /**
+         * A bot, STRICT (TASK-CONTRACT R1): a signed X-SM-Auth request only (never Bearer, whatever allowBearer says),
+         * the current key only (never the previous one), body at most 1 MiB. This is the default for every bot route:
+         * a new route that should be lenient must say so with ADDON_KEY_LEGACY.
+         */
         ADDON_KEY,
+        /**
+         * A bot, LEGACY class: the routes that existed before the strict flag (index, heartbeat, delivery, orders, kit and
+         * repair reports). Signed requests may use the previous key for 10 minutes after a regenerate, bodies up to 8 MiB,
+         * and an unsigned Bearer key when allowBearer=true. A test lists them; nothing new may join them without a reason.
+         * (Anything under /api/v1/bot/ is strict whatever its guard says.)
+         */
+        ADDON_KEY_LEGACY,
         /** A logged-in browser (sm_session cookie), otherwise 401 {"error":"login required"}. Every browser GET. */
         SESSION,
         /** The CSRF checks in PROTOCOL.md without a session (login and setup), otherwise 403. */
@@ -71,7 +82,9 @@ final class Router implements HttpHandler {
         /** The live viewer: a bot's map, position, nearby entities, HUD and chat (implies ACTIVITY). */
         VIEWER("viewer", "use the live viewer"),
         /** The owner only: user management and the audit log. */
-        OWNER("owner", "manage users (owner only)");
+        OWNER("owner", "manage users (owner only)"),
+        /** Farms, tasks, STOP and bot roles: the owner only (FARM-CONTRACT Q2). Same key as OWNER, a farm-specific message. */
+        FARMS("owner", "manage farms (owner only)");
 
         final String key;
         final String what;
@@ -98,7 +111,7 @@ final class Router implements HttpHandler {
                 case PLANNER -> x.planner();
                 case PLANNER_ORDER -> x.plannerOrder();
                 case VIEWER -> x.viewer();
-                case OWNER -> p.owner();
+                case OWNER, FARMS -> p.owner();
             };
         }
     }
@@ -117,6 +130,11 @@ final class Router implements HttpHandler {
 
     private final AccessControl access;
     private final Signer signer = new Signer();
+
+    /** The request signer (the tests set its start-time floor). */
+    Signer signer() {
+        return signer;
+    }
     private final SessionStore sessions;
     private final Config config;
     private final Users users;
@@ -310,8 +328,8 @@ final class Router implements HttpHandler {
             }
 
             switch (match.guard) {
-                case ADDON_KEY -> {
-                    if (!botAuth(ex, path)) return;
+                case ADDON_KEY, ADDON_KEY_LEGACY -> {
+                    if (!botAuth(ex, path, match.guard == Guard.ADDON_KEY)) return;
                 }
                 case SESSION -> {
                     if (!loggedIn(ex, match.perm)) return;
@@ -398,8 +416,9 @@ final class Router implements HttpHandler {
      * A bot request: X-SM-Auth (HMAC, PROTOCOL.md "Signed requests"); the response is then signed too. The old Bearer
      * header only with allowBearer=true and never on bot/*. False after answering 401.
      */
-    private boolean botAuth(HttpExchange ex, String path) throws IOException {
-        boolean dashboard = path.startsWith("/api/v1/bot/");
+    private boolean botAuth(HttpExchange ex, String path, boolean routeStrict) throws IOException {
+        // Strict is the route's flag (R1); the old /api/v1/bot/ prefix still counts, as a second layer.
+        boolean dashboard = routeStrict || path.startsWith("/api/v1/bot/");
         String header = ex.getRequestHeaders().getFirst(Signer.REQUEST_HEADER);
         if (header != null) {
             // Format, timestamp and nonce syntax first, so unauthenticated junk never makes the server read a body.
